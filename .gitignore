@@ -1,0 +1,45 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Python sidecar
+sidecar/.venv/
+sidecar/**/__pycache__/
+sidecar/**/*.pyc
+sidecar/.pytest_cache/
+sidecar/.mypy_cache/
+sidecar/.ruff_cache/
+sidecar/*.egg-info/
+sidecar/build/
+
+# Local data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+.env
+.env.local
+
+# Bundled sidecar binaries (built per release, not checked in)
+src-tauri/binaries/
