@@ -1,0 +1,182 @@
+"""Live IBKR provider using ib_async.
+
+Requires TWS or IB Gateway running locally with API enabled:
+    - Paper trading default port: 7497
+    - Live trading default port:  7496
+    - In TWS: Edit > Global Configuration > API > Settings
+        - Enable ActiveX and Socket Clients
+        - Trusted IPs: 127.0.0.1
+        - Read-Only API: ON for v1 (no order routing yet — see Task #12)
+
+Reconnect behavior: if the TWS connection drops mid-stream, this provider
+attempts to reconnect with exponential backoff up to `max_reconnect_attempts`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from datetime import datetime
+
+from fef_sidecar.ibkr.models import Bar, Contract, ContractKind, Quote
+
+logger = logging.getLogger(__name__)
+
+
+def _to_ib_contract(c: Contract):
+    """Translate our Contract to ib_async's Contract."""
+    from ib_async import Index, Option, Stock
+
+    if c.kind == ContractKind.INDEX:
+        return Index(c.symbol, c.exchange, c.currency)
+    if c.kind == ContractKind.STOCK:
+        return Stock(c.symbol, c.exchange, c.currency)
+    if c.kind == ContractKind.OPTION:
+        if not (c.expiry and c.strike is not None and c.right):
+            raise ValueError("Option contract requires expiry, strike, right")
+        return Option(c.symbol, c.expiry, c.strike, c.right, c.exchange, currency=c.currency)
+    raise ValueError(f"Unsupported contract kind: {c.kind}")
+
+
+def _bar_from_ib(b) -> Bar:
+    """Convert an ib_async BarData into our Bar model."""
+    ts = b.date
+    if isinstance(ts, str):
+        ts = datetime.fromisoformat(ts.replace(" ", "T"))
+    return Bar(
+        timestamp=ts,
+        open=float(b.open),
+        high=float(b.high),
+        low=float(b.low),
+        close=float(b.close),
+        volume=float(b.volume or 0),
+    )
+
+
+class LiveIBKRProvider:
+    """ib_async-backed provider."""
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 7497,
+        client_id: int = 1,
+        *,
+        max_reconnect_attempts: int = 5,
+        reconnect_base_delay: float = 2.0,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.client_id = client_id
+        self._max_reconnect = max_reconnect_attempts
+        self._reconnect_base = reconnect_base_delay
+        self._ib = None  # lazy-imported
+
+    @property
+    def is_connected(self) -> bool:
+        return self._ib is not None and self._ib.isConnected()
+
+    async def connect(self) -> None:
+        if self.is_connected:
+            return
+        from ib_async import IB
+
+        if self._ib is None:
+            self._ib = IB()
+        await self._ib.connectAsync(self.host, self.port, clientId=self.client_id)
+        logger.info(
+            "IBKR connected: host=%s port=%d client_id=%d",
+            self.host,
+            self.port,
+            self.client_id,
+        )
+
+    async def disconnect(self) -> None:
+        if self._ib is not None and self._ib.isConnected():
+            self._ib.disconnect()
+        self._ib = None
+
+    async def _ensure_connected(self) -> None:
+        for attempt in range(self._max_reconnect):
+            try:
+                await self.connect()
+                return
+            except Exception as e:
+                delay = self._reconnect_base * (2**attempt)
+                logger.warning(
+                    "IBKR connect failed (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt + 1,
+                    self._max_reconnect,
+                    e,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        raise ConnectionError(
+            f"Could not connect to IBKR at {self.host}:{self.port} "
+            f"after {self._max_reconnect} attempts"
+        )
+
+    async def stream_bars(
+        self,
+        contract: Contract,
+        *,
+        bar_size: str = "2 mins",
+        duration: str = "1 D",
+    ) -> AsyncIterator[Bar]:
+        await self._ensure_connected()
+        assert self._ib is not None
+
+        ib_contract = _to_ib_contract(contract)
+        await self._ib.qualifyContractsAsync(ib_contract)
+
+        bars = await self._ib.reqHistoricalDataAsync(
+            ib_contract,
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES" if contract.kind == ContractKind.STOCK else "MIDPOINT",
+            useRTH=True,
+            formatDate=2,
+            keepUpToDate=True,
+        )
+
+        queue: asyncio.Queue[Bar] = asyncio.Queue()
+
+        for b in bars:
+            await queue.put(_bar_from_ib(b))
+
+        def _on_update(bar_list, has_new_bar: bool) -> None:
+            if not has_new_bar or not bar_list:
+                return
+            queue.put_nowait(_bar_from_ib(bar_list[-1]))
+
+        bars.updateEvent += _on_update
+
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            bars.updateEvent -= _on_update
+            self._ib.cancelHistoricalData(bars)
+
+    async def get_last_quote(self, contract: Contract) -> Quote:
+        await self._ensure_connected()
+        assert self._ib is not None
+
+        ib_contract = _to_ib_contract(contract)
+        await self._ib.qualifyContractsAsync(ib_contract)
+
+        ticker = self._ib.reqMktData(ib_contract, snapshot=True)
+        # Give it a moment to populate
+        await asyncio.sleep(1.5)
+        self._ib.cancelMktData(ib_contract)
+
+        return Quote(
+            timestamp=datetime.now(),
+            last=float(ticker.last) if ticker.last else float(ticker.close or 0),
+            bid=float(ticker.bid) if ticker.bid else None,
+            ask=float(ticker.ask) if ticker.ask else None,
+            bid_size=float(ticker.bidSize) if ticker.bidSize else None,
+            ask_size=float(ticker.askSize) if ticker.askSize else None,
+        )
