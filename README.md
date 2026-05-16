@@ -33,7 +33,16 @@ Personal quant workstation for SPX 0DTE trading. Combines real-time QuantData op
 
 ## Dev workflow
 
-Open two terminals.
+### Option A — one-click launcher (recommended)
+```powershell
+.\scripts\start.ps1                         # mock providers, 2-min cadence
+.\scripts\start.ps1 -IbkrMode live          # IBKR live (requires TWS running)
+.\scripts\start.ps1 -QuantDataMode live -IbkrMode live -LoopIntervalSec 60
+```
+
+Or just double-click `scripts\start.bat` for the simple version.
+
+### Option B — manual (two terminals)
 
 **Terminal 1 — Python sidecar:**
 ```powershell
@@ -48,6 +57,15 @@ npm run tauri dev
 ```
 
 The frontend talks to the sidecar over `ws://127.0.0.1:8765/ws`.
+
+### Provider modes
+
+Both default to mock so you can run offline. Switch via env vars:
+- `FEF_PROVIDER_QUANTDATA=live` — use real QuantData (requires `~/.quantdata-mcp/config.json`)
+- `FEF_PROVIDER_IBKR=live` — use real IBKR (requires TWS / Gateway running)
+- `FEF_LOOP_INTERVAL_SEC=60` — FEF iter cadence (default 120s)
+- `FEF_LOOP_MARKET_HOURS_ONLY=true` — only run during 9:30-16:00 ET
+- `FEF_DISABLE_AUTO_LOOP=true` — skip the background loops (for tests)
 
 ## Project layout
 
