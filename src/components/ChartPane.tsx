@@ -3,13 +3,16 @@ import {
   CandlestickSeries,
   ColorType,
   CrosshairMode,
+  LineStyle,
   createChart,
   type CandlestickData,
   type IChartApi,
+  type IPriceLine,
   type ISeriesApi,
   type UTCTimestamp,
 } from "lightweight-charts";
 import { useSidecar } from "../context/WebSocketContext";
+import type { IterEvent, WallRow } from "../lib/events";
 
 const DARK_THEME = {
   layout: {
@@ -22,17 +25,13 @@ const DARK_THEME = {
     vertLines: { color: "#1c222b" },
     horzLines: { color: "#1c222b" },
   },
-  crosshair: {
-    mode: CrosshairMode.Normal,
-  },
+  crosshair: { mode: CrosshairMode.Normal },
   timeScale: {
     borderColor: "#2a323e",
     timeVisible: true,
     secondsVisible: false,
   },
-  rightPriceScale: {
-    borderColor: "#2a323e",
-  },
+  rightPriceScale: { borderColor: "#2a323e" },
 };
 
 const CANDLE_OPTIONS = {
@@ -44,11 +43,64 @@ const CANDLE_OPTIONS = {
   wickDownColor: "#f85149",
 };
 
+const WALL_COLORS = {
+  GEX_CALL: "#58a6ff",
+  GEX_PUT: "#a371f7",
+  DEX_CALL: "#3fb950",
+  DEX_PUT: "#f85149",
+  MAX_PAIN: "#d29922",
+};
+
+interface AggregatedWall {
+  strike: number;
+  sources: string[];  // ["GEX 32.7M", "DEX 1336M"] etc.
+  dominantColor: string;
+}
+
+function aggregateWalls(iter: IterEvent | null): {
+  walls: AggregatedWall[];
+  ntmMaxPain: number | null;
+} {
+  if (!iter) return { walls: [], ntmMaxPain: null };
+
+  const byStrike = new Map<number, AggregatedWall>();
+
+  const addWall = (w: WallRow, kind: "GEX" | "DEX") => {
+    const existing = byStrike.get(w.strike);
+    const sign = w.net_m > 0 ? "+" : "";
+    const label = `${kind} ${sign}${w.net_m.toFixed(0)}M`;
+    const color = kind === "GEX"
+      ? (w.side === "CALL" ? WALL_COLORS.GEX_CALL : WALL_COLORS.GEX_PUT)
+      : (w.side === "CALL" ? WALL_COLORS.DEX_CALL : WALL_COLORS.DEX_PUT);
+
+    if (existing) {
+      existing.sources.push(label);
+      // Keep the strongest-abs color preference
+      if (Math.abs(w.net_m) > 0) existing.dominantColor = color;
+    } else {
+      byStrike.set(w.strike, {
+        strike: w.strike,
+        sources: [label],
+        dominantColor: color,
+      });
+    }
+  };
+
+  for (const w of iter.snapshot.top_gex.slice(0, 5)) addWall(w, "GEX");
+  for (const w of iter.snapshot.top_dex.slice(0, 5)) addWall(w, "DEX");
+
+  return {
+    walls: Array.from(byStrike.values()),
+    ntmMaxPain: iter.snapshot.ntm_max_pain,
+  };
+}
+
 export function ChartPane() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const { recentBars, recentTicks } = useSidecar();
+  const priceLinesRef = useRef<IPriceLine[]>([]);
+  const { recentBars, recentTicks, lastIter } = useSidecar();
 
   // Create chart once on mount
   useEffect(() => {
@@ -79,15 +131,12 @@ export function ChartPane() {
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
+      priceLinesRef.current = [];
     };
   }, []);
 
-  // Map bars onto chart whenever recentBars changes
+  // Map bars onto chart whenever recentBars/recentTicks changes
   const candleData = useMemo<CandlestickData[]>(() => {
-    if (recentBars.length === 0 && recentTicks.length === 0) return [];
-
-    // Bars come from TickEvent.bar — each tick may or may not have a bar
-    // Reconstruct from recentTicks since those preserve the timestamp
     const fromTicks = recentTicks
       .filter((t) => t.bar)
       .map((t) => ({
@@ -98,7 +147,6 @@ export function ChartPane() {
         close: t.bar!.close,
       }));
 
-    // Dedupe by time (last write wins), sort ascending
     const map = new Map<number, CandlestickData>();
     for (const c of fromTicks) map.set(c.time as number, c);
     return Array.from(map.values()).sort(
@@ -113,6 +161,44 @@ export function ChartPane() {
       chartRef.current.timeScale().fitContent();
     }
   }, [candleData]);
+
+  // Redraw wall + max-pain overlays on each new IterEvent
+  useEffect(() => {
+    if (!seriesRef.current) return;
+    const series = seriesRef.current;
+
+    // Clear previous lines
+    for (const line of priceLinesRef.current) {
+      series.removePriceLine(line);
+    }
+    priceLinesRef.current = [];
+
+    const { walls, ntmMaxPain } = aggregateWalls(lastIter);
+
+    for (const w of walls) {
+      const line = series.createPriceLine({
+        price: w.strike,
+        color: w.dominantColor,
+        lineWidth: 1,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: w.sources.join(" | "),
+      });
+      priceLinesRef.current.push(line);
+    }
+
+    if (ntmMaxPain && ntmMaxPain > 0) {
+      const line = series.createPriceLine({
+        price: ntmMaxPain,
+        color: WALL_COLORS.MAX_PAIN,
+        lineWidth: 2,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: `NTM MP ${ntmMaxPain.toFixed(0)}`,
+      });
+      priceLinesRef.current.push(line);
+    }
+  }, [lastIter]);
 
   return (
     <div className="chart-pane">
