@@ -10,6 +10,7 @@ dependencies = [
     "httpx>=0.28",
     "ib_async>=1.0.3",
     "sqlmodel>=0.0.22",
+    "aiosqlite>=0.20",
     "websockets>=14.0",
     "python-dotenv>=1.0",
 ]
@@ -35,3 +36,7 @@ packages = ["src/fef_sidecar"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
