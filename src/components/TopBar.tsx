@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useSidecar } from "../context/WebSocketContext";
 import { popoutChart } from "../lib/popoutChart";
+import { SymbolSelector } from "./SymbolSelector";
 
 const connectionColor: Record<string, string> = {
   connecting: "var(--color-amber)",
@@ -51,8 +52,9 @@ export function TopBar() {
 
   return (
     <header className="topbar">
+      <SymbolSelector />
       <div className="topbar-section">
-        <span className="topbar-label">SPX</span>
+        <span className="topbar-label">PRICE</span>
         <span className={`topbar-price ${flash ? `flash-${flash}` : ""}`}>
           {spx != null ? spx.toFixed(2) : "—"}
         </span>

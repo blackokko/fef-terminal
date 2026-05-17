@@ -1289,3 +1289,79 @@ button:active {
   font-weight: 600;
   margin-right: 4px;
 }
+
+/* Symbol selector */
+
+.symbol-selector { gap: 4px; }
+.symbol-select {
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.symbol-select:disabled { opacity: 0.4; cursor: wait; }
+
+/* Microstructure */
+
+.microstructure-panel { background: var(--color-bg); }
+.micro-hero {
+  padding: 6px 10px;
+  background: var(--color-bg-elevated);
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+.micro-direction {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+}
+.micro-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.micro-stat {
+  background: var(--color-bg-elevated);
+  padding: 4px 6px;
+  border-radius: 3px;
+  display: flex;
+  flex-direction: column;
+}
+.micro-stat-label { font-size: 9px; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.3px; }
+.micro-stat-value { font-weight: 600; font-size: 12px; }
+.micro-avi-bar { margin-top: 8px; }
+.micro-avi-bar-bg {
+  position: relative;
+  height: 10px;
+  background: var(--color-bg-elevated);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.micro-avi-bar-fill { position: absolute; top: 0; bottom: 0; transition: width 0.15s; }
+.micro-avi-bar-mid { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--color-border); }
+.micro-avi-bar-labels { display: flex; justify-content: space-between; margin-top: 2px; font-size: 9px; }
+.micro-glossary { padding-left: 16px; margin-top: 6px; font-size: 10px; line-height: 1.4; }
+.micro-glossary li { margin-bottom: 4px; }
+
+/* Order ticket spread banner */
+
+.ticket-spread-banner {
+  background: var(--color-bg-elevated);
+  border-left: 3px solid var(--color-blue);
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  border-radius: 3px;
+}
+.ticket-spread-kind {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--color-blue);
+}
