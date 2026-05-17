@@ -64,6 +64,7 @@ class AppState:
     last_snapshot: object | None = None  # cached MarketSnapshot for FEF to consume
     ibkr_status: str = "unknown"  # "connected" | "disconnected" | "reconnecting" | "unknown"
     last_iter_perf_ms: dict[str, float] = field(default_factory=dict)  # IMPROVEMENTS #10
+    session_date: str = ""  # IMPROVEMENTS #22 — tracks current session for reset detection
 
     @classmethod
     def build(cls) -> AppState:

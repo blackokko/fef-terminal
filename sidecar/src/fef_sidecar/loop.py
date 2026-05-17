@@ -128,14 +128,39 @@ async def fef_tick_loop(state: AppState) -> None:
         "yes",
         "on",
     )
+    warmup_iters = int(os.environ.get("FEF_WARMUP_ITERS", "3"))
     logger.info(
         "Starting FEF tick loop (interval=%ds, market_hours_only=%s)",
         interval,
         market_hours_only,
     )
 
+    # IMPROVEMENTS #21: pre-market warmup — seed the engine buffer with
+    # `warmup_iters` quick fetches so the first post-open iter isn't WAIT.
+    if warmup_iters > 0:
+        logger.info("Pre-warming FEF buffer with %d quick iters", warmup_iters)
+        for i in range(warmup_iters):
+            try:
+                await _run_one_iter(state, force_fresh=True)
+                if i < warmup_iters - 1:
+                    await asyncio.sleep(1)
+            except Exception:
+                logger.exception("Warmup iter %d failed", i)
+
     while True:
         try:
+            # IMPROVEMENTS #22: detect new session_date and reset engine
+            current_date = _today_et()
+            if state.session_date != current_date:
+                if state.session_date != "":
+                    logger.info(
+                        "New session detected (%s -> %s) — resetting engine buffer",
+                        state.session_date,
+                        current_date,
+                    )
+                    state.engine.reset()
+                state.session_date = current_date
+
             if market_hours_only and not _in_market_hours_et():
                 logger.debug("Outside market hours — sleeping 60s")
                 await asyncio.sleep(60)
