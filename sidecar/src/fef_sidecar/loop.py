@@ -342,6 +342,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
         RegimeSample(
             spx_price=inputs.spx_price,
             drift_cum_net_m=inputs.drift_cum_net_m,
+            drift_bias=inputs.drift_bias,
             wall_proximity_pts=verdict.nearest_wall_distance,
             aligned=verdict.aligned,
             absorption=verdict.absorption,

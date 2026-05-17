@@ -38,6 +38,7 @@ class RegimeAssessment:
 class RegimeSample:
     spx_price: float
     drift_cum_net_m: float
+    drift_bias: str  # BULLISH / BEARISH / NEUTRAL
     wall_proximity_pts: float | None
     aligned: bool
     absorption: bool
@@ -61,9 +62,25 @@ REGIMES: dict[str, dict[str, Any]] = {
         "label": "Trend Day",
         "rationale_template": "SPX range {range:.1f}pts, drift {drift:+.1f}M, {aligned_count}/{n} iters aligned",
         "recommended_preset_hint": "trend day",
-        "recommended_patterns": ["Aligned HIGH-conviction breakout"],
+        "recommended_patterns": ["FEF: Aligned HIGH long calls", "FEF: Aligned HIGH long puts"],
         "bias": "FOLLOW_DRIFT",
         "sizing": "FULL",
+    },
+    "DRIFT_BULL": {
+        "label": "Bull Drift",
+        "rationale_template": "Drift +{drift:.1f}M over {n} iters, bullish bias, no clear archetype",
+        "recommended_preset_hint": "default",
+        "recommended_patterns": ["FEF: Aligned HIGH long calls", "Wall: Bullish wall stack"],
+        "bias": "FOLLOW_DRIFT",
+        "sizing": "STANDARD",
+    },
+    "DRIFT_BEAR": {
+        "label": "Bear Drift",
+        "rationale_template": "Drift {drift:.1f}M over {n} iters, bearish bias, no clear archetype",
+        "recommended_preset_hint": "default",
+        "recommended_patterns": ["FEF: Aligned HIGH long puts", "Wall: Bearish wall stack"],
+        "bias": "FOLLOW_DRIFT",
+        "sizing": "STANDARD",
     },
     "CHOP": {
         "label": "Chop",
@@ -160,57 +177,72 @@ class RegimeDetector:
         prices = [s.spx_price for s in self._window]
         spx_range = max(prices) - min(prices)
         drift = latest.drift_cum_net_m
+        # Loosened wall-proximity threshold: 15pts catches the cases where SPX
+        # is "near" a major wall without being tick-tight against it
         prox_count = sum(
-            1 for s in self._window if s.wall_proximity_pts is not None and s.wall_proximity_pts < 10
+            1 for s in self._window if s.wall_proximity_pts is not None and s.wall_proximity_pts < 15
         )
         prox_pct = prox_count / n
         aligned_count = sum(1 for s in self._window if s.aligned)
         absorption_count = sum(1 for s in self._window if s.absorption)
+        bullish_count = sum(1 for s in self._window if s.direction == "LONG_CALLS")
+        bearish_count = sum(1 for s in self._window if s.direction == "LONG_PUTS")
         minutes = latest.minutes_since_open
         vix = latest.vix
 
         scores: dict[str, tuple[float, dict[str, Any]]] = {}
 
         # OPEN_DRIVE: first 30 min + meaningful range
-        if 0 <= minutes <= 30 and spx_range >= 8:
+        if 0 <= minutes <= 30 and spx_range >= 6:
             scores["OPEN_DRIVE"] = (0.85, {"range": spx_range, "n": n})
 
-        # POWER_HOUR: after 3pm ET (210+ minutes since 9:30)
-        if minutes >= 330:  # 9:30 + 5.5hr = 15:00 ET = 330 min
-            scores["POWER_HOUR"] = (0.7, {"n": n})
+        # POWER_HOUR: after 3pm ET (330+ minutes since 9:30)
+        if minutes >= 330:
+            scores["POWER_HOUR"] = (0.75, {"n": n})
 
         # HIGH_VOL: VIX elevated
         if vix is not None and vix > 20:
             scores["HIGH_VOL"] = (min(1.0, (vix - 20) / 10 + 0.5), {"vix": vix, "n": n})
 
-        # PIN_DAY: tight range + frequently near walls
-        if spx_range < 10 and prox_pct >= 0.5 and aligned_count <= 1:
-            score = 0.7 + min(0.3, (0.5 - spx_range / 20))
+        # PIN_DAY: tight range + frequently near walls (loosened from <10 to <15)
+        if spx_range < 12 and prox_pct >= 0.4:
+            score = 0.7 + min(0.3, (0.6 - spx_range / 20))
             scores["PIN_DAY"] = (score, {"range": spx_range, "n": n, "prox_pct": prox_pct})
 
-        # WALL_TEST: heavy proximity (but not pin-tight)
-        if prox_pct >= 0.6 and spx_range >= 5:
-            scores["WALL_TEST"] = (0.7, {"prox_pct": prox_pct, "n": n})
+        # WALL_TEST: heavy proximity, moderate range
+        if prox_pct >= 0.5 and spx_range >= 4:
+            scores["WALL_TEST"] = (0.65 + prox_pct * 0.2, {"prox_pct": prox_pct, "n": n})
 
-        # TREND_DAY: wide range + aligned iters + big drift
-        if spx_range >= 15 and aligned_count >= max(2, n // 3) and abs(drift) >= 10:
-            score = min(1.0, 0.6 + spx_range / 100 + aligned_count / n * 0.3)
-            scores["TREND_DAY"] = (score, {"range": spx_range, "drift": drift, "aligned_count": aligned_count, "n": n})
+        # TREND_DAY: wide range + bias direction count (alignment is too strict)
+        if spx_range >= 12 and (bullish_count + bearish_count) >= max(2, n // 4):
+            direction_bias = max(bullish_count, bearish_count)
+            score = min(1.0, 0.55 + spx_range / 100 + direction_bias / n * 0.4)
+            scores["TREND_DAY"] = (score, {
+                "range": spx_range, "drift": drift,
+                "aligned_count": max(aligned_count, direction_bias), "n": n,
+            })
 
         # ABSORPTION_HEAVY: lots of absorption flags
-        if absorption_count >= max(2, n // 3):
+        if absorption_count >= max(2, n // 4):
             scores["ABSORPTION_HEAVY"] = (0.65 + absorption_count / n * 0.3, {"absorption_count": absorption_count, "n": n})
 
-        # CHOP: no alignment, weak drift
-        if aligned_count == 0 and abs(drift) < 5 and absorption_count == 0:
+        # CHOP: no clear movement
+        if aligned_count == 0 and abs(drift) < 5 and absorption_count == 0 and spx_range < 8:
             scores["CHOP"] = (0.6, {"drift": drift, "n": n})
+
+        # DRIFT_BULL / DRIFT_BEAR: catch-all for moderate directional days
+        # that don't qualify as full TREND_DAY but have clear bias.
+        if drift > 15 and latest.drift_bias == "BULLISH":
+            scores["DRIFT_BULL"] = (0.55 + min(0.25, abs(drift) / 200), {"drift": drift, "n": n})
+        elif drift < -15 and latest.drift_bias == "BEARISH":
+            scores["DRIFT_BEAR"] = (0.55 + min(0.25, abs(drift) / 200), {"drift": drift, "n": n})
 
         if not scores:
             return RegimeAssessment(
                 regime="UNCLEAR",
                 label=REGIMES["UNCLEAR"]["label"],
                 confidence=0.0,
-                rationale=REGIMES["UNCLEAR"]["rationale_template"],
+                rationale=f"no regime fired — range={spx_range:.1f} drift={drift:+.1f}M prox={prox_pct:.0%} aligned={aligned_count}/{n}",
                 recommended_preset_hint="",
             )
 

@@ -46,6 +46,40 @@ async def status(request: Request) -> dict[str, Any]:
 
 
 # IMPROVEMENTS #9: engine state introspection — "why did/didn't FEF fire?"
+@router.get("/regime/debug")
+async def regime_debug(request: Request) -> dict[str, Any]:
+    """Inspect the regime detector's rolling window + last assessment.
+    Useful when 'UNCLEAR' is showing and you need to know why."""
+    s = _state(request)
+    r = s.regime_detector
+    last = s.last_regime
+    return {
+        "window_size_max": r._window_size,  # type: ignore[attr-defined]
+        "window_size_current": r.n,
+        "window_samples": [
+            {
+                "spx_price": x.spx_price,
+                "drift_cum_net_m": x.drift_cum_net_m,
+                "drift_bias": x.drift_bias,
+                "wall_proximity_pts": x.wall_proximity_pts,
+                "aligned": x.aligned,
+                "absorption": x.absorption,
+                "direction": x.direction,
+                "confidence": x.confidence,
+                "minutes_since_open": x.minutes_since_open,
+                "vix": x.vix,
+            }
+            for x in r._window  # type: ignore[attr-defined]
+        ],
+        "last_assessment": {
+            "regime": last.regime if last else None,
+            "label": last.label if last else None,
+            "confidence": last.confidence if last else None,
+            "rationale": last.rationale if last else None,
+        } if last else None,
+    }
+
+
 @router.get("/engine/state")
 async def engine_state(request: Request) -> dict[str, Any]:
     s = _state(request)
