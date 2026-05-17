@@ -23,8 +23,40 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
     """Run an optimization sweep + compare to current engine config."""
     from fef_sidecar.engine.optimization import SweepConfig, run_sweep
 
-    cfg = SweepConfig()  # defaults
-    results = await run_sweep(cfg=cfg, days=days, train_pct=0.6)
+    cfg = SweepConfig(
+        proximity_values=[3.0, 5.0, 8.0],
+        collapse_pct_values=[0.15, 0.20, 0.30],
+        collapse_floor_values=[3.0, 5.0, 10.0],
+        absorption_fe_values=[3.0, 5.0, 8.0],
+    )
+    # Pull historical iters from DB to feed the sweep (run_sweep is sync
+    # and expects pre-fetched data)
+    from datetime import timedelta, timezone
+    from sqlmodel import select
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import SignalIter
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    async with get_session() as session:
+        rows = list((await session.exec(
+            select(SignalIter)
+            .where(SignalIter.timestamp >= cutoff)
+            .order_by(SignalIter.timestamp.asc())  # type: ignore[attr-defined]
+        )).all())
+
+    iters_data = [
+        {"spx_price": r.spx_price, "drift_cum_net_m": r.drift_cum_net_m,
+         "drift_bias": r.drift_bias, "ntm_max_pain": r.ntm_max_pain,
+         "raw_max_pain": r.raw_max_pain,
+         "top_gex_walls": r.top_gex_walls or [],
+         "top_dex_walls": r.top_dex_walls or [],
+         "aggression_call_pct": r.aggression_call_pct or 50,
+         "aggression_put_pct": r.aggression_put_pct or 50,
+         "iv_rank_call_pct": r.iv_rank_call_pct or 50,
+         "iv_rank_put_pct": r.iv_rank_put_pct or 50}
+        for r in rows
+    ]
+    results = run_sweep(iters=iters_data, cfg=cfg) if iters_data else []
 
     # Pick best by test_sharpe (or test_total_pnl if no sharpe)
     best = None
@@ -36,10 +68,10 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
 
     eng = state.engine
     current = {
-        "wall_proximity_pts": eng.wall_proximity_pts,
-        "wall_collapse_pct": eng.wall_collapse_pct,
-        "wall_collapse_floor_m": eng.wall_collapse_floor_m,
-        "absorption_fe_ratio_min": eng.absorption_fe_ratio_min,
+        "wall_proximity_pts": eng._wall_proximity_pts,  # type: ignore[attr-defined]
+        "wall_collapse_pct": eng._wall_collapse_pct,  # type: ignore[attr-defined]
+        "wall_collapse_floor_m": eng._wall_collapse_floor_m,  # type: ignore[attr-defined]
+        "absorption_fe_ratio_min": eng._absorption_fe_min,  # type: ignore[attr-defined]
     }
 
     if best is None:

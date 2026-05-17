@@ -79,6 +79,29 @@ class StatusEvent(BaseModel):
     vix: float | None = None  # IMPROVEMENTS #M — last VIX quote
 
 
+class HFTEvent(BaseModel):
+    """Combined high-frequency signal — realized vol + quote stuffing +
+    L2 depth imbalance. Fires on threshold-cross flips OR poll cadence."""
+
+    type: Literal["hft"] = "hft"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    short_vol_pts: float = 0.0
+    long_vol_pts: float = 0.0
+    vol_ratio: float = 1.0
+    vol_regime: str = "NORMAL"
+    cancel_to_trade_ratio: float = 0.0
+    quote_intensity_per_sec: float = 0.0
+    stuffing_severity: str = "NORMAL"
+    book_imbalance: float = 0.0
+    book_imbalance_5lvl: float = 0.0
+    book_direction: str = "BALANCED"
+    book_confidence: str = "LOW"
+    weighted_mid_price: float | None = None
+    book_spread: float | None = None
+    composite_direction: str = "NEUTRAL"
+    fired_on: str = "poll"
+
+
 class MicrostructureEvent(BaseModel):
     """Sub-second order flow / aggression / microprice signal.
 
@@ -176,6 +199,7 @@ Event = (
     | AccountEvent
     | TournamentEvent
     | MicrostructureEvent
+    | HFTEvent
 )
 
 
