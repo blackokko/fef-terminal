@@ -65,6 +65,8 @@ class AppState:
     ibkr_status: str = "unknown"  # "connected" | "disconnected" | "reconnecting" | "unknown"
     last_iter_perf_ms: dict[str, float] = field(default_factory=dict)  # IMPROVEMENTS #10
     session_date: str = ""  # IMPROVEMENTS #22 — tracks current session for reset detection
+    last_vix: float | None = None  # IMPROVEMENTS #M
+    vix_task: object | None = None
 
     @classmethod
     def build(cls) -> AppState:

@@ -76,6 +76,7 @@ class StatusEvent(BaseModel):
     ibkr: str
     engine: str  # "running" | "stopped"
     history_size: int = 0
+    vix: float | None = None  # IMPROVEMENTS #M — last VIX quote
 
 
 Event = TickEvent | IterEvent | TicketEvent | StatusEvent | SnapshotEvent

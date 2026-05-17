@@ -214,6 +214,95 @@ async def close_ticket(
         return {"ok": True, "ticket_id": ticket_id, "status": ticket.status.value}
 
 
+# IMPROVEMENTS #C: strategy presets — save/apply named threshold sets
+@router.get("/presets")
+async def list_presets() -> list[dict[str, Any]]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import StrategyPreset
+
+    async with get_session() as session:
+        rows = (await session.exec(select(StrategyPreset).order_by(StrategyPreset.name))).all()
+        return [
+            {
+                "id": p.id,
+                "name": p.name,
+                "description": p.description,
+                "fef_loop_interval_sec": p.fef_loop_interval_sec,
+                "wall_proximity_pts": p.wall_proximity_pts,
+                "wall_collapse_pct": p.wall_collapse_pct,
+                "wall_collapse_floor_m": p.wall_collapse_floor_m,
+                "absorption_fe_ratio_min": p.absorption_fe_ratio_min,
+            }
+            for p in rows
+        ]
+
+
+@router.post("/presets")
+async def create_preset(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    from datetime import UTC, datetime
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import StrategyPreset
+
+    async with get_session() as session:
+        preset = StrategyPreset(
+            name=str(body["name"]),
+            description=str(body.get("description", "")),
+            fef_loop_interval_sec=int(body.get("fef_loop_interval_sec", 120)),
+            wall_proximity_pts=float(body.get("wall_proximity_pts", 5.0)),
+            wall_collapse_pct=float(body.get("wall_collapse_pct", 0.20)),
+            wall_collapse_floor_m=float(body.get("wall_collapse_floor_m", 5.0)),
+            absorption_fe_ratio_min=float(body.get("absorption_fe_ratio_min", 5.0)),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        session.add(preset)
+        await session.flush()
+        return {"ok": True, "preset_id": preset.id}
+
+
+@router.delete("/presets/{preset_id}")
+async def delete_preset(preset_id: int) -> dict[str, Any]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import StrategyPreset
+
+    async with get_session() as session:
+        preset = (await session.exec(select(StrategyPreset).where(StrategyPreset.id == preset_id))).first()
+        if preset is None:
+            raise HTTPException(404, f"Preset {preset_id} not found")
+        await session.delete(preset)
+        return {"ok": True}
+
+
+@router.post("/presets/{preset_id}/apply")
+async def apply_preset(preset_id: int, request: Request) -> dict[str, Any]:
+    """Hot-apply preset thresholds to the live engine."""
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import StrategyPreset
+
+    s = _state(request)
+    async with get_session() as session:
+        preset = (await session.exec(select(StrategyPreset).where(StrategyPreset.id == preset_id))).first()
+        if preset is None:
+            raise HTTPException(404, f"Preset {preset_id} not found")
+        s.engine._wall_proximity_pts = preset.wall_proximity_pts  # type: ignore[attr-defined]
+        s.engine._wall_collapse_pct = preset.wall_collapse_pct  # type: ignore[attr-defined]
+        s.engine._wall_collapse_floor_m = preset.wall_collapse_floor_m  # type: ignore[attr-defined]
+        s.engine._absorption_fe_min = preset.absorption_fe_ratio_min  # type: ignore[attr-defined]
+        return {
+            "ok": True,
+            "applied": preset.name,
+            "hot_reloaded": ["wall_proximity_pts", "wall_collapse_pct", "wall_collapse_floor_m", "absorption_fe_ratio_min"],
+            "requires_restart_for": ["fef_loop_interval_sec"],
+        }
+
+
 # IMPROVEMENTS #19: replay a past session — return all iters in order
 @router.get("/history/replay/{date}")
 async def replay_session(date: str) -> list[dict[str, Any]]:

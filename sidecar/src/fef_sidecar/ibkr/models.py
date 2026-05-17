@@ -30,6 +30,10 @@ class Contract(BaseModel):
     def spx_index(cls) -> Contract:
         return cls(symbol="SPX", kind=ContractKind.INDEX, exchange="CBOE")
 
+    @classmethod
+    def vix_index(cls) -> Contract:
+        return cls(symbol="VIX", kind=ContractKind.INDEX, exchange="CBOE")
+
 
 class Bar(BaseModel):
     """One OHLCV bar."""

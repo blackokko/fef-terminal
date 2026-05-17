@@ -22,6 +22,7 @@ from fef_sidecar.db.models import (
     FEFConfidence,
     FEFDirection,
     SignalIter,
+    StrategyPreset,
     TicketStatus,
     TradeTicket,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "FEFDirection",
     "SignalIter",
     "SignalIterRepository",
+    "StrategyPreset",
     "TicketStatus",
     "TradeTicket",
     "dispose_db",

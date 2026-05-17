@@ -392,6 +392,39 @@ async def bar_stream_loop(state: AppState) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# VIX poll loop — periodic VIX index quote for the top-bar IV regime indicator
+# ---------------------------------------------------------------------------
+
+
+async def vix_poll_loop(state: AppState) -> None:
+    """IMPROVEMENTS #M — refresh VIX every FEF_VIX_POLL_INTERVAL_SEC (default 30s)."""
+    from fef_sidecar.events import StatusEvent
+
+    interval = float(os.environ.get("FEF_VIX_POLL_INTERVAL_SEC", "30"))
+    logger.info("Starting VIX poll loop (interval=%.1fs)", interval)
+    while True:
+        try:
+            quote = await state.ibkr.get_last_quote(Contract.vix_index())
+            if quote and quote.last > 0:
+                state.last_vix = quote.last
+                # Broadcast updated status with VIX value
+                await state.broadcaster.publish(
+                    StatusEvent(
+                        quantdata=type(state.quantdata).__name__,
+                        ibkr=state.ibkr_status if state.ibkr_status != "unknown" else "connected",
+                        engine="running" if state.loop_task is not None else "stopped",
+                        history_size=state.engine.history_size,
+                        vix=state.last_vix,
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("VIX poll iteration failed")
+        await asyncio.sleep(interval)
+
+
 async def tick_stream_loop(state: AppState) -> None:
     logger.info("Starting tick stream loop")
     while True:

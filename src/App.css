@@ -297,6 +297,33 @@ body,
 .toast-warn    { border-left-color: var(--color-amber); }
 .toast-info    { border-left-color: var(--color-blue); }
 
+/* Strategy presets */
+
+.presets-body { margin-top: 8px; }
+.presets-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.preset-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--color-bg-elevated);
+  border-radius: 4px;
+  align-items: center;
+}
+.preset-info { display: flex; flex-direction: column; gap: 2px; }
+.preset-name { font-weight: 600; font-size: 12px; }
+.preset-stats { font-family: var(--font-mono); }
+.preset-actions { display: flex; gap: 4px; }
+.preset-actions button { padding: 4px 8px; font-size: 11px; }
+.preset-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--color-border);
+}
+
 /* Chart pane */
 
 .chart-pane {

@@ -95,6 +95,19 @@ class MockIBKRProvider:
     async def get_last_quote(self, contract: Contract) -> Quote:
         if not self._connected:
             await self.connect()
+        # Mock VIX: gentle drift around 15.0
+        if contract.symbol == "VIX":
+            import math as _m
+            import time as _t
+            vix = 15.0 + _m.sin(_t.time() / 60.0) * 1.5
+            return Quote(
+                timestamp=self._bars[-1].timestamp,
+                last=round(vix, 2),
+                bid=round(vix - 0.05, 2),
+                ask=round(vix + 0.05, 2),
+                bid_size=10,
+                ask_size=10,
+            )
         last_bar = self._bars[-1]
         return Quote(
             timestamp=last_bar.timestamp,

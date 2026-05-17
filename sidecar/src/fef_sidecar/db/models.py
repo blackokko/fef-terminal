@@ -119,6 +119,29 @@ class TradeTicket(SQLModel, table=True):
     notes: str = Field(default="")
 
 
+class StrategyPreset(SQLModel, table=True):
+    """IMPROVEMENTS #C — named threshold sets the user can swap into the engine.
+
+    Examples: 'tight pin day' (high wall_proximity), 'trend day' (lower
+    thresholds, smaller wall_collapse_pct), 'wild Fed day' (everything wider).
+    """
+
+    __tablename__ = "strategy_preset"
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(unique=True, index=True)
+    description: str = Field(default="")
+
+    fef_loop_interval_sec: int = 120
+    wall_proximity_pts: float = 5.0
+    wall_collapse_pct: float = 0.20
+    wall_collapse_floor_m: float = 5.0
+    absorption_fe_ratio_min: float = 5.0
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
 class DailySession(SQLModel, table=True):
     """Per-session aggregates, updated incrementally during the day."""
 

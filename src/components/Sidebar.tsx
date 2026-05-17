@@ -5,6 +5,7 @@ import { QuantDataPanel } from "../panels/QuantDataPanel";
 import { ReplayPanel } from "../panels/ReplayPanel";
 import { SettingsPanel } from "../panels/SettingsPanel";
 import { SignalLogPanel } from "../panels/SignalLogPanel";
+import { StrategyPresetsPanel } from "../panels/StrategyPresetsPanel";
 
 export function Sidebar() {
   return (
@@ -13,6 +14,7 @@ export function Sidebar() {
       <OrderTicketPanel />
       <QuantDataPanel />
       <SignalLogPanel />
+      <StrategyPresetsPanel />
       <ReplayPanel />
       <SettingsPanel />
       <GlossaryPanel />
