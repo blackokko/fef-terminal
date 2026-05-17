@@ -37,8 +37,19 @@ class Contract(BaseModel):
 
     @classmethod
     def es_future(cls) -> Contract:
-        """ES front-month E-mini S&P 500 (continuous, IBKR resolves expiry)."""
+        """ES front-month E-mini S&P 500 (continuous, IBKR resolves expiry).
+        Lead market for S&P 500 — runs ~23h/day, sets the cash open."""
         return cls(symbol="ES", kind=ContractKind.FUTURE, exchange="CME")
+
+    @classmethod
+    def nq_future(cls) -> Contract:
+        """NQ front-month E-mini Nasdaq-100 (continuous). Lead market for QQQ."""
+        return cls(symbol="NQ", kind=ContractKind.FUTURE, exchange="CME")
+
+    @classmethod
+    def rty_future(cls) -> Contract:
+        """RTY front-month E-mini Russell 2000 (continuous). Lead market for IWM."""
+        return cls(symbol="RTY", kind=ContractKind.FUTURE, exchange="CME")
 
     @classmethod
     def qqq_stock(cls) -> Contract:
@@ -70,6 +81,10 @@ class Contract(BaseModel):
             return cls.iwm_stock()
         if s == "SPY":
             return cls.spy_stock()
+        if s == "NQ":
+            return cls.nq_future()
+        if s == "RTY":
+            return cls.rty_future()
         raise ValueError(f"Unsupported symbol: {symbol}")
 
 

@@ -715,10 +715,20 @@ async def microstructure_loop(state: AppState) -> None:
             timestamp_ms=ts_ms, price=price, size=size, aggressor=aggressor,  # type: ignore[arg-type]
         ))
 
+    # Microstructure proxy mapping — futures lead their cash/ETF counterparts.
+    # ES is the source of truth for S&P 500 order flow (24h tape, consolidated
+    # CME book, professional liquidity); SPY is fragmented retail tape across
+    # ~15 exchanges. Same logic for NQ vs QQQ and RTY vs IWM. SPX is an index
+    # with no tape so we MUST use a tradable proxy.
+    MICRO_PROXY = {
+        "SPX": "ES",
+        "SPY": "ES",
+        "QQQ": "NQ",
+        "IWM": "RTY",
+    }
     cancel_live = None
     if isinstance(state.ibkr, LiveIBKRProvider):
-        # SPX has no tape — use SPY as the microstructure proxy
-        micro_symbol = "SPY" if state.active_symbol == "SPX" else state.active_symbol
+        micro_symbol = MICRO_PROXY.get(state.active_symbol, state.active_symbol)
         try:
             await state.ibkr.connect()
             cancel_live = await state.ibkr.subscribe_tick_by_tick(
