@@ -40,8 +40,7 @@ const CANDLE_OPTIONS = {
 const WALL_COLORS = {
   GEX_CALL: "#58a6ff", GEX_PUT: "#a371f7",
   DEX_CALL: "#3fb950", DEX_PUT: "#f85149",
-  MAX_PAIN: "#d29922", CURRENT: "#e6edf3",
-  DAY_HIGH: "#3fb950", DAY_LOW: "#f85149",
+  MAX_PAIN: "#d29922", DAY_HIGH: "#3fb950", DAY_LOW: "#f85149",
   VWAP: "#58a6ff",
 };
 
@@ -58,12 +57,11 @@ const TIMEFRAMES = [
 ];
 const SYMBOLS = ["SPX", "ES"];
 
-const MIN_Y_RANGE_PTS = 50; // always show at least 50pt vertical range
+const MIN_Y_RANGE_PTS = 50;
+const POLL_INTERVAL_MS = 3000;  // refresh historical bars every 3s
 
 interface AggregatedWall {
-  strike: number;
-  sources: string[];
-  dominantColor: string;
+  strike: number; sources: string[]; dominantColor: string;
 }
 
 function aggregateWalls(iter: IterEvent | null): { walls: AggregatedWall[]; ntmMaxPain: number | null } {
@@ -89,12 +87,7 @@ function aggregateWalls(iter: IterEvent | null): { walls: AggregatedWall[]; ntmM
 }
 
 interface FetchedBar {
-  timestamp_ms: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
+  timestamp_ms: number; open: number; high: number; low: number; close: number; volume: number;
 }
 
 export function ChartPane() {
@@ -104,14 +97,13 @@ export function ChartPane() {
   const vwapSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const ambientLinesRef = useRef<IPriceLine[]>([]);
-  const currentBarRef = useRef<CandlestickData | null>(null);
-  const cumVolRef = useRef(0);
-  const cumPVRef = useRef(0);
+  const renderedBarCountRef = useRef(0);
 
-  const { recentTicks, lastIter, lastTick } = useSidecar();
+  const { lastIter, lastTick } = useSidecar();
   const [symbol, setSymbol] = useState<string>("SPX");
   const [timeframe, setTimeframe] = useState<string>("2 mins");
   const [bars, setBars] = useState<FetchedBar[]>([]);
+  const [hasFittedOnce, setHasFittedOnce] = useState(false);
 
   // Create chart once
   useEffect(() => {
@@ -119,7 +111,6 @@ export function ChartPane() {
     const chart = createChart(containerRef.current, { ...DARK_THEME, autoSize: true });
     const series = chart.addSeries(CandlestickSeries, {
       ...CANDLE_OPTIONS,
-      // Enforce minimum visible y-range so the chart doesn't squish tightly
       autoscaleInfoProvider: (original: () => AutoscaleInfo | null): AutoscaleInfo | null => {
         const r = original();
         if (!r || !r.priceRange) return r;
@@ -135,11 +126,8 @@ export function ChartPane() {
       },
     });
     const vwap = chart.addSeries(LineSeries, {
-      color: WALL_COLORS.VWAP,
-      lineWidth: 1,
-      lineStyle: LineStyle.Dotted,
-      priceLineVisible: false,
-      lastValueVisible: false,
+      color: WALL_COLORS.VWAP, lineWidth: 1, lineStyle: LineStyle.Dotted,
+      priceLineVisible: false, lastValueVisible: false,
     });
     chartRef.current = chart;
     seriesRef.current = series;
@@ -163,128 +151,90 @@ export function ChartPane() {
       vwapSeriesRef.current = null;
       priceLinesRef.current = [];
       ambientLinesRef.current = [];
-      currentBarRef.current = null;
+      renderedBarCountRef.current = 0;
     };
   }, []);
 
-  // Fetch bars from backend on symbol/timeframe change
+  // Poll /bars every 3s. Refetches immediately when symbol/timeframe change.
   useEffect(() => {
-    void (async () => {
+    let cancelled = false;
+    const fetchBars = async () => {
       try {
-        const r = await fetch(`${API_BASE}/bars?symbol=${symbol}&bar_size=${encodeURIComponent(timeframe)}&duration=1 D`);
-        if (r.ok) {
-          const data = (await r.json()) as FetchedBar[];
-          setBars(data);
-          currentBarRef.current = null;
-          cumVolRef.current = 0;
-          cumPVRef.current = 0;
-        }
-      } catch (e) {
-        console.error("Failed to fetch bars:", e);
-      }
-    })();
+        const r = await fetch(
+          `${API_BASE}/bars?symbol=${symbol}&bar_size=${encodeURIComponent(timeframe)}&duration=1 D`,
+        );
+        if (!r.ok || cancelled) return;
+        const data = (await r.json()) as FetchedBar[];
+        if (!cancelled) setBars(data);
+      } catch {}
+    };
+    // Reset render state on symbol/timeframe change so we re-setData
+    renderedBarCountRef.current = 0;
+    setHasFittedOnce(false);
+    void fetchBars();
+    const id = window.setInterval(fetchBars, POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
   }, [symbol, timeframe]);
 
-  // Initial setData when bars first load (or symbol/timeframe changes)
+  // Apply bars to the chart — full setData on count change, update() on the
+  // last bar when count is same (in case its OHLC adjusted)
   useEffect(() => {
-    if (!seriesRef.current) return;
-    if (bars.length === 0) {
-      seriesRef.current.setData([]);
-      if (vwapSeriesRef.current) vwapSeriesRef.current.setData([]);
-      return;
-    }
+    if (!seriesRef.current || bars.length === 0) return;
     const candleData: CandlestickData[] = bars.map((b) => ({
       time: Math.floor(b.timestamp_ms / 1000) as UTCTimestamp,
       open: b.open, high: b.high, low: b.low, close: b.close,
     }));
-    // Dedupe by time (keep last)
+    // Dedupe by time (defense)
     const map = new Map<number, CandlestickData>();
     for (const c of candleData) map.set(c.time as number, c);
     const deduped = Array.from(map.values()).sort((a, b) => (a.time as number) - (b.time as number));
-    seriesRef.current.setData(deduped);
 
-    // VWAP from bars
-    cumVolRef.current = 0;
-    cumPVRef.current = 0;
-    const vwapData: LineData[] = bars.map((b) => {
-      const typical = (b.high + b.low + b.close) / 3;
-      const vol = b.volume || 1;
-      cumPVRef.current += typical * vol;
-      cumVolRef.current += vol;
-      return { time: Math.floor(b.timestamp_ms / 1000) as UTCTimestamp, value: cumPVRef.current / cumVolRef.current };
-    });
-    if (vwapSeriesRef.current) vwapSeriesRef.current.setData(vwapData);
-
-    currentBarRef.current = deduped[deduped.length - 1] ?? null;
-
-    // Fit ONCE per data load — NOT on every tick
-    if (chartRef.current) chartRef.current.timeScale().fitContent();
-  }, [bars]);
-
-  // Append NEW bars arriving via WS (TickEvents with bar payload)
-  const lastBarCountRef = useRef(0);
-  useEffect(() => {
-    if (!seriesRef.current) return;
-    // Only consider ticks with bars for THIS symbol — for v1 we assume WS
-    // bars are SPX; if user is viewing ES we skip WS bar updates.
-    if (symbol !== "SPX") return;
-
-    const barTicks = recentTicks.filter((t) => t.bar);
-    if (barTicks.length <= lastBarCountRef.current) return;
-
-    const newOnes = barTicks.slice(lastBarCountRef.current);
-    const lastTime = currentBarRef.current ? (currentBarRef.current.time as number) : 0;
-    for (const t of newOnes) {
-      const time = Math.floor(t.timestamp_ms / 1000) as UTCTimestamp;
-      // Guard against time regression — lightweight-charts errors and the
-      // chart goes black if we ever send a bar with an earlier timestamp
-      if ((time as number) < lastTime) continue;
-      const candle: CandlestickData = {
-        time,
-        open: t.bar!.open, high: t.bar!.high, low: t.bar!.low, close: t.bar!.close,
-      };
-      try {
-        seriesRef.current.update(candle);
-        currentBarRef.current = candle;
-
-        // Update VWAP
-        const typical = (t.bar!.high + t.bar!.low + t.bar!.close) / 3;
-        const vol = t.bar!.volume || 1;
-        cumPVRef.current += typical * vol;
-        cumVolRef.current += vol;
-        vwapSeriesRef.current?.update({
-          time: candle.time,
-          value: cumPVRef.current / cumVolRef.current,
-        });
-      } catch (err) {
-        console.warn("chart update skipped:", err);
+    if (deduped.length !== renderedBarCountRef.current) {
+      seriesRef.current.setData(deduped);
+      // VWAP rebuild
+      let cumPV = 0, cumV = 0;
+      const vwapData: LineData[] = bars.map((b) => {
+        const typical = (b.high + b.low + b.close) / 3;
+        const vol = b.volume || 1;
+        cumPV += typical * vol;
+        cumV += vol;
+        return { time: Math.floor(b.timestamp_ms / 1000) as UTCTimestamp, value: cumPV / cumV };
+      });
+      if (vwapSeriesRef.current) vwapSeriesRef.current.setData(vwapData);
+      renderedBarCountRef.current = deduped.length;
+      // Fit only ONCE per symbol/timeframe load
+      if (!hasFittedOnce && chartRef.current) {
+        chartRef.current.timeScale().fitContent();
+        setHasFittedOnce(true);
       }
+    } else {
+      // Same count — just update the last bar in case its OHLC moved
+      const last = deduped[deduped.length - 1];
+      try { seriesRef.current.update(last); } catch {}
     }
-    lastBarCountRef.current = barTicks.length;
-  }, [recentTicks, symbol]);
+  }, [bars, hasFittedOnce]);
 
-  // Live-tick update of the current candle (close/high/low) — no setData, no fitContent
+  // Live tick → extend the last bar's high/low and shift close to tick price.
+  // No new candle is created; just modify the last in place.
   useEffect(() => {
-    if (!seriesRef.current || !currentBarRef.current || !lastTick) return;
-    if (symbol !== "SPX") return;  // ES doesn't get SPX ticks
+    if (!seriesRef.current || !lastTick || bars.length === 0) return;
+    if (symbol !== "SPX") return;
+    const last = bars[bars.length - 1];
     const tickPrice = lastTick.spx_price;
-    const cb = currentBarRef.current;
-    const updated: CandlestickData = {
-      time: cb.time,
-      open: cb.open,
-      high: Math.max(cb.high, tickPrice),
-      low: Math.min(cb.low, tickPrice),
+    const candle: CandlestickData = {
+      time: Math.floor(last.timestamp_ms / 1000) as UTCTimestamp,
+      open: last.open,
+      high: Math.max(last.high, tickPrice),
+      low: Math.min(last.low, tickPrice),
       close: tickPrice,
     };
-    try {
-      seriesRef.current.update(updated);
-      currentBarRef.current = updated;
-    } catch (err) {
-      console.warn("live tick update skipped:", err);
-    }
-  }, [lastTick, symbol]);
+    try { seriesRef.current.update(candle); } catch {}
+  }, [lastTick, symbol, bars]);
 
-  // Wall overlays — redrawn on each iter (low frequency, OK to re-create lines)
+  // Wall overlays
   useEffect(() => {
     if (!seriesRef.current || symbol !== "SPX") return;
     const series = seriesRef.current;
@@ -305,7 +255,7 @@ export function ChartPane() {
     }
   }, [lastIter, symbol]);
 
-  // Ambient: day H/L only (no current-price line — the live candle close already shows it)
+  // Day H/L
   const dayHighLow = useMemo(() => {
     if (bars.length === 0) return null;
     let high = -Infinity, low = Infinity;
@@ -338,21 +288,18 @@ export function ChartPane() {
       <div className="chart-toolbar">
         <div className="chart-toolbar-group">
           {SYMBOLS.map((s) => (
-            <button
-              key={s}
-              className={`chart-toolbar-btn ${symbol === s ? "active" : ""}`}
-              onClick={() => setSymbol(s)}
-            >{s}</button>
+            <button key={s} className={`chart-toolbar-btn ${symbol === s ? "active" : ""}`}
+              onClick={() => setSymbol(s)}>{s}</button>
           ))}
         </div>
         <div className="chart-toolbar-group">
           {TIMEFRAMES.map((tf) => (
-            <button
-              key={tf.value}
-              className={`chart-toolbar-btn ${timeframe === tf.value ? "active" : ""}`}
-              onClick={() => setTimeframe(tf.value)}
-            >{tf.label}</button>
+            <button key={tf.value} className={`chart-toolbar-btn ${timeframe === tf.value ? "active" : ""}`}
+              onClick={() => setTimeframe(tf.value)}>{tf.label}</button>
           ))}
+        </div>
+        <div className="chart-toolbar-info muted small">
+          {bars.length} bar{bars.length === 1 ? "" : "s"}
         </div>
       </div>
       <div ref={containerRef} className="chart-container" />

@@ -384,7 +384,10 @@ async def get_bars(
     import os as _os
 
     if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
-        bars = _aggregate_scripted_bars(symbol, bar_size)
+        # Cap at how far the bar stream has progressed so chart grows
+        # bar-by-bar as the day plays (instead of dumping all 190 at once)
+        max_frame = getattr(s.ibkr, "_scripted_index", 0) + 1
+        bars = _aggregate_scripted_bars(symbol, bar_size, max_frame=max_frame)
     elif type(s.ibkr).__name__ == "MockIBKRProvider":
         # Static morning bars from mock, optionally offset for ES
         offset = -5.0 if symbol.upper() == "ES" else 0.0
@@ -429,30 +432,32 @@ async def get_bars(
     return bars
 
 
-def _aggregate_scripted_bars(symbol: str, bar_size: str) -> list[dict[str, Any]]:
+def _aggregate_scripted_bars(symbol: str, bar_size: str, max_frame: int | None = None) -> list[dict[str, Any]]:
     """Aggregate the scripted day script into bars at the requested timeframe.
 
     Each frame is 2 simulated minutes. ES adds a -5pt basis offset.
+    max_frame: only include frames up to this index (1-based). None = all.
     """
     from datetime import datetime, time, timedelta
 
     from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
 
-    # Map bar_size -> minutes per bar
     size_minutes = {
         "1 min": 1, "2 mins": 2, "5 mins": 5, "15 mins": 15, "30 mins": 30,
         "1 hour": 60, "4 hours": 240, "1 day": 390, "1 week": 1950,
     }.get(bar_size, 2)
-    # Frames per bar (each frame = 2 sim minutes)
     frames_per_bar = max(1, round(size_minutes / 2))
 
     offset = -5.0 if symbol.upper() == "ES" else 0.0
     today = datetime.now().date()
     market_open = datetime.combine(today, time(9, 30))
 
+    limit = max_frame if max_frame is not None else len(DAY_SCRIPT)
+    frames = DAY_SCRIPT[:limit]
+
     out: list[dict[str, Any]] = []
-    for i in range(0, len(DAY_SCRIPT), frames_per_bar):
-        chunk = DAY_SCRIPT[i : i + frames_per_bar]
+    for i in range(0, len(frames), frames_per_bar):
+        chunk = frames[i : i + frames_per_bar]
         if not chunk:
             continue
         opens = chunk[0].spx + offset
