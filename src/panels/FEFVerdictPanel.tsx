@@ -1,4 +1,6 @@
+import { useEffect, useRef } from "react";
 import { useSidecar } from "../context/WebSocketContext";
+import { flashTitle, playBearishChime, playBullishChime } from "../lib/audioAlert";
 
 const CONFIDENCE_COLOR: Record<string, string> = {
   HIGH: "var(--color-green)",
@@ -9,6 +11,23 @@ const CONFIDENCE_COLOR: Record<string, string> = {
 
 export function FEFVerdictPanel() {
   const { lastIter } = useSidecar();
+  const lastAlertedIter = useRef<number | null>(null);
+
+  // IMPROVEMENTS #17: chime + title flash on HIGH-confidence fires
+  useEffect(() => {
+    if (!lastIter) return;
+    if (lastIter.iter_num === lastAlertedIter.current) return;
+    const v = lastIter.verdict;
+    if (v.confidence === "HIGH" && (v.direction === "LONG_CALLS" || v.direction === "LONG_PUTS")) {
+      lastAlertedIter.current = lastIter.iter_num;
+      if (v.direction === "LONG_CALLS") {
+        playBullishChime();
+      } else {
+        playBearishChime();
+      }
+      flashTitle(`🔔 ${v.direction} HIGH @ $${lastIter.spx_price.toFixed(2)}`);
+    }
+  }, [lastIter]);
 
   if (!lastIter) {
     return (

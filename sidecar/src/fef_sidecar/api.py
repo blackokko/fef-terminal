@@ -6,6 +6,9 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+from fastapi import Body
+
+from fef_sidecar.config_store import UIConfig, load_config, save_config
 from fef_sidecar.db import SignalIterRepository
 from fef_sidecar.loop import _run_one_iter
 from fef_sidecar.state import AppState
@@ -103,6 +106,99 @@ async def run_iter_now(request: Request) -> dict[str, Any]:
         return {"ok": True, "iter_num": s.last_iter_num, "verdict": s.last_verdict}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# IMPROVEMENTS #24: UI-tunable config (no env-var editing needed)
+@router.get("/config")
+async def get_config() -> dict[str, Any]:
+    return load_config().model_dump()
+
+
+@router.post("/config")
+async def update_config(
+    request: Request,
+    updates: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Update one or more settings + hot-reload engine thresholds."""
+    s = _state(request)
+    current = load_config()
+    merged = UIConfig.model_validate(current.model_dump() | updates)
+    save_config(merged)
+
+    # Hot-reload engine thresholds (those that don't require restart)
+    s.engine._wall_proximity_pts = merged.wall_proximity_pts  # type: ignore[attr-defined]
+    s.engine._wall_collapse_pct = merged.wall_collapse_pct  # type: ignore[attr-defined]
+    s.engine._wall_collapse_floor_m = merged.wall_collapse_floor_m  # type: ignore[attr-defined]
+
+    return {
+        "ok": True,
+        "config": merged.model_dump(),
+        "hot_reloaded": ["wall_proximity_pts", "wall_collapse_pct", "wall_collapse_floor_m"],
+        "requires_restart": ["fef_loop_interval_sec", "quantdata_poll_interval_sec"],
+    }
+
+
+# IMPROVEMENTS #20: record trade outcome — updates ticket + linked signal
+@router.post("/tickets/{ticket_id}/close")
+async def close_ticket(
+    ticket_id: int,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Record exit prices + pnl on a ticket. Frontend posts when user closes a trade."""
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import TicketStatus, TradeTicket
+
+    async with get_session() as session:
+        ticket = (await session.exec(select(TradeTicket).where(TradeTicket.id == ticket_id))).first()
+        if ticket is None:
+            raise HTTPException(404, f"Ticket {ticket_id} not found")
+        from datetime import UTC, datetime
+
+        if "fill_price" in body:
+            ticket.fill_price = body["fill_price"]
+            ticket.filled_at = datetime.now(UTC)
+        if "exit_t1_price" in body:
+            ticket.exit_t1_price = body["exit_t1_price"]
+        if "exit_t2_price" in body:
+            ticket.exit_t2_price = body["exit_t2_price"]
+        if "exit_t3_price" in body:
+            ticket.exit_t3_price = body["exit_t3_price"]
+        if "exit_stop_price" in body:
+            ticket.exit_stop_price = body["exit_stop_price"]
+            ticket.status = TicketStatus.STOPPED
+        if "pnl_dollars" in body:
+            ticket.pnl_dollars = body["pnl_dollars"]
+        if "status" in body:
+            ticket.status = TicketStatus(body["status"])
+        if "notes" in body:
+            ticket.notes = body["notes"]
+        if ticket.status in (TicketStatus.CLOSED, TicketStatus.STOPPED):
+            ticket.closed_at = datetime.now(UTC)
+        session.add(ticket)
+        await session.flush()
+        return {"ok": True, "ticket_id": ticket_id, "status": ticket.status.value}
+
+
+# IMPROVEMENTS #19: replay a past session — return all iters in order
+@router.get("/history/replay/{date}")
+async def replay_session(date: str) -> list[dict[str, Any]]:
+    """Return all iters for the given session_date in chronological order."""
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import SignalIter
+
+    async with get_session() as session:
+        stmt = (
+            select(SignalIter)
+            .where(SignalIter.session_date == date)
+            .order_by(SignalIter.iter_num.asc())  # type: ignore[attr-defined]
+        )
+        rows = (await session.exec(stmt)).all()
+        return [_signal_to_dict(r) for r in rows]
 
 
 def _signal_to_dict(r) -> dict[str, Any]:
