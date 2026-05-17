@@ -10,6 +10,7 @@ import {
 import type {
   Bar,
   IterEvent,
+  PatternMatchEvent,
   SidecarEvent,
   SnapshotEvent,
   StatusEvent,
@@ -31,6 +32,7 @@ interface SidecarState {
   recentIters: IterEvent[];
   recentBars: Bar[];
   recentTickets: TicketEvent[];
+  recentPatternMatches: PatternMatchEvent[];
 }
 
 const initialState: SidecarState = {
@@ -43,6 +45,7 @@ const initialState: SidecarState = {
   recentIters: [],
   recentBars: [],
   recentTickets: [],
+  recentPatternMatches: [],
 };
 
 const SidecarContext = createContext<SidecarState>(initialState);
@@ -80,6 +83,11 @@ export function SidecarProvider({
           };
         case "snapshot":
           return { ...prev, lastSnapshot: event };
+        case "pattern_match":
+          return {
+            ...prev,
+            recentPatternMatches: [...prev.recentPatternMatches, event].slice(-RECENT_LIMIT),
+          };
         case "ticket":
           return {
             ...prev,

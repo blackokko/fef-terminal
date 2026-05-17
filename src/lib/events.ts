@@ -92,6 +92,19 @@ export interface SnapshotEvent {
   aggression: { call_pct: number; put_pct: number } | null;
 }
 
+export interface PatternMatchEvent {
+  type: "pattern_match";
+  timestamp_ms: number;
+  pattern_id: number;
+  pattern_name: string;
+  pattern_description: string;
+  signal_iter_id: number;
+  iter_num: number;
+  spx_price: number;
+  audio_alert: boolean;
+  toast_alert: boolean;
+}
+
 export interface TicketEvent {
   type: "ticket";
   timestamp_ms: number;
@@ -123,4 +136,5 @@ export type SidecarEvent =
   | IterEvent
   | TicketEvent
   | StatusEvent
-  | SnapshotEvent;
+  | SnapshotEvent
+  | PatternMatchEvent;

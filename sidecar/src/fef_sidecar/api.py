@@ -421,6 +421,209 @@ async def option_chain(
     return {"spx_price": spx, "expiry": expiry, "calls": calls, "puts": puts}
 
 
+# IMPROVEMENTS #R: pattern library — user-defined setups
+@router.get("/patterns/fields")
+async def list_pattern_fields() -> list[dict[str, Any]]:
+    """List available fields with type info for the condition builder UI."""
+    from fef_sidecar.engine.patterns import FIELDS
+
+    return [
+        {
+            "name": f.name,
+            "label": f.label,
+            "kind": f.kind,
+            "enum_values": list(f.enum_values),
+            "description": f.description,
+        }
+        for f in FIELDS
+    ]
+
+
+@router.get("/patterns")
+async def list_patterns() -> list[dict[str, Any]]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern
+
+    async with get_session() as session:
+        rows = (await session.exec(select(Pattern).order_by(Pattern.name))).all()
+        return [
+            {
+                "id": p.id,
+                "name": p.name,
+                "description": p.description,
+                "conditions": p.conditions or [],
+                "enabled": p.enabled,
+                "audio_alert": p.audio_alert,
+                "toast_alert": p.toast_alert,
+                "match_count": p.match_count,
+                "last_matched_at": p.last_matched_at.isoformat() if p.last_matched_at else None,
+            }
+            for p in rows
+        ]
+
+
+@router.post("/patterns")
+async def create_pattern(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern
+
+    async with get_session() as session:
+        p = Pattern(
+            name=str(body["name"]),
+            description=str(body.get("description", "")),
+            conditions=body.get("conditions", []),
+            enabled=bool(body.get("enabled", True)),
+            audio_alert=bool(body.get("audio_alert", True)),
+            toast_alert=bool(body.get("toast_alert", True)),
+        )
+        session.add(p)
+        await session.flush()
+        return {"ok": True, "id": p.id}
+
+
+@router.put("/patterns/{pattern_id}")
+async def update_pattern(pattern_id: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern
+
+    async with get_session() as session:
+        p = (await session.exec(select(Pattern).where(Pattern.id == pattern_id))).first()
+        if p is None:
+            raise HTTPException(404, f"Pattern {pattern_id} not found")
+        for k in ("name", "description", "conditions", "enabled", "audio_alert", "toast_alert"):
+            if k in body:
+                setattr(p, k, body[k])
+        session.add(p)
+        return {"ok": True}
+
+
+@router.delete("/patterns/{pattern_id}")
+async def delete_pattern(pattern_id: int) -> dict[str, Any]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern
+
+    async with get_session() as session:
+        p = (await session.exec(select(Pattern).where(Pattern.id == pattern_id))).first()
+        if p is None:
+            raise HTTPException(404, f"Pattern {pattern_id} not found")
+        await session.delete(p)
+        return {"ok": True}
+
+
+@router.post("/patterns/{pattern_id}/toggle")
+async def toggle_pattern(pattern_id: int) -> dict[str, Any]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern
+
+    async with get_session() as session:
+        p = (await session.exec(select(Pattern).where(Pattern.id == pattern_id))).first()
+        if p is None:
+            raise HTTPException(404, f"Pattern {pattern_id} not found")
+        p.enabled = not p.enabled
+        session.add(p)
+        return {"ok": True, "enabled": p.enabled}
+
+
+@router.get("/patterns/{pattern_id}/matches")
+async def pattern_matches(pattern_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import PatternMatch
+
+    async with get_session() as session:
+        stmt = (
+            select(PatternMatch)
+            .where(PatternMatch.pattern_id == pattern_id)
+            .order_by(PatternMatch.matched_at.desc())  # type: ignore[attr-defined]
+            .limit(limit)
+        )
+        rows = (await session.exec(stmt)).all()
+        return [
+            {
+                "id": m.id,
+                "pattern_id": m.pattern_id,
+                "signal_iter_id": m.signal_iter_id,
+                "matched_at": m.matched_at.isoformat() if m.matched_at else None,
+                "fields_snapshot": m.fields_snapshot,
+            }
+            for m in rows
+        ]
+
+
+@router.post("/patterns/test")
+async def test_pattern(
+    request: Request,
+    body: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Test a conditions list against the most recent iter (returns matched + per-condition debug).
+
+    Body: { 'conditions': [...] }
+    """
+    from fef_sidecar.engine.patterns import evaluate_pattern, extract_fields
+    from fef_sidecar.engine.fef import snapshot_to_inputs
+
+    s = _state(request)
+    if s.last_snapshot is None or not s.last_verdict:
+        raise HTTPException(400, "No iter to test against — run /run_iter_now first")
+
+    inputs = snapshot_to_inputs(s.last_snapshot)  # type: ignore[arg-type]
+    # Reconstruct a partial verdict for field extraction
+    from types import SimpleNamespace
+
+    fake_verdict = SimpleNamespace(
+        direction=SimpleNamespace(value=s.last_verdict.get("direction", "WAIT")),
+        confidence=SimpleNamespace(value=s.last_verdict.get("confidence", "NONE")),
+        nearest_wall_distance=s.last_verdict.get("nearest_wall_distance"),
+        delta_price=s.last_verdict.get("delta_price"),
+        delta_drift_m=s.last_verdict.get("delta_drift_m"),
+        fe_ratio=s.last_verdict.get("fe_ratio"),
+        aligned=s.last_verdict.get("aligned", False),
+        absorption=s.last_verdict.get("absorption", False),
+    )
+
+    fields = extract_fields(inputs, fake_verdict, vix=s.last_vix, iter_num=s.last_iter_num)
+    matched, results = evaluate_pattern(body.get("conditions", []), fields)
+    return {"matched": matched, "conditions": results, "field_values": fields}
+
+
+@router.post("/patterns/seed_defaults")
+async def seed_default_patterns() -> dict[str, Any]:
+    """Insert built-in template patterns if not already present (idempotent)."""
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern
+    from fef_sidecar.engine.patterns import DEFAULT_TEMPLATES
+
+    added = []
+    async with get_session() as session:
+        for tpl in DEFAULT_TEMPLATES:
+            existing = (
+                await session.exec(select(Pattern).where(Pattern.name == tpl["name"]))
+            ).first()
+            if existing:
+                continue
+            session.add(
+                Pattern(
+                    name=tpl["name"],
+                    description=tpl["description"],
+                    conditions=tpl["conditions"],
+                    enabled=True,
+                )
+            )
+            added.append(tpl["name"])
+    return {"ok": True, "added": added}
+
+
 # IMPROVEMENTS #19: replay a past session — return all iters in order
 @router.get("/history/replay/{date}")
 async def replay_session(date: str) -> list[dict[str, Any]]:

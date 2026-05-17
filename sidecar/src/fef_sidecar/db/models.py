@@ -155,6 +155,35 @@ class ChartAnnotation(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class Pattern(SQLModel, table=True):
+    """IMPROVEMENTS #R — user-defined pattern that fires when conditions match."""
+
+    __tablename__ = "pattern"
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(unique=True, index=True)
+    description: str = Field(default="")
+    conditions: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    enabled: bool = Field(default=True, index=True)
+    audio_alert: bool = Field(default=True)
+    toast_alert: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    last_matched_at: datetime | None = None
+    match_count: int = Field(default=0)
+
+
+class PatternMatch(SQLModel, table=True):
+    """One row per pattern firing — link to the iter that caused it."""
+
+    __tablename__ = "pattern_match"
+
+    id: int | None = Field(default=None, primary_key=True)
+    pattern_id: int = Field(foreign_key="pattern.id", index=True)
+    signal_iter_id: int = Field(foreign_key="signal_iter.id", index=True)
+    matched_at: datetime = Field(default_factory=_utcnow)
+    fields_snapshot: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+
+
 class DailySession(SQLModel, table=True):
     """Per-session aggregates, updated incrementally during the day."""
 

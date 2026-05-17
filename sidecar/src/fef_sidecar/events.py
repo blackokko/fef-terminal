@@ -79,7 +79,22 @@ class StatusEvent(BaseModel):
     vix: float | None = None  # IMPROVEMENTS #M — last VIX quote
 
 
-Event = TickEvent | IterEvent | TicketEvent | StatusEvent | SnapshotEvent
+class PatternMatchEvent(BaseModel):
+    """IMPROVEMENTS #R — fires when a user-defined pattern matches an iter."""
+
+    type: Literal["pattern_match"] = "pattern_match"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    pattern_id: int
+    pattern_name: str
+    pattern_description: str = ""
+    signal_iter_id: int
+    iter_num: int
+    spx_price: float
+    audio_alert: bool = True
+    toast_alert: bool = True
+
+
+Event = TickEvent | IterEvent | TicketEvent | StatusEvent | SnapshotEvent | PatternMatchEvent
 
 
 class EventBroadcaster:

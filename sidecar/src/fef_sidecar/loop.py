@@ -29,7 +29,8 @@ from fef_sidecar.db import (
 )
 from fef_sidecar.engine.fef import snapshot_to_inputs
 from fef_sidecar.engine.option_targets import OptionTargets, build_option_targets
-from fef_sidecar.events import IterEvent, SnapshotEvent, TickEvent
+from fef_sidecar.engine.patterns import evaluate_pattern, extract_fields
+from fef_sidecar.events import IterEvent, PatternMatchEvent, SnapshotEvent, TickEvent
 from fef_sidecar.ibkr import Contract, ContractKind
 
 if TYPE_CHECKING:
@@ -276,6 +277,12 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     t0 = _time.perf_counter()
     await state.broadcaster.publish(event)
     perf["broadcast_ms"] = (_time.perf_counter() - t0) * 1000
+
+    # IMPROVEMENTS #R: evaluate user-defined patterns against this iter
+    t0 = _time.perf_counter()
+    await _evaluate_patterns(state, inputs, verdict, signal.id, signal.iter_num)
+    perf["pattern_eval_ms"] = (_time.perf_counter() - t0) * 1000
+
     perf["total_ms"] = (_time.perf_counter() - t_start) * 1000
     state.last_iter_perf_ms = {k: round(v, 2) for k, v in perf.items()}
 
@@ -302,6 +309,72 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
 # ---------------------------------------------------------------------------
 # Bar stream — chart candles
 # ---------------------------------------------------------------------------
+
+
+async def _evaluate_patterns(
+    state: AppState,
+    inputs: Any,
+    verdict: Any,
+    signal_iter_id: int | None,
+    iter_num: int,
+) -> None:
+    """Walk enabled patterns; fire PatternMatchEvent + log match for each hit."""
+    if signal_iter_id is None:
+        return
+
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern, PatternMatch
+
+    field_values = extract_fields(
+        inputs, verdict, vix=state.last_vix, iter_num=iter_num
+    )
+
+    async with get_session() as session:
+        patterns = (
+            await session.exec(select(Pattern).where(Pattern.enabled == True))  # noqa: E712
+        ).all()
+
+        for pattern in patterns:
+            matched, _ = evaluate_pattern(pattern.conditions or [], field_values)
+            if not matched:
+                continue
+
+            from datetime import UTC, datetime
+
+            pattern.match_count += 1
+            pattern.last_matched_at = datetime.now(UTC)
+            session.add(pattern)
+
+            session.add(
+                PatternMatch(
+                    pattern_id=pattern.id,
+                    signal_iter_id=signal_iter_id,
+                    fields_snapshot={
+                        k: v for k, v in field_values.items() if v is not None
+                    },
+                )
+            )
+
+            await state.broadcaster.publish(
+                PatternMatchEvent(
+                    pattern_id=pattern.id,
+                    pattern_name=pattern.name,
+                    pattern_description=pattern.description,
+                    signal_iter_id=signal_iter_id,
+                    iter_num=iter_num,
+                    spx_price=inputs.spx_price,
+                    audio_alert=pattern.audio_alert,
+                    toast_alert=pattern.toast_alert,
+                )
+            )
+            logger.info(
+                "Pattern matched: '%s' on iter #%d (SPX $%.2f)",
+                pattern.name,
+                iter_num,
+                inputs.spx_price,
+            )
 
 
 async def _maybe_fetch_option_targets(
