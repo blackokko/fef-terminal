@@ -67,6 +67,7 @@ class MockIBKRProvider:
         self._bars = bars if bars is not None else _default_spx_5_15_bars()
         self._playback_interval = playback_interval
         self._connected = False
+        self._scripted_index = 0  # tracks the latest scripted-day frame for tick base
 
     @property
     def is_connected(self) -> bool:
@@ -87,10 +88,58 @@ class MockIBKRProvider:
     ) -> AsyncIterator[Bar]:
         if not self._connected:
             await self.connect()
+
+        import os as _os
+
+        if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
+            async for bar in self._scripted_day_bars():
+                yield bar
+            return
+
         for bar in self._bars:
             yield bar
             if self._playback_interval > 0:
                 await asyncio.sleep(self._playback_interval)
+
+    async def _scripted_day_bars(self) -> AsyncIterator[Bar]:
+        """Generate bars from the DAY_SCRIPT, yielded at FEF_LOOP_INTERVAL_SEC cadence.
+
+        Each frame's SPX value becomes the close of one bar. Open is the
+        previous frame's close. High/low add small random wiggle around the
+        open-close range. Timestamps are anchored to today's market open
+        (9:30 ET) + frame.minutes_since_open.
+        """
+        from datetime import datetime, time, timedelta
+        import os as _os
+        import random as _random
+        from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+
+        interval = float(_os.environ.get("FEF_LOOP_INTERVAL_SEC", "3"))
+        rng = _random.Random(123)
+
+        today = datetime.now().date()
+        market_open = datetime.combine(today, time(9, 30))
+
+        prev_close = DAY_SCRIPT[0].spx
+        for i, frame in enumerate(DAY_SCRIPT):
+            close = frame.spx
+            open_ = prev_close
+            wiggle_high = rng.uniform(0.1, 1.5)
+            wiggle_low = rng.uniform(0.1, 1.5)
+            high = max(open_, close) + wiggle_high
+            low = min(open_, close) - wiggle_low
+            volume = 1000 + rng.randint(0, 3000)
+            self._scripted_index = i
+            yield Bar(
+                timestamp=market_open + timedelta(minutes=frame.minutes_since_open),
+                open=round(open_, 2),
+                high=round(high, 2),
+                low=round(low, 2),
+                close=round(close, 2),
+                volume=volume,
+            )
+            await asyncio.sleep(interval)
+            prev_close = close
 
     async def get_last_quote(self, contract: Contract) -> Quote:
         if not self._connected:
@@ -164,8 +213,12 @@ class MockIBKRProvider:
         self,
         contract: Contract,
     ) -> AsyncIterator[Quote]:
-        """Emit synthetic ticks every FEF_TICK_INTERVAL_SEC (default 2s) with
-        small random walk around the last bar's close."""
+        """Emit synthetic ticks every FEF_TICK_INTERVAL_SEC (default 2s).
+
+        In scripted-day mode, the random walk tracks the latest scripted
+        frame's SPX so ticks reflect where the day is in its arc. Otherwise,
+        mean-reverts to the last static bar's close.
+        """
         import os
         import random
         from datetime import datetime
@@ -173,12 +226,23 @@ class MockIBKRProvider:
         if not self._connected:
             await self.connect()
         interval = float(os.environ.get("FEF_TICK_INTERVAL_SEC", "2"))
-        base_price = self._bars[-1].close
-        price = base_price
+        is_scripted = os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+
+        if is_scripted:
+            from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+
+        price = self._bars[-1].close
         while True:
-            # Random walk: small step each tick, mean-reverting to base
+            if is_scripted:
+                base_price = DAY_SCRIPT[self._scripted_index % len(DAY_SCRIPT)].spx
+            else:
+                base_price = self._bars[-1].close
             step = random.uniform(-0.5, 0.5)
-            drift = (base_price - price) * 0.1  # gentle pull back to base
+            drift = (base_price - price) * 0.3  # tighter pull so ticks track the arc
             price = round(price + step + drift, 2)
             yield Quote(
                 timestamp=datetime.now(),
