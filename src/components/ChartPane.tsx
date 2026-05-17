@@ -233,23 +233,32 @@ export function ChartPane() {
     if (barTicks.length <= lastBarCountRef.current) return;
 
     const newOnes = barTicks.slice(lastBarCountRef.current);
+    const lastTime = currentBarRef.current ? (currentBarRef.current.time as number) : 0;
     for (const t of newOnes) {
+      const time = Math.floor(t.timestamp_ms / 1000) as UTCTimestamp;
+      // Guard against time regression — lightweight-charts errors and the
+      // chart goes black if we ever send a bar with an earlier timestamp
+      if ((time as number) < lastTime) continue;
       const candle: CandlestickData = {
-        time: Math.floor(t.timestamp_ms / 1000) as UTCTimestamp,
+        time,
         open: t.bar!.open, high: t.bar!.high, low: t.bar!.low, close: t.bar!.close,
       };
-      seriesRef.current.update(candle);
-      currentBarRef.current = candle;
+      try {
+        seriesRef.current.update(candle);
+        currentBarRef.current = candle;
 
-      // Update VWAP
-      const typical = (t.bar!.high + t.bar!.low + t.bar!.close) / 3;
-      const vol = t.bar!.volume || 1;
-      cumPVRef.current += typical * vol;
-      cumVolRef.current += vol;
-      vwapSeriesRef.current?.update({
-        time: candle.time,
-        value: cumPVRef.current / cumVolRef.current,
-      });
+        // Update VWAP
+        const typical = (t.bar!.high + t.bar!.low + t.bar!.close) / 3;
+        const vol = t.bar!.volume || 1;
+        cumPVRef.current += typical * vol;
+        cumVolRef.current += vol;
+        vwapSeriesRef.current?.update({
+          time: candle.time,
+          value: cumPVRef.current / cumVolRef.current,
+        });
+      } catch (err) {
+        console.warn("chart update skipped:", err);
+      }
     }
     lastBarCountRef.current = barTicks.length;
   }, [recentTicks, symbol]);
@@ -267,8 +276,12 @@ export function ChartPane() {
       low: Math.min(cb.low, tickPrice),
       close: tickPrice,
     };
-    seriesRef.current.update(updated);
-    currentBarRef.current = updated;
+    try {
+      seriesRef.current.update(updated);
+      currentBarRef.current = updated;
+    } catch (err) {
+      console.warn("live tick update skipped:", err);
+    }
   }, [lastTick, symbol]);
 
   // Wall overlays — redrawn on each iter (low frequency, OK to re-create lines)

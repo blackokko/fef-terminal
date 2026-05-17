@@ -156,5 +156,12 @@ def total_frames() -> int:
 
 
 def frame_at(index: int) -> DayFrame:
-    """Loop the script if we run past the end."""
-    return DAY_SCRIPT[index % len(DAY_SCRIPT)]
+    """Clamp at the last frame instead of looping — looping caused the chart
+    to receive bars with regressing timestamps (lightweight-charts errors)."""
+    if index >= len(DAY_SCRIPT):
+        return DAY_SCRIPT[-1]
+    return DAY_SCRIPT[index]
+
+
+def replay_complete(index: int) -> bool:
+    return index >= len(DAY_SCRIPT)

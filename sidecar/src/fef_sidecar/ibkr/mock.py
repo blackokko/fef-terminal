@@ -102,17 +102,24 @@ class MockIBKRProvider:
                 await asyncio.sleep(self._playback_interval)
 
     async def _scripted_day_bars(self) -> AsyncIterator[Bar]:
-        """Generate bars from the DAY_SCRIPT, yielded at FEF_LOOP_INTERVAL_SEC cadence.
+        """Generate bars from the DAY_SCRIPT — ONE-SHOT replay.
 
-        Each frame's SPX value becomes the close of one bar. Open is the
-        previous frame's close. High/low add small random wiggle around the
-        open-close range. Timestamps are anchored to today's market open
-        (9:30 ET) + frame.minutes_since_open.
+        After all 190 frames are yielded, the generator exits and stays
+        exited (state in self._scripted_bars_done). The outer bar loop will
+        sleep + retry, but subsequent calls return an empty generator so
+        we never go backwards in time on the chart.
+
+        Each frame's SPX becomes the close; open is the previous close;
+        high/low add small random wiggle; timestamps anchored to today's
+        market open + frame.minutes_since_open.
         """
         from datetime import datetime, time, timedelta
         import os as _os
         import random as _random
         from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+
+        if getattr(self, "_scripted_bars_done", False):
+            return  # already replayed — don't re-yield with same timestamps
 
         interval = float(_os.environ.get("FEF_LOOP_INTERVAL_SEC", "3"))
         rng = _random.Random(123)
@@ -140,6 +147,8 @@ class MockIBKRProvider:
             )
             await asyncio.sleep(interval)
             prev_close = close
+
+        self._scripted_bars_done = True
 
     async def get_last_quote(self, contract: Contract) -> Quote:
         if not self._connected:
