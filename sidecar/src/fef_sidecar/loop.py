@@ -82,10 +82,12 @@ def _walls_json(walls: Any) -> list[dict[str, Any]]:
 
 async def quantdata_poll_loop(state: AppState) -> None:
     interval = float(os.environ.get("FEF_QUANTDATA_POLL_INTERVAL_SEC", "15"))
-    logger.info("Starting QuantData poll loop (interval=%.1fs)", interval)
+    logger.info("Starting QuantData poll loop (interval=%.1fs, symbol=%s)", interval, state.active_symbol)
 
     while True:
         try:
+            # Ensure QuantData page filter matches active symbol (idempotent)
+            await state.quantdata.set_page_filter(ticker=state.active_symbol)  # type: ignore[attr-defined]
             snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
             state.last_snapshot = snap
             state.last_spx_price = snap.spx_price  # type: ignore[union-attr]
@@ -202,6 +204,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     snap = state.last_snapshot
     if snap is None or force_fresh:
         t0 = _time.perf_counter()
+        await state.quantdata.set_page_filter(ticker=state.active_symbol)  # type: ignore[attr-defined]
         snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
         state.last_snapshot = snap
         perf["quantdata_fetch_ms"] = (_time.perf_counter() - t0) * 1000
@@ -555,11 +558,12 @@ def _option_pricing_dict(targets: OptionTargets | None) -> dict[str, Any] | None
 
 
 async def bar_stream_loop(state: AppState) -> None:
-    logger.info("Starting bar stream loop")
+    symbol = state.active_symbol
+    logger.info("Starting bar stream loop for %s", symbol)
     while True:
         try:
             await state.ibkr.connect()
-            async for bar in state.ibkr.stream_bars(Contract.spx_index()):
+            async for bar in state.ibkr.stream_bars(Contract.for_symbol(symbol)):
                 state.last_spx_price = bar.close
                 event = TickEvent(
                     timestamp_ms=bar.epoch_ms,
@@ -672,12 +676,16 @@ async def account_poll_loop(state: AppState) -> None:
 
 
 async def microstructure_loop(state: AppState) -> None:
-    """Synthesize quote + trade events from the tick stream and broadcast a
-    MicrostructureSignal every FEF_MICRO_INTERVAL_SEC (default 0.5s).
+    """Continuously broadcast a microstructure signal every
+    FEF_MICRO_INTERVAL_SEC (default 0.5s).
 
-    Mock mode: derives quote sizes + aggressor from synthetic random walks
-    around the current SPX price. Live mode would subscribe to
-    reqTickByTickData and reqMktData L1 events.
+    Live mode (LiveIBKRProvider): subscribes to reqTickByTickData on the
+    active symbol's underlying (uses SPY when active_symbol == SPX since
+    SPX is an index without a trade tape). Real bid/ask/trade events
+    feed the OFI/AVI/microprice calculations.
+
+    Mock mode: synthesizes plausible quote + trade events around the
+    current price anchor so the UI populates without a live feed.
     """
     import asyncio as _asyncio
     import random as _random
@@ -692,66 +700,96 @@ async def microstructure_loop(state: AppState) -> None:
         push_trade,
     )
     from fef_sidecar.events import MicrostructureEvent
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
 
     interval = float(os.environ.get("FEF_MICRO_INTERVAL_SEC", "0.5"))
     rng = _random.Random()
-    logger.info("Starting microstructure loop (interval=%.2fs)", interval)
 
-    while True:
+    def _on_quote(ts_ms: int, bid: float, ask: float, bs: float, as_: float) -> None:
+        push_quote(state.microstructure_state, QuoteUpdate(
+            timestamp_ms=ts_ms, bid=bid, ask=ask, bid_size=bs, ask_size=as_,
+        ))
+
+    def _on_trade(ts_ms: int, price: float, size: float, aggressor: str) -> None:
+        push_trade(state.microstructure_state, TradePrint(
+            timestamp_ms=ts_ms, price=price, size=size, aggressor=aggressor,  # type: ignore[arg-type]
+        ))
+
+    cancel_live = None
+    if isinstance(state.ibkr, LiveIBKRProvider):
+        # SPX has no tape — use SPY as the microstructure proxy
+        micro_symbol = "SPY" if state.active_symbol == "SPX" else state.active_symbol
         try:
-            # In mock, use last_spx_price as the anchor. Synthesize a quote
-            # with random spread + sizes, and a trade with random aggressor.
-            spx = state.last_spx_price or 7400.0
-            now_ms = int(_time.time() * 1000)
-
-            # Quote: tight spread, sizes biased by current "trend" (we just
-            # use sin of current second for variation)
-            spread = round(rng.uniform(0.05, 0.25), 2)
-            bid = round(spx - spread / 2, 2)
-            ask = round(spx + spread / 2, 2)
-            bid_size = float(rng.randint(50, 500))
-            ask_size = float(rng.randint(50, 500))
-            push_quote(state.microstructure_state, QuoteUpdate(
-                timestamp_ms=now_ms, bid=bid, ask=ask, bid_size=bid_size, ask_size=ask_size,
-            ))
-
-            # Trade: random price near mid + classify via Lee-Ready
-            trade_price = round(spx + rng.uniform(-spread / 2, spread / 2), 2)
-            trade_size = float(rng.randint(1, 50))
-            agg = classify_trade(trade_price, bid, ask)
-            push_trade(state.microstructure_state, TradePrint(
-                timestamp_ms=now_ms, price=trade_price, size=trade_size, aggressor=agg,
-            ))
-
-            sig = assess(state.microstructure_state, now_ms)
-            await state.broadcaster.publish(MicrostructureEvent(
-                timestamp_ms=sig.timestamp_ms,
-                ofi_window=sig.ofi_window,
-                avi_pct=sig.avi_pct,
-                aggressive_buy_volume=sig.aggressive_buy_volume,
-                aggressive_sell_volume=sig.aggressive_sell_volume,
-                microprice=sig.microprice,
-                last_trade_price=sig.last_trade_price,
-                microprice_deviation_bp=sig.microprice_deviation_bp,
-                direction=sig.direction,
-                confidence=sig.confidence,
-                reasoning=sig.reasoning,
-                quote_count=sig.quote_count,
-                trade_count=sig.trade_count,
-            ))
-        except _asyncio.CancelledError:
-            raise
+            await state.ibkr.connect()
+            cancel_live = await state.ibkr.subscribe_tick_by_tick(
+                Contract.for_symbol(micro_symbol), _on_quote, _on_trade,
+            )
+            logger.info("Microstructure loop subscribed to LIVE %s ticks (interval=%.2fs)", micro_symbol, interval)
         except Exception:
-            logger.exception("Microstructure iteration failed")
-        await _asyncio.sleep(interval)
+            logger.exception("Live microstructure subscription failed — falling back to synth")
+            cancel_live = None
+    else:
+        logger.info("Microstructure loop in MOCK mode (synthesizing ticks, interval=%.2fs)", interval)
+
+    try:
+        while True:
+            try:
+                if cancel_live is None:
+                    # MOCK: synthesize a quote + a trade per tick interval
+                    spx = state.last_spx_price or 7400.0
+                    now_ms = int(_time.time() * 1000)
+                    spread = round(rng.uniform(0.05, 0.25), 2)
+                    bid = round(spx - spread / 2, 2)
+                    ask = round(spx + spread / 2, 2)
+                    bid_size = float(rng.randint(50, 500))
+                    ask_size = float(rng.randint(50, 500))
+                    push_quote(state.microstructure_state, QuoteUpdate(
+                        timestamp_ms=now_ms, bid=bid, ask=ask, bid_size=bid_size, ask_size=ask_size,
+                    ))
+                    trade_price = round(spx + rng.uniform(-spread / 2, spread / 2), 2)
+                    trade_size = float(rng.randint(1, 50))
+                    agg = classify_trade(trade_price, bid, ask)
+                    push_trade(state.microstructure_state, TradePrint(
+                        timestamp_ms=now_ms, price=trade_price, size=trade_size, aggressor=agg,
+                    ))
+
+                now_ms = int(_time.time() * 1000)
+                sig = assess(state.microstructure_state, now_ms)
+                await state.broadcaster.publish(MicrostructureEvent(
+                    timestamp_ms=sig.timestamp_ms,
+                    ofi_window=sig.ofi_window,
+                    avi_pct=sig.avi_pct,
+                    aggressive_buy_volume=sig.aggressive_buy_volume,
+                    aggressive_sell_volume=sig.aggressive_sell_volume,
+                    microprice=sig.microprice,
+                    last_trade_price=sig.last_trade_price,
+                    microprice_deviation_bp=sig.microprice_deviation_bp,
+                    direction=sig.direction,
+                    confidence=sig.confidence,
+                    reasoning=sig.reasoning,
+                    quote_count=sig.quote_count,
+                    trade_count=sig.trade_count,
+                ))
+            except _asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Microstructure iteration failed")
+            await _asyncio.sleep(interval)
+    finally:
+        if cancel_live is not None:
+            try:
+                await cancel_live()
+            except Exception:
+                logger.exception("Microstructure live cancel failed")
 
 
 async def tick_stream_loop(state: AppState) -> None:
-    logger.info("Starting tick stream loop")
+    symbol = state.active_symbol
+    logger.info("Starting tick stream loop for %s", symbol)
     while True:
         try:
             await state.ibkr.connect()
-            async for quote in state.ibkr.stream_last_price(Contract.spx_index()):
+            async for quote in state.ibkr.stream_last_price(Contract.for_symbol(symbol)):
                 state.last_spx_price = quote.last
                 event = TickEvent(
                     timestamp_ms=int(quote.timestamp.timestamp() * 1000),

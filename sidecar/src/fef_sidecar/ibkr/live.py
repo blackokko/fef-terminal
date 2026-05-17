@@ -312,6 +312,91 @@ class LiveIBKRProvider:
             logger.warning("IBKR ping failed: %s", e)
             return False
 
+    async def subscribe_tick_by_tick(
+        self,
+        contract: Contract,
+        on_quote,
+        on_trade,
+    ):
+        """Subscribe to tick-by-tick quote + trade events from IBKR.
+
+        Returns an async cancellation handle. Use:
+            handle = await provider.subscribe_tick_by_tick(c, on_quote, on_trade)
+            try: ...
+            finally: await handle()
+
+        on_quote: callable(timestamp_ms: int, bid: float, ask: float,
+                           bid_size: float, ask_size: float)
+        on_trade: callable(timestamp_ms: int, price: float, size: float,
+                           aggressor: 'BUY' | 'SELL' | 'UNKNOWN')
+
+        Uses ib_async's reqTickByTickData with tickType='BidAsk' for quote
+        updates and 'AllLast' for every trade print. Trade aggressor is
+        classified via Lee-Ready (1991) based on the latest known BBO.
+
+        Note: SPX is an INDEX — it has no trade tape. For microstructure on
+        an SPX-related instrument, use SPY (the ETF proxy).
+        """
+        import time as _time
+
+        await self._ensure_connected()
+        assert self._ib is not None
+
+        ib_contract = _to_ib_contract(contract)
+        await self._ib.qualifyContractsAsync(ib_contract)
+
+        latest_bid: float | None = None
+        latest_ask: float | None = None
+
+        bidask_ticker = self._ib.reqTickByTickData(ib_contract, "BidAsk", 0, False)
+        alllast_ticker = self._ib.reqTickByTickData(ib_contract, "AllLast", 0, False)
+
+        def _on_bidask(t) -> None:
+            nonlocal latest_bid, latest_ask
+            tbb = t.tickByTicks[-1] if t.tickByTicks else None
+            if tbb is None:
+                return
+            bid = float(getattr(tbb, "bidPrice", 0) or 0)
+            ask = float(getattr(tbb, "askPrice", 0) or 0)
+            bid_size = float(getattr(tbb, "bidSize", 0) or 0)
+            ask_size = float(getattr(tbb, "askSize", 0) or 0)
+            if bid > 0:
+                latest_bid = bid
+            if ask > 0:
+                latest_ask = ask
+            on_quote(int(_time.time() * 1000), bid, ask, bid_size, ask_size)
+
+        def _on_alllast(t) -> None:
+            tbb = t.tickByTicks[-1] if t.tickByTicks else None
+            if tbb is None:
+                return
+            price = float(getattr(tbb, "price", 0) or 0)
+            size = float(getattr(tbb, "size", 0) or 0)
+            if price <= 0 or size <= 0:
+                return
+            # Lee-Ready classification
+            if latest_ask is not None and price >= latest_ask:
+                agg = "BUY"
+            elif latest_bid is not None and price <= latest_bid:
+                agg = "SELL"
+            else:
+                agg = "UNKNOWN"
+            on_trade(int(_time.time() * 1000), price, size, agg)
+
+        bidask_ticker.updateEvent += _on_bidask
+        alllast_ticker.updateEvent += _on_alllast
+
+        async def _cancel() -> None:
+            bidask_ticker.updateEvent -= _on_bidask
+            alllast_ticker.updateEvent -= _on_alllast
+            try:
+                self._ib.cancelTickByTickData(ib_contract, "BidAsk")
+                self._ib.cancelTickByTickData(ib_contract, "AllLast")
+            except Exception as e:
+                logger.warning("Tick-by-tick cancellation error: %s", e)
+
+        return _cancel
+
     async def stream_last_price(self, contract: Contract):  # AsyncIterator[Quote]
         """Subscribe to reqMktData and yield Quotes on each tick update."""
         await self._ensure_connected()

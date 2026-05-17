@@ -79,6 +79,15 @@ class AppState:
     last_account: object | None = None  # AccountSummary or None
     microstructure_state: MicrostructureState = field(default_factory=MicrostructureState)
     microstructure_task: object | None = None
+    # Active symbol — drives which contract is fed to bar/tick/iter loops and
+    # which ticker is set on the QuantData page filter. Changing it triggers
+    # a loop restart (api.py /config/symbol POST handler).
+    active_symbol: str = field(default_factory=lambda: os.environ.get("FEF_ACTIVE_SYMBOL", "SPX").upper())
+    # Symbols allowed in the UI selector (env-overridable for users with
+    # extra QuantData subscriptions). Default = SPX + the new equity tickers.
+    available_symbols: list[str] = field(default_factory=lambda: [
+        s.strip().upper() for s in os.environ.get("FEF_AVAILABLE_SYMBOLS", "SPX,QQQ,IWM,SPY").split(",") if s.strip()
+    ])
 
     @classmethod
     def build(cls) -> AppState:

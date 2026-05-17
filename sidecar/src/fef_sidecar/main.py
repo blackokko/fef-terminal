@@ -85,6 +85,48 @@ async def _seed_defaults_on_first_run() -> None:
             logger.info("Seeded %d default presets", len(DEFAULT_PRESETS))
 
 
+def spawn_data_loops(state: AppState) -> None:
+    """(Re-)spawn the per-symbol data loops. Called on startup and whenever
+    the active symbol is changed via /config/symbol so the loops pick up
+    the new symbol immediately."""
+    state.quantdata_poll_task = asyncio.create_task(
+        quantdata_poll_loop(state), name="quantdata-poll-loop"
+    )
+    state.loop_task = asyncio.create_task(fef_tick_loop(state), name="fef-tick-loop")
+    state.bar_task = asyncio.create_task(bar_stream_loop(state), name="bar-stream-loop")
+    state.tick_task = asyncio.create_task(tick_stream_loop(state), name="tick-stream-loop")
+    state.health_check_task = asyncio.create_task(
+        ibkr_health_check_loop(state), name="ibkr-health-check-loop"
+    )
+    state.vix_task = asyncio.create_task(vix_poll_loop(state), name="vix-poll-loop")
+    state.account_task = asyncio.create_task(account_poll_loop(state), name="account-poll-loop")
+    state.microstructure_task = asyncio.create_task(
+        microstructure_loop(state), name="microstructure-loop"
+    )
+
+
+async def cancel_data_loops(state: AppState) -> None:
+    """Cancel the per-symbol data loops. Awaits each to ensure clean
+    teardown before respawning."""
+    tasks = [
+        state.loop_task, state.bar_task, state.tick_task,
+        state.quantdata_poll_task, state.health_check_task,
+        state.vix_task, state.account_task, state.microstructure_task,
+    ]
+    for t in tasks:
+        if t is not None:
+            t.cancel()  # type: ignore[attr-defined]
+    for t in tasks:
+        if t is not None:
+            try:
+                await t  # type: ignore[misc]
+            except (asyncio.CancelledError, Exception):
+                pass
+    state.loop_task = state.bar_task = state.tick_task = None
+    state.quantdata_poll_task = state.health_check_task = None
+    state.vix_task = state.account_task = state.microstructure_task = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("fef-sidecar starting up")
@@ -101,20 +143,7 @@ async def lifespan(app: FastAPI):
         "on",
     )
     if auto_loops:
-        state.quantdata_poll_task = asyncio.create_task(
-            quantdata_poll_loop(state), name="quantdata-poll-loop"
-        )
-        state.loop_task = asyncio.create_task(fef_tick_loop(state), name="fef-tick-loop")
-        state.bar_task = asyncio.create_task(bar_stream_loop(state), name="bar-stream-loop")
-        state.tick_task = asyncio.create_task(tick_stream_loop(state), name="tick-stream-loop")
-        state.health_check_task = asyncio.create_task(
-            ibkr_health_check_loop(state), name="ibkr-health-check-loop"
-        )
-        state.vix_task = asyncio.create_task(vix_poll_loop(state), name="vix-poll-loop")
-        state.account_task = asyncio.create_task(account_poll_loop(state), name="account-poll-loop")
-        state.microstructure_task = asyncio.create_task(
-            microstructure_loop(state), name="microstructure-loop"
-        )
+        spawn_data_loops(state)
 
     logger.info(
         "fef-sidecar ready (QD=%s, IBKR=%s, auto_loops=%s)",

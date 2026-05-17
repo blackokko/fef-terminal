@@ -42,7 +42,36 @@ async def status(request: Request) -> dict[str, Any]:
         "subscriber_count": s.broadcaster.subscriber_count,
         "all_mock": is_quantdata_mock and is_ibkr_mock,  # IMPROVEMENTS #13
         "last_iter_perf_ms": s.last_iter_perf_ms,  # IMPROVEMENTS #10
+        "active_symbol": s.active_symbol,
+        "available_symbols": s.available_symbols,
     }
+
+
+@router.get("/config/symbol")
+async def get_symbol(request: Request) -> dict[str, Any]:
+    s = _state(request)
+    return {"active_symbol": s.active_symbol, "available_symbols": s.available_symbols}
+
+
+@router.post("/config/symbol")
+async def set_symbol(request: Request, body: dict[str, str] = Body(...)) -> dict[str, Any]:
+    """Switch the active symbol. Cancels in-flight data loops and respawns
+    them so the new symbol is in effect within a second or two. The DB
+    keeps tagging rows with whichever symbol is active at write time."""
+    from fef_sidecar.main import cancel_data_loops, spawn_data_loops
+
+    symbol = body.get("symbol", "").strip().upper()
+    s = _state(request)
+    if symbol not in s.available_symbols:
+        raise HTTPException(400, f"Symbol {symbol!r} not in available_symbols ({s.available_symbols})")
+    if symbol == s.active_symbol:
+        return {"ok": True, "active_symbol": s.active_symbol, "changed": False}
+
+    s.active_symbol = symbol
+    s.last_snapshot = None  # force a fresh QuantData fetch on the new symbol
+    await cancel_data_loops(s)
+    spawn_data_loops(s)
+    return {"ok": True, "active_symbol": s.active_symbol, "changed": True}
 
 
 # IMPROVEMENTS #9: engine state introspection — "why did/didn't FEF fire?"
