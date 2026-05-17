@@ -120,6 +120,17 @@ body,
   display: inline-block;
 }
 
+.all-mock-banner {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  margin-right: 8px;
+  border: 1px solid var(--color-amber);
+  color: var(--color-amber);
+  border-radius: 3px;
+}
+
 /* Chart pane */
 
 .chart-pane {

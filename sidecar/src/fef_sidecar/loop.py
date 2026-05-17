@@ -158,18 +158,29 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     manual /run_iter_now triggers so rapid back-to-back calls actually see
     new data instead of replaying the same cached snapshot.
     """
+    import time as _time
+
+    perf: dict[str, float] = {}
+    t_start = _time.perf_counter()
+
     snap = state.last_snapshot
     if snap is None or force_fresh:
+        t0 = _time.perf_counter()
         snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
         state.last_snapshot = snap
+        perf["quantdata_fetch_ms"] = (_time.perf_counter() - t0) * 1000
 
+    t0 = _time.perf_counter()
     inputs = snapshot_to_inputs(snap)  # type: ignore[arg-type]
     verdict = state.engine.push(inputs)
+    perf["fef_compute_ms"] = (_time.perf_counter() - t0) * 1000
     state.last_spx_price = inputs.spx_price
 
     # When verdict is actionable, also pull the option chain quote for the
     # recommended strike and compute target option prices via delta.
+    t0 = _time.perf_counter()
     option_targets = await _maybe_fetch_option_targets(state, verdict, inputs)
+    perf["option_quote_ms"] = (_time.perf_counter() - t0) * 1000
 
     signal = await SignalIterRepository.write_iter(
         spx_price=inputs.spx_price,
@@ -237,13 +248,30 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
         },
     )
     state.last_verdict = event.verdict
+    t0 = _time.perf_counter()
     await state.broadcaster.publish(event)
-    logger.debug(
-        "FEF iter %d — SPX $%.2f — %s",
-        signal.iter_num,
-        inputs.spx_price,
-        verdict.direction.value,
-    )
+    perf["broadcast_ms"] = (_time.perf_counter() - t0) * 1000
+    perf["total_ms"] = (_time.perf_counter() - t_start) * 1000
+    state.last_iter_perf_ms = {k: round(v, 2) for k, v in perf.items()}
+
+    if perf["total_ms"] > 1000:
+        logger.warning(
+            "FEF iter %d took %.0fms (qd=%.0f / fef=%.0f / opt=%.0f / bcast=%.0f)",
+            signal.iter_num,
+            perf["total_ms"],
+            perf.get("quantdata_fetch_ms", 0),
+            perf["fef_compute_ms"],
+            perf["option_quote_ms"],
+            perf["broadcast_ms"],
+        )
+    else:
+        logger.debug(
+            "FEF iter %d — SPX $%.2f — %s (%.0fms)",
+            signal.iter_num,
+            inputs.spx_price,
+            verdict.direction.value,
+            perf["total_ms"],
+        )
 
 
 # ---------------------------------------------------------------------------

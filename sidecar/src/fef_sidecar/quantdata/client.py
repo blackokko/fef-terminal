@@ -136,6 +136,14 @@ class QuantDataClient:
             try:
                 response = await client.request(method, path, **kwargs)
                 if response.status_code == 401:
+                    # IMPROVEMENTS #12: surface auth failure loudly. Re-auth flow
+                    # requires the MCP's interactive setup, which we don't drive
+                    # from here — user must re-run `quantdata-mcp setup`. We log
+                    # at ERROR and let callers decide whether to broadcast a status.
+                    logger.error(
+                        "QuantData 401: token expired or invalid. "
+                        "Re-run `quantdata-mcp setup --auth-token <NEW_TOKEN>` to refresh."
+                    )
                     raise QuantDataAuthError("Authentication failed — check token and instance_id")
                 if response.status_code == 429:
                     if attempt < self._max_retries - 1:

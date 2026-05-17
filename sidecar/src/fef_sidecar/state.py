@@ -63,6 +63,7 @@ class AppState:
     last_verdict: dict[str, object] = field(default_factory=dict)
     last_snapshot: object | None = None  # cached MarketSnapshot for FEF to consume
     ibkr_status: str = "unknown"  # "connected" | "disconnected" | "reconnecting" | "unknown"
+    last_iter_perf_ms: dict[str, float] = field(default_factory=dict)  # IMPROVEMENTS #10
 
     @classmethod
     def build(cls) -> AppState:

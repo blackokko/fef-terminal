@@ -41,6 +41,11 @@ export function TopBar() {
       </div>
 
       <div className="topbar-section topbar-section-right">
+        {lastStatus?.quantdata?.startsWith("Mock") && lastStatus?.ibkr === "connected" && (
+          <span className="all-mock-banner" title="Both providers are mock — signals are replay only, not live data">
+            ⚠ ALL MOCK
+          </span>
+        )}
         <span
           className="connection-dot"
           style={{ background: connectionColor[connection] }}

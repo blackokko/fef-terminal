@@ -41,10 +41,16 @@ export function QuantDataPanel() {
   const ageMs = Date.now() - source.ts;
   const ageStr =
     ageMs < 60_000 ? `${Math.round(ageMs / 1000)}s` : `${Math.round(ageMs / 60_000)}m`;
+  // IMPROVEMENTS #8: flag stale data — sidebar poll runs every 15s, anything
+  // older than 30s suggests upstream stall.
+  const isStale = ageMs > 30_000;
 
   return (
     <section className="sidebar-section">
-      <h3 className="sidebar-section-title">QuantData · {ageStr} ago</h3>
+      <h3 className="sidebar-section-title">
+        QuantData · <span style={isStale ? { color: "var(--color-red)" } : undefined}>{ageStr} ago</span>
+        {isStale && <span style={{ color: "var(--color-red)" }}> ⚠ STALE</span>}
+      </h3>
 
       <SubSection title="Drift">
         <div>

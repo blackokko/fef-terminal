@@ -25,14 +25,53 @@ async def healthz() -> dict[str, str]:
 @router.get("/status")
 async def status(request: Request) -> dict[str, Any]:
     s = _state(request)
+    is_quantdata_mock = type(s.quantdata).__name__ == "MockQuantDataClient"
+    is_ibkr_mock = type(s.ibkr).__name__ == "MockIBKRProvider"
     return {
         "quantdata": type(s.quantdata).__name__,
-        "ibkr": "connected" if s.ibkr.is_connected else "disconnected",
+        "ibkr": s.ibkr_status if s.ibkr_status != "unknown" else (
+            "connected" if s.ibkr.is_connected else "disconnected"
+        ),
         "ibkr_provider": type(s.ibkr).__name__,
         "engine_history_size": s.engine.history_size,
         "last_spx_price": s.last_spx_price,
         "last_iter_num": s.last_iter_num,
         "subscriber_count": s.broadcaster.subscriber_count,
+        "all_mock": is_quantdata_mock and is_ibkr_mock,  # IMPROVEMENTS #13
+        "last_iter_perf_ms": s.last_iter_perf_ms,  # IMPROVEMENTS #10
+    }
+
+
+# IMPROVEMENTS #9: engine state introspection — "why did/didn't FEF fire?"
+@router.get("/engine/state")
+async def engine_state(request: Request) -> dict[str, Any]:
+    s = _state(request)
+    eng = s.engine
+    buffer = [
+        {
+            "timestamp_ms": fi.timestamp_ms,
+            "spx_price": fi.spx_price,
+            "drift_cum_net_m": fi.drift_cum_net_m,
+            "drift_bias": fi.drift_bias,
+            "ntm_max_pain": fi.ntm_max_pain,
+            "raw_max_pain": fi.raw_max_pain,
+            "top_gex_walls": [
+                {"strike": w.strike, "net_m": round(w.net_m, 2), "side": w.side}
+                for w in fi.top_gex_walls[:3]
+            ],
+        }
+        for fi in list(eng._history)  # type: ignore[attr-defined]
+    ]
+    return {
+        "history_size": eng.history_size,
+        "history_window": eng._history_window,  # type: ignore[attr-defined]
+        "wall_proximity_pts": eng._wall_proximity_pts,  # type: ignore[attr-defined]
+        "wall_collapse_pct": eng._wall_collapse_pct,  # type: ignore[attr-defined]
+        "wall_collapse_floor_m": eng._wall_collapse_floor_m,  # type: ignore[attr-defined]
+        "threshold_scale": eng._threshold_scale,  # type: ignore[attr-defined]
+        "absorption_fe_min": eng._absorption_fe_min,  # type: ignore[attr-defined]
+        "buffer": buffer,
+        "last_verdict": s.last_verdict,
     }
 
 
