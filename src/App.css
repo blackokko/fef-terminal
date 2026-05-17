@@ -483,3 +483,89 @@ button:active {
 .signal-spx {
   text-align: right;
 }
+
+/* Glossary panel */
+
+.glossary-panel {
+  font-size: 12px;
+}
+
+.glossary-summary {
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 0;
+}
+
+.glossary-summary:hover {
+  color: var(--color-blue);
+}
+
+.glossary-body {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.glossary-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.glossary-section-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-blue);
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: 4px;
+}
+
+.glossary-entry {
+  padding: 6px 8px;
+  background: var(--color-bg-elevated);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.glossary-term {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.glossary-short {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-text);
+}
+
+.glossary-context {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+.glossary-sign {
+  font-size: 11px;
+  line-height: 1.4;
+  padding-left: 8px;
+  border-left: 2px solid var(--color-border);
+}
+
+.sign-pos {
+  color: var(--color-green);
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.sign-neg {
+  color: var(--color-red);
+  font-weight: 600;
+  margin-right: 4px;
+}
