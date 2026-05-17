@@ -28,8 +28,9 @@ from fef_sidecar.db import (
     SignalIterRepository,
 )
 from fef_sidecar.engine.fef import snapshot_to_inputs
+from fef_sidecar.engine.option_targets import OptionTargets, build_option_targets
 from fef_sidecar.events import IterEvent, SnapshotEvent, TickEvent
-from fef_sidecar.ibkr import Contract
+from fef_sidecar.ibkr import Contract, ContractKind
 
 if TYPE_CHECKING:
     from fef_sidecar.state import AppState
@@ -150,16 +151,25 @@ async def fef_tick_loop(state: AppState) -> None:
         await asyncio.sleep(interval)
 
 
-async def _run_one_iter(state: AppState) -> None:
-    """One FEF iter — uses cached snapshot if available, else fetches fresh."""
+async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
+    """One FEF iter — uses cached snapshot if available, else fetches fresh.
+
+    force_fresh=True bypasses the cache and fetches a new snapshot. Used by
+    manual /run_iter_now triggers so rapid back-to-back calls actually see
+    new data instead of replaying the same cached snapshot.
+    """
     snap = state.last_snapshot
-    if snap is None:
+    if snap is None or force_fresh:
         snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
         state.last_snapshot = snap
 
     inputs = snapshot_to_inputs(snap)  # type: ignore[arg-type]
     verdict = state.engine.push(inputs)
     state.last_spx_price = inputs.spx_price
+
+    # When verdict is actionable, also pull the option chain quote for the
+    # recommended strike and compute target option prices via delta.
+    option_targets = await _maybe_fetch_option_targets(state, verdict, inputs)
 
     signal = await SignalIterRepository.write_iter(
         spx_price=inputs.spx_price,
@@ -176,7 +186,10 @@ async def _run_one_iter(state: AppState) -> None:
         aggression_put_pct=inputs.aggression_put_pct,
         iv_rank_call_pct=inputs.iv_rank_call_pct,
         iv_rank_put_pct=inputs.iv_rank_put_pct,
-        extras=verdict.to_log_extras(),
+        extras={
+            **verdict.to_log_extras(),
+            "option_pricing": _option_pricing_dict(option_targets),
+        },
         session_date=_today_et(),
     )
     state.last_iter_num = signal.iter_num
@@ -204,6 +217,7 @@ async def _run_one_iter(state: AppState) -> None:
             "nearest_wall_strike": verdict.nearest_wall_strike,
             "nearest_wall_distance": verdict.nearest_wall_distance,
             "secondary_scores": verdict.secondary_scores,
+            "option_pricing": _option_pricing_dict(option_targets),
         },
         snapshot={
             "top_gex": _walls_json(inputs.top_gex_walls),
@@ -235,6 +249,60 @@ async def _run_one_iter(state: AppState) -> None:
 # ---------------------------------------------------------------------------
 # Bar stream — chart candles
 # ---------------------------------------------------------------------------
+
+
+async def _maybe_fetch_option_targets(
+    state: AppState,
+    verdict: Any,
+    inputs: Any,
+) -> OptionTargets | None:
+    """If verdict is actionable, fetch the option chain quote and build option-price targets."""
+    if verdict.direction.value == "WAIT" or verdict.strike_rec is None:
+        return None
+    if verdict.t1 is None or verdict.t2 is None or verdict.t3 is None or verdict.stop is None:
+        return None
+
+    expiry = _today_et().replace("-", "")  # YYYYMMDD for IBKR
+    right = "C" if verdict.direction.value == "LONG_CALLS" else "P"
+
+    contract = Contract(
+        symbol="SPX",
+        kind=ContractKind.OPTION,
+        exchange="CBOE",  # SPX options are CBOE-listed
+        expiry=expiry,
+        strike=verdict.strike_rec,
+        right=right,
+    )
+
+    try:
+        quote = await state.ibkr.get_option_quote(contract)
+        return build_option_targets(
+            quote=quote,
+            current_spx=inputs.spx_price,
+            spx_t1=verdict.t1,
+            spx_t2=verdict.t2,
+            spx_t3=verdict.t3,
+            spx_stop=verdict.stop,
+        )
+    except Exception as e:
+        logger.warning("Could not fetch option quote for %s: %s", contract, e)
+        return None
+
+
+def _option_pricing_dict(targets: OptionTargets | None) -> dict[str, Any] | None:
+    if targets is None:
+        return None
+    return {
+        "contract_strike": targets.contract_strike,
+        "right": targets.right,
+        "entry_limit": targets.entry_limit,
+        "delta": targets.delta,
+        "underlying_price_at_quote": targets.underlying_price_at_quote,
+        "t1": targets.t1,
+        "t2": targets.t2,
+        "t3": targets.t3,
+        "stop": targets.stop,
+    }
 
 
 async def bar_stream_loop(state: AppState) -> None:

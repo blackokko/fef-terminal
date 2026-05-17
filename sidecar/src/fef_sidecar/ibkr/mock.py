@@ -10,7 +10,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 
-from fef_sidecar.ibkr.models import Bar, Contract, Quote
+from fef_sidecar.ibkr.models import Bar, Contract, ContractKind, OptionQuote, Quote
 
 
 def _default_spx_5_15_bars() -> list[Bar]:
@@ -103,6 +103,45 @@ class MockIBKRProvider:
             ask=last_bar.close + 0.25,
             bid_size=10,
             ask_size=10,
+        )
+
+    async def get_option_quote(self, contract: Contract) -> OptionQuote:
+        """Synthetic option quote: intrinsic + flat extrinsic, ATM-ish delta."""
+        if contract.kind != ContractKind.OPTION:
+            raise ValueError(f"Expected OPTION contract, got {contract.kind}")
+        if contract.strike is None or contract.right is None:
+            raise ValueError("Option contract requires strike + right")
+
+        if not self._connected:
+            await self.connect()
+
+        from datetime import datetime as _dt
+
+        spx = self._bars[-1].close
+        strike = contract.strike
+        is_call = contract.right == "C"
+
+        intrinsic = max(0.0, (spx - strike) if is_call else (strike - spx))
+        # Simple extrinsic model: $8 ATM, decays linearly with moneyness up to $50 OTM
+        moneyness = abs(spx - strike)
+        extrinsic = max(0.05, 8.0 * max(0.0, 1.0 - moneyness / 50.0))
+        price = round(intrinsic + extrinsic, 2)
+
+        # Delta approximation: 0.5 ATM, scales with how OTM/ITM
+        if is_call:
+            raw_delta = 0.5 + (spx - strike) / 200.0
+        else:
+            raw_delta = -0.5 + (spx - strike) / 200.0
+        delta = round(max(-0.95, min(0.95, raw_delta)), 3)
+
+        return OptionQuote(
+            timestamp=_dt.now(),
+            contract=contract,
+            last=price,
+            bid=round(price - 0.25, 2),
+            ask=round(price + 0.25, 2),
+            delta=delta,
+            underlying_price=spx,
         )
 
     async def stream_last_price(

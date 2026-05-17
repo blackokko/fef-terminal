@@ -89,6 +89,8 @@ class MockQuantDataClient:
 
     def __init__(self, spx_price: float = SPX_PRICE) -> None:
         self.spx_price = spx_price
+        self._fetch_count = 0
+        self._cum_drift_m = 0.0
 
     async def __aenter__(self) -> Self:
         return self
@@ -172,14 +174,43 @@ class MockQuantDataClient:
         include_iv_rank: bool = True,
         include_oi: bool = True,
     ) -> MarketSnapshot:
+        """Mock snapshot with per-call SPX drift so FEF sees real motion across iters.
+
+        Cycles SPX +/- ~10pts over ~16 fetches and accumulates bullish drift so
+        the engine can actually fire an aligned LONG_CALLS verdict in mock mode
+        (useful for demoing the order ticket / option pricing panels).
+        """
+        import math as _math
+
+        self._fetch_count += 1
+        # Sinusoidal SPX drift centered on SPX_PRICE
+        spx_offset = _math.sin(self._fetch_count / 2.5) * 10.0
+        spx_now = round(self.spx_price + spx_offset, 2)
+
+        # Bullish drift accumulates for actionable LONG_CALLS demo
+        self._cum_drift_m += 5.0 + _math.sin(self._fetch_count / 1.5) * 3.0
+
+        # Build a drift summary reflecting the synthetic accumulation
+        drift = DriftSummary(
+            entries=list(_DRIFT_ENTRIES),
+            cumulative_call_m=self._cum_drift_m + 5.0,
+            cumulative_put_m=-5.0,
+            cumulative_net_m=self._cum_drift_m,
+            bias="BULLISH" if self._cum_drift_m > 5 else "NEUTRAL",
+        )
+
+        # GEX/DEX still use the frozen rows; only SPX price moves
+        gex = StrikeExposureSnapshot(greek=GreekType.GAMMA, spx_price=spx_now, rows=list(_GEX_ROWS))
+        dex = StrikeExposureSnapshot(greek=GreekType.DELTA, spx_price=spx_now, rows=list(_DEX_ROWS))
+
         return MarketSnapshot(
             fetched_at_ms=int(time.time() * 1000),
-            spx_price=self.spx_price,
-            gex=await self.get_exposure_by_strike(GreekType.GAMMA),
-            dex=await self.get_exposure_by_strike(GreekType.DELTA),
-            drift=await self.get_net_drift(),
-            max_pain=await self.get_max_pain(),
+            spx_price=spx_now,
+            gex=gex,
+            dex=dex,
+            drift=drift,
+            max_pain=MaxPainSnapshot(max_pain=7000.0, spx_price=spx_now),
             aggression=await self.get_trade_side_stats() if include_aggression else None,
             iv_rank=await self.get_iv_rank() if include_iv_rank else None,
-            oi=await self.get_oi_by_strike() if include_oi else None,
+            oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
         )

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
-from fef_sidecar.ibkr.models import Bar, Contract, Quote
+from fef_sidecar.ibkr.models import Bar, Contract, OptionQuote, Quote
 
 
 @runtime_checkable
@@ -53,3 +53,6 @@ class IBKRProvider(Protocol):
         """
         raise NotImplementedError
         yield  # pragma: no cover
+
+    async def get_option_quote(self, contract: Contract) -> OptionQuote:
+        """One-shot option price + greeks (delta required for target estimation)."""

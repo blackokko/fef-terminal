@@ -57,10 +57,10 @@ async def history_actionable(
 
 @router.post("/run_iter_now")
 async def run_iter_now(request: Request) -> dict[str, Any]:
-    """Manually trigger one FEF iter (bypasses the 2-min cadence)."""
+    """Manually trigger one FEF iter (bypasses the 2-min cadence + cache)."""
     s = _state(request)
     try:
-        await _run_one_iter(s)
+        await _run_one_iter(s, force_fresh=True)
         return {"ok": True, "iter_num": s.last_iter_num, "verdict": s.last_verdict}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

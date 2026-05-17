@@ -38,11 +38,14 @@ export function OrderTicketPanel() {
   }
 
   const side = v.direction === "LONG_CALLS" ? "C" : "P";
+  const opt = v.option_pricing ?? null;
+
   const ticketText = formatTicketText(
     v.direction === "LONG_CALLS" ? "CALL" : "PUT",
     v.strike_rec,
     lastIter.session_date,
     qty,
+    opt?.entry_limit ?? null,
   );
 
   const handleCopy = () => {
@@ -63,31 +66,37 @@ export function OrderTicketPanel() {
             className="qty-input"
             onChange={(e) => setQty(Number(e.target.value) || DEFAULT_QTY)}
           /> SPX {v.strike_rec.toFixed(0)}{side}
+          {opt && (
+            <span className="ticket-option-entry">
+              @ ${opt.entry_limit.toFixed(2)}
+            </span>
+          )}
         </div>
 
         <div className="muted small">
           expiry {lastIter.session_date} · 0DTE
+          {opt && opt.delta != null && (
+            <> · delta {opt.delta.toFixed(2)}</>
+          )}
         </div>
 
-        <div className="ticket-targets">
-          <div>
-            <span className="ticket-label">T1</span>
-            <span>SPX {v.t1?.toFixed(0)}</span>
+        <div className="ticket-targets-grid">
+          <div className="ticket-targets-col">
+            <div className="ticket-targets-header">SPX target</div>
+            <Row label="T1" value={v.t1} suffix="" />
+            <Row label="T2" value={v.t2} suffix="" />
+            <Row label="T3" value={v.t3} suffix="" />
+            <Row label="STOP" value={v.stop} suffix="" danger />
           </div>
-          <div>
-            <span className="ticket-label">T2</span>
-            <span>SPX {v.t2?.toFixed(0)}</span>
-          </div>
-          <div>
-            <span className="ticket-label">T3</span>
-            <span>SPX {v.t3?.toFixed(0)}</span>
-          </div>
-          <div>
-            <span className="ticket-label" style={{ color: "var(--color-red)" }}>
-              STOP
-            </span>
-            <span>SPX {v.stop?.toFixed(0)}</span>
-          </div>
+          {opt && (
+            <div className="ticket-targets-col">
+              <div className="ticket-targets-header">Option price</div>
+              <Row label="T1" value={opt.t1} prefix="$" />
+              <Row label="T2" value={opt.t2} prefix="$" />
+              <Row label="T3" value={opt.t3} prefix="$" />
+              <Row label="STOP" value={opt.stop} prefix="$" danger />
+            </div>
+          )}
         </div>
 
         <button onClick={handleCopy}>
@@ -103,16 +112,48 @@ export function OrderTicketPanel() {
   );
 }
 
+function Row({
+  label,
+  value,
+  prefix = "",
+  suffix = "",
+  danger = false,
+}: {
+  label: string;
+  value: number | null;
+  prefix?: string;
+  suffix?: string;
+  danger?: boolean;
+}) {
+  if (value == null) return null;
+  return (
+    <div>
+      <span
+        className="ticket-label"
+        style={danger ? { color: "var(--color-red)" } : undefined}
+      >
+        {label}
+      </span>
+      <span>
+        {prefix}
+        {value.toFixed(value < 100 ? 2 : 0)}
+        {suffix}
+      </span>
+    </div>
+  );
+}
+
 function formatTicketText(
   right: "CALL" | "PUT",
   strike: number,
   expiryDate: string,
   qty: number,
+  limitPrice: number | null,
 ): string {
-  // Expiry: YYYY-MM-DD -> mmm DD 'YY style (TWS-friendly)
   const date = new Date(expiryDate);
   const monthShort = date.toLocaleString("en-US", { month: "short" }).toUpperCase();
   const day = date.getDate().toString().padStart(2, "0");
   const year = date.getFullYear().toString().slice(-2);
-  return `BUY ${qty} SPX ${monthShort}${day}'${year} ${strike.toFixed(0)} ${right} @ LMT`;
+  const price = limitPrice ? `$${limitPrice.toFixed(2)} LMT` : "LMT";
+  return `BUY ${qty} SPX ${monthShort}${day}'${year} ${strike.toFixed(0)} ${right} @ ${price}`;
 }

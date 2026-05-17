@@ -416,6 +416,42 @@ button:active {
   justify-content: space-between;
 }
 
+.ticket-targets-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 8px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.ticket-targets-col {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ticket-targets-col > div {
+  display: flex;
+  justify-content: space-between;
+}
+
+.ticket-targets-header {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: 2px;
+  margin-bottom: 2px;
+}
+
+.ticket-option-entry {
+  color: var(--color-blue);
+  font-weight: 600;
+  margin-left: 6px;
+}
+
 .ticket-label {
   color: var(--color-text-muted);
   font-size: 10px;

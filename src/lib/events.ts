@@ -19,6 +19,18 @@ export interface WallRow {
   side: "CALL" | "PUT";
 }
 
+export interface OptionPricing {
+  contract_strike: number;
+  right: "C" | "P";
+  entry_limit: number;
+  delta: number | null;
+  underlying_price_at_quote: number | null;
+  t1: number;
+  t2: number;
+  t3: number;
+  stop: number;
+}
+
 export interface FEFVerdict {
   direction: FEFDirection;
   confidence: FEFConfidence;
@@ -38,6 +50,7 @@ export interface FEFVerdict {
   nearest_wall_strike: number | null;
   nearest_wall_distance: number | null;
   secondary_scores: Record<string, number>;
+  option_pricing?: OptionPricing | null;
 }
 
 export interface IterSnapshot {

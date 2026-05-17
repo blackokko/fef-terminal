@@ -55,3 +55,23 @@ class Quote(BaseModel):
     ask: float | None = None
     bid_size: float | None = None
     ask_size: float | None = None
+
+
+class OptionQuote(BaseModel):
+    """Option-specific quote with greeks (when available)."""
+
+    timestamp: datetime
+    contract: Contract
+    last: float
+    bid: float | None = None
+    ask: float | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    iv: float | None = None
+    underlying_price: float | None = None
+
+    @property
+    def mid(self) -> float:
+        if self.bid is not None and self.ask is not None and self.bid > 0 and self.ask > 0:
+            return round((self.bid + self.ask) / 2, 2)
+        return self.last

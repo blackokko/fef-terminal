@@ -19,7 +19,7 @@ import logging
 from collections.abc import AsyncIterator
 from datetime import datetime
 
-from fef_sidecar.ibkr.models import Bar, Contract, ContractKind, Quote
+from fef_sidecar.ibkr.models import Bar, Contract, ContractKind, OptionQuote, Quote
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +179,64 @@ class LiveIBKRProvider:
             ask=float(ticker.ask) if ticker.ask else None,
             bid_size=float(ticker.bidSize) if ticker.bidSize else None,
             ask_size=float(ticker.askSize) if ticker.askSize else None,
+        )
+
+    async def get_option_quote(self, contract: Contract) -> OptionQuote:
+        """Fetch option price + greeks via reqMktData (genericTickList='106' for IV)."""
+        if contract.kind != ContractKind.OPTION:
+            raise ValueError(f"Expected OPTION contract, got {contract.kind}")
+        await self._ensure_connected()
+        assert self._ib is not None
+
+        ib_contract = _to_ib_contract(contract)
+        await self._ib.qualifyContractsAsync(ib_contract)
+
+        # genericTickList='13' = model option computation (delta/gamma/vega/theta/IV)
+        ticker = self._ib.reqMktData(ib_contract, "13", False, False)
+        # Wait briefly for the greeks to populate (TWS streams them)
+        for _ in range(20):
+            await asyncio.sleep(0.1)
+            if ticker.modelGreeks is not None or (ticker.last and ticker.last > 0):
+                break
+
+        last = float(ticker.last) if ticker.last and ticker.last > 0 else float(
+            ticker.close or 0
+        )
+        bid = float(ticker.bid) if ticker.bid and ticker.bid > 0 else None
+        ask = float(ticker.ask) if ticker.ask and ticker.ask > 0 else None
+        delta = (
+            float(ticker.modelGreeks.delta)
+            if ticker.modelGreeks and ticker.modelGreeks.delta is not None
+            else None
+        )
+        gamma = (
+            float(ticker.modelGreeks.gamma)
+            if ticker.modelGreeks and ticker.modelGreeks.gamma is not None
+            else None
+        )
+        iv = (
+            float(ticker.modelGreeks.impliedVol)
+            if ticker.modelGreeks and ticker.modelGreeks.impliedVol is not None
+            else None
+        )
+        underlying = (
+            float(ticker.modelGreeks.undPrice)
+            if ticker.modelGreeks and ticker.modelGreeks.undPrice is not None
+            else None
+        )
+
+        self._ib.cancelMktData(ib_contract)
+
+        return OptionQuote(
+            timestamp=datetime.now(),
+            contract=contract,
+            last=last,
+            bid=bid,
+            ask=ask,
+            delta=delta,
+            gamma=gamma,
+            iv=iv,
+            underlying_price=underlying,
         )
 
     async def stream_last_price(self, contract: Contract):  # AsyncIterator[Quote]
