@@ -23,7 +23,8 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     # Send initial status snapshot
     initial = StatusEvent(
         quantdata=type(state.quantdata).__name__,
-        ibkr="connected" if state.ibkr.is_connected else "disconnected",
+        ibkr=state.ibkr_status if state.ibkr_status != "unknown"
+        else ("connected" if state.ibkr.is_connected else "disconnected"),
         engine="running" if state.loop_task is not None else "stopped",
         history_size=state.engine.history_size,
     )

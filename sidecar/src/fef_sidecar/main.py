@@ -27,6 +27,7 @@ from fef_sidecar.db import dispose_db, init_db
 from fef_sidecar.loop import (
     bar_stream_loop,
     fef_tick_loop,
+    ibkr_health_check_loop,
     quantdata_poll_loop,
     tick_stream_loop,
 )
@@ -61,6 +62,9 @@ async def lifespan(app: FastAPI):
         state.loop_task = asyncio.create_task(fef_tick_loop(state), name="fef-tick-loop")
         state.bar_task = asyncio.create_task(bar_stream_loop(state), name="bar-stream-loop")
         state.tick_task = asyncio.create_task(tick_stream_loop(state), name="tick-stream-loop")
+        state.health_check_task = asyncio.create_task(
+            ibkr_health_check_loop(state), name="ibkr-health-check-loop"
+        )
 
     logger.info(
         "fef-sidecar ready (QD=%s, IBKR=%s, auto_loops=%s)",
@@ -78,6 +82,7 @@ async def lifespan(app: FastAPI):
             state.bar_task,
             state.tick_task,
             state.quantdata_poll_task,
+            state.health_check_task,
         ):
             if task is not None:
                 task.cancel()  # type: ignore[attr-defined]

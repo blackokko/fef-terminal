@@ -358,3 +358,71 @@ async def tick_stream_loop(state: AppState) -> None:
         except Exception:
             logger.exception("Tick stream failed — reconnecting in 5s")
             await asyncio.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# IBKR health check — pings every 30s, broadcasts StatusEvent on state change
+# ---------------------------------------------------------------------------
+
+
+async def ibkr_health_check_loop(state: AppState) -> None:
+    """Ping IBKR every FEF_IBKR_HEALTHCHECK_SEC seconds. On state change,
+    broadcast a StatusEvent so the UI dot updates without waiting for an
+    iter or a manual refresh. On transition to disconnected, force a
+    reconnect attempt — the streams will then catch their broken
+    subscriptions and re-subscribe.
+    """
+    from fef_sidecar.events import StatusEvent
+
+    interval = float(os.environ.get("FEF_IBKR_HEALTHCHECK_SEC", "30"))
+    logger.info("Starting IBKR health check loop (interval=%.1fs)", interval)
+
+    last_status = state.ibkr_status
+
+    async def _publish(current: str) -> None:
+        event = StatusEvent(
+            quantdata=type(state.quantdata).__name__,
+            ibkr=current,
+            engine="running" if state.loop_task is not None else "stopped",
+            history_size=state.engine.history_size,
+        )
+        await state.broadcaster.publish(event)
+
+    while True:
+        try:
+            healthy = await state.ibkr.ping()
+            current = "connected" if healthy else "disconnected"
+            state.ibkr_status = current
+
+            if current != last_status:
+                logger.info("IBKR status change: %s -> %s", last_status, current)
+                await _publish(current)
+                last_status = current
+
+                if current == "disconnected":
+                    # Force reconnect — streams will re-subscribe on next iter
+                    logger.warning("IBKR ping failed; forcing reconnect")
+                    state.ibkr_status = "reconnecting"
+                    await _publish("reconnecting")
+                    try:
+                        await state.ibkr.disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        await state.ibkr.connect()
+                        if await state.ibkr.ping():
+                            state.ibkr_status = "connected"
+                            last_status = "connected"
+                            await _publish("connected")
+                            logger.info("IBKR reconnect succeeded")
+                        else:
+                            logger.warning("Reconnect did not restore health")
+                    except Exception:
+                        logger.exception("Forced reconnect failed; streams will retry")
+        except asyncio.CancelledError:
+            logger.info("IBKR health check cancelled — exiting")
+            raise
+        except Exception:
+            logger.exception("IBKR health check iteration failed")
+
+        await asyncio.sleep(interval)

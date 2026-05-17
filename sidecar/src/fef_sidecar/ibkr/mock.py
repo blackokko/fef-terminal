@@ -144,6 +144,9 @@ class MockIBKRProvider:
             underlying_price=spx,
         )
 
+    async def ping(self) -> bool:
+        return self._connected
+
     async def stream_last_price(
         self,
         contract: Contract,

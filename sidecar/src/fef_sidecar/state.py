@@ -57,10 +57,12 @@ class AppState:
     bar_task: object | None = None
     tick_task: object | None = None
     quantdata_poll_task: object | None = None
+    health_check_task: object | None = None
     last_spx_price: float = 0.0
     last_iter_num: int = 0
     last_verdict: dict[str, object] = field(default_factory=dict)
     last_snapshot: object | None = None  # cached MarketSnapshot for FEF to consume
+    ibkr_status: str = "unknown"  # "connected" | "disconnected" | "reconnecting" | "unknown"
 
     @classmethod
     def build(cls) -> AppState:

@@ -239,6 +239,20 @@ class LiveIBKRProvider:
             underlying_price=underlying,
         )
 
+    async def ping(self) -> bool:
+        """Lightweight RPC roundtrip — calls reqCurrentTimeAsync.
+
+        Returns False if not connected OR if the call times out / errors.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            return False
+        try:
+            await asyncio.wait_for(self._ib.reqCurrentTimeAsync(), timeout=5.0)
+            return True
+        except Exception as e:
+            logger.warning("IBKR ping failed: %s", e)
+            return False
+
     async def stream_last_price(self, contract: Contract):  # AsyncIterator[Quote]
         """Subscribe to reqMktData and yield Quotes on each tick update."""
         await self._ensure_connected()

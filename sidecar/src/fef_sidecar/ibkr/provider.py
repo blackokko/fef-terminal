@@ -56,3 +56,10 @@ class IBKRProvider(Protocol):
 
     async def get_option_quote(self, contract: Contract) -> OptionQuote:
         """One-shot option price + greeks (delta required for target estimation)."""
+
+    async def ping(self) -> bool:
+        """Return True if the connection is alive (lightweight RPC roundtrip).
+
+        Called by the health-check loop every ~30s. Returning False triggers
+        a forced disconnect + reconnect attempt.
+        """
