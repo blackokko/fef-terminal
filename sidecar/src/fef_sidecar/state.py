@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from fef_sidecar.engine import FEFEngine
+from fef_sidecar.engine.mock_autotrader import MockAutoTraderState
 from fef_sidecar.engine.regime import RegimeAssessment, RegimeDetector
+from fef_sidecar.engine.tournament import DEFAULT_VARIANTS, TournamentRunner
 from fef_sidecar.events import EventBroadcaster
 from fef_sidecar.ibkr import IBKRProvider, LiveIBKRProvider, MockIBKRProvider
 from fef_sidecar.quantdata import MockQuantDataClient, QuantDataClient
@@ -54,6 +56,8 @@ class AppState:
     ibkr: IBKRProvider
     engine: FEFEngine
     regime_detector: RegimeDetector
+    tournament: TournamentRunner
+    autotrader: MockAutoTraderState
     broadcaster: EventBroadcaster
     loop_task: object | None = None
     bar_task: object | None = None
@@ -82,6 +86,8 @@ class AppState:
             regime_detector=RegimeDetector(
                 window_size=int(os.environ.get("FEF_REGIME_WINDOW", "12"))
             ),
+            tournament=TournamentRunner(DEFAULT_VARIANTS),
+            autotrader=MockAutoTraderState(),
             broadcaster=EventBroadcaster(),
         )
 

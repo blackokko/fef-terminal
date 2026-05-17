@@ -28,15 +28,18 @@ from fef_sidecar.db import (
     SignalIterRepository,
 )
 from fef_sidecar.engine.fef import snapshot_to_inputs
+from fef_sidecar.engine.mock_autotrader import advance_pending, maybe_create_ticket
 from fef_sidecar.engine.option_targets import OptionTargets, build_option_targets
 from fef_sidecar.engine.patterns import evaluate_pattern, extract_fields
 from fef_sidecar.engine.regime import RegimeSample, now_minutes_since_open_et
+from fef_sidecar.engine.tournament import consensus
 from fef_sidecar.events import (
     IterEvent,
     PatternMatchEvent,
     RegimeEvent,
     SnapshotEvent,
     TickEvent,
+    TournamentEvent,
 )
 from fef_sidecar.ibkr import Contract, ContractKind
 
@@ -289,6 +292,44 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     t0 = _time.perf_counter()
     await _evaluate_patterns(state, inputs, verdict, signal.id, signal.iter_num)
     perf["pattern_eval_ms"] = (_time.perf_counter() - t0) * 1000
+
+    # Tournament: parallel strategies
+    t0 = _time.perf_counter()
+    variant_verdicts = state.tournament.push(inputs)
+    cons = consensus(variant_verdicts)
+    await state.broadcaster.publish(
+        TournamentEvent(
+            iter_num=signal.iter_num,
+            spx_price=inputs.spx_price,
+            variants=[
+                {
+                    "name": v.name,
+                    "direction": v.direction,
+                    "confidence": v.confidence,
+                    "reasoning": v.reasoning,
+                    "aligned": v.aligned,
+                    "absorption": v.absorption,
+                }
+                for v in variant_verdicts
+            ],
+            consensus=cons,
+        )
+    )
+    perf["tournament_ms"] = (_time.perf_counter() - t0) * 1000
+
+    # Mock auto-trader (opt-in via env var, default ON when scripted day active)
+    auto_trade = os.environ.get(
+        "FEF_MOCK_AUTO_TRADE",
+        os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false")
+    ).lower() in ("true", "1", "yes")
+    if auto_trade and signal.id is not None:
+        try:
+            await maybe_create_ticket(
+                state.autotrader, verdict, inputs, signal.id, signal.iter_num
+            )
+            await advance_pending(state.autotrader, signal.iter_num, inputs.spx_price)
+        except Exception:
+            logger.exception("Mock auto-trader iteration failed")
 
     # Market regime detection — push this iter, broadcast updated assessment
     t0 = _time.perf_counter()

@@ -500,6 +500,75 @@ body,
   margin-top: 4px;
 }
 
+/* Tournament */
+
+.tournament-consensus {
+  background: var(--color-bg);
+  padding: 8px 10px;
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+.tournament-consensus-direction {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.5px;
+}
+.tournament-consensus-stats { margin-top: 2px; }
+.tournament-variants { list-style: none; display: flex; flex-direction: column; gap: 3px; }
+.tournament-variant-row {
+  display: grid;
+  grid-template-columns: 100px 1fr 60px;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  background: var(--color-bg-elevated);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.tournament-variant-name { font-weight: 600; }
+.tournament-variant-direction { text-align: right; font-weight: 600; }
+.tournament-variant-conf {
+  text-align: center;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 2px 4px;
+  border-radius: 2px;
+}
+
+/* Optimize / sweep */
+
+.optimize-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 8px 0;
+}
+.optimize-summary { margin: 4px 0 8px; }
+.optimize-results {
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.optimize-header, .optimize-row {
+  display: grid;
+  grid-template-columns: 150px 60px 90px 70px;
+  gap: 4px;
+  padding: 3px 2px;
+  border-bottom: 1px solid var(--color-bg);
+}
+.optimize-header {
+  color: var(--color-text-muted);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  border-bottom-color: var(--color-border);
+}
+.optimize-best { background: rgba(63, 185, 80, 0.08); font-weight: 600; }
+.optimize-params { color: var(--color-blue); }
+
 /* Risk overlay */
 
 .risk-panel.risk-breached {

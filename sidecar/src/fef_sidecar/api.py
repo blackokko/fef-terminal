@@ -806,6 +806,92 @@ async def seed_default_patterns() -> dict[str, Any]:
     return {"ok": True, "added": added}
 
 
+# Walk-forward parameter sweep — find threshold params that maximize Sharpe
+@router.post("/optimize/sweep")
+async def optimize_sweep(
+    request: Request,
+    body: dict[str, Any] = Body(default={}),
+) -> dict[str, Any]:
+    """Grid-search FEF thresholds over historical signals.
+
+    Body: { 'days': 30, 'proximity': [3,5,8], 'collapse_pct': [0.15,0.20,0.30],
+            'collapse_floor': [3,5,10], 'absorption_fe': [4,5,8],
+            'lookahead_iters': 3, 'train_fraction': 0.6 }
+    All keys optional — defaults used otherwise.
+    """
+    from datetime import UTC, datetime, timedelta
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import SignalIter
+    from fef_sidecar.engine.optimization import SweepConfig, run_sweep
+
+    days = int(body.get("days", 30))
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+    async with get_session() as session:
+        rows = (await session.exec(
+            select(SignalIter)
+            .where(SignalIter.timestamp >= cutoff)  # type: ignore[arg-type]
+            .order_by(SignalIter.timestamp.asc())  # type: ignore[attr-defined]
+        )).all()
+
+    iters_data = [
+        {
+            "spx_price": s.spx_price,
+            "drift_cum_net_m": s.drift_cum_net_m,
+            "drift_bias": s.drift_bias,
+            "ntm_max_pain": s.ntm_max_pain,
+            "raw_max_pain": s.raw_max_pain,
+            "top_gex_walls": s.top_gex_walls,
+            "top_dex_walls": s.top_dex_walls,
+            "aggression_call_pct": s.aggression_call_pct,
+            "aggression_put_pct": s.aggression_put_pct,
+        }
+        for s in rows
+    ]
+    if len(iters_data) < 10:
+        return {"error": f"need >=10 iters, only have {len(iters_data)}"}
+
+    cfg = SweepConfig(
+        proximity_values=body.get("proximity", [3.0, 5.0, 8.0, 12.0]),
+        collapse_pct_values=body.get("collapse_pct", [0.15, 0.20, 0.30]),
+        collapse_floor_values=body.get("collapse_floor", [3.0, 5.0, 10.0]),
+        absorption_fe_values=body.get("absorption_fe", [4.0, 5.0, 8.0]),
+        lookahead_iters=int(body.get("lookahead_iters", 3)),
+    )
+    train_frac = float(body.get("train_fraction", 0.6))
+
+    import time as _t
+    t0 = _t.perf_counter()
+    results = run_sweep(iters_data, cfg, train_fraction=train_frac)
+    elapsed_ms = round((_t.perf_counter() - t0) * 1000, 1)
+
+    return {
+        "elapsed_ms": elapsed_ms,
+        "total_combos": len(results),
+        "iters_in_window": len(iters_data),
+        "train_fraction": train_frac,
+        "top_results": [
+            {
+                "wall_proximity_pts": r.wall_proximity_pts,
+                "wall_collapse_pct": r.wall_collapse_pct,
+                "wall_collapse_floor_m": r.wall_collapse_floor_m,
+                "absorption_fe_ratio_min": r.absorption_fe_ratio_min,
+                "train_sharpe": r.train_sharpe,
+                "test_sharpe": r.test_sharpe,
+                "train_trades": r.train_trades,
+                "test_trades": r.test_trades,
+                "train_win_rate_pct": r.train_win_rate_pct,
+                "test_win_rate_pct": r.test_win_rate_pct,
+                "train_total_pnl": r.train_total_pnl,
+                "test_total_pnl": r.test_total_pnl,
+            }
+            for r in results[:20]
+        ],
+    }
+
+
 # Pattern backtest — run conditions against historical signals + return stats
 @router.post("/patterns/{pattern_id}/backtest")
 async def backtest_pattern(pattern_id: int, days: int = 30) -> dict[str, Any]:

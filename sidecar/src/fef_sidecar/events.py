@@ -79,6 +79,17 @@ class StatusEvent(BaseModel):
     vix: float | None = None  # IMPROVEMENTS #M — last VIX quote
 
 
+class TournamentEvent(BaseModel):
+    """Parallel-strategy verdicts — side-by-side what each preset would fire."""
+
+    type: Literal["tournament"] = "tournament"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    iter_num: int
+    spx_price: float
+    variants: list[dict[str, Any]]  # [{name, direction, confidence, reasoning, aligned, absorption}]
+    consensus: dict[str, Any]
+
+
 class AccountEvent(BaseModel):
     """Live IBKR account scorecard — realized + unrealized P/L from broker."""
 
@@ -140,6 +151,7 @@ Event = (
     | PatternMatchEvent
     | RegimeEvent
     | AccountEvent
+    | TournamentEvent
 )
 
 

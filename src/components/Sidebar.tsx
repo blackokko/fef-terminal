@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { ChartAnnotationsPanel } from "../panels/ChartAnnotationsPanel";
+import { OptimizePanel } from "../panels/OptimizePanel";
 import { RiskOverlayPanel } from "../panels/RiskOverlayPanel";
+import { TournamentPanel } from "../panels/TournamentPanel";
 import { FEFVerdictPanel } from "../panels/FEFVerdictPanel";
 import { GlossaryPanel } from "../panels/GlossaryPanel";
 import { OptionChainPanel } from "../panels/OptionChainPanel";
@@ -61,6 +63,7 @@ export function Sidebar() {
         )}
         {tab === "patterns" && (
           <>
+            <TournamentPanel />
             <PatternLibraryPanel />
             <StrategyPresetsPanel />
           </>
@@ -68,6 +71,7 @@ export function Sidebar() {
         {tab === "history" && (
           <>
             <AnalyticsPanel />
+            <OptimizePanel />
             <ReplayPanel />
           </>
         )}
