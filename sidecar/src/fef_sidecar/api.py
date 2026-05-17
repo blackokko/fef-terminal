@@ -357,6 +357,120 @@ async def delete_annotation(annotation_id: int) -> dict[str, Any]:
         return {"ok": True}
 
 
+# Historical bars at any symbol + timeframe (for chart symbol/timeframe switcher)
+@router.get("/bars")
+async def get_bars(
+    request: Request,
+    symbol: str = "SPX",
+    bar_size: str = "2 mins",
+    duration: str = "1 D",
+) -> list[dict[str, Any]]:
+    """Return historical OHLCV bars.
+
+    bar_size: '1 min', '2 mins', '5 mins', '15 mins', '30 mins', '1 hour',
+              '4 hours', '1 day', '1 week'
+    """
+    from fef_sidecar.ibkr.models import Contract
+
+    s = _state(request)
+    try:
+        contract = Contract.for_symbol(symbol)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+    # For live IBKR we'd use reqHistoricalData with bar_size. For mock, we
+    # aggregate the scripted day frames if scripted mode is on, else replay
+    # the default static bars.
+    import os as _os
+
+    if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
+        bars = _aggregate_scripted_bars(symbol, bar_size)
+    elif type(s.ibkr).__name__ == "MockIBKRProvider":
+        # Static morning bars from mock, optionally offset for ES
+        offset = -5.0 if symbol.upper() == "ES" else 0.0
+        bars = [
+            {
+                "timestamp_ms": int(b.timestamp.timestamp() * 1000),
+                "open": b.open + offset,
+                "high": b.high + offset,
+                "low": b.low + offset,
+                "close": b.close + offset,
+                "volume": b.volume,
+            }
+            for b in s.ibkr._bars  # type: ignore[attr-defined]
+        ]
+    else:
+        # Live IBKR: do a one-shot historical fetch
+        from ib_async import util as ib_util  # type: ignore[import-not-found]
+
+        ib_contract = type(s.ibkr)._to_ib_contract(contract)  # type: ignore[attr-defined]
+        await s.ibkr._ensure_connected()  # type: ignore[attr-defined]
+        ib = s.ibkr._ib  # type: ignore[attr-defined]
+        ib_bars = await ib.reqHistoricalDataAsync(
+            ib_contract,
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES" if symbol.upper() in ("ES",) else "MIDPOINT",
+            useRTH=True,
+            formatDate=2,
+        )
+        bars = [
+            {
+                "timestamp_ms": int(b.date.timestamp() * 1000) if hasattr(b.date, "timestamp") else 0,
+                "open": float(b.open),
+                "high": float(b.high),
+                "low": float(b.low),
+                "close": float(b.close),
+                "volume": float(b.volume or 0),
+            }
+            for b in ib_bars
+        ]
+    return bars
+
+
+def _aggregate_scripted_bars(symbol: str, bar_size: str) -> list[dict[str, Any]]:
+    """Aggregate the scripted day script into bars at the requested timeframe.
+
+    Each frame is 2 simulated minutes. ES adds a -5pt basis offset.
+    """
+    from datetime import datetime, time, timedelta
+
+    from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+
+    # Map bar_size -> minutes per bar
+    size_minutes = {
+        "1 min": 1, "2 mins": 2, "5 mins": 5, "15 mins": 15, "30 mins": 30,
+        "1 hour": 60, "4 hours": 240, "1 day": 390, "1 week": 1950,
+    }.get(bar_size, 2)
+    # Frames per bar (each frame = 2 sim minutes)
+    frames_per_bar = max(1, round(size_minutes / 2))
+
+    offset = -5.0 if symbol.upper() == "ES" else 0.0
+    today = datetime.now().date()
+    market_open = datetime.combine(today, time(9, 30))
+
+    out: list[dict[str, Any]] = []
+    for i in range(0, len(DAY_SCRIPT), frames_per_bar):
+        chunk = DAY_SCRIPT[i : i + frames_per_bar]
+        if not chunk:
+            continue
+        opens = chunk[0].spx + offset
+        closes = chunk[-1].spx + offset
+        highs = max(f.spx for f in chunk) + offset + 0.5
+        lows = min(f.spx for f in chunk) + offset - 0.5
+        ts = market_open + timedelta(minutes=chunk[0].minutes_since_open)
+        out.append({
+            "timestamp_ms": int(ts.timestamp() * 1000),
+            "open": round(opens, 2),
+            "high": round(highs, 2),
+            "low": round(lows, 2),
+            "close": round(closes, 2),
+            "volume": 1000 * frames_per_bar,
+        })
+    return out
+
+
 # IMPROVEMENTS #D: option chain ladder — N strikes around spot for 0DTE expiry
 @router.get("/option_chain")
 async def option_chain(

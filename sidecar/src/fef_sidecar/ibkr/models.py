@@ -12,6 +12,7 @@ class ContractKind(str, Enum):
     INDEX = "INDEX"
     STOCK = "STOCK"
     OPTION = "OPTION"
+    FUTURE = "FUTURE"  # ES, NQ, RTY (front-month continuous)
 
 
 class Contract(BaseModel):
@@ -33,6 +34,22 @@ class Contract(BaseModel):
     @classmethod
     def vix_index(cls) -> Contract:
         return cls(symbol="VIX", kind=ContractKind.INDEX, exchange="CBOE")
+
+    @classmethod
+    def es_future(cls) -> Contract:
+        """ES front-month E-mini S&P 500 (continuous, IBKR resolves expiry)."""
+        return cls(symbol="ES", kind=ContractKind.FUTURE, exchange="CME")
+
+    @classmethod
+    def for_symbol(cls, symbol: str) -> Contract:
+        s = symbol.upper()
+        if s == "SPX":
+            return cls.spx_index()
+        if s == "ES":
+            return cls.es_future()
+        if s == "VIX":
+            return cls.vix_index()
+        raise ValueError(f"Unsupported symbol: {symbol}")
 
 
 class Bar(BaseModel):

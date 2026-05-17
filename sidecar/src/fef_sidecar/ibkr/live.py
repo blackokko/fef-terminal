@@ -26,12 +26,15 @@ logger = logging.getLogger(__name__)
 
 def _to_ib_contract(c: Contract):
     """Translate our Contract to ib_async's Contract."""
-    from ib_async import Index, Option, Stock
+    from ib_async import ContFuture, Index, Option, Stock
 
     if c.kind == ContractKind.INDEX:
         return Index(c.symbol, c.exchange, c.currency)
     if c.kind == ContractKind.STOCK:
         return Stock(c.symbol, c.exchange, c.currency)
+    if c.kind == ContractKind.FUTURE:
+        # Continuous front-month future (IBKR resolves the expiry)
+        return ContFuture(c.symbol, c.exchange, c.currency)
     if c.kind == ContractKind.OPTION:
         if not (c.expiry and c.strike is not None and c.right):
             raise ValueError("Option contract requires expiry, strike, right")
