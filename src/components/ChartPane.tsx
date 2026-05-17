@@ -16,6 +16,7 @@ import {
 } from "lightweight-charts";
 import { useSidecar } from "../context/WebSocketContext";
 import type { IterEvent, WallRow } from "../lib/events";
+import { formatExposureM } from "../lib/format";
 
 const API_BASE = "http://127.0.0.1:8765";
 
@@ -69,8 +70,7 @@ function aggregateWalls(iter: IterEvent | null): { walls: AggregatedWall[]; ntmM
   const byStrike = new Map<number, AggregatedWall>();
   const addWall = (w: WallRow, kind: "GEX" | "DEX") => {
     const existing = byStrike.get(w.strike);
-    const sign = w.net_m > 0 ? "+" : "";
-    const label = `${kind} ${sign}${w.net_m.toFixed(0)}M`;
+    const label = `${kind} ${formatExposureM(w.net_m)}`;
     const color = kind === "GEX"
       ? (w.side === "CALL" ? WALL_COLORS.GEX_CALL : WALL_COLORS.GEX_PUT)
       : (w.side === "CALL" ? WALL_COLORS.DEX_CALL : WALL_COLORS.DEX_PUT);

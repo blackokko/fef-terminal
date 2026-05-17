@@ -18,7 +18,7 @@ interface Toast {
   duration: number;
 }
 
-interface ToastApi {
+export interface ToastApi {
   show: (message: string, opts?: { variant?: ToastVariant; duration?: number }) => void;
 }
 

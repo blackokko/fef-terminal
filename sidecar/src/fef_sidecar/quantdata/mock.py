@@ -25,7 +25,7 @@ from fef_sidecar.quantdata.models import (
     OIRow,
     OpenInterestSnapshot,
     StrikeExposureSnapshot,
-)
+)  # noqa: F401  AggressionStats + ContractAggression used inside fetch_market_snapshot
 
 # Captured from live session 2026-05-15 around 4pm ET (SPX $7,409).
 SPX_PRICE = 7409.18
@@ -206,6 +206,9 @@ class MockQuantDataClient:
             )
             gex = StrikeExposureSnapshot(greek=GreekType.GAMMA, spx_price=spx_now, rows=list(_GEX_ROWS))
             dex = StrikeExposureSnapshot(greek=GreekType.DELTA, spx_price=spx_now, rows=list(_DEX_ROWS))
+            # Per-frame aggression dynamics from the archetype generator
+            agg_call = getattr(frame, "aggression_call_pct", 41.0)
+            agg_put = getattr(frame, "aggression_put_pct", 41.0)
             return MarketSnapshot(
                 fetched_at_ms=int(time.time() * 1000),
                 spx_price=spx_now,
@@ -213,7 +216,24 @@ class MockQuantDataClient:
                 dex=dex,
                 drift=drift,
                 max_pain=MaxPainSnapshot(max_pain=7000.0, spx_price=spx_now),
-                aggression=await self.get_trade_side_stats() if include_aggression else None,
+                aggression=AggressionStats(
+                    call=ContractAggression(
+                        side="CALL",
+                        aa=agg_call * 1e8,  # synthesize raw $ to satisfy schema
+                        a=agg_call * 5e8,
+                        mid=2.5e10,
+                        b=(100 - agg_call) * 4e8,
+                        bb=(100 - agg_call) * 1e7,
+                    ),
+                    put=ContractAggression(
+                        side="PUT",
+                        aa=agg_put * 1e8,
+                        a=agg_put * 5e8,
+                        mid=2.5e10,
+                        b=(100 - agg_put) * 4e8,
+                        bb=(100 - agg_put) * 1e7,
+                    ),
+                ) if include_aggression else None,
                 iv_rank=await self.get_iv_rank() if include_iv_rank else None,
                 oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
                 simulated_minutes_since_open=frame.minutes_since_open,

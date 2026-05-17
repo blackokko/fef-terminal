@@ -15,11 +15,15 @@ param(
 
     [switch]$Dev,
 
-    # Replay a synthetic full trading day through every regime state
-    # (OPEN_DRIVE -> TREND -> ABSORPTION -> PIN -> WALL_TEST -> HIGH_VOL ->
-    #  CHOP -> POWER_HOUR). Auto-sets fast 3s cadence so the day replays
-    # in ~10 minutes.
-    [switch]$ScriptedDay
+    [switch]$ScriptedDay,
+
+    # Which day archetype to replay (only used with -ScriptedDay)
+    [ValidateSet("5_15_REPLAY", "STEADY_BULL", "STEADY_BEAR", "REVERSAL",
+                 "PURE_CHOP", "FED_DAY", "GAP_AND_FADE")]
+    [string]$Archetype = "5_15_REPLAY",
+
+    # Mock seed (only used with -ScriptedDay). 0 = stochastic (time-based seed)
+    [int]$MockSeed = 42
 )
 
 $ErrorActionPreference = "Continue"
@@ -61,7 +65,14 @@ if ($IbkrMode -eq "live") {
 
 # Build sidecar watchdog script as a single-line block.
 # Using a script-block string avoids here-string quoting issues in PS 5.1.
-$scriptedDayEnv = if ($ScriptedDay) { "`$env:FEF_MOCK_SCRIPTED_DAY='true'; " } else { "" }
+$scriptedDayEnv = ""
+if ($ScriptedDay) {
+    $scriptedDayEnv = "`$env:FEF_MOCK_SCRIPTED_DAY='true'; " +
+                      "`$env:FEF_MOCK_ARCHETYPE='" + $Archetype + "'; " +
+                      "`$env:FEF_MOCK_SEED='" + $MockSeed + "'; "
+    Write-Host ("  Archetype:     " + $Archetype) -ForegroundColor Magenta
+    Write-Host ("  Mock seed:     " + $MockSeed + $(if ($MockSeed -eq 0) { " (stochastic)" } else { " (deterministic)" })) -ForegroundColor Magenta
+}
 $watchdogScript = "Set-Location '" + (Join-Path $repo "sidecar") + "'; " + `
     "& .\.venv\Scripts\Activate.ps1; " + `
     "`$env:FEF_PROVIDER_QUANTDATA='" + $QuantDataMode + "'; " + `

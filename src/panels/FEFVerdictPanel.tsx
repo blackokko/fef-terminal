@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useSidecar } from "../context/WebSocketContext";
 import { flashTitle, playBearishChime, playBullishChime } from "../lib/audioAlert";
+import { formatDrift } from "../lib/format";
 
 const CONFIDENCE_COLOR: Record<string, string> = {
   HIGH: "var(--color-green)",
@@ -62,7 +63,10 @@ export function FEFVerdictPanel() {
 
         <div className="verdict-metrics">
           <Metric label="ΔPrice" value={v.delta_price} format="signed" suffix="pts" />
-          <Metric label="ΔDrift" value={v.delta_drift_m} format="signed" suffix="M" />
+          <div className="metric">
+            <span className="metric-label">ΔDrift</span>
+            <span className="metric-value">{formatDrift(v.delta_drift_m)}</span>
+          </div>
           <Metric label="FE" value={v.fe_ratio} format="fixed" />
         </div>
 

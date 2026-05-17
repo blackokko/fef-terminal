@@ -135,7 +135,9 @@ class MockIBKRProvider:
             wiggle_low = rng.uniform(0.1, 1.5)
             high = max(open_, close) + wiggle_high
             low = min(open_, close) - wiggle_low
-            volume = 1000 + rng.randint(0, 3000)
+            # Use archetype's volume profile (U-shape: spike at open/close,
+            # midday lull). Falls back to base volume if attr missing.
+            volume = getattr(frame, "volume", 1500) + rng.randint(-100, 200)
             self._scripted_index = i
             yield Bar(
                 timestamp=market_open + timedelta(minutes=frame.minutes_since_open),

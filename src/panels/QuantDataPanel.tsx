@@ -1,5 +1,6 @@
 import { useSidecar } from "../context/WebSocketContext";
 import type { WallRow } from "../lib/events";
+import { formatDrift, formatExposureM } from "../lib/format";
 
 // Prefer SnapshotEvent (fires every ~15s) over IterEvent's snapshot (~2min)
 // so walls/drift/MP refresh ahead of the FEF cadence.
@@ -54,9 +55,7 @@ export function QuantDataPanel() {
 
       <SubSection title="Drift">
         <div>
-          {source.drift.bias} (cum net{" "}
-          {source.drift.cum_net_m > 0 ? "+" : ""}
-          {source.drift.cum_net_m.toFixed(2)}M)
+          {source.drift.bias} (cum net <strong>{formatDrift(source.drift.cum_net_m)}</strong>)
         </div>
       </SubSection>
 
@@ -116,12 +115,7 @@ function WallList({ walls }: { walls: WallRow[] }) {
       {walls.slice(0, 5).map((w) => (
         <li key={`${w.strike}-${w.side}`} className={`wall-${w.side.toLowerCase()}`}>
           <span className="wall-strike">${w.strike.toFixed(0)}</span>
-          <span className="wall-net">
-            {w.net_m > 0 ? "+" : ""}
-            {w.net_m >= 1000 || w.net_m <= -1000
-              ? `${(w.net_m / 1000).toFixed(1)}B`
-              : `${w.net_m.toFixed(1)}M`}
-          </span>
+          <span className="wall-net">{formatExposureM(w.net_m)}</span>
         </li>
       ))}
     </ul>

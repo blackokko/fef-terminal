@@ -743,6 +743,126 @@ async def seed_default_patterns() -> dict[str, Any]:
     return {"ok": True, "added": added}
 
 
+# Analytics — aggregated stats across stored signals + trades
+@router.get("/analytics/summary")
+async def analytics_summary(days: int = 30) -> dict[str, Any]:
+    """Aggregate stats over the last `days` sessions.
+
+    Returns:
+        win_rate_by_confidence: dict[confidence -> {wins, losses, total, pct}]
+        win_rate_by_direction:  dict[direction -> {wins, losses, total, pct}]
+        win_rate_by_pattern:    dict[pattern_name -> {wins, losses, total, pct}]
+        pnl_by_hour:            dict[hour_et -> total_pnl_dollars]
+        pattern_frequency:      dict[pattern_name -> match_count]
+        recent_sessions:        list of {date, total_iters, actionable, pnl}
+    """
+    from datetime import UTC, datetime, timedelta
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import DailySession, Pattern, PatternMatch, SignalIter, TicketStatus, TradeTicket
+
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+    async with get_session() as session:
+        # Pull all tickets in window with their linked signal
+        tickets = (await session.exec(
+            select(TradeTicket).where(TradeTicket.created_at >= cutoff)  # type: ignore[arg-type]
+        )).all()
+
+        # Map ticket -> signal for confidence/direction lookup
+        signal_ids = list({t.signal_iter_id for t in tickets})
+        signals_by_id: dict[int, SignalIter] = {}
+        if signal_ids:
+            sigs = (await session.exec(
+                select(SignalIter).where(SignalIter.id.in_(signal_ids))  # type: ignore[attr-defined]
+            )).all()
+            signals_by_id = {s.id: s for s in sigs if s.id is not None}
+
+        def _bucket(d: dict, key: str, won: bool, pnl: float) -> None:
+            b = d.setdefault(key, {"wins": 0, "losses": 0, "total": 0, "pnl": 0.0})
+            b["total"] += 1
+            b["pnl"] += pnl
+            if won:
+                b["wins"] += 1
+            else:
+                b["losses"] += 1
+
+        wr_conf: dict[str, dict[str, Any]] = {}
+        wr_dir: dict[str, dict[str, Any]] = {}
+        pnl_by_hour: dict[int, float] = {}
+
+        for t in tickets:
+            if t.status not in (TicketStatus.CLOSED, TicketStatus.STOPPED):
+                continue
+            pnl = t.pnl_dollars or 0.0
+            won = pnl > 0
+            sig = signals_by_id.get(t.signal_iter_id)
+            if sig:
+                _bucket(wr_conf, sig.confidence.value, won, pnl)
+            _bucket(wr_dir, t.direction.value, won, pnl)
+            if t.filled_at:
+                hour = t.filled_at.hour
+                pnl_by_hour[hour] = pnl_by_hour.get(hour, 0.0) + pnl
+
+        # Add percentage fields
+        def _add_pct(d: dict) -> dict:
+            for v in d.values():
+                v["pct"] = round((v["wins"] / v["total"] * 100), 1) if v["total"] > 0 else 0.0
+            return d
+
+        # Pattern win rate via PatternMatch -> SignalIter -> TradeTicket join
+        wr_pattern: dict[str, dict[str, Any]] = {}
+        matches = (await session.exec(
+            select(PatternMatch).where(PatternMatch.matched_at >= cutoff)  # type: ignore[arg-type]
+        )).all()
+        patterns_by_id = {
+            p.id: p for p in (await session.exec(select(Pattern))).all() if p.id is not None
+        }
+        pattern_frequency = {p.name: 0 for p in patterns_by_id.values()}
+        # Index tickets by signal_iter_id for quick lookup
+        tickets_by_signal: dict[int, list[TradeTicket]] = {}
+        for t in tickets:
+            tickets_by_signal.setdefault(t.signal_iter_id, []).append(t)
+
+        for m in matches:
+            p = patterns_by_id.get(m.pattern_id)
+            if not p:
+                continue
+            pattern_frequency[p.name] = pattern_frequency.get(p.name, 0) + 1
+            for t in tickets_by_signal.get(m.signal_iter_id, []):
+                if t.status not in (TicketStatus.CLOSED, TicketStatus.STOPPED):
+                    continue
+                pnl = t.pnl_dollars or 0.0
+                _bucket(wr_pattern, p.name, pnl > 0, pnl)
+
+        # Recent daily sessions
+        recent = (await session.exec(
+            select(DailySession).order_by(DailySession.session_date.desc()).limit(days)  # type: ignore[attr-defined]
+        )).all()
+
+        return {
+            "window_days": days,
+            "win_rate_by_confidence": _add_pct(wr_conf),
+            "win_rate_by_direction": _add_pct(wr_dir),
+            "win_rate_by_pattern": _add_pct(wr_pattern),
+            "pnl_by_hour_et": {str(h): round(v, 2) for h, v in sorted(pnl_by_hour.items())},
+            "pattern_frequency": pattern_frequency,
+            "recent_sessions": [
+                {
+                    "date": s.session_date,
+                    "total_iters": s.total_iters,
+                    "actionable": s.actionable_signals,
+                    "trades": s.trades_taken,
+                    "net_pnl": round(s.net_pnl, 2),
+                    "wins": s.win_count,
+                    "losses": s.loss_count,
+                }
+                for s in recent
+            ],
+        }
+
+
 # IMPROVEMENTS #19: replay a past session — return all iters in order
 @router.get("/history/replay/{date}")
 async def replay_session(date: str) -> list[dict[str, Any]]:
