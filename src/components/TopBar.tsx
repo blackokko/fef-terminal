@@ -1,4 +1,5 @@
 import { useSidecar } from "../context/WebSocketContext";
+import { popoutChart } from "../lib/popoutChart";
 
 const connectionColor: Record<string, string> = {
   connecting: "var(--color-amber)",
@@ -41,6 +42,13 @@ export function TopBar() {
       </div>
 
       <div className="topbar-section topbar-section-right">
+        <button
+          className="topbar-button"
+          onClick={() => void popoutChart()}
+          title="Open chart in standalone window (for second monitor)"
+        >
+          ⧉ Pop chart
+        </button>
         {lastStatus?.quantdata?.startsWith("Mock") && lastStatus?.ibkr === "connected" && (
           <span className="all-mock-banner" title="Both providers are mock — signals are replay only, not live data">
             ⚠ ALL MOCK

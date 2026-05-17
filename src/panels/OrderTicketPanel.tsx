@@ -2,12 +2,21 @@ import { useEffect, useState } from "react";
 import { useSidecar } from "../context/WebSocketContext";
 
 const DEFAULT_QTY = 15;  // [[user-trading-style]]
+const API_BASE = "http://127.0.0.1:8765";
+
+interface SignalRow {
+  id: number;
+  iter_num: number;
+}
 
 export function OrderTicketPanel() {
   const { lastIter } = useSidecar();
   const [qty, setQty] = useState<number>(DEFAULT_QTY);
   const [copied, setCopied] = useState(false);
   const [qtyUserOverridden, setQtyUserOverridden] = useState(false);
+  const [ticketId, setTicketId] = useState<number | null>(null);
+  const [showOutcomeForm, setShowOutcomeForm] = useState(false);
+  const [outcomeStatus, setOutcomeStatus] = useState<string | null>(null);
 
   // Update default qty to track verdict's suggested_qty when it changes,
   // unless the user has manually edited it for this verdict.
@@ -19,6 +28,9 @@ export function OrderTicketPanel() {
 
   useEffect(() => {
     setQtyUserOverridden(false);
+    setTicketId(null);  // new iter = new ticket lifecycle
+    setShowOutcomeForm(false);
+    setOutcomeStatus(null);
   }, [lastIter?.iter_num]);
 
   useEffect(() => {
@@ -61,8 +73,59 @@ export function OrderTicketPanel() {
     opt?.entry_limit ?? null,
   );
 
-  const handleCopy = () => {
-    void navigator.clipboard.writeText(ticketText).then(() => setCopied(true));
+  const handleCopy = async () => {
+    await navigator.clipboard.writeText(ticketText);
+    setCopied(true);
+    // Also create a DB ticket record so we can attach an outcome later
+    if (ticketId === null) {
+      try {
+        // Look up signal_iter_id by iter_num for today's session
+        const r = await fetch(`${API_BASE}/history/signals?limit=1`);
+        const rows: SignalRow[] = await r.json();
+        const sig = rows.find((x) => x.iter_num === lastIter!.iter_num);
+        if (!sig) return;
+
+        const resp = await fetch(`${API_BASE}/tickets`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            signal_iter_id: sig.id,
+            direction: v.direction,
+            contract_strike: v.strike_rec,
+            contract_expiry: lastIter!.session_date,
+            qty,
+            entry_limit: opt?.entry_limit ?? 0,
+            t1: v.t1 ?? 0,
+            t2: v.t2 ?? 0,
+            t3: v.t3 ?? 0,
+            stop: v.stop ?? 0,
+            status: "COPIED",
+          }),
+        });
+        const data = await resp.json();
+        if (data.ok) setTicketId(data.ticket_id);
+      } catch (e) {
+        console.error("Failed to record ticket:", e);
+      }
+    }
+  };
+
+  const submitOutcome = async (fields: Record<string, number | string>) => {
+    if (ticketId === null) return;
+    try {
+      const r = await fetch(`${API_BASE}/tickets/${ticketId}/close`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(fields),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        setOutcomeStatus(`✓ Recorded (${data.status})`);
+        setShowOutcomeForm(false);
+      }
+    } catch (e) {
+      setOutcomeStatus(`Failed: ${(e as Error).message}`);
+    }
   };
 
   return (
@@ -102,25 +165,40 @@ export function OrderTicketPanel() {
         <div className="ticket-targets-grid">
           <div className="ticket-targets-col">
             <div className="ticket-targets-header">SPX target</div>
-            <Row label="T1" value={v.t1} suffix="" />
-            <Row label="T2" value={v.t2} suffix="" />
-            <Row label="T3" value={v.t3} suffix="" />
-            <Row label="STOP" value={v.stop} suffix="" danger />
+            <TargetCell label="T1" value={v.t1} suffix="" />
+            <TargetCell label="T2" value={v.t2} suffix="" />
+            <TargetCell label="T3" value={v.t3} suffix="" />
+            <TargetCell label="STOP" value={v.stop} suffix="" danger />
           </div>
           {opt && (
             <div className="ticket-targets-col">
               <div className="ticket-targets-header">Option price</div>
-              <Row label="T1" value={opt.t1} prefix="$" />
-              <Row label="T2" value={opt.t2} prefix="$" />
-              <Row label="T3" value={opt.t3} prefix="$" />
-              <Row label="STOP" value={opt.stop} prefix="$" danger />
+              <TargetCell label="T1" value={opt.t1} prefix="$" />
+              <TargetCell label="T2" value={opt.t2} prefix="$" />
+              <TargetCell label="T3" value={opt.t3} prefix="$" />
+              <TargetCell label="STOP" value={opt.stop} prefix="$" danger />
             </div>
           )}
         </div>
 
-        <button onClick={handleCopy}>
-          {copied ? "✓ Copied" : "Copy to clipboard"}
-        </button>
+        <div className="ticket-actions">
+          <button onClick={() => void handleCopy()}>
+            {copied ? "✓ Copied" : "Copy to clipboard"}
+          </button>
+          {ticketId !== null && !showOutcomeForm && (
+            <button onClick={() => setShowOutcomeForm(true)}>Record outcome</button>
+          )}
+        </div>
+
+        {outcomeStatus && (
+          <div className="small" style={{ color: "var(--color-green)", marginTop: 6 }}>
+            {outcomeStatus}
+          </div>
+        )}
+
+        {showOutcomeForm && ticketId !== null && (
+          <OutcomeForm onSubmit={submitOutcome} onCancel={() => setShowOutcomeForm(false)} />
+        )}
 
         <details className="ticket-text-detail">
           <summary className="small muted">show order text</summary>
@@ -131,7 +209,80 @@ export function OrderTicketPanel() {
   );
 }
 
+function OutcomeForm({
+  onSubmit,
+  onCancel,
+}: {
+  onSubmit: (fields: Record<string, number | string>) => void;
+  onCancel: () => void;
+}) {
+  const [fillPrice, setFillPrice] = useState<string>("");
+  const [exitT1, setExitT1] = useState<string>("");
+  const [exitT2, setExitT2] = useState<string>("");
+  const [exitT3, setExitT3] = useState<string>("");
+  const [exitStop, setExitStop] = useState<string>("");
+  const [pnl, setPnl] = useState<string>("");
+  const [status, setStatus] = useState<string>("CLOSED");
+
+  const handle = () => {
+    const fields: Record<string, number | string> = { status };
+    if (fillPrice) fields.fill_price = Number(fillPrice);
+    if (exitT1) fields.exit_t1_price = Number(exitT1);
+    if (exitT2) fields.exit_t2_price = Number(exitT2);
+    if (exitT3) fields.exit_t3_price = Number(exitT3);
+    if (exitStop) fields.exit_stop_price = Number(exitStop);
+    if (pnl) fields.pnl_dollars = Number(pnl);
+    onSubmit(fields);
+  };
+
+  return (
+    <div className="outcome-form">
+      <Row label="Fill" value={fillPrice} setValue={setFillPrice} />
+      <Row label="T1 exit" value={exitT1} setValue={setExitT1} />
+      <Row label="T2 exit" value={exitT2} setValue={setExitT2} />
+      <Row label="T3 exit" value={exitT3} setValue={setExitT3} />
+      <Row label="Stop exit" value={exitStop} setValue={setExitStop} />
+      <Row label="Net P/L $" value={pnl} setValue={setPnl} />
+      <div className="outcome-row">
+        <span className="ticket-label">Status</span>
+        <select value={status} onChange={(e) => setStatus(e.target.value)} className="settings-input">
+          <option>CLOSED</option>
+          <option>STOPPED</option>
+          <option>PARTIAL</option>
+        </select>
+      </div>
+      <div className="outcome-actions">
+        <button onClick={handle}>Save</button>
+        <button onClick={onCancel}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
 function Row({
+  label,
+  value,
+  setValue,
+}: {
+  label: string;
+  value: string;
+  setValue: (v: string) => void;
+}) {
+  return (
+    <div className="outcome-row">
+      <span className="ticket-label">{label}</span>
+      <input
+        type="number"
+        step={0.01}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        className="settings-input"
+      />
+    </div>
+  );
+}
+
+function TargetCell({
   label,
   value,
   prefix = "",

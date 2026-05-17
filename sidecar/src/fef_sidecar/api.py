@@ -138,6 +138,38 @@ async def update_config(
     }
 
 
+# IMPROVEMENTS #20: create a ticket from the current actionable verdict
+@router.post("/tickets")
+async def create_ticket(
+    request: Request,
+    body: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Create a TradeTicket linked to a SignalIter.
+
+    Frontend posts this when user clicks 'Copy to clipboard' so we have a
+    record to later attach exit prices to via /tickets/{id}/close.
+    """
+    from fef_sidecar.db.models import FEFDirection, TicketStatus, TradeTicket
+
+    signal_iter_id = int(body["signal_iter_id"])
+    ticket = TradeTicket(
+        signal_iter_id=signal_iter_id,
+        direction=FEFDirection(body["direction"]),
+        contract_strike=float(body["contract_strike"]),
+        contract_expiry=str(body["contract_expiry"]),
+        qty=int(body.get("qty", 15)),
+        entry_limit=float(body["entry_limit"]),
+        t1=float(body["t1"]),
+        t2=float(body["t2"]),
+        t3=float(body["t3"]),
+        stop=float(body["stop"]),
+        status=TicketStatus(body.get("status", "DRAFT")),
+        notes=str(body.get("notes", "")),
+    )
+    saved = await SignalIterRepository.attach_ticket(signal_iter_id, ticket)
+    return {"ok": True, "ticket_id": saved.id, "status": saved.status.value}
+
+
 # IMPROVEMENTS #20: record trade outcome — updates ticket + linked signal
 @router.post("/tickets/{ticket_id}/close")
 async def close_ticket(
