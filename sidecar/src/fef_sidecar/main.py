@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fef_sidecar.api import router as api_router
 from fef_sidecar.db import dispose_db, init_db
 from fef_sidecar.loop import (
+    account_poll_loop,
     bar_stream_loop,
     fef_tick_loop,
     ibkr_health_check_loop,
@@ -67,6 +68,7 @@ async def lifespan(app: FastAPI):
             ibkr_health_check_loop(state), name="ibkr-health-check-loop"
         )
         state.vix_task = asyncio.create_task(vix_poll_loop(state), name="vix-poll-loop")
+        state.account_task = asyncio.create_task(account_poll_loop(state), name="account-poll-loop")
 
     logger.info(
         "fef-sidecar ready (QD=%s, IBKR=%s, auto_loops=%s)",
@@ -86,6 +88,7 @@ async def lifespan(app: FastAPI):
             state.quantdata_poll_task,
             state.health_check_task,
             state.vix_task,
+            state.account_task,
         ):
             if task is not None:
                 task.cancel()  # type: ignore[attr-defined]

@@ -543,6 +543,51 @@ async def vix_poll_loop(state: AppState) -> None:
         await asyncio.sleep(interval)
 
 
+# ---------------------------------------------------------------------------
+# Account poll loop — live broker scorecard (realized + unrealized P/L)
+# ---------------------------------------------------------------------------
+
+
+async def account_poll_loop(state: AppState) -> None:
+    """Poll IBKR account summary every FEF_ACCOUNT_POLL_INTERVAL_SEC (default 15s).
+
+    IBKR is the source of truth for P/L — no need to reconcile from our
+    TradeTicket records. Broadcasts AccountEvent on every poll.
+    """
+    from fef_sidecar.events import AccountEvent
+
+    interval = float(os.environ.get("FEF_ACCOUNT_POLL_INTERVAL_SEC", "15"))
+    logger.info("Starting account poll loop (interval=%.1fs)", interval)
+    while True:
+        try:
+            summary = await state.ibkr.get_account_summary()
+            if summary is None:
+                await asyncio.sleep(interval)
+                continue
+            state.last_account = summary
+            await state.broadcaster.publish(
+                AccountEvent(
+                    timestamp_ms=summary.timestamp_ms,
+                    account=summary.account,
+                    net_liquidation=summary.net_liquidation,
+                    buying_power=summary.buying_power,
+                    available_funds=summary.available_funds,
+                    daily_pnl=summary.daily_pnl,
+                    realized_pnl=summary.realized_pnl,
+                    unrealized_pnl=summary.unrealized_pnl,
+                    gross_position_value=summary.gross_position_value,
+                    open_positions_count=summary.open_positions_count,
+                    open_options_count=summary.open_options_count,
+                    currency=summary.currency,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Account poll iteration failed")
+        await asyncio.sleep(interval)
+
+
 async def tick_stream_loop(state: AppState) -> None:
     logger.info("Starting tick stream loop")
     while True:

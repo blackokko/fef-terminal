@@ -78,6 +78,27 @@ class Quote(BaseModel):
     ask_size: float | None = None
 
 
+class AccountSummary(BaseModel):
+    """Live IBKR account snapshot — realized + unrealized P/L, BP, positions.
+
+    Pulled via account_poll_loop every 30s. IBKR is the source of truth — no
+    need to manually close tickets in our UI; P/L comes from the broker.
+    """
+
+    account: str
+    timestamp_ms: int
+    net_liquidation: float | None = None
+    buying_power: float | None = None
+    available_funds: float | None = None
+    daily_pnl: float | None = None        # combined daily realized + unrealized
+    realized_pnl: float | None = None     # closed-trade gains today
+    unrealized_pnl: float | None = None   # mark-to-market on open positions
+    gross_position_value: float | None = None
+    open_positions_count: int = 0
+    open_options_count: int = 0           # count of open option positions specifically
+    currency: str = "USD"
+
+
 class OptionQuote(BaseModel):
     """Option-specific quote with greeks (when available)."""
 

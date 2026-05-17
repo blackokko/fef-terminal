@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import type {
+  AccountEvent,
   Bar,
   IterEvent,
   PatternMatchEvent,
@@ -30,6 +31,7 @@ interface SidecarState {
   lastSnapshot: SnapshotEvent | null;
   lastStatus: StatusEvent | null;
   lastRegime: RegimeEvent | null;
+  lastAccount: AccountEvent | null;
   recentTicks: TickEvent[];
   recentIters: IterEvent[];
   recentBars: Bar[];
@@ -44,6 +46,7 @@ const initialState: SidecarState = {
   lastSnapshot: null,
   lastStatus: null,
   lastRegime: null,
+  lastAccount: null,
   recentTicks: [],
   recentIters: [],
   recentBars: [],
@@ -93,6 +96,8 @@ export function SidecarProvider({
           };
         case "regime":
           return { ...prev, lastRegime: event };
+        case "account":
+          return { ...prev, lastAccount: event };
         case "ticket":
           return {
             ...prev,

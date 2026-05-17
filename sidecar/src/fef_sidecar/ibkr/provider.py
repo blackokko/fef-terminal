@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
-from fef_sidecar.ibkr.models import Bar, Contract, OptionQuote, Quote
+from fef_sidecar.ibkr.models import AccountSummary, Bar, Contract, OptionQuote, Quote
 
 
 @runtime_checkable
@@ -63,3 +63,6 @@ class IBKRProvider(Protocol):
         Called by the health-check loop every ~30s. Returning False triggers
         a forced disconnect + reconnect attempt.
         """
+
+    async def get_account_summary(self) -> AccountSummary | None:
+        """Live account-level P/L + buying power. Polled every ~30s."""

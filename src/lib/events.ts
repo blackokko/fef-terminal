@@ -92,6 +92,22 @@ export interface SnapshotEvent {
   aggression: { call_pct: number; put_pct: number } | null;
 }
 
+export interface AccountEvent {
+  type: "account";
+  timestamp_ms: number;
+  account: string;
+  net_liquidation: number | null;
+  buying_power: number | null;
+  available_funds: number | null;
+  daily_pnl: number | null;
+  realized_pnl: number | null;
+  unrealized_pnl: number | null;
+  gross_position_value: number | null;
+  open_positions_count: number;
+  open_options_count: number;
+  currency: string;
+}
+
 export interface RegimeEvent {
   type: "regime";
   timestamp_ms: number;
@@ -151,4 +167,5 @@ export type SidecarEvent =
   | StatusEvent
   | SnapshotEvent
   | PatternMatchEvent
-  | RegimeEvent;
+  | RegimeEvent
+  | AccountEvent;

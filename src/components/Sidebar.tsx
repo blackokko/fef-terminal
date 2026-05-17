@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { ChartAnnotationsPanel } from "../panels/ChartAnnotationsPanel";
 import { FEFVerdictPanel } from "../panels/FEFVerdictPanel";
 import { GlossaryPanel } from "../panels/GlossaryPanel";
@@ -43,6 +44,7 @@ export function Sidebar() {
       <div className="sidebar-tab-content">
         {tab === "trade" && (
           <>
+            <AccountScorecardPanel />
             <RegimePanel />
             <FEFVerdictPanel />
             <OrderTicketPanel />

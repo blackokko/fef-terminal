@@ -357,6 +357,33 @@ async def delete_annotation(annotation_id: int) -> dict[str, Any]:
         return {"ok": True}
 
 
+# Live broker scorecard — realized + unrealized P/L from IBKR
+@router.get("/account")
+async def get_account(request: Request) -> dict[str, Any] | None:
+    s = _state(request)
+    if s.last_account is None:
+        # Fall back to a one-shot fetch if poll hasn't run yet
+        summary = await s.ibkr.get_account_summary()
+        if summary is None:
+            return None
+        s.last_account = summary
+    a = s.last_account
+    return {
+        "account": a.account,
+        "timestamp_ms": a.timestamp_ms,
+        "net_liquidation": a.net_liquidation,
+        "buying_power": a.buying_power,
+        "available_funds": a.available_funds,
+        "daily_pnl": a.daily_pnl,
+        "realized_pnl": a.realized_pnl,
+        "unrealized_pnl": a.unrealized_pnl,
+        "gross_position_value": a.gross_position_value,
+        "open_positions_count": a.open_positions_count,
+        "open_options_count": a.open_options_count,
+        "currency": a.currency,
+    }
+
+
 # Historical bars at any symbol + timeframe (for chart symbol/timeframe switcher)
 @router.get("/bars")
 async def get_bars(

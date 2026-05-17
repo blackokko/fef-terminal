@@ -500,6 +500,49 @@ body,
   margin-top: 4px;
 }
 
+/* Account scorecard */
+
+.scorecard-panel {
+  background: var(--color-bg);
+}
+
+.scorecard-hero {
+  font-family: var(--font-mono);
+  font-size: 28px;
+  font-weight: 700;
+  text-align: center;
+  padding: 8px 0 12px;
+  letter-spacing: 0.5px;
+}
+
+.scorecard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.scorecard-stat {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 3px 6px;
+  background: var(--color-bg-elevated);
+  border-radius: 3px;
+}
+
+.scorecard-stat-label {
+  color: var(--color-text-muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.scorecard-stat-value {
+  font-weight: 600;
+}
+
 /* Analytics */
 
 .analytics-body { display: flex; flex-direction: column; gap: 14px; margin-top: 8px; }

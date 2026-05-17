@@ -79,6 +79,24 @@ class StatusEvent(BaseModel):
     vix: float | None = None  # IMPROVEMENTS #M — last VIX quote
 
 
+class AccountEvent(BaseModel):
+    """Live IBKR account scorecard — realized + unrealized P/L from broker."""
+
+    type: Literal["account"] = "account"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    account: str
+    net_liquidation: float | None = None
+    buying_power: float | None = None
+    available_funds: float | None = None
+    daily_pnl: float | None = None
+    realized_pnl: float | None = None
+    unrealized_pnl: float | None = None
+    gross_position_value: float | None = None
+    open_positions_count: int = 0
+    open_options_count: int = 0
+    currency: str = "USD"
+
+
 class RegimeEvent(BaseModel):
     """IMPROVEMENTS: market regime classification + recommendations.
 
@@ -121,6 +139,7 @@ Event = (
     | SnapshotEvent
     | PatternMatchEvent
     | RegimeEvent
+    | AccountEvent
 )
 
 

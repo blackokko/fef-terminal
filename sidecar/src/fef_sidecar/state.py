@@ -70,6 +70,8 @@ class AppState:
     last_vix: float | None = None  # IMPROVEMENTS #M
     vix_task: object | None = None
     last_regime: RegimeAssessment | None = None
+    account_task: object | None = None
+    last_account: object | None = None  # AccountSummary or None
 
     @classmethod
     def build(cls) -> AppState:

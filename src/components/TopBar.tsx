@@ -10,7 +10,7 @@ const connectionColor: Record<string, string> = {
 };
 
 export function TopBar() {
-  const { connection, lastTick, lastIter, lastStatus, lastSnapshot } = useSidecar();
+  const { connection, lastTick, lastIter, lastStatus, lastSnapshot, lastAccount } = useSidecar();
   const spx = lastTick?.spx_price ?? lastIter?.spx_price;
 
   // IMPROVEMENTS #I: price flash on tick — micro-flash green/red on direction
@@ -62,6 +62,19 @@ export function TopBar() {
         <span className="topbar-label">VIX</span>
         <span className="topbar-value">
           {(lastStatus as any)?.vix != null ? (lastStatus as any).vix.toFixed(2) : "—"}
+        </span>
+      </div>
+
+      <div className="topbar-section">
+        <span className="topbar-label">Today P/L</span>
+        <span className="topbar-value" style={{
+          color: lastAccount?.daily_pnl == null ? undefined
+            : lastAccount.daily_pnl >= 0 ? "var(--color-green)" : "var(--color-red)",
+          fontWeight: 600,
+        }}>
+          {lastAccount?.daily_pnl != null
+            ? `${lastAccount.daily_pnl >= 0 ? "+" : "-"}$${Math.abs(lastAccount.daily_pnl).toFixed(0)}`
+            : "—"}
         </span>
       </div>
 

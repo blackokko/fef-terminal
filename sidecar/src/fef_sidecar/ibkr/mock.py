@@ -10,7 +10,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 
-from fef_sidecar.ibkr.models import Bar, Contract, ContractKind, OptionQuote, Quote
+from fef_sidecar.ibkr.models import AccountSummary, Bar, Contract, ContractKind, OptionQuote, Quote
 
 
 def _default_spx_5_15_bars() -> list[Bar]:
@@ -219,6 +219,56 @@ class MockIBKRProvider:
 
     async def ping(self) -> bool:
         return self._connected
+
+    async def get_account_summary(self) -> AccountSummary | None:
+        """Synthetic account scorecard.
+
+        In scripted-day mode, daily P/L correlates with the day's price
+        action so the scorecard moves with the simulated session. Otherwise
+        returns flat baseline values appropriate for a $50k account.
+        """
+        import os as _os
+        import time as _time
+        import math as _math
+
+        if not self._connected:
+            await self.connect()
+
+        net_liq = 50_000.0
+        # If scripted day on, derive a plausible P/L from where we are in the day
+        if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
+            from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+            idx = max(0, min(self._scripted_index, len(DAY_SCRIPT) - 1))
+            frame = DAY_SCRIPT[idx]
+            # Simple model: daily P/L scales with how far drift has moved from 0,
+            # plus a small sin component for intraday variation
+            base_pnl = frame.drift_cum_net_m * 8  # $8 P/L per $1M drift (arbitrary)
+            jitter = _math.sin(idx * 0.3) * 200
+            daily_pnl = round(base_pnl + jitter, 2)
+            realized = round(daily_pnl * 0.6, 2)  # 60% closed
+            unrealized = round(daily_pnl * 0.4, 2)
+            positions = 1 if abs(unrealized) > 50 else 0
+        else:
+            # Default mock: small positive P/L baseline
+            daily_pnl = 250.0
+            realized = 150.0
+            unrealized = 100.0
+            positions = 0
+
+        return AccountSummary(
+            account="MOCK_ACCOUNT",
+            timestamp_ms=int(_time.time() * 1000),
+            net_liquidation=net_liq + daily_pnl,
+            buying_power=net_liq * 2,  # 2:1 reg-T margin
+            available_funds=net_liq + daily_pnl - abs(unrealized) * 100,
+            daily_pnl=daily_pnl,
+            realized_pnl=realized,
+            unrealized_pnl=unrealized,
+            gross_position_value=abs(unrealized) * 100,
+            open_positions_count=positions,
+            open_options_count=positions,
+            currency="USD",
+        )
 
     async def stream_last_price(
         self,

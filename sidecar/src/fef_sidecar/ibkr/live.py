@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime
 
-from fef_sidecar.ibkr.models import Bar, Contract, ContractKind, OptionQuote, Quote
+from fef_sidecar.ibkr.models import AccountSummary, Bar, Contract, ContractKind, OptionQuote, Quote
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,61 @@ class LiveIBKRProvider:
             gamma=gamma,
             iv=iv,
             underlying_price=underlying,
+        )
+
+    async def get_account_summary(self) -> AccountSummary | None:
+        """Pulls accountSummary + positions via ib_async.
+
+        accountSummary returns ~30 tags per account; we pick the ones that
+        matter for a live trading scorecard. P/L tags are auto-updated by
+        TWS as positions move + fills happen.
+        """
+        await self._ensure_connected()
+        assert self._ib is not None
+
+        # accountSummaryAsync returns list[AccountValue] for all accounts.
+        # Most retail users have one account; we aggregate if multiple.
+        try:
+            values = await self._ib.accountSummaryAsync()
+        except Exception as e:
+            logger.warning("accountSummary failed: %s", e)
+            return None
+
+        if not values:
+            return None
+
+        # Pick the first account's tags (or 'All' if it's the only one)
+        account_id = values[0].account if values else "DEFAULT"
+        by_tag: dict[str, float] = {}
+        for v in values:
+            if v.account != account_id and account_id != "All":
+                continue
+            try:
+                by_tag[v.tag] = float(v.value)
+            except (ValueError, TypeError):
+                pass  # non-numeric tag (currency string, etc.)
+
+        positions = self._ib.positions()
+        open_positions = [p for p in positions if abs(p.position) > 0]
+        open_options = [
+            p for p in open_positions if getattr(p.contract, "secType", "") == "OPT"
+        ]
+
+        return AccountSummary(
+            account=account_id,
+            timestamp_ms=int(time.time() * 1000),
+            net_liquidation=by_tag.get("NetLiquidation"),
+            buying_power=by_tag.get("BuyingPower"),
+            available_funds=by_tag.get("AvailableFunds"),
+            daily_pnl=by_tag.get("DailyPnL") or (
+                (by_tag.get("RealizedPnL", 0) or 0) + (by_tag.get("UnrealizedPnL", 0) or 0)
+            ),
+            realized_pnl=by_tag.get("RealizedPnL"),
+            unrealized_pnl=by_tag.get("UnrealizedPnL"),
+            gross_position_value=by_tag.get("GrossPositionValue"),
+            open_positions_count=len(open_positions),
+            open_options_count=len(open_options),
+            currency="USD",
         )
 
     async def ping(self) -> bool:
