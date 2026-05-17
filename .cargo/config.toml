@@ -1,0 +1,9 @@
+# Repo-scoped Cargo config: redirect build artifacts off C: drive.
+#
+# Tauri debug builds easily reach 3-5 GB. C: was 99.8% full when we first
+# tried `npm run tauri dev` — moved here to D: which has ~900 GB free.
+# This only affects builds run from inside this repo (other Rust projects
+# on the machine are unaffected).
+
+[build]
+target-dir = "D:/fef-terminal-builds/target"

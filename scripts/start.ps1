@@ -77,9 +77,16 @@ $env:FEF_PROVIDER_QUANTDATA = $QuantDataMode
 $env:FEF_PROVIDER_IBKR = $IbkrMode
 $env:FEF_LOOP_INTERVAL_SEC = $LoopIntervalSec.ToString()
 
+# Use pwsh (PS7+) if available, otherwise fall back to Windows PowerShell 5.1.
+$psExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+Write-Host "[FEF] Using shell: $psExe" -ForegroundColor DarkGray
+
+# Add Rust cargo bin to PATH so `npm run tauri` finds cargo even in fresh shells
+$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+
 Write-Host "[FEF] Starting Python sidecar..." -ForegroundColor Cyan
-$sidecarCmd = "cd '$repo\sidecar'; .venv\Scripts\activate; `$env:FEF_PROVIDER_QUANTDATA='$QuantDataMode'; `$env:FEF_PROVIDER_IBKR='$IbkrMode'; `$env:FEF_LOOP_INTERVAL_SEC='$LoopIntervalSec'; fef-sidecar"
-Start-Process pwsh -ArgumentList "-NoExit", "-Command", $sidecarCmd -WindowStyle Normal
+$sidecarCmd = "Set-Location '$repo\sidecar'; & .\.venv\Scripts\Activate.ps1; `$env:FEF_PROVIDER_QUANTDATA='$QuantDataMode'; `$env:FEF_PROVIDER_IBKR='$IbkrMode'; `$env:FEF_LOOP_INTERVAL_SEC='$LoopIntervalSec'; fef-sidecar"
+Start-Process $psExe -ArgumentList "-NoExit", "-Command", $sidecarCmd -WindowStyle Normal
 
 # Wait for /healthz
 Write-Host "[FEF] Waiting for sidecar /healthz..." -ForegroundColor Cyan
@@ -104,8 +111,8 @@ if (-not $ready) {
 
 # Spawn Tauri dev
 Write-Host "[FEF] Launching Tauri app..." -ForegroundColor Cyan
-$tauriCmd = "cd '$repo'; npm run tauri dev"
-Start-Process pwsh -ArgumentList "-NoExit", "-Command", $tauriCmd -WindowStyle Normal
+$tauriCmd = "Set-Location '$repo'; `$env:Path = '$cargoBin;' + `$env:Path; npm run tauri dev"
+Start-Process $psExe -ArgumentList "-NoExit", "-Command", $tauriCmd -WindowStyle Normal
 
 Write-Host ""
 Write-Host "[FEF] All processes started. Close each window to stop." -ForegroundColor Green
