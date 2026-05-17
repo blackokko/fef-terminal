@@ -34,6 +34,7 @@ interface SidecarState {
   lastRegime: RegimeEvent | null;
   lastAccount: AccountEvent | null;
   lastMicrostructure: MicrostructureEvent | null;
+  activeSymbol: string | null;  // From /status — drives chart + engine
   recentTicks: TickEvent[];
   recentIters: IterEvent[];
   recentBars: Bar[];
@@ -50,6 +51,7 @@ const initialState: SidecarState = {
   lastRegime: null,
   lastAccount: null,
   lastMicrostructure: null,
+  activeSymbol: null,
   recentTicks: [],
   recentIters: [],
   recentBars: [],
@@ -132,6 +134,7 @@ export function SidecarProvider({
           // Synthesize a StatusEvent from /status payload
           setState((prev) => ({
             ...prev,
+            activeSymbol: s.active_symbol ?? prev.activeSymbol,
             lastStatus: {
               type: "status",
               timestamp_ms: Date.now(),

@@ -1365,3 +1365,14 @@ button:active {
   font-weight: 600;
   color: var(--color-blue);
 }
+
+.chart-date-select {
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+}

@@ -39,6 +39,9 @@ export function SymbolSelector() {
       if (r.ok) {
         const data = await r.json();
         setCfg((prev) => (prev ? { ...prev, active_symbol: data.active_symbol } : prev));
+        // Hard-reload so every component (chart, sidecar context, panels) re-reads
+        // state from the freshly-restarted backend loops. ~100ms gap.
+        setTimeout(() => window.location.reload(), 300);
       }
     } finally {
       setBusy(false);

@@ -92,6 +92,27 @@ async def quantdata_poll_loop(state: AppState) -> None:
             state.last_snapshot = snap
             state.last_spx_price = snap.spx_price  # type: ignore[union-attr]
 
+            # Persist flow snapshot for historical replay + backtest
+            try:
+                await SignalIterRepository.write_flow_snapshot(
+                    symbol=state.active_symbol,
+                    session_date=_today_et(),
+                    timestamp_ms=snap.fetched_at_ms,  # type: ignore[union-attr]
+                    spx_price=snap.spx_price,  # type: ignore[union-attr]
+                    top_gex_walls=_walls_json(snap.gex.top(5)),  # type: ignore[union-attr]
+                    top_dex_walls=_walls_json(snap.dex.top(5)),  # type: ignore[union-attr]
+                    drift_cum_net_m=snap.drift.cumulative_net_m,  # type: ignore[union-attr]
+                    drift_bias=snap.drift.bias,  # type: ignore[union-attr]
+                    ntm_max_pain=_ntm_max_pain(snap),
+                    raw_max_pain=snap.max_pain.max_pain,  # type: ignore[union-attr]
+                    aggression_call_pct=snap.aggression.call.aggression_pct if snap.aggression and snap.aggression.call else None,  # type: ignore[union-attr]
+                    aggression_put_pct=snap.aggression.put.aggression_pct if snap.aggression and snap.aggression.put else None,  # type: ignore[union-attr]
+                    iv_rank_call_pct=snap.iv_rank.call.ivr_pct if snap.iv_rank and snap.iv_rank.call else None,  # type: ignore[union-attr]
+                    iv_rank_put_pct=snap.iv_rank.put.ivr_pct if snap.iv_rank and snap.iv_rank.put else None,  # type: ignore[union-attr]
+                )
+            except Exception:
+                logger.exception("Failed to persist flow snapshot")
+
             event = SnapshotEvent(
                 timestamp_ms=snap.fetched_at_ms,  # type: ignore[union-attr]
                 spx_price=snap.spx_price,  # type: ignore[union-attr]
@@ -559,12 +580,22 @@ def _option_pricing_dict(targets: OptionTargets | None) -> dict[str, Any] | None
 
 async def bar_stream_loop(state: AppState) -> None:
     symbol = state.active_symbol
-    logger.info("Starting bar stream loop for %s", symbol)
+    bar_size = os.environ.get("FEF_BAR_SIZE", "1 min")
+    logger.info("Starting bar stream loop for %s (%s)", symbol, bar_size)
     while True:
         try:
             await state.ibkr.connect()
             async for bar in state.ibkr.stream_bars(Contract.for_symbol(symbol)):
                 state.last_spx_price = bar.close
+                # Persist bar for historical chart + backtest replay
+                try:
+                    await SignalIterRepository.write_bar(
+                        symbol=symbol, bar_size=bar_size, timestamp_ms=bar.epoch_ms,
+                        open_=bar.open, high=bar.high, low=bar.low, close=bar.close,
+                        volume=bar.volume,
+                    )
+                except Exception:
+                    logger.exception("Failed to persist bar")
                 event = TickEvent(
                     timestamp_ms=bar.epoch_ms,
                     spx_price=bar.close,
@@ -608,6 +639,14 @@ async def vix_poll_loop(state: AppState) -> None:
             quote = await state.ibkr.get_last_quote(Contract.vix_index())
             if quote and quote.last > 0:
                 state.last_vix = quote.last
+                # Persist for historical VIX timeline
+                try:
+                    await SignalIterRepository.write_vix(
+                        timestamp_ms=int(quote.timestamp.timestamp() * 1000),
+                        value=quote.last,
+                    )
+                except Exception:
+                    logger.exception("Failed to persist VIX sample")
                 # Broadcast updated status with VIX value
                 await state.broadcaster.publish(
                     StatusEvent(
@@ -703,6 +742,8 @@ async def microstructure_loop(state: AppState) -> None:
     from fef_sidecar.ibkr.live import LiveIBKRProvider
 
     interval = float(os.environ.get("FEF_MICRO_INTERVAL_SEC", "0.5"))
+    persist_every_ms = int(float(os.environ.get("FEF_MICRO_PERSIST_SEC", "1.0")) * 1000)
+    last_persisted_ms = 0
     rng = _random.Random()
 
     def _on_quote(ts_ms: int, bid: float, ask: float, bs: float, as_: float) -> None:
@@ -780,6 +821,23 @@ async def microstructure_loop(state: AppState) -> None:
                     quote_count=sig.quote_count,
                     trade_count=sig.trade_count,
                 ))
+                # Persist sampled (every FEF_MICRO_PERSIST_SEC, default 1s)
+                if now_ms - last_persisted_ms >= persist_every_ms:
+                    try:
+                        proxy = MICRO_PROXY.get(state.active_symbol, state.active_symbol) if cancel_live else state.active_symbol
+                        await SignalIterRepository.write_microstructure(
+                            symbol=proxy, timestamp_ms=sig.timestamp_ms,
+                            ofi_window=sig.ofi_window, avi_pct=sig.avi_pct,
+                            aggressive_buy_volume=sig.aggressive_buy_volume,
+                            aggressive_sell_volume=sig.aggressive_sell_volume,
+                            microprice=sig.microprice,
+                            last_trade_price=sig.last_trade_price,
+                            microprice_deviation_bp=sig.microprice_deviation_bp,
+                            direction=sig.direction, confidence=sig.confidence,
+                        )
+                        last_persisted_ms = now_ms
+                    except Exception:
+                        logger.exception("Failed to persist microstructure sample")
             except _asyncio.CancelledError:
                 raise
             except Exception:

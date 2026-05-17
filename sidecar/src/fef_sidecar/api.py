@@ -141,6 +141,100 @@ async def engine_state(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/history/bars")
+async def history_bars(
+    symbol: str = "SPX",
+    bar_size: str = "1 min",
+    from_ms: int | None = None,
+    to_ms: int | None = None,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """Persisted OHLCV bars. Used by the chart date picker to render any
+    past day without re-hitting IBKR."""
+    rows = await SignalIterRepository.query_bars(
+        symbol=symbol.upper(), bar_size=bar_size,
+        from_ms=from_ms, to_ms=to_ms, limit=limit,
+    )
+    return [
+        {
+            "timestamp_ms": r.timestamp_ms,
+            "open": r.open, "high": r.high, "low": r.low, "close": r.close,
+            "volume": r.volume,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/history/flow")
+async def history_flow(
+    symbol: str = "SPX",
+    session_date: str | None = None,
+    from_ms: int | None = None,
+    to_ms: int | None = None,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """Persisted QuantData flow snapshots — walls, drift, max pain, IVR.
+    Replay any past day's flow evolution."""
+    rows = await SignalIterRepository.query_flow_snapshots(
+        symbol=symbol.upper(), session_date=session_date,
+        from_ms=from_ms, to_ms=to_ms, limit=limit,
+    )
+    return [
+        {
+            "timestamp_ms": r.timestamp_ms,
+            "session_date": r.session_date,
+            "spx_price": r.spx_price,
+            "top_gex_walls": r.top_gex_walls,
+            "top_dex_walls": r.top_dex_walls,
+            "drift_cum_net_m": r.drift_cum_net_m,
+            "drift_bias": r.drift_bias,
+            "ntm_max_pain": r.ntm_max_pain,
+            "raw_max_pain": r.raw_max_pain,
+            "aggression_call_pct": r.aggression_call_pct,
+            "aggression_put_pct": r.aggression_put_pct,
+            "iv_rank_call_pct": r.iv_rank_call_pct,
+            "iv_rank_put_pct": r.iv_rank_put_pct,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/history/microstructure")
+async def history_microstructure(
+    symbol: str = "ES",
+    from_ms: int | None = None,
+    to_ms: int | None = None,
+    limit: int = 10000,
+) -> list[dict[str, Any]]:
+    """Persisted microstructure samples. Symbol here is the PROXY
+    (ES/NQ/RTY/SPY/QQQ/IWM) the engine actually subscribed to."""
+    rows = await SignalIterRepository.query_microstructure(
+        symbol=symbol.upper(), from_ms=from_ms, to_ms=to_ms, limit=limit,
+    )
+    return [
+        {
+            "timestamp_ms": r.timestamp_ms,
+            "ofi_window": r.ofi_window,
+            "avi_pct": r.avi_pct,
+            "aggressive_buy_volume": r.aggressive_buy_volume,
+            "aggressive_sell_volume": r.aggressive_sell_volume,
+            "microprice": r.microprice,
+            "last_trade_price": r.last_trade_price,
+            "microprice_deviation_bp": r.microprice_deviation_bp,
+            "direction": r.direction,
+            "confidence": r.confidence,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/history/dates")
+async def history_dates(symbol: str = "SPX") -> list[str]:
+    """List YYYY-MM-DD dates with persisted flow snapshots for a symbol.
+    Powers the chart's date picker."""
+    return await SignalIterRepository.list_historical_dates(symbol.upper())
+
+
 @router.get("/history/signals")
 async def history_signals(
     request: Request,

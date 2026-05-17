@@ -56,7 +56,6 @@ const TIMEFRAMES = [
   { label: "1D", value: "1 day" },
   { label: "1W", value: "1 week" },
 ];
-const SYMBOLS = ["SPX", "ES"];
 
 const MIN_Y_RANGE_PTS = 50;
 const POLL_INTERVAL_MS = 3000;  // refresh historical bars every 3s
@@ -99,11 +98,14 @@ export function ChartPane() {
   const ambientLinesRef = useRef<IPriceLine[]>([]);
   const renderedBarCountRef = useRef(0);
 
-  const { lastIter, lastTick } = useSidecar();
-  const [symbol, setSymbol] = useState<string>("SPX");
+  const { lastIter, lastTick, activeSymbol } = useSidecar();
+  const symbol = activeSymbol ?? "SPX";  // dropdown in TopBar is single source of truth
   const [timeframe, setTimeframe] = useState<string>("2 mins");
   const [bars, setBars] = useState<FetchedBar[]>([]);
   const [hasFittedOnce, setHasFittedOnce] = useState(false);
+  // YYYY-MM-DD or "" (today/live)
+  const [historicalDate, setHistoricalDate] = useState<string>("");
+  const [availableDates, setAvailableDates] = useState<string[]>([]);
 
   // Create chart once
   useEffect(() => {
@@ -155,13 +157,21 @@ export function ChartPane() {
     };
   }, []);
 
-  // Poll /bars every 3s. Refetches immediately when symbol/timeframe change.
+  // Poll /bars every 3s for live. For historical (non-empty date), one-shot
+  // fetch from /history/bars (no need to re-poll since the day is closed).
   const [fetchError, setFetchError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     const fetchBars = async () => {
       try {
-        const url = `${API_BASE}/bars?symbol=${encodeURIComponent(symbol)}&bar_size=${encodeURIComponent(timeframe)}`;
+        let url: string;
+        if (historicalDate) {
+          const dayStart = new Date(`${historicalDate}T00:00:00`).getTime();
+          const dayEnd = dayStart + 86_400_000;
+          url = `${API_BASE}/history/bars?symbol=${encodeURIComponent(symbol)}&bar_size=${encodeURIComponent(timeframe)}&from_ms=${dayStart}&to_ms=${dayEnd}&limit=5000`;
+        } else {
+          url = `${API_BASE}/bars?symbol=${encodeURIComponent(symbol)}&bar_size=${encodeURIComponent(timeframe)}`;
+        }
         const r = await fetch(url);
         if (cancelled) return;
         if (!r.ok) {
@@ -178,15 +188,32 @@ export function ChartPane() {
         console.error("bars fetch failed:", e);
       }
     };
-    // Reset render state on symbol/timeframe change so we re-setData
+    // Reset render state on symbol/timeframe/date change so we re-setData
     renderedBarCountRef.current = 0;
     setHasFittedOnce(false);
     void fetchBars();
+    // Historical mode: no polling (the day is closed). Live mode: poll every 3s.
+    if (historicalDate) return () => { cancelled = true; };
     const id = window.setInterval(fetchBars, POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
+  }, [symbol, timeframe, historicalDate]);
+
+  // Refresh available historical dates whenever symbol changes
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/history/dates?symbol=${encodeURIComponent(symbol)}`);
+        if (!r.ok || cancelled) return;
+        setAvailableDates(await r.json());
+      } catch {
+        // ignore — dates list is optional
+      }
+    })();
+    return () => { cancelled = true; };
   }, [symbol, timeframe]);
 
   // Apply bars to the chart — full setData on count change, update() on the
@@ -297,19 +324,27 @@ export function ChartPane() {
     <div className="chart-pane">
       <div className="chart-toolbar">
         <div className="chart-toolbar-group">
-          {SYMBOLS.map((s) => (
-            <button key={s} className={`chart-toolbar-btn ${symbol === s ? "active" : ""}`}
-              onClick={() => setSymbol(s)}>{s}</button>
-          ))}
-        </div>
-        <div className="chart-toolbar-group">
           {TIMEFRAMES.map((tf) => (
             <button key={tf.value} className={`chart-toolbar-btn ${timeframe === tf.value ? "active" : ""}`}
               onClick={() => setTimeframe(tf.value)}>{tf.label}</button>
           ))}
         </div>
+        <div className="chart-toolbar-group">
+          <select
+            value={historicalDate}
+            onChange={(e) => setHistoricalDate(e.target.value)}
+            className="chart-date-select"
+            title="Pick a past day to replay (from persisted bars). Empty = live."
+          >
+            <option value="">Live ({symbol})</option>
+            {availableDates.map((d) => (
+              <option key={d} value={d}>{d}</option>
+            ))}
+          </select>
+        </div>
         <div className="chart-toolbar-info muted small">
           {bars.length} bar{bars.length === 1 ? "" : "s"}
+          {historicalDate && <span style={{ marginLeft: 8, color: "var(--color-amber)" }}>HISTORICAL</span>}
         </div>
       </div>
       <div ref={containerRef} className="chart-container" />

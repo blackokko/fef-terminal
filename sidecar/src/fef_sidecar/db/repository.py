@@ -16,8 +16,12 @@ from fef_sidecar.db.models import (
     DailySession,
     FEFConfidence,
     FEFDirection,
+    FlowSnapshot,
+    HistoricalBar,
+    MicrostructureSample,
     SignalIter,
     TradeTicket,
+    VixSample,
 )
 
 
@@ -134,6 +138,147 @@ class SignalIterRepository:
             )
             result = await session.exec(stmt)
             return list(result.all())
+
+    # ------------------------------------------------------------------
+    # Historical persistence — bars, flow snapshots, microstructure, VIX
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def write_bar(symbol: str, bar_size: str, timestamp_ms: int,
+                        open_: float, high: float, low: float, close: float, volume: float) -> None:
+        """Persist a single OHLCV bar. Silently no-ops on duplicate
+        (same symbol+bar_size+timestamp_ms) so reconnects don't fail."""
+        async with get_session() as session:
+            existing = await session.exec(
+                select(HistoricalBar)
+                .where(HistoricalBar.symbol == symbol)
+                .where(HistoricalBar.bar_size == bar_size)
+                .where(HistoricalBar.timestamp_ms == timestamp_ms)
+            )
+            if existing.first() is not None:
+                return
+            session.add(HistoricalBar(
+                symbol=symbol, bar_size=bar_size, timestamp_ms=timestamp_ms,
+                open=open_, high=high, low=low, close=close, volume=volume,
+            ))
+
+    @staticmethod
+    async def query_bars(symbol: str, bar_size: str, *,
+                         from_ms: int | None = None, to_ms: int | None = None,
+                         limit: int = 5000) -> list[HistoricalBar]:
+        async with get_session() as session:
+            stmt = (
+                select(HistoricalBar)
+                .where(HistoricalBar.symbol == symbol)
+                .where(HistoricalBar.bar_size == bar_size)
+                .order_by(HistoricalBar.timestamp_ms.asc())  # type: ignore[attr-defined]
+                .limit(limit)
+            )
+            if from_ms is not None:
+                stmt = stmt.where(HistoricalBar.timestamp_ms >= from_ms)
+            if to_ms is not None:
+                stmt = stmt.where(HistoricalBar.timestamp_ms <= to_ms)
+            return list((await session.exec(stmt)).all())
+
+    @staticmethod
+    async def write_flow_snapshot(
+        symbol: str, session_date: str, timestamp_ms: int, spx_price: float,
+        top_gex_walls: list, top_dex_walls: list,
+        drift_cum_net_m: float, drift_bias: str,
+        ntm_max_pain: float, raw_max_pain: float,
+        aggression_call_pct: float | None, aggression_put_pct: float | None,
+        iv_rank_call_pct: float | None, iv_rank_put_pct: float | None,
+    ) -> None:
+        async with get_session() as session:
+            session.add(FlowSnapshot(
+                symbol=symbol, session_date=session_date, timestamp_ms=timestamp_ms,
+                spx_price=spx_price,
+                top_gex_walls=top_gex_walls, top_dex_walls=top_dex_walls,
+                drift_cum_net_m=drift_cum_net_m, drift_bias=drift_bias,
+                ntm_max_pain=ntm_max_pain, raw_max_pain=raw_max_pain,
+                aggression_call_pct=aggression_call_pct,
+                aggression_put_pct=aggression_put_pct,
+                iv_rank_call_pct=iv_rank_call_pct,
+                iv_rank_put_pct=iv_rank_put_pct,
+            ))
+
+    @staticmethod
+    async def query_flow_snapshots(
+        symbol: str, session_date: str | None = None,
+        *, from_ms: int | None = None, to_ms: int | None = None,
+        limit: int = 5000,
+    ) -> list[FlowSnapshot]:
+        async with get_session() as session:
+            stmt = (
+                select(FlowSnapshot)
+                .where(FlowSnapshot.symbol == symbol)
+                .order_by(FlowSnapshot.timestamp_ms.asc())  # type: ignore[attr-defined]
+                .limit(limit)
+            )
+            if session_date is not None:
+                stmt = stmt.where(FlowSnapshot.session_date == session_date)
+            if from_ms is not None:
+                stmt = stmt.where(FlowSnapshot.timestamp_ms >= from_ms)
+            if to_ms is not None:
+                stmt = stmt.where(FlowSnapshot.timestamp_ms <= to_ms)
+            return list((await session.exec(stmt)).all())
+
+    @staticmethod
+    async def write_microstructure(
+        symbol: str, timestamp_ms: int,
+        ofi_window: float, avi_pct: float,
+        aggressive_buy_volume: float, aggressive_sell_volume: float,
+        microprice: float | None, last_trade_price: float | None,
+        microprice_deviation_bp: float | None,
+        direction: str, confidence: str,
+    ) -> None:
+        async with get_session() as session:
+            session.add(MicrostructureSample(
+                symbol=symbol, timestamp_ms=timestamp_ms,
+                ofi_window=ofi_window, avi_pct=avi_pct,
+                aggressive_buy_volume=aggressive_buy_volume,
+                aggressive_sell_volume=aggressive_sell_volume,
+                microprice=microprice, last_trade_price=last_trade_price,
+                microprice_deviation_bp=microprice_deviation_bp,
+                direction=direction, confidence=confidence,
+            ))
+
+    @staticmethod
+    async def query_microstructure(symbol: str, *,
+                                   from_ms: int | None = None, to_ms: int | None = None,
+                                   limit: int = 10000) -> list[MicrostructureSample]:
+        async with get_session() as session:
+            stmt = (
+                select(MicrostructureSample)
+                .where(MicrostructureSample.symbol == symbol)
+                .order_by(MicrostructureSample.timestamp_ms.asc())  # type: ignore[attr-defined]
+                .limit(limit)
+            )
+            if from_ms is not None:
+                stmt = stmt.where(MicrostructureSample.timestamp_ms >= from_ms)
+            if to_ms is not None:
+                stmt = stmt.where(MicrostructureSample.timestamp_ms <= to_ms)
+            return list((await session.exec(stmt)).all())
+
+    @staticmethod
+    async def write_vix(timestamp_ms: int, value: float) -> None:
+        async with get_session() as session:
+            session.add(VixSample(timestamp_ms=timestamp_ms, value=value))
+
+    @staticmethod
+    async def list_historical_dates(symbol: str) -> list[str]:
+        """Return distinct YYYY-MM-DD dates that have flow snapshots
+        for this symbol, descending. Used by the chart date picker."""
+        from datetime import datetime as _dt
+        async with get_session() as session:
+            stmt = (
+                select(FlowSnapshot.session_date)
+                .where(FlowSnapshot.symbol == symbol)
+                .distinct()
+            )
+            dates = list((await session.exec(stmt)).all())
+            dates.sort(reverse=True)
+            return dates
 
     @staticmethod
     async def attach_ticket(signal_iter_id: int, ticket: TradeTicket) -> TradeTicket:

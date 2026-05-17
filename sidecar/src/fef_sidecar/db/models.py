@@ -191,6 +191,7 @@ class DailySession(SQLModel, table=True):
 
     id: int | None = Field(default=None, primary_key=True)
     session_date: str = Field(unique=True, index=True, description="YYYY-MM-DD")
+    updated_at: datetime = Field(default_factory=_utcnow)
 
     total_iters: int = 0
     actionable_signals: int = 0
@@ -205,4 +206,103 @@ class DailySession(SQLModel, table=True):
 
     notes: str = Field(default="")
 
-    updated_at: datetime = Field(default_factory=_utcnow)
+
+# ---------------------------------------------------------------------------
+# Historical persistence — bars, microstructure, flow snapshots, VIX
+#
+# These tables exist so that ALL data flowing through the sidecar is
+# durable across restarts and replayable for backtesting. None of these
+# were saved in v1 — the bar/tick/microstructure/snapshot WS broadcasts
+# evaporated after delivery. With these tables in place, every iter,
+# every bar, every microstructure sample, and every QuantData snapshot
+# is recoverable for historical chart review + offline strategy testing.
+#
+# Storage rough order-of-magnitude per symbol (active trading hours only):
+#   - HistoricalBar:        ~390 rows/day/timeframe ⟶ ~14 MB/yr per timeframe
+#   - FlowSnapshot:         ~1,600 rows/day        ⟶ ~280 MB/yr (walls JSON heavy)
+#   - MicrostructureSample: ~23,400 rows/day (1s)  ⟶ ~1.7 GB/yr
+#   - VixSample:            ~780 rows/day (30s)    ⟶ ~22 MB/yr
+# ---------------------------------------------------------------------------
+
+
+class HistoricalBar(SQLModel, table=True):
+    """One OHLCV bar persisted for chart history + backtest replay.
+
+    Written by bar_stream_loop every time a new bar closes. UNIQUE
+    (symbol, bar_size, timestamp_ms) to prevent duplicates on reconnect.
+    """
+
+    __tablename__ = "historical_bar"
+
+    id: int | None = Field(default=None, primary_key=True)
+    symbol: str = Field(index=True, description="SPX / ES / QQQ / etc.")
+    bar_size: str = Field(default="1 min", description="ib_async bar_size string")
+    timestamp_ms: int = Field(index=True, description="Bar start, UTC ms")
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+
+
+class FlowSnapshot(SQLModel, table=True):
+    """One QuantData market snapshot — walls, drift, max pain, aggression, IVR.
+
+    Written by quantdata_poll_loop on every successful fetch (default 15s
+    cadence). Lets the user replay any past day's flow evolution without
+    re-hitting the QuantData REST API."""
+
+    __tablename__ = "flow_snapshot"
+
+    id: int | None = Field(default=None, primary_key=True)
+    symbol: str = Field(index=True)
+    session_date: str = Field(index=True, description="YYYY-MM-DD ET")
+    timestamp_ms: int = Field(index=True)
+
+    spx_price: float
+
+    top_gex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    top_dex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+
+    drift_cum_net_m: float = 0.0
+    drift_bias: str = "NEUTRAL"
+    ntm_max_pain: float = 0.0
+    raw_max_pain: float = 0.0
+    aggression_call_pct: float | None = None
+    aggression_put_pct: float | None = None
+    iv_rank_call_pct: float | None = None
+    iv_rank_put_pct: float | None = None
+
+
+class MicrostructureSample(SQLModel, table=True):
+    """One microstructure signal sample — OFI / AVI / microprice / direction.
+
+    Written by microstructure_loop at FEF_MICRO_PERSIST_SEC cadence (default
+    1s, sampled from the 500ms broadcast). Source of truth for
+    backtesting microstructure-driven entries."""
+
+    __tablename__ = "microstructure_sample"
+
+    id: int | None = Field(default=None, primary_key=True)
+    symbol: str = Field(index=True, description="The PROXY symbol used (ES/NQ/RTY) — not the active symbol")
+    timestamp_ms: int = Field(index=True)
+
+    ofi_window: float
+    avi_pct: float
+    aggressive_buy_volume: float
+    aggressive_sell_volume: float
+    microprice: float | None = None
+    last_trade_price: float | None = None
+    microprice_deviation_bp: float | None = None
+    direction: str = "BALANCED"
+    confidence: str = "LOW"
+
+
+class VixSample(SQLModel, table=True):
+    """One VIX index reading. Written by vix_poll_loop (default 30s)."""
+
+    __tablename__ = "vix_sample"
+
+    id: int | None = Field(default=None, primary_key=True)
+    timestamp_ms: int = Field(index=True)
+    value: float
