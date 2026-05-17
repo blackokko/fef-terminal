@@ -292,6 +292,11 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
 
     # Market regime detection — push this iter, broadcast updated assessment
     t0 = _time.perf_counter()
+    # Honor simulated time of day from the mock day script if present
+    sim_minutes = getattr(snap, "simulated_minutes_since_open", None)
+    sim_vix = getattr(snap, "simulated_vix", None)
+    minutes_for_regime = sim_minutes if sim_minutes is not None else now_minutes_since_open_et()
+    vix_for_regime = sim_vix if sim_vix is not None else state.last_vix
     state.regime_detector.push(
         RegimeSample(
             spx_price=inputs.spx_price,
@@ -302,8 +307,8 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             direction=verdict.direction.value,
             confidence=verdict.confidence.value,
             fe_ratio=verdict.fe_ratio,
-            minutes_since_open=now_minutes_since_open_et(),
-            vix=state.last_vix,
+            minutes_since_open=minutes_for_regime,
+            vix=vix_for_regime,
         )
     )
     assessment = state.regime_detector.assess()

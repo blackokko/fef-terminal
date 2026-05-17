@@ -13,17 +13,33 @@ param(
 
     [int]$LoopIntervalSec = 120,
 
-    [switch]$Dev
+    [switch]$Dev,
+
+    # Replay a synthetic full trading day through every regime state
+    # (OPEN_DRIVE -> TREND -> ABSORPTION -> PIN -> WALL_TEST -> HIGH_VOL ->
+    #  CHOP -> POWER_HOUR). Auto-sets fast 3s cadence so the day replays
+    # in ~10 minutes.
+    [switch]$ScriptedDay
 )
 
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent $PSScriptRoot
+
+# Scripted-day mode forces mock providers + fast cadence so we can see
+# every regime phase fire in ~10 minutes instead of 5.5hr.
+if ($ScriptedDay) {
+    $QuantDataMode = "mock"
+    $IbkrMode = "mock"
+    if ($LoopIntervalSec -eq 120) { $LoopIntervalSec = 3 }
+    Write-Host "[SCRIPTED DAY MODE] mocks forced, 3s cadence" -ForegroundColor Magenta
+}
 
 Write-Host "FEF Terminal launcher" -ForegroundColor Cyan
 Write-Host ("  Repo:          " + $repo)
 Write-Host ("  QuantData:     " + $QuantDataMode)
 Write-Host ("  IBKR:          " + $IbkrMode)
 Write-Host ("  FEF interval:  " + $LoopIntervalSec + "s")
+Write-Host ("  Scripted day:  " + $ScriptedDay)
 Write-Host ""
 
 # Sanity checks
@@ -45,11 +61,13 @@ if ($IbkrMode -eq "live") {
 
 # Build sidecar watchdog script as a single-line block.
 # Using a script-block string avoids here-string quoting issues in PS 5.1.
+$scriptedDayEnv = if ($ScriptedDay) { "`$env:FEF_MOCK_SCRIPTED_DAY='true'; " } else { "" }
 $watchdogScript = "Set-Location '" + (Join-Path $repo "sidecar") + "'; " + `
     "& .\.venv\Scripts\Activate.ps1; " + `
     "`$env:FEF_PROVIDER_QUANTDATA='" + $QuantDataMode + "'; " + `
     "`$env:FEF_PROVIDER_IBKR='" + $IbkrMode + "'; " + `
     "`$env:FEF_LOOP_INTERVAL_SEC='" + $LoopIntervalSec + "'; " + `
+    $scriptedDayEnv + `
     "while (`$true) { " + `
         "Write-Host '[watchdog] Starting fef-sidecar...' -ForegroundColor Yellow; " + `
         "fef-sidecar; " + `

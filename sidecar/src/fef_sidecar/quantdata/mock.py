@@ -174,23 +174,58 @@ class MockQuantDataClient:
         include_iv_rank: bool = True,
         include_oi: bool = True,
     ) -> MarketSnapshot:
-        """Mock snapshot with per-call SPX drift so FEF sees real motion across iters.
+        """Mock snapshot with per-call variation.
 
-        Cycles SPX +/- ~10pts over ~16 fetches and accumulates bullish drift so
-        the engine can actually fire an aligned LONG_CALLS verdict in mock mode
-        (useful for demoing the order ticket / option pricing panels).
+        Two modes:
+        - Default (sinusoidal): cycles SPX +/-10pts, accumulates bullish drift
+        - Scripted day (FEF_MOCK_SCRIPTED_DAY=true): walks through a 165-iter
+          full-day script that hits every regime state (OPEN_DRIVE / TREND /
+          ABSORPTION / PIN / WALL_TEST / HIGH_VOL / CHOP / POWER_HOUR). The
+          simulated_minutes_since_open is also set so the regime detector
+          uses sim time. Pair with FEF_LOOP_INTERVAL_SEC=3 to replay the
+          full day in ~8 minutes.
         """
         import math as _math
+        import os as _os
 
         self._fetch_count += 1
-        # Sinusoidal SPX drift centered on SPX_PRICE
+
+        # ----- Scripted day mode -----
+        if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
+            from fef_sidecar.quantdata.mock_day import frame_at
+
+            frame = frame_at(self._fetch_count - 1)
+            spx_now = frame.spx
+            self._cum_drift_m = frame.drift_cum_net_m
+            drift = DriftSummary(
+                entries=list(_DRIFT_ENTRIES),
+                cumulative_call_m=max(0.0, frame.drift_cum_net_m) + 5.0,
+                cumulative_put_m=min(0.0, -frame.drift_cum_net_m / 2) - 5.0,
+                cumulative_net_m=frame.drift_cum_net_m,
+                bias=frame.drift_bias,
+            )
+            gex = StrikeExposureSnapshot(greek=GreekType.GAMMA, spx_price=spx_now, rows=list(_GEX_ROWS))
+            dex = StrikeExposureSnapshot(greek=GreekType.DELTA, spx_price=spx_now, rows=list(_DEX_ROWS))
+            return MarketSnapshot(
+                fetched_at_ms=int(time.time() * 1000),
+                spx_price=spx_now,
+                gex=gex,
+                dex=dex,
+                drift=drift,
+                max_pain=MaxPainSnapshot(max_pain=7000.0, spx_price=spx_now),
+                aggression=await self.get_trade_side_stats() if include_aggression else None,
+                iv_rank=await self.get_iv_rank() if include_iv_rank else None,
+                oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
+                simulated_minutes_since_open=frame.minutes_since_open,
+                simulated_phase_label=frame.label,
+                simulated_vix=frame.vix,
+            )
+
+        # ----- Default sinusoidal mode -----
         spx_offset = _math.sin(self._fetch_count / 2.5) * 10.0
         spx_now = round(self.spx_price + spx_offset, 2)
-
-        # Bullish drift accumulates for actionable LONG_CALLS demo
         self._cum_drift_m += 5.0 + _math.sin(self._fetch_count / 1.5) * 3.0
 
-        # Build a drift summary reflecting the synthetic accumulation
         drift = DriftSummary(
             entries=list(_DRIFT_ENTRIES),
             cumulative_call_m=self._cum_drift_m + 5.0,
@@ -198,11 +233,8 @@ class MockQuantDataClient:
             cumulative_net_m=self._cum_drift_m,
             bias="BULLISH" if self._cum_drift_m > 5 else "NEUTRAL",
         )
-
-        # GEX/DEX still use the frozen rows; only SPX price moves
         gex = StrikeExposureSnapshot(greek=GreekType.GAMMA, spx_price=spx_now, rows=list(_GEX_ROWS))
         dex = StrikeExposureSnapshot(greek=GreekType.DELTA, spx_price=spx_now, rows=list(_DEX_ROWS))
-
         return MarketSnapshot(
             fetched_at_ms=int(time.time() * 1000),
             spx_price=spx_now,

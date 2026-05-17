@@ -213,3 +213,9 @@ class MarketSnapshot(BaseModel):
     aggression: AggressionStats | None = None
     iv_rank: IVRankSnapshot | None = None
     oi: OpenInterestSnapshot | None = None
+
+    # Optional sim metadata — only set by the scripted-day mock. Lets the
+    # regime detector use simulated time of day for testing transitions.
+    simulated_minutes_since_open: int | None = None
+    simulated_phase_label: str | None = None
+    simulated_vix: float | None = None
