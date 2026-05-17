@@ -92,6 +92,26 @@ export interface SnapshotEvent {
   aggression: { call_pct: number; put_pct: number } | null;
 }
 
+export interface HFTEvent {
+  type: "hft";
+  timestamp_ms: number;
+  short_vol_pts: number;
+  long_vol_pts: number;
+  vol_ratio: number;
+  vol_regime: string;
+  cancel_to_trade_ratio: number;
+  quote_intensity_per_sec: number;
+  stuffing_severity: string;
+  book_imbalance: number;
+  book_imbalance_5lvl: number;
+  book_direction: string;
+  book_confidence: string;
+  weighted_mid_price: number | null;
+  book_spread: number | null;
+  composite_direction: string;
+  fired_on: string;
+}
+
 export interface MicrostructureEvent {
   type: "microstructure";
   timestamp_ms: number;
@@ -186,4 +206,5 @@ export type SidecarEvent =
   | PatternMatchEvent
   | RegimeEvent
   | AccountEvent
-  | MicrostructureEvent;
+  | MicrostructureEvent
+  | HFTEvent;

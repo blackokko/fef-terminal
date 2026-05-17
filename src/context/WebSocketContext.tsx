@@ -10,6 +10,7 @@ import {
 import type {
   AccountEvent,
   Bar,
+  HFTEvent,
   IterEvent,
   MicrostructureEvent,
   PatternMatchEvent,
@@ -34,6 +35,7 @@ interface SidecarState {
   lastRegime: RegimeEvent | null;
   lastAccount: AccountEvent | null;
   lastMicrostructure: MicrostructureEvent | null;
+  lastHFT: HFTEvent | null;
   activeSymbol: string | null;  // From /status — drives chart + engine
   recentTicks: TickEvent[];
   recentIters: IterEvent[];
@@ -51,6 +53,7 @@ const initialState: SidecarState = {
   lastRegime: null,
   lastAccount: null,
   lastMicrostructure: null,
+  lastHFT: null,
   activeSymbol: null,
   recentTicks: [],
   recentIters: [],
@@ -105,6 +108,8 @@ export function SidecarProvider({
           return { ...prev, lastAccount: event };
         case "microstructure":
           return { ...prev, lastMicrostructure: event };
+        case "hft":
+          return { ...prev, lastHFT: event };
         case "ticket":
           return {
             ...prev,

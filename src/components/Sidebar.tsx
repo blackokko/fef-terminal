@@ -1,6 +1,16 @@
 import { useState, type ReactNode } from "react";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
+import { AttributionPanel } from "../panels/AttributionPanel";
+import { AuditLogPanel } from "../panels/AuditLogPanel";
+import { CalendarPanel } from "../panels/CalendarPanel";
+import { CrossSymbolPanel } from "../panels/CrossSymbolPanel";
+import { HFTPanel } from "../panels/HFTPanel";
+import { LiveExecutionPanel } from "../panels/LiveExecutionPanel";
+import { LivePositionsPanel } from "../panels/LivePositionsPanel";
+import { MLPanel } from "../panels/MLPanel";
+import { MultiStrategyPanel } from "../panels/MultiStrategyPanel";
+import { WalkForwardPanel } from "../panels/WalkForwardPanel";
 import { ChartAnnotationsPanel } from "../panels/ChartAnnotationsPanel";
 import { MicrostructurePanel } from "../panels/MicrostructurePanel";
 import { OptimizePanel } from "../panels/OptimizePanel";
@@ -57,8 +67,12 @@ export function Sidebar() {
             <Safe name="RiskOverlay"><RiskOverlayPanel /></Safe>
             <Safe name="Regime"><RegimePanel /></Safe>
             <Safe name="FEFVerdict"><FEFVerdictPanel /></Safe>
+            <Safe name="HFT"><HFTPanel /></Safe>
             <Safe name="Microstructure"><MicrostructurePanel /></Safe>
+            <Safe name="CrossSymbol"><CrossSymbolPanel /></Safe>
             <Safe name="OrderTicket"><OrderTicketPanel /></Safe>
+            <Safe name="LiveExecution"><LiveExecutionPanel /></Safe>
+            <Safe name="LivePositions"><LivePositionsPanel /></Safe>
             <Safe name="OptionChain"><OptionChainPanel /></Safe>
           </>
         )}
@@ -71,6 +85,8 @@ export function Sidebar() {
         {tab === "patterns" && (
           <>
             <Safe name="Tournament"><TournamentPanel /></Safe>
+            <Safe name="MultiStrategy"><MultiStrategyPanel /></Safe>
+            <Safe name="ML"><MLPanel /></Safe>
             <Safe name="PatternLibrary"><PatternLibraryPanel /></Safe>
             <Safe name="StrategyPresets"><StrategyPresetsPanel /></Safe>
           </>
@@ -78,6 +94,8 @@ export function Sidebar() {
         {tab === "history" && (
           <>
             <Safe name="Analytics"><AnalyticsPanel /></Safe>
+            <Safe name="Attribution"><AttributionPanel /></Safe>
+            <Safe name="WalkForward"><WalkForwardPanel /></Safe>
             <Safe name="Optimize"><OptimizePanel /></Safe>
             <Safe name="Replay"><ReplayPanel /></Safe>
           </>
@@ -85,6 +103,8 @@ export function Sidebar() {
         {tab === "config" && (
           <>
             <Safe name="Settings"><SettingsPanel /></Safe>
+            <Safe name="Calendar"><CalendarPanel /></Safe>
+            <Safe name="AuditLog"><AuditLogPanel /></Safe>
             <Safe name="ChartAnnotations"><ChartAnnotationsPanel /></Safe>
             <Safe name="Glossary"><GlossaryPanel /></Safe>
           </>
