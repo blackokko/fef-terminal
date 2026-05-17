@@ -66,6 +66,18 @@ export interface IterEvent {
   snapshot: IterSnapshot;
 }
 
+export interface SnapshotEvent {
+  type: "snapshot";
+  timestamp_ms: number;
+  spx_price: number;
+  top_gex: WallRow[];
+  top_dex: WallRow[];
+  drift: { cum_net_m: number; bias: string };
+  ntm_max_pain: number;
+  raw_max_pain: number;
+  aggression: { call_pct: number; put_pct: number } | null;
+}
+
 export interface TicketEvent {
   type: "ticket";
   timestamp_ms: number;
@@ -92,4 +104,9 @@ export interface StatusEvent {
   history_size: number;
 }
 
-export type SidecarEvent = TickEvent | IterEvent | TicketEvent | StatusEvent;
+export type SidecarEvent =
+  | TickEvent
+  | IterEvent
+  | TicketEvent
+  | StatusEvent
+  | SnapshotEvent;

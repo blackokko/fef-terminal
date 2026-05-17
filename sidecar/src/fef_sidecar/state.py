@@ -55,9 +55,12 @@ class AppState:
     broadcaster: EventBroadcaster
     loop_task: object | None = None
     bar_task: object | None = None
+    tick_task: object | None = None
+    quantdata_poll_task: object | None = None
     last_spx_price: float = 0.0
     last_iter_num: int = 0
     last_verdict: dict[str, object] = field(default_factory=dict)
+    last_snapshot: object | None = None  # cached MarketSnapshot for FEF to consume
 
     @classmethod
     def build(cls) -> AppState:

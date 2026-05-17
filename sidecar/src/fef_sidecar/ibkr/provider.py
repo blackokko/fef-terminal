@@ -41,3 +41,15 @@ class IBKRProvider(Protocol):
 
     async def get_last_quote(self, contract: Contract) -> Quote:
         """One-shot last-trade snapshot."""
+
+    async def stream_last_price(
+        self,
+        contract: Contract,
+    ) -> AsyncIterator[Quote]:
+        """Yield Quote objects as tick prices update (sub-second cadence when live).
+
+        Used by the tick_stream_loop to feed the top-bar SPX banner without
+        waiting for bar closes or the FEF iter cadence.
+        """
+        raise NotImplementedError
+        yield  # pragma: no cover

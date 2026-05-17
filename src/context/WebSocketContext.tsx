@@ -11,6 +11,7 @@ import type {
   Bar,
   IterEvent,
   SidecarEvent,
+  SnapshotEvent,
   StatusEvent,
   TicketEvent,
   TickEvent,
@@ -24,6 +25,7 @@ interface SidecarState {
   connection: ConnectionState;
   lastTick: TickEvent | null;
   lastIter: IterEvent | null;
+  lastSnapshot: SnapshotEvent | null;
   lastStatus: StatusEvent | null;
   recentTicks: TickEvent[];
   recentIters: IterEvent[];
@@ -35,6 +37,7 @@ const initialState: SidecarState = {
   connection: "connecting",
   lastTick: null,
   lastIter: null,
+  lastSnapshot: null,
   lastStatus: null,
   recentTicks: [],
   recentIters: [],
@@ -75,6 +78,8 @@ export function SidecarProvider({
             lastIter: event,
             recentIters: [...prev.recentIters, event].slice(-RECENT_LIMIT),
           };
+        case "snapshot":
+          return { ...prev, lastSnapshot: event };
         case "ticket":
           return {
             ...prev,

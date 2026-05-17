@@ -24,7 +24,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from fef_sidecar.api import router as api_router
 from fef_sidecar.db import dispose_db, init_db
-from fef_sidecar.loop import bar_stream_loop, fef_tick_loop
+from fef_sidecar.loop import (
+    bar_stream_loop,
+    fef_tick_loop,
+    quantdata_poll_loop,
+    tick_stream_loop,
+)
 from fef_sidecar.state import AppState
 from fef_sidecar.ws import router as ws_router
 
@@ -50,8 +55,12 @@ async def lifespan(app: FastAPI):
         "on",
     )
     if auto_loops:
+        state.quantdata_poll_task = asyncio.create_task(
+            quantdata_poll_loop(state), name="quantdata-poll-loop"
+        )
         state.loop_task = asyncio.create_task(fef_tick_loop(state), name="fef-tick-loop")
         state.bar_task = asyncio.create_task(bar_stream_loop(state), name="bar-stream-loop")
+        state.tick_task = asyncio.create_task(tick_stream_loop(state), name="tick-stream-loop")
 
     logger.info(
         "fef-sidecar ready (QD=%s, IBKR=%s, auto_loops=%s)",
@@ -64,7 +73,12 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         logger.info("fef-sidecar shutting down")
-        for task in (state.loop_task, state.bar_task):
+        for task in (
+            state.loop_task,
+            state.bar_task,
+            state.tick_task,
+            state.quantdata_poll_task,
+        ):
             if task is not None:
                 task.cancel()  # type: ignore[attr-defined]
                 try:

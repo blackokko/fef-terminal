@@ -36,6 +36,22 @@ class IterEvent(BaseModel):
     snapshot: dict[str, Any]
 
 
+class SnapshotEvent(BaseModel):
+    """Lightweight market snapshot — fires on the QuantData poll cadence (faster
+    than the FEF loop). Lets the sidebar walls/drift/MP refresh without waiting
+    for the next FEF iter."""
+
+    type: Literal["snapshot"] = "snapshot"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    spx_price: float
+    top_gex: list[dict[str, Any]]
+    top_dex: list[dict[str, Any]]
+    drift: dict[str, Any]
+    ntm_max_pain: float
+    raw_max_pain: float
+    aggression: dict[str, Any] | None = None
+
+
 class TicketEvent(BaseModel):
     type: Literal["ticket"] = "ticket"
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
@@ -62,7 +78,7 @@ class StatusEvent(BaseModel):
     history_size: int = 0
 
 
-Event = TickEvent | IterEvent | TicketEvent | StatusEvent
+Event = TickEvent | IterEvent | TicketEvent | StatusEvent | SnapshotEvent
 
 
 class EventBroadcaster:

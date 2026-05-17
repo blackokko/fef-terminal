@@ -104,3 +104,33 @@ class MockIBKRProvider:
             bid_size=10,
             ask_size=10,
         )
+
+    async def stream_last_price(
+        self,
+        contract: Contract,
+    ) -> AsyncIterator[Quote]:
+        """Emit synthetic ticks every FEF_TICK_INTERVAL_SEC (default 2s) with
+        small random walk around the last bar's close."""
+        import os
+        import random
+        from datetime import datetime
+
+        if not self._connected:
+            await self.connect()
+        interval = float(os.environ.get("FEF_TICK_INTERVAL_SEC", "2"))
+        base_price = self._bars[-1].close
+        price = base_price
+        while True:
+            # Random walk: small step each tick, mean-reverting to base
+            step = random.uniform(-0.5, 0.5)
+            drift = (base_price - price) * 0.1  # gentle pull back to base
+            price = round(price + step + drift, 2)
+            yield Quote(
+                timestamp=datetime.now(),
+                last=price,
+                bid=price - 0.25,
+                ask=price + 0.25,
+                bid_size=10,
+                ask_size=10,
+            )
+            await asyncio.sleep(interval)

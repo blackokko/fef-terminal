@@ -1,9 +1,17 @@
-"""Background loops: FEF tick loop + IBKR bar stream.
+"""Background loops:
 
-Both are spawned as asyncio tasks in the FastAPI lifespan and cancelled on
-shutdown. The FEF loop ticks every `FEF_LOOP_INTERVAL_SEC` (default 120s)
-and publishes IterEvents. The bar stream runs continuously and publishes
-TickEvents as each 2-min bar closes.
+- fef_tick_loop        — every FEF_LOOP_INTERVAL_SEC (default 120s): consumes
+                         the cached snapshot, runs FEF, persists, broadcasts IterEvent
+- bar_stream_loop      — continuously streams IBKR 2-min bars, broadcasts TickEvent
+                         on each close
+- tick_stream_loop     — sub-second last-price stream (live: ib_async updateEvent;
+                         mock: synthetic ticks every FEF_TICK_INTERVAL_SEC). Broadcasts
+                         TickEvent without a bar payload.
+- quantdata_poll_loop  — every FEF_QUANTDATA_POLL_INTERVAL_SEC (default 15s): fetches
+                         a fresh MarketSnapshot, caches it in AppState, broadcasts
+                         SnapshotEvent so the sidebar refreshes ahead of the FEF cadence
+
+All four spawn as asyncio tasks in the FastAPI lifespan and cancel on shutdown.
 """
 
 from __future__ import annotations
@@ -12,7 +20,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fef_sidecar.db import (
     FEFConfidence,
@@ -20,7 +28,7 @@ from fef_sidecar.db import (
     SignalIterRepository,
 )
 from fef_sidecar.engine.fef import snapshot_to_inputs
-from fef_sidecar.events import IterEvent, TickEvent
+from fef_sidecar.events import IterEvent, SnapshotEvent, TickEvent
 from fef_sidecar.ibkr import Contract
 
 if TYPE_CHECKING:
@@ -30,8 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def _market_hours_et() -> tuple[int, int]:
-    """Return (open_minute, close_minute) for ET market hours, midnight-relative."""
-    return 9 * 60 + 30, 16 * 60  # 9:30 - 16:00
+    return 9 * 60 + 30, 16 * 60
 
 
 def _in_market_hours_et() -> bool:
@@ -49,8 +56,70 @@ def _today_et() -> str:
     return datetime.now(et).strftime("%Y-%m-%d")
 
 
+def _walls_json(walls: Any) -> list[dict[str, Any]]:
+    return [
+        {"strike": w.strike, "net_m": round(w.net_m, 2), "side": w.side}
+        for w in walls
+    ]
+
+
+# ---------------------------------------------------------------------------
+# QuantData poll loop — refreshes the cached snapshot at high cadence
+# ---------------------------------------------------------------------------
+
+
+async def quantdata_poll_loop(state: AppState) -> None:
+    interval = float(os.environ.get("FEF_QUANTDATA_POLL_INTERVAL_SEC", "15"))
+    logger.info("Starting QuantData poll loop (interval=%.1fs)", interval)
+
+    while True:
+        try:
+            snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
+            state.last_snapshot = snap
+            state.last_spx_price = snap.spx_price  # type: ignore[union-attr]
+
+            event = SnapshotEvent(
+                timestamp_ms=snap.fetched_at_ms,  # type: ignore[union-attr]
+                spx_price=snap.spx_price,  # type: ignore[union-attr]
+                top_gex=_walls_json(snap.gex.top(5)),  # type: ignore[union-attr]
+                top_dex=_walls_json(snap.dex.top(5)),  # type: ignore[union-attr]
+                drift={
+                    "cum_net_m": snap.drift.cumulative_net_m,  # type: ignore[union-attr]
+                    "bias": snap.drift.bias,  # type: ignore[union-attr]
+                },
+                ntm_max_pain=_ntm_max_pain(snap),
+                raw_max_pain=snap.max_pain.max_pain,  # type: ignore[union-attr]
+                aggression={
+                    "call_pct": snap.aggression.call.aggression_pct,  # type: ignore[union-attr]
+                    "put_pct": snap.aggression.put.aggression_pct,  # type: ignore[union-attr]
+                }
+                if snap.aggression is not None  # type: ignore[union-attr]
+                else None,
+            )
+            await state.broadcaster.publish(event)
+        except asyncio.CancelledError:
+            logger.info("QuantData poll loop cancelled — exiting")
+            raise
+        except Exception:
+            logger.exception("QuantData poll iteration failed")
+        await asyncio.sleep(interval)
+
+
+def _ntm_max_pain(snap: Any) -> float:
+    """NTM max pain from the snapshot's OI rows, or fall back to raw chain MP."""
+    if snap.oi is None:
+        return snap.max_pain.max_pain
+    from fef_sidecar.quantdata.max_pain import compute_ntm_max_pain
+
+    return compute_ntm_max_pain(snap.oi.rows, snap.spx_price).max_pain
+
+
+# ---------------------------------------------------------------------------
+# FEF tick loop — consumes the cached snapshot, runs the engine
+# ---------------------------------------------------------------------------
+
+
 async def fef_tick_loop(state: AppState) -> None:
-    """Pull a market snapshot, run the FEF engine, persist + broadcast — forever."""
     interval = int(os.environ.get("FEF_LOOP_INTERVAL_SEC", "120"))
     market_hours_only = os.environ.get("FEF_LOOP_MARKET_HOURS_ONLY", "false").lower() in (
         "true",
@@ -58,7 +127,6 @@ async def fef_tick_loop(state: AppState) -> None:
         "yes",
         "on",
     )
-
     logger.info(
         "Starting FEF tick loop (interval=%ds, market_hours_only=%s)",
         interval,
@@ -83,18 +151,15 @@ async def fef_tick_loop(state: AppState) -> None:
 
 
 async def _run_one_iter(state: AppState) -> None:
-    """Single iteration of the FEF loop — extracted so it's testable + manually triggerable."""
-    snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
+    """One FEF iter — uses cached snapshot if available, else fetches fresh."""
+    snap = state.last_snapshot
+    if snap is None:
+        snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
+        state.last_snapshot = snap
+
     inputs = snapshot_to_inputs(snap)  # type: ignore[arg-type]
     verdict = state.engine.push(inputs)
-
     state.last_spx_price = inputs.spx_price
-
-    def _walls_json(walls):
-        return [
-            {"strike": w.strike, "net_m": round(w.net_m, 2), "side": w.side}
-            for w in walls
-        ]
 
     signal = await SignalIterRepository.write_iter(
         spx_price=inputs.spx_price,
@@ -114,7 +179,6 @@ async def _run_one_iter(state: AppState) -> None:
         extras=verdict.to_log_extras(),
         session_date=_today_et(),
     )
-
     state.last_iter_num = signal.iter_num
 
     event = IterEvent(
@@ -168,8 +232,12 @@ async def _run_one_iter(state: AppState) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Bar stream — chart candles
+# ---------------------------------------------------------------------------
+
+
 async def bar_stream_loop(state: AppState) -> None:
-    """Stream IBKR SPX 2-min bars and broadcast TickEvents on each close."""
     logger.info("Starting bar stream loop")
     while True:
         try:
@@ -188,8 +256,6 @@ async def bar_stream_loop(state: AppState) -> None:
                     },
                 )
                 await state.broadcaster.publish(event)
-            # Stream exhausted (e.g. mock provider) — wait before reconnecting
-            # to avoid flooding the broadcaster with replays.
             logger.info("Bar stream completed — sleeping 60s before reconnect")
             await asyncio.sleep(60)
         except asyncio.CancelledError:
@@ -197,4 +263,30 @@ async def bar_stream_loop(state: AppState) -> None:
             raise
         except Exception:
             logger.exception("Bar stream failed — reconnecting in 5s")
+            await asyncio.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# Tick stream — sub-second last price for the top-bar SPX banner
+# ---------------------------------------------------------------------------
+
+
+async def tick_stream_loop(state: AppState) -> None:
+    logger.info("Starting tick stream loop")
+    while True:
+        try:
+            await state.ibkr.connect()
+            async for quote in state.ibkr.stream_last_price(Contract.spx_index()):
+                state.last_spx_price = quote.last
+                event = TickEvent(
+                    timestamp_ms=int(quote.timestamp.timestamp() * 1000),
+                    spx_price=quote.last,
+                    bar=None,  # tick without a bar — just a price update
+                )
+                await state.broadcaster.publish(event)
+        except asyncio.CancelledError:
+            logger.info("Tick stream cancelled — exiting")
+            raise
+        except Exception:
+            logger.exception("Tick stream failed — reconnecting in 5s")
             await asyncio.sleep(5)

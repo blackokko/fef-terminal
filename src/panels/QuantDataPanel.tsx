@@ -1,10 +1,35 @@
 import { useSidecar } from "../context/WebSocketContext";
 import type { WallRow } from "../lib/events";
 
+// Prefer SnapshotEvent (fires every ~15s) over IterEvent's snapshot (~2min)
+// so walls/drift/MP refresh ahead of the FEF cadence.
 export function QuantDataPanel() {
-  const { lastIter } = useSidecar();
+  const { lastSnapshot, lastIter } = useSidecar();
 
-  if (!lastIter) {
+  // SnapshotEvent has the same shape as IterEvent.snapshot but without verdict.
+  const source = lastSnapshot
+    ? {
+        ts: lastSnapshot.timestamp_ms,
+        gex: lastSnapshot.top_gex,
+        dex: lastSnapshot.top_dex,
+        drift: lastSnapshot.drift,
+        ntm_max_pain: lastSnapshot.ntm_max_pain,
+        raw_max_pain: lastSnapshot.raw_max_pain,
+        aggression: lastSnapshot.aggression,
+      }
+    : lastIter
+      ? {
+          ts: lastIter.timestamp_ms,
+          gex: lastIter.snapshot.top_gex,
+          dex: lastIter.snapshot.top_dex,
+          drift: lastIter.snapshot.drift,
+          ntm_max_pain: lastIter.snapshot.ntm_max_pain,
+          raw_max_pain: lastIter.snapshot.raw_max_pain,
+          aggression: lastIter.snapshot.aggression,
+        }
+      : null;
+
+  if (!source) {
     return (
       <section className="sidebar-section">
         <h3 className="sidebar-section-title">QuantData</h3>
@@ -13,56 +38,52 @@ export function QuantDataPanel() {
     );
   }
 
-  const s = lastIter.snapshot;
-
-  const ageMs = Date.now() - lastIter.timestamp_ms;
+  const ageMs = Date.now() - source.ts;
   const ageStr =
     ageMs < 60_000 ? `${Math.round(ageMs / 1000)}s` : `${Math.round(ageMs / 60_000)}m`;
 
   return (
     <section className="sidebar-section">
-      <h3 className="sidebar-section-title">
-        QuantData · {ageStr} ago
-      </h3>
+      <h3 className="sidebar-section-title">QuantData · {ageStr} ago</h3>
 
       <SubSection title="Drift">
         <div>
-          {s.drift.bias} (cum net{" "}
-          {s.drift.cum_net_m > 0 ? "+" : ""}
-          {s.drift.cum_net_m.toFixed(2)}M)
+          {source.drift.bias} (cum net{" "}
+          {source.drift.cum_net_m > 0 ? "+" : ""}
+          {source.drift.cum_net_m.toFixed(2)}M)
         </div>
       </SubSection>
 
       <SubSection title="Max Pain">
         <div>
-          NTM <strong>${s.ntm_max_pain.toFixed(0)}</strong>
+          NTM <strong>${source.ntm_max_pain.toFixed(0)}</strong>
           <span className="muted small">
             {" "}
-            (raw chain ${s.raw_max_pain.toFixed(0)})
+            (raw chain ${source.raw_max_pain.toFixed(0)})
           </span>
         </div>
       </SubSection>
 
       <SubSection title="Top GEX walls">
-        <WallList walls={s.top_gex} />
+        <WallList walls={source.gex} />
       </SubSection>
 
       <SubSection title="Top DEX walls">
-        <WallList walls={s.top_dex} />
+        <WallList walls={source.dex} />
       </SubSection>
 
-      {s.aggression && (
+      {source.aggression && (
         <SubSection title="Aggression">
           <div className="aggression-row">
             <span>call</span>
             <span style={{ color: "var(--color-green)" }}>
-              {s.aggression.call_pct.toFixed(1)}%
+              {source.aggression.call_pct.toFixed(1)}%
             </span>
           </div>
           <div className="aggression-row">
             <span>put</span>
             <span style={{ color: "var(--color-red)" }}>
-              {s.aggression.put_pct.toFixed(1)}%
+              {source.aggression.put_pct.toFixed(1)}%
             </span>
           </div>
         </SubSection>

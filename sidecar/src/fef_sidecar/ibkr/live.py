@@ -180,3 +180,37 @@ class LiveIBKRProvider:
             bid_size=float(ticker.bidSize) if ticker.bidSize else None,
             ask_size=float(ticker.askSize) if ticker.askSize else None,
         )
+
+    async def stream_last_price(self, contract: Contract):  # AsyncIterator[Quote]
+        """Subscribe to reqMktData and yield Quotes on each tick update."""
+        await self._ensure_connected()
+        assert self._ib is not None
+
+        ib_contract = _to_ib_contract(contract)
+        await self._ib.qualifyContractsAsync(ib_contract)
+
+        ticker = self._ib.reqMktData(ib_contract, "", False, False)
+        queue: asyncio.Queue[Quote] = asyncio.Queue()
+
+        def _on_update(t) -> None:
+            last = t.last if t.last and t.last > 0 else (t.close or 0)
+            if not last:
+                return
+            queue.put_nowait(
+                Quote(
+                    timestamp=datetime.now(),
+                    last=float(last),
+                    bid=float(t.bid) if t.bid and t.bid > 0 else None,
+                    ask=float(t.ask) if t.ask and t.ask > 0 else None,
+                    bid_size=float(t.bidSize) if t.bidSize and t.bidSize > 0 else None,
+                    ask_size=float(t.askSize) if t.askSize and t.askSize > 0 else None,
+                )
+            )
+
+        ticker.updateEvent += _on_update
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            ticker.updateEvent -= _on_update
+            self._ib.cancelMktData(ib_contract)
