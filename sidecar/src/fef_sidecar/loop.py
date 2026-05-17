@@ -307,6 +307,22 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             else None,
         },
     )
+    # Calendar pause window — demote actionable verdicts to WAIT during
+    # FOMC/CPI/NFP windows. Engine still records the original direction in
+    # extras so backtest analysis can see what the verdict would've been.
+    try:
+        from fef_sidecar.engine.calendar import is_pause_window
+        pause = await is_pause_window()
+        if pause.paused and verdict.direction.value != "WAIT":
+            event.verdict["original_direction"] = verdict.direction.value
+            event.verdict["direction"] = "WAIT"
+            event.verdict["reasoning"] = f"PAUSED — {pause.reason}"
+            event.verdict["calendar_pause"] = {
+                "reason": pause.reason, "event": pause.event,
+            }
+    except Exception:
+        logger.exception("Calendar pause check failed")
+
     # Spread recommendation — added to verdict as a separate field
     try:
         from fef_sidecar.engine.spread_recommender import recommend as recommend_spread
@@ -712,6 +728,137 @@ async def account_poll_loop(state: AppState) -> None:
 # ---------------------------------------------------------------------------
 # Microstructure loop — sub-second OFI / AVI / Microprice signal
 # ---------------------------------------------------------------------------
+
+
+async def hft_loop(state: AppState) -> None:
+    """Combined HFT signal loop — realized vol + quote stuffing + L2 depth.
+
+    Runs at HFT_LOOP_INTERVAL_SEC (default 0.25s = 4Hz). Event-driven on top
+    of that: if vol_regime, stuffing_severity, or book_direction flips
+    between polls, fires immediately instead of waiting.
+    """
+    import asyncio as _asyncio
+    import random as _random
+    import time as _time
+
+    from fef_sidecar.engine.depth import BookLevel, DepthState, assess as depth_assess, update_book
+    from fef_sidecar.engine.quote_stuffing import StuffingState, assess as stuffing_assess, push_quote as stuffing_push_quote, push_trade as stuffing_push_trade
+    from fef_sidecar.engine.realized_vol import RealizedVolState, assess as vol_assess, push_tick as vol_push
+    from fef_sidecar.events import HFTEvent
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+
+    interval = float(os.environ.get("HFT_LOOP_INTERVAL_SEC", "0.25"))
+    rng = _random.Random()
+
+    state.vol_state = RealizedVolState()
+    state.stuffing_state = StuffingState()
+    state.depth_state = DepthState()
+
+    cancel_depth = None
+    if isinstance(state.ibkr, LiveIBKRProvider):
+        # Live: subscribe to L2 depth on the active symbol (or proxy)
+        from fef_sidecar.ibkr.models import Contract
+        depth_symbol = {"SPX": "ES", "SPY": "ES", "QQQ": "NQ", "IWM": "RTY"}.get(
+            state.active_symbol, state.active_symbol)
+        try:
+            await state.ibkr.connect()
+            cancel_depth = await state.ibkr.subscribe_depth(
+                Contract.for_symbol(depth_symbol),
+                lambda ts, b, a: update_book(state.depth_state, b, a, ts),  # type: ignore[arg-type]
+            )
+            logger.info("HFT loop subscribed to LIVE depth on %s", depth_symbol)
+        except Exception:
+            logger.exception("Live depth subscription failed — using synth")
+            cancel_depth = None
+    else:
+        logger.info("HFT loop in MOCK mode (synth vol/stuffing/depth, interval=%.2fs)", interval)
+
+    # Track last direction strings for event-driven fire detection
+    last_vol_regime = "NORMAL"
+    last_stuffing_sev = "NORMAL"
+    last_book_dir = "BALANCED"
+
+    try:
+        while True:
+            try:
+                now_ms = int(_time.time() * 1000)
+                spx = state.last_spx_price or 7400.0
+
+                # Mock: synthesize new tick + quote + book
+                if cancel_depth is None:
+                    # Tick: random walk
+                    tick_price = round(spx + rng.uniform(-0.5, 0.5), 2)
+                    vol_push(state.vol_state, now_ms, tick_price)
+                    # Quote: 70% of polls add a quote update, 20% add a trade
+                    stuffing_push_quote(state.stuffing_state, now_ms)
+                    if rng.random() < 0.2:
+                        stuffing_push_trade(state.stuffing_state, now_ms)
+                    # Synth book — 10 levels each side, sizes biased by recent direction
+                    bids = [BookLevel(price=round(spx - i * 0.25, 2),
+                                      size=float(rng.randint(50, 500)))
+                            for i in range(1, 11)]
+                    asks = [BookLevel(price=round(spx + i * 0.25, 2),
+                                      size=float(rng.randint(50, 500)))
+                            for i in range(1, 11)]
+                    update_book(state.depth_state, bids, asks, now_ms)
+                else:
+                    # Live: push current spx as a tick + count microstructure events as quotes
+                    vol_push(state.vol_state, now_ms, spx)
+                    stuffing_push_quote(state.stuffing_state, now_ms)
+
+                vol = vol_assess(state.vol_state, now_ms)
+                stuff = stuffing_assess(state.stuffing_state, now_ms)
+                depth = depth_assess(state.depth_state, now_ms)
+
+                # Event-driven: fire on direction change OR poll interval
+                flips = []
+                if vol.regime != last_vol_regime:
+                    flips.append(f"vol_regime:{last_vol_regime}→{vol.regime}")
+                    last_vol_regime = vol.regime
+                if stuff.severity != last_stuffing_sev:
+                    flips.append(f"stuffing:{last_stuffing_sev}→{stuff.severity}")
+                    last_stuffing_sev = stuff.severity
+                if depth.direction != last_book_dir:
+                    flips.append(f"book:{last_book_dir}→{depth.direction}")
+                    last_book_dir = depth.direction
+
+                # Composite direction: book trumps vol unless stuffing is high
+                if stuff.severity == "STUFFING":
+                    composite = "FADE"  # stuffing often precedes reversion
+                elif depth.direction == "BID_HEAVY" and vol.regime != "EXPANSION":
+                    composite = "BULLISH"
+                elif depth.direction == "ASK_HEAVY" and vol.regime != "EXPANSION":
+                    composite = "BEARISH"
+                elif vol.regime == "EXPANSION":
+                    composite = "VOLATILE"
+                else:
+                    composite = "NEUTRAL"
+
+                fired_on = ",".join(flips) if flips else "poll"
+
+                await state.broadcaster.publish(HFTEvent(
+                    timestamp_ms=now_ms,
+                    short_vol_pts=vol.short_vol_pts, long_vol_pts=vol.long_vol_pts,
+                    vol_ratio=vol.ratio, vol_regime=vol.regime,
+                    cancel_to_trade_ratio=stuff.cancel_to_trade_ratio,
+                    quote_intensity_per_sec=stuff.quote_intensity_per_sec,
+                    stuffing_severity=stuff.severity,
+                    book_imbalance=depth.imbalance, book_imbalance_5lvl=depth.imbalance_5lvl,
+                    book_direction=depth.direction, book_confidence=depth.confidence,
+                    weighted_mid_price=depth.weighted_mid_price, book_spread=depth.spread,
+                    composite_direction=composite, fired_on=fired_on,
+                ))
+            except _asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("HFT iteration failed")
+            await _asyncio.sleep(interval)
+    finally:
+        if cancel_depth is not None:
+            try:
+                await cancel_depth()
+            except Exception:
+                logger.exception("Depth cancel failed")
 
 
 async def microstructure_loop(state: AppState) -> None:

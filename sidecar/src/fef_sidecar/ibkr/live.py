@@ -397,6 +397,46 @@ class LiveIBKRProvider:
 
         return _cancel
 
+    async def subscribe_depth(self, contract: Contract, on_book):
+        """Subscribe to L2 depth-of-book updates via reqMktDepth.
+
+        Requires an IBKR depth-data subscription for the exchange (extra
+        per-month cost). Without it, ib_async returns an empty book.
+
+        on_book: callable(timestamp_ms: int, bids: list[BookLevel], asks: list[BookLevel])
+        Returns an async cancel handle.
+        """
+        import time as _time
+
+        from fef_sidecar.engine.depth import BookLevel
+
+        await self._ensure_connected()
+        assert self._ib is not None
+
+        ib_contract = _to_ib_contract(contract)
+        await self._ib.qualifyContractsAsync(ib_contract)
+
+        # numRows=10, useSmartDepth=True for SMART-routed depth where available
+        ticker = self._ib.reqMktDepth(ib_contract, numRows=10, isSmartDepth=True)
+
+        def _on_update(t) -> None:
+            bids = [BookLevel(price=float(d.price), size=float(d.size))
+                    for d in (t.domBids or [])]
+            asks = [BookLevel(price=float(d.price), size=float(d.size))
+                    for d in (t.domAsks or [])]
+            on_book(int(_time.time() * 1000), bids, asks)
+
+        ticker.updateEvent += _on_update
+
+        async def _cancel() -> None:
+            ticker.updateEvent -= _on_update
+            try:
+                self._ib.cancelMktDepth(ib_contract, isSmartDepth=True)
+            except Exception as e:
+                logger.warning("Depth cancellation failed: %s", e)
+
+        return _cancel
+
     async def stream_last_price(self, contract: Contract):  # AsyncIterator[Quote]
         """Subscribe to reqMktData and yield Quotes on each tick update."""
         await self._ensure_connected()

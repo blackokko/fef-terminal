@@ -47,17 +47,36 @@ class SweepResult:
     test_total_pnl: float
 
 
-def _proxy_pnl(direction: str, spx_now: float, spx_future: float, qty: int = 15) -> float:
+def _proxy_pnl(direction: str, spx_now: float, spx_future: float, qty: int = 15,
+               symbol: str = "SPX", apply_friction: bool = True) -> float:
     """Per-share-equivalent: SPX move × delta × 100 × qty.
 
     Assumes 0.5 delta, $50/pt/contract. Caps at -$10/pt loss to simulate stop.
+
+    apply_friction (default True): subtracts slippage + commission via the
+    standard cost model. Without this, walk-forward results overstate edge
+    by 20-50% for 0DTE since 0DTE bid-ask is wide enough to eat real fills.
     """
+    from fef_sidecar.engine.slippage import DEFAULTS as SLIP_DEFAULTS
+
     move = spx_future - spx_now
     if direction == "LONG_PUTS":
         move = -move
     pnl = move * 50 * qty
     stop = -10 * 50 * qty
-    return max(stop, pnl)
+    gross_pnl = max(stop, pnl)
+
+    if not apply_friction:
+        return gross_pnl
+
+    # Friction model: 1pt entry premium × half-spread × 2 (round trip)
+    # + commission round-trip
+    cfg = SLIP_DEFAULTS.get(symbol.upper(), SLIP_DEFAULTS["SPX"])
+    # Approximate entry premium ~ $5 for an ATM 0DTE (rough)
+    entry_premium_estimate = 5.0
+    spread_cost = entry_premium_estimate * cfg["bid_ask_pct_of_mid"] * qty * 100
+    commission = cfg["commission_per_contract"] * qty * 2  # round-trip
+    return round(gross_pnl - spread_cost - commission, 2)
 
 
 def _sharpe(returns: list[float]) -> float | None:

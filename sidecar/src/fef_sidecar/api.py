@@ -141,6 +141,241 @@ async def engine_state(request: Request) -> dict[str, Any]:
     }
 
 
+@router.post("/walk_forward/run_now")
+async def walk_forward_run_now(request: Request) -> dict[str, Any]:
+    from fef_sidecar.engine.auto_walk_forward import run_auto_walk_forward
+    s = _state(request)
+    run = await run_auto_walk_forward(s)
+    return {
+        "ok": True, "run_at": run.run_at.isoformat(),
+        "drift_score": run.drift_score,
+        "current": {
+            "wall_proximity_pts": run.current_wall_proximity_pts,
+            "wall_collapse_pct": run.current_wall_collapse_pct,
+            "wall_collapse_floor_m": run.current_wall_collapse_floor_m,
+            "absorption_fe_ratio_min": run.current_absorption_fe_ratio_min,
+        },
+        "optimal": {
+            "wall_proximity_pts": run.optimal_wall_proximity_pts,
+            "wall_collapse_pct": run.optimal_wall_collapse_pct,
+            "wall_collapse_floor_m": run.optimal_wall_collapse_floor_m,
+            "absorption_fe_ratio_min": run.optimal_absorption_fe_ratio_min,
+            "sharpe": run.optimal_sharpe,
+            "total_pnl": run.optimal_total_pnl,
+            "win_rate_pct": run.optimal_win_rate,
+        },
+    }
+
+
+@router.get("/walk_forward/runs")
+async def walk_forward_runs(limit: int = 30) -> list[dict[str, Any]]:
+    rows = await SignalIterRepository.query_walk_forward_runs(limit=limit)
+    return [
+        {"id": r.id, "run_at": r.run_at.isoformat(), "window_days": r.window_days,
+         "drift_score": r.drift_score,
+         "current": {
+             "wall_proximity_pts": r.current_wall_proximity_pts,
+             "wall_collapse_pct": r.current_wall_collapse_pct,
+             "wall_collapse_floor_m": r.current_wall_collapse_floor_m,
+             "absorption_fe_ratio_min": r.current_absorption_fe_ratio_min,
+         },
+         "optimal": {
+             "wall_proximity_pts": r.optimal_wall_proximity_pts,
+             "wall_collapse_pct": r.optimal_wall_collapse_pct,
+             "wall_collapse_floor_m": r.optimal_wall_collapse_floor_m,
+             "absorption_fe_ratio_min": r.optimal_absorption_fe_ratio_min,
+             "sharpe": r.optimal_sharpe, "total_pnl": r.optimal_total_pnl,
+             "win_rate_pct": r.optimal_win_rate,
+         },
+         "notes": r.notes}
+        for r in rows
+    ]
+
+
+@router.post("/ml/train")
+async def ml_train() -> dict[str, Any]:
+    from fef_sidecar.engine.ml_patterns import train_and_persist
+    return await train_and_persist()
+
+
+@router.get("/ml/runs")
+async def ml_runs(limit: int = 20) -> list[dict[str, Any]]:
+    rows = await SignalIterRepository.query_ml_model_runs(limit=limit)
+    return [
+        {"id": r.id, "trained_at": r.trained_at.isoformat(), "algorithm": r.algorithm,
+         "n_training_rows": r.n_training_rows, "n_features": r.n_features,
+         "train_accuracy": r.train_accuracy, "test_accuracy": r.test_accuracy,
+         "test_auc": r.test_auc, "feature_importances": r.feature_importances}
+        for r in rows
+    ]
+
+
+@router.get("/multi_strategy/configs")
+async def multi_strategy_configs() -> list[dict[str, Any]]:
+    from fef_sidecar.engine.multi_strategy import DEFAULT_STRATEGIES
+    return [
+        {"name": s.name, "description": s.description,
+         "wall_proximity_pts": s.wall_proximity_pts,
+         "wall_collapse_pct": s.wall_collapse_pct,
+         "wall_collapse_floor_m": s.wall_collapse_floor_m,
+         "absorption_fe_ratio_min": s.absorption_fe_ratio_min,
+         "base_qty": s.base_qty}
+        for s in DEFAULT_STRATEGIES
+    ]
+
+
+@router.post("/live/place_bracket")
+async def live_place_bracket(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Place a bracket order. Two-gate safety:
+       1. FEF_LIVE_TRADING=true env required
+       2. body.confirm=true required
+    Without both → DRY_RUN (writes records but doesn't hit IBKR)."""
+    from fef_sidecar.engine.live_trading import BracketSpec, place_bracket
+    s = _state(request)
+    spec = BracketSpec(
+        symbol=body["symbol"], strike=float(body["strike"]),
+        right=body["right"], expiry=body["expiry"],
+        qty=int(body["qty"]),
+        entry_limit=float(body["entry_limit"]),
+        t1_limit=float(body["t1_limit"]), t2_limit=float(body["t2_limit"]),
+        t3_limit=float(body["t3_limit"]), stop_limit=float(body["stop_limit"]),
+        t1_qty=int(body.get("t1_qty", body["qty"] // 3)),
+        t2_qty=int(body.get("t2_qty", body["qty"] // 3)),
+        t3_qty=int(body.get("t3_qty", body["qty"] - 2 * (body["qty"] // 3))),
+    )
+    return await place_bracket(
+        s.ibkr, spec, confirm=body.get("confirm", False),
+        ticket_id=body.get("ticket_id"),
+    )
+
+
+@router.post("/live/kill")
+async def live_kill(request: Request) -> dict[str, Any]:
+    """Cancel every working IBKR order under this client_id."""
+    from fef_sidecar.engine.live_trading import kill_all_orders
+    s = _state(request)
+    return await kill_all_orders(s.ibkr)
+
+
+@router.get("/live/orders")
+async def live_orders(status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    rows = await SignalIterRepository.query_live_orders(status=status, limit=limit)
+    return [
+        {"id": r.id, "submitted_at": r.submitted_at.isoformat(), "symbol": r.symbol,
+         "strike": r.strike, "right": r.right, "expiry": r.expiry, "action": r.action,
+         "qty": r.qty, "order_type": r.order_type, "limit_price": r.limit_price,
+         "parent_id": r.parent_id, "bracket_role": r.bracket_role,
+         "status": r.status, "filled_qty": r.filled_qty, "avg_fill_price": r.avg_fill_price,
+         "commission": r.commission, "dry_run": r.dry_run, "ib_order_id": r.ib_order_id}
+        for r in rows
+    ]
+
+
+@router.get("/live/positions")
+async def live_positions(limit: int = 100) -> list[dict[str, Any]]:
+    rows = await SignalIterRepository.query_live_positions(limit=limit)
+    return [
+        {"id": r.id, "snapshot_ts": r.snapshot_ts.isoformat(),
+         "symbol": r.symbol, "strike": r.strike, "right": r.right, "expiry": r.expiry,
+         "qty": r.qty, "avg_cost": r.avg_cost, "market_price": r.market_price,
+         "unrealized_pnl": r.unrealized_pnl, "delta": r.delta, "gamma": r.gamma,
+         "theta": r.theta, "vega": r.vega, "iv": r.iv}
+        for r in rows
+    ]
+
+
+@router.get("/live/status")
+async def live_status() -> dict[str, Any]:
+    """Show whether live trading is enabled + safety gates."""
+    from fef_sidecar.engine.live_trading import is_live_trading_enabled
+    return {
+        "live_trading_enabled": is_live_trading_enabled(),
+        "live_trading_env_var": "FEF_LIVE_TRADING",
+        "confirm_required_per_order": True,
+        "dry_run_default": True,
+    }
+
+
+@router.get("/calendar")
+async def get_calendar(from_date: str | None = None, to_date: str | None = None) -> list[dict[str, Any]]:
+    rows = await SignalIterRepository.query_calendar_events(from_date=from_date, to_date=to_date)
+    return [
+        {
+            "id": r.id, "event_date": r.event_date, "event_time_et": r.event_time_et,
+            "category": r.category, "title": r.title, "impact": r.impact,
+            "auto_pause_minutes_before": r.auto_pause_minutes_before,
+            "auto_pause_minutes_after": r.auto_pause_minutes_after, "notes": r.notes,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/calendar")
+async def create_calendar_event(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    from fef_sidecar.db.models import CalendarEvent
+    event = CalendarEvent(
+        event_date=body["event_date"],
+        event_time_et=body.get("event_time_et"),
+        category=body.get("category", "OTHER"),
+        title=body["title"],
+        impact=body.get("impact", "MEDIUM"),
+        auto_pause_minutes_before=int(body.get("auto_pause_minutes_before", 15)),
+        auto_pause_minutes_after=int(body.get("auto_pause_minutes_after", 30)),
+        notes=body.get("notes", ""),
+    )
+    saved = await SignalIterRepository.upsert_calendar_event(event)
+    await SignalIterRepository.write_audit_log(
+        category="calendar", actor="user",
+        summary=f"Added {event.category}: {event.title}",
+        details={"event_id": saved.id},
+    )
+    return {"ok": True, "id": saved.id}
+
+
+@router.get("/calendar/pause_check")
+async def calendar_pause_check() -> dict[str, Any]:
+    from fef_sidecar.engine.calendar import is_pause_window
+    d = await is_pause_window()
+    return {"paused": d.paused, "reason": d.reason, "event": d.event}
+
+
+@router.get("/analytics/attribution")
+async def analytics_attribution() -> dict[str, Any]:
+    from fef_sidecar.engine.perf_attribution import attribution
+    result = await attribution()
+    return {
+        k: [
+            {"bucket": s.bucket, "trades": s.trades, "wins": s.wins, "losses": s.losses,
+             "total_pnl": s.total_pnl, "avg_pnl": s.avg_pnl, "win_rate": s.win_rate}
+            for s in v
+        ]
+        for k, v in result.items()
+    }
+
+
+@router.get("/cross_symbol")
+async def cross_symbol(window_seconds: int = 120) -> dict[str, Any]:
+    from fef_sidecar.engine.cross_symbol import compute_cross_symbol_view
+    v = await compute_cross_symbol_view(window_seconds=window_seconds)
+    return {
+        "symbols_seen": v.symbols_seen,
+        "alignment_score": v.alignment_score,
+        "composite_direction": v.composite_direction,
+        "composite_confidence": v.composite_confidence,
+        "per_symbol": v.per_symbol,
+    }
+
+
+@router.get("/audit_log")
+async def audit_log(category: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    rows = await SignalIterRepository.query_audit_log(category=category, limit=limit)
+    return [
+        {"id": r.id, "timestamp": r.timestamp.isoformat(), "category": r.category,
+         "actor": r.actor, "summary": r.summary, "details": r.details}
+        for r in rows
+    ]
+
+
 @router.get("/history/bars")
 async def history_bars(
     symbol: str = "SPX",

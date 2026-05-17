@@ -306,3 +306,175 @@ class VixSample(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     timestamp_ms: int = Field(index=True)
     value: float
+
+
+# ---------------------------------------------------------------------------
+# Audit log — every config change, override, kill switch
+# ---------------------------------------------------------------------------
+
+
+class AuditLog(SQLModel, table=True):
+    """Append-only log of decisions, config changes, manual overrides.
+    Source of truth for 'what did I change Tuesday and why'."""
+
+    __tablename__ = "audit_log"
+
+    id: int | None = Field(default=None, primary_key=True)
+    timestamp: datetime = Field(default_factory=_utcnow, index=True)
+    category: str = Field(index=True, description="config / override / kill_switch / symbol_switch / order")
+    actor: str = Field(default="user", description="user / system / sidecar / auto-walk-forward")
+    summary: str
+    details: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+
+
+# ---------------------------------------------------------------------------
+# Calendar events — FOMC / CPI / NFP / OPEX
+# ---------------------------------------------------------------------------
+
+
+class CalendarEvent(SQLModel, table=True):
+    """Scheduled macro / market events. Used by the engine to auto-pause or
+    de-risk around them. Seeded with recurring patterns at startup +
+    user-editable via /calendar endpoints."""
+
+    __tablename__ = "calendar_event"
+
+    id: int | None = Field(default=None, primary_key=True)
+    event_date: str = Field(index=True, description="YYYY-MM-DD")
+    event_time_et: str | None = Field(default=None, description="HH:MM ET, null if all-day")
+    category: str = Field(index=True, description="FOMC / CPI / NFP / OPEX / EARNINGS / OTHER")
+    title: str
+    impact: str = Field(default="HIGH", description="HIGH / MEDIUM / LOW — drives auto-pause behavior")
+    auto_pause_minutes_before: int = Field(default=15, description="Minutes prior to event to pause new signals")
+    auto_pause_minutes_after: int = Field(default=30)
+    notes: str = Field(default="")
+
+
+# ---------------------------------------------------------------------------
+# Live execution — orders + positions
+# ---------------------------------------------------------------------------
+
+
+class LiveOrder(SQLModel, table=True):
+    """Order placed via the live trading scaffold. Each row tracks one
+    order's lifecycle (submitted → filled → closed)."""
+
+    __tablename__ = "live_order"
+
+    id: int | None = Field(default=None, primary_key=True)
+    submitted_at: datetime = Field(default_factory=_utcnow, index=True)
+    ticket_id: int | None = Field(default=None, foreign_key="trade_ticket.id", index=True)
+
+    ib_order_id: int | None = Field(default=None, index=True, description="IBKR-assigned order ID")
+    ib_perm_id: int | None = Field(default=None, description="IBKR permanent order ID")
+
+    symbol: str
+    strike: float
+    right: str = Field(description="C or P")
+    expiry: str = Field(description="YYYYMMDD")
+    action: str = Field(description="BUY / SELL")
+    qty: int
+    order_type: str = Field(default="LMT")
+    limit_price: float | None = None
+
+    # Bracket children — set when parent order has T1/T2/T3/stop attached
+    parent_id: int | None = Field(default=None, foreign_key="live_order.id")
+    bracket_role: str | None = Field(default=None, description="parent / t1 / t2 / t3 / stop")
+
+    status: str = Field(default="SUBMITTED", description="SUBMITTED / FILLED / PARTIAL / CANCELLED / REJECTED / CLOSED")
+    filled_qty: int = 0
+    avg_fill_price: float | None = None
+    commission: float = 0.0
+
+    last_status_at: datetime = Field(default_factory=_utcnow)
+    notes: str = Field(default="")
+
+    # If DRY_RUN, we wrote the row but never submitted to IBKR
+    dry_run: bool = Field(default=True)
+
+
+class LivePosition(SQLModel, table=True):
+    """Snapshot of an open position with live greeks. Refreshed by the
+    position monitor loop."""
+
+    __tablename__ = "live_position"
+
+    id: int | None = Field(default=None, primary_key=True)
+    snapshot_ts: datetime = Field(default_factory=_utcnow, index=True)
+
+    symbol: str
+    strike: float
+    right: str
+    expiry: str
+    qty: int
+    avg_cost: float
+    market_price: float
+    unrealized_pnl: float = 0.0
+
+    delta: float | None = None
+    gamma: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+    iv: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Auto walk-forward results — daily optimal vs current threshold drift
+# ---------------------------------------------------------------------------
+
+
+class WalkForwardRun(SQLModel, table=True):
+    """One nightly auto-walk-forward run with optimal thresholds + drift
+    from currently-configured engine values."""
+
+    __tablename__ = "walk_forward_run"
+
+    id: int | None = Field(default=None, primary_key=True)
+    run_at: datetime = Field(default_factory=_utcnow, index=True)
+    window_days: int = 7
+    train_test_split: float = 0.6
+
+    # Current config snapshot
+    current_wall_proximity_pts: float
+    current_wall_collapse_pct: float
+    current_wall_collapse_floor_m: float
+    current_absorption_fe_ratio_min: float
+
+    # Optimal from sweep
+    optimal_wall_proximity_pts: float | None = None
+    optimal_wall_collapse_pct: float | None = None
+    optimal_wall_collapse_floor_m: float | None = None
+    optimal_absorption_fe_ratio_min: float | None = None
+
+    optimal_sharpe: float | None = None
+    optimal_total_pnl: float | None = None
+    optimal_win_rate: float | None = None
+
+    # Drift magnitude: how far off is current from optimal?
+    drift_score: float = Field(default=0.0, description="0=identical, higher=more drift")
+    notes: str = Field(default="")
+
+
+# ---------------------------------------------------------------------------
+# ML pattern discovery — feature importance + win-rate model
+# ---------------------------------------------------------------------------
+
+
+class MLModelRun(SQLModel, table=True):
+    """One trained ML model run — features, predicted win rate, importance."""
+
+    __tablename__ = "ml_model_run"
+
+    id: int | None = Field(default=None, primary_key=True)
+    trained_at: datetime = Field(default_factory=_utcnow, index=True)
+    algorithm: str = Field(default="RandomForestClassifier")
+    n_training_rows: int
+    n_features: int
+
+    train_accuracy: float
+    test_accuracy: float
+    test_auc: float | None = None
+
+    # Top features by importance (sorted desc): [{name, importance}, ...]
+    feature_importances: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    notes: str = Field(default="")

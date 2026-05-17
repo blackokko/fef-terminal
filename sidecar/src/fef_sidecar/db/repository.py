@@ -13,15 +13,21 @@ from sqlmodel import select
 
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import (
+    AuditLog,
+    CalendarEvent,
     DailySession,
     FEFConfidence,
     FEFDirection,
     FlowSnapshot,
     HistoricalBar,
+    LiveOrder,
+    LivePosition,
+    MLModelRun,
     MicrostructureSample,
     SignalIter,
     TradeTicket,
     VixSample,
+    WalkForwardRun,
 )
 
 
@@ -264,6 +270,110 @@ class SignalIterRepository:
     async def write_vix(timestamp_ms: int, value: float) -> None:
         async with get_session() as session:
             session.add(VixSample(timestamp_ms=timestamp_ms, value=value))
+
+    @staticmethod
+    async def write_audit_log(category: str, summary: str,
+                              actor: str = "user", details: dict | None = None) -> None:
+        async with get_session() as session:
+            session.add(AuditLog(category=category, summary=summary,
+                                 actor=actor, details=details or {}))
+
+    @staticmethod
+    async def query_audit_log(*, category: str | None = None, limit: int = 200) -> list[AuditLog]:
+        async with get_session() as session:
+            stmt = select(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit)  # type: ignore[attr-defined]
+            if category is not None:
+                stmt = stmt.where(AuditLog.category == category)
+            return list((await session.exec(stmt)).all())
+
+    @staticmethod
+    async def upsert_calendar_event(event: CalendarEvent) -> CalendarEvent:
+        async with get_session() as session:
+            existing = await session.exec(
+                select(CalendarEvent)
+                .where(CalendarEvent.event_date == event.event_date)
+                .where(CalendarEvent.category == event.category)
+                .where(CalendarEvent.title == event.title)
+            )
+            row = existing.first()
+            if row is not None:
+                return row
+            session.add(event)
+            await session.flush()
+            await session.refresh(event)
+            return event
+
+    @staticmethod
+    async def query_calendar_events(*, from_date: str | None = None,
+                                    to_date: str | None = None) -> list[CalendarEvent]:
+        async with get_session() as session:
+            stmt = select(CalendarEvent).order_by(CalendarEvent.event_date.asc())  # type: ignore[attr-defined]
+            if from_date is not None:
+                stmt = stmt.where(CalendarEvent.event_date >= from_date)
+            if to_date is not None:
+                stmt = stmt.where(CalendarEvent.event_date <= to_date)
+            return list((await session.exec(stmt)).all())
+
+    @staticmethod
+    async def write_live_order(order: LiveOrder) -> LiveOrder:
+        async with get_session() as session:
+            session.add(order)
+            await session.flush()
+            await session.refresh(order)
+            return order
+
+    @staticmethod
+    async def query_live_orders(*, status: str | None = None,
+                                limit: int = 200) -> list[LiveOrder]:
+        async with get_session() as session:
+            stmt = select(LiveOrder).order_by(LiveOrder.submitted_at.desc()).limit(limit)  # type: ignore[attr-defined]
+            if status is not None:
+                stmt = stmt.where(LiveOrder.status == status)
+            return list((await session.exec(stmt)).all())
+
+    @staticmethod
+    async def update_live_order(order_id: int, **fields: object) -> None:
+        async with get_session() as session:
+            row = (await session.exec(select(LiveOrder).where(LiveOrder.id == order_id))).first()
+            if row is None:
+                return
+            for k, v in fields.items():
+                setattr(row, k, v)
+            row.last_status_at = datetime.now(UTC)
+
+    @staticmethod
+    async def write_live_position(pos: LivePosition) -> None:
+        async with get_session() as session:
+            session.add(pos)
+
+    @staticmethod
+    async def query_live_positions(*, since_ms: int | None = None,
+                                   limit: int = 100) -> list[LivePosition]:
+        async with get_session() as session:
+            stmt = select(LivePosition).order_by(LivePosition.snapshot_ts.desc()).limit(limit)  # type: ignore[attr-defined]
+            return list((await session.exec(stmt)).all())
+
+    @staticmethod
+    async def write_walk_forward_run(run: WalkForwardRun) -> None:
+        async with get_session() as session:
+            session.add(run)
+
+    @staticmethod
+    async def query_walk_forward_runs(limit: int = 30) -> list[WalkForwardRun]:
+        async with get_session() as session:
+            stmt = select(WalkForwardRun).order_by(WalkForwardRun.run_at.desc()).limit(limit)  # type: ignore[attr-defined]
+            return list((await session.exec(stmt)).all())
+
+    @staticmethod
+    async def write_ml_model_run(run: MLModelRun) -> None:
+        async with get_session() as session:
+            session.add(run)
+
+    @staticmethod
+    async def query_ml_model_runs(limit: int = 20) -> list[MLModelRun]:
+        async with get_session() as session:
+            stmt = select(MLModelRun).order_by(MLModelRun.trained_at.desc()).limit(limit)  # type: ignore[attr-defined]
+            return list((await session.exec(stmt)).all())
 
     @staticmethod
     async def list_historical_dates(symbol: str) -> list[str]:

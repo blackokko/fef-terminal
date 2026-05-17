@@ -28,6 +28,7 @@ from fef_sidecar.loop import (
     account_poll_loop,
     bar_stream_loop,
     fef_tick_loop,
+    hft_loop,
     ibkr_health_check_loop,
     microstructure_loop,
     quantdata_poll_loop,
@@ -103,6 +104,15 @@ def spawn_data_loops(state: AppState) -> None:
     state.microstructure_task = asyncio.create_task(
         microstructure_loop(state), name="microstructure-loop"
     )
+    state.hft_task = asyncio.create_task(hft_loop(state), name="hft-loop")
+    from fef_sidecar.engine.position_monitor import position_monitor_loop
+    state.position_task = asyncio.create_task(
+        position_monitor_loop(state), name="position-monitor-loop"
+    )
+    from fef_sidecar.engine.auto_walk_forward import nightly_scheduler
+    state.auto_wf_task = asyncio.create_task(
+        nightly_scheduler(state), name="auto-walk-forward-scheduler"
+    )
 
 
 async def cancel_data_loops(state: AppState) -> None:
@@ -112,6 +122,7 @@ async def cancel_data_loops(state: AppState) -> None:
         state.loop_task, state.bar_task, state.tick_task,
         state.quantdata_poll_task, state.health_check_task,
         state.vix_task, state.account_task, state.microstructure_task,
+        state.hft_task,
     ]
     for t in tasks:
         if t is not None:
@@ -125,6 +136,7 @@ async def cancel_data_loops(state: AppState) -> None:
     state.loop_task = state.bar_task = state.tick_task = None
     state.quantdata_poll_task = state.health_check_task = None
     state.vix_task = state.account_task = state.microstructure_task = None
+    state.hft_task = None
 
 
 @asynccontextmanager
@@ -132,6 +144,8 @@ async def lifespan(app: FastAPI):
     logger.info("fef-sidecar starting up")
     await init_db()
     await _seed_defaults_on_first_run()
+    from fef_sidecar.engine.calendar import seed_calendar_if_empty
+    await seed_calendar_if_empty()
 
     state = AppState.build()
     app.state.fef = state
@@ -165,6 +179,7 @@ async def lifespan(app: FastAPI):
             state.vix_task,
             state.account_task,
             state.microstructure_task,
+            state.hft_task,
         ):
             if task is not None:
                 task.cancel()  # type: ignore[attr-defined]

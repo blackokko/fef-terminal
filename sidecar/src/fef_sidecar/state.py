@@ -79,6 +79,13 @@ class AppState:
     last_account: object | None = None  # AccountSummary or None
     microstructure_state: MicrostructureState = field(default_factory=MicrostructureState)
     microstructure_task: object | None = None
+    # HFT signal subsystems
+    vol_state: object | None = None    # RealizedVolState
+    stuffing_state: object | None = None  # StuffingState
+    depth_state: object | None = None  # DepthState
+    hft_task: object | None = None
+    position_task: object | None = None
+    auto_wf_task: object | None = None
     # Active symbol — drives which contract is fed to bar/tick/iter loops and
     # which ticker is set on the QuantData page filter. Changing it triggers
     # a loop restart (api.py /config/symbol POST handler).
