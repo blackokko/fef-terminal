@@ -110,6 +110,8 @@ export function SidecarProvider({
           };
         case "status":
           return { ...prev, lastStatus: event };
+        default:
+          return prev;  // unknown event type — keep state unchanged
       }
     });
   }, []);

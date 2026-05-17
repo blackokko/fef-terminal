@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { ChartAnnotationsPanel } from "../panels/ChartAnnotationsPanel";
 import { MicrostructurePanel } from "../panels/MicrostructurePanel";
@@ -28,6 +29,10 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "config", label: "Config" },
 ];
 
+function Safe({ name, children }: { name: string; children: ReactNode }) {
+  return <ErrorBoundary label={name}>{children}</ErrorBoundary>;
+}
+
 export function Sidebar() {
   const [tab, setTab] = useState<Tab>("trade");
 
@@ -48,40 +53,40 @@ export function Sidebar() {
       <div className="sidebar-tab-content">
         {tab === "trade" && (
           <>
-            <AccountScorecardPanel />
-            <RiskOverlayPanel />
-            <RegimePanel />
-            <FEFVerdictPanel />
-            <MicrostructurePanel />
-            <OrderTicketPanel />
-            <OptionChainPanel />
+            <Safe name="AccountScorecard"><AccountScorecardPanel /></Safe>
+            <Safe name="RiskOverlay"><RiskOverlayPanel /></Safe>
+            <Safe name="Regime"><RegimePanel /></Safe>
+            <Safe name="FEFVerdict"><FEFVerdictPanel /></Safe>
+            <Safe name="Microstructure"><MicrostructurePanel /></Safe>
+            <Safe name="OrderTicket"><OrderTicketPanel /></Safe>
+            <Safe name="OptionChain"><OptionChainPanel /></Safe>
           </>
         )}
         {tab === "data" && (
           <>
-            <QuantDataPanel />
-            <SignalLogPanel />
+            <Safe name="QuantData"><QuantDataPanel /></Safe>
+            <Safe name="SignalLog"><SignalLogPanel /></Safe>
           </>
         )}
         {tab === "patterns" && (
           <>
-            <TournamentPanel />
-            <PatternLibraryPanel />
-            <StrategyPresetsPanel />
+            <Safe name="Tournament"><TournamentPanel /></Safe>
+            <Safe name="PatternLibrary"><PatternLibraryPanel /></Safe>
+            <Safe name="StrategyPresets"><StrategyPresetsPanel /></Safe>
           </>
         )}
         {tab === "history" && (
           <>
-            <AnalyticsPanel />
-            <OptimizePanel />
-            <ReplayPanel />
+            <Safe name="Analytics"><AnalyticsPanel /></Safe>
+            <Safe name="Optimize"><OptimizePanel /></Safe>
+            <Safe name="Replay"><ReplayPanel /></Safe>
           </>
         )}
         {tab === "config" && (
           <>
-            <SettingsPanel />
-            <ChartAnnotationsPanel />
-            <GlossaryPanel />
+            <Safe name="Settings"><SettingsPanel /></Safe>
+            <Safe name="ChartAnnotations"><ChartAnnotationsPanel /></Safe>
+            <Safe name="Glossary"><GlossaryPanel /></Safe>
           </>
         )}
       </div>
