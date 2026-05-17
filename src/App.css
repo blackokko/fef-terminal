@@ -1377,6 +1377,55 @@ button:active {
   cursor: pointer;
 }
 
+/* Live quote panel */
+.live-quote-panel { background: var(--color-bg); }
+.live-quote-source {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+.live-quote-hero {
+  text-align: center;
+  padding: 8px 0;
+  background: var(--color-bg-elevated);
+  border-radius: 4px;
+  margin-bottom: 6px;
+}
+.live-quote-last {
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 700;
+  transition: color 0.15s, text-shadow 0.15s;
+}
+.live-quote-last.flash-up { color: var(--color-green); text-shadow: 0 0 10px rgba(63, 185, 80, 0.6); }
+.live-quote-last.flash-down { color: var(--color-red); text-shadow: 0 0 10px rgba(248, 81, 73, 0.6); }
+.live-quote-book {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+  align-items: center;
+}
+.live-quote-side {
+  background: var(--color-bg-elevated);
+  padding: 6px 4px;
+  border-radius: 3px;
+  text-align: center;
+}
+.live-quote-bid { border-left: 3px solid var(--color-green); }
+.live-quote-ask { border-left: 3px solid var(--color-red); }
+.live-quote-price {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 14px;
+}
+.live-quote-spread {
+  text-align: center;
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+.live-quote-spread-dollars { font-size: 14px; }
+
 /* HFT panel */
 .hft-panel { background: var(--color-bg); }
 .hft-composite {

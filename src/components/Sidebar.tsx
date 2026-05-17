@@ -8,6 +8,7 @@ import { CrossSymbolPanel } from "../panels/CrossSymbolPanel";
 import { HFTPanel } from "../panels/HFTPanel";
 import { LiveExecutionPanel } from "../panels/LiveExecutionPanel";
 import { LivePositionsPanel } from "../panels/LivePositionsPanel";
+import { LiveQuotePanel } from "../panels/LiveQuotePanel";
 import { MLPanel } from "../panels/MLPanel";
 import { MultiStrategyPanel } from "../panels/MultiStrategyPanel";
 import { WalkForwardPanel } from "../panels/WalkForwardPanel";
@@ -66,6 +67,7 @@ export function Sidebar() {
             <Safe name="AccountScorecard"><AccountScorecardPanel /></Safe>
             <Safe name="RiskOverlay"><RiskOverlayPanel /></Safe>
             <Safe name="Regime"><RegimePanel /></Safe>
+            <Safe name="LiveQuote"><LiveQuotePanel /></Safe>
             <Safe name="FEFVerdict"><FEFVerdictPanel /></Safe>
             <Safe name="HFT"><HFTPanel /></Safe>
             <Safe name="Microstructure"><MicrostructurePanel /></Safe>

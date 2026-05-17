@@ -224,6 +224,52 @@ async def multi_strategy_configs() -> list[dict[str, Any]]:
     ]
 
 
+@router.get("/quote/{symbol}")
+async def quote(request: Request, symbol: str) -> dict[str, Any]:
+    """Live bid/ask/last for any supported symbol.
+
+    Works with whichever IBKR provider is configured (mock or live).
+    For futures (ES, NQ, RTY) returns the front-month continuous contract.
+    Bid-ask spread + spread% included for liquidity check before entering."""
+    from fef_sidecar.ibkr.models import Contract
+
+    s = _state(request)
+    try:
+        contract = Contract.for_symbol(symbol)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+    try:
+        q = await s.ibkr.get_last_quote(contract)
+    except Exception as e:
+        raise HTTPException(503, f"Quote fetch failed: {e}") from e
+
+    bid = q.bid if q.bid is not None else None
+    ask = q.ask if q.ask is not None else None
+    last = q.last
+    spread = (ask - bid) if (bid is not None and ask is not None) else None
+    spread_pct = (spread / last * 100) if (spread is not None and last) else None
+
+    provider_name = type(s.ibkr).__name__
+    is_live = provider_name == "LiveIBKRProvider"
+
+    return {
+        "symbol": symbol.upper(),
+        "exchange": contract.exchange,
+        "kind": contract.kind.value if hasattr(contract.kind, "value") else str(contract.kind),
+        "last": round(last, 2) if last else None,
+        "bid": round(bid, 2) if bid is not None else None,
+        "ask": round(ask, 2) if ask is not None else None,
+        "bid_size": q.bid_size,
+        "ask_size": q.ask_size,
+        "spread": round(spread, 4) if spread is not None else None,
+        "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
+        "timestamp_ms": int(q.timestamp.timestamp() * 1000),
+        "source": "live" if is_live else "mock",
+        "provider": provider_name,
+    }
+
+
 @router.post("/live/place_bracket")
 async def live_place_bracket(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Place a bracket order. Two-gate safety:
