@@ -324,6 +324,67 @@ body,
   border-top: 1px solid var(--color-border);
 }
 
+/* Annotations */
+
+.annotations-body { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.annotations-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.annotation-row {
+  display: grid;
+  grid-template-columns: 12px 60px 1fr 20px;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 6px;
+  background: var(--color-bg-elevated);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.annotation-swatch { width: 12px; height: 12px; border-radius: 2px; }
+.annotation-price { font-weight: 600; }
+.annotation-label { color: var(--color-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.annotation-delete { padding: 0 4px; font-size: 14px; line-height: 1; background: transparent; border: none; cursor: pointer; color: var(--color-text-muted); }
+.annotation-delete:hover { color: var(--color-red); }
+.annotation-create {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.annotation-create .settings-input { width: 80px; }
+
+/* Option chain */
+
+.chain-body { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.chain-controls { display: flex; align-items: center; gap: 8px; }
+.chain-grid { display: flex; flex-direction: column; font-family: var(--font-mono); font-size: 11px; max-height: 360px; overflow-y: auto; }
+.chain-header {
+  display: grid;
+  grid-template-columns: 1fr 50px 1fr;
+  gap: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  padding: 4px 0;
+  border-bottom: 1px solid var(--color-border);
+  text-align: center;
+}
+.chain-row {
+  display: grid;
+  grid-template-columns: 1fr 50px 1fr;
+  gap: 6px;
+  padding: 2px 0;
+  border-bottom: 1px solid var(--color-bg);
+  text-align: center;
+}
+.chain-row.chain-atm {
+  background: var(--color-bg-elevated);
+  font-weight: 600;
+}
+.chain-strike { color: var(--color-text-muted); }
+.chain-cell { text-align: center; }
+.chain-call { color: var(--color-green); text-align: right; }
+.chain-put { color: var(--color-red); text-align: left; }
+
 /* Chart pane */
 
 .chart-pane {

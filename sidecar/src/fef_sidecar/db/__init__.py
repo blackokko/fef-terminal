@@ -18,6 +18,7 @@ Public entrypoints:
 
 from fef_sidecar.db.engine import dispose_db, get_session, init_db
 from fef_sidecar.db.models import (
+    ChartAnnotation,
     DailySession,
     FEFConfidence,
     FEFDirection,
@@ -29,6 +30,7 @@ from fef_sidecar.db.models import (
 from fef_sidecar.db.repository import SignalIterRepository
 
 __all__ = [
+    "ChartAnnotation",
     "DailySession",
     "FEFConfidence",
     "FEFDirection",

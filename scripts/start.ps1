@@ -88,9 +88,22 @@ Write-Host "[FEF] Using shell: $psExe" -ForegroundColor DarkGray
 # Add Rust cargo bin to PATH so `npm run tauri` finds cargo even in fresh shells
 $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 
-Write-Host "[FEF] Starting Python sidecar..." -ForegroundColor Cyan
-$sidecarCmd = "Set-Location '$repo\sidecar'; & .\.venv\Scripts\Activate.ps1; `$env:FEF_PROVIDER_QUANTDATA='$QuantDataMode'; `$env:FEF_PROVIDER_IBKR='$IbkrMode'; `$env:FEF_LOOP_INTERVAL_SEC='$LoopIntervalSec'; fef-sidecar"
-Start-Process $psExe -ArgumentList "-NoExit", "-Command", $sidecarCmd -WindowStyle Normal
+# IMPROVEMENTS #O: spawn sidecar in a watchdog loop — auto-respawn after 3s if it crashes
+Write-Host "[FEF] Starting Python sidecar (with watchdog)..." -ForegroundColor Cyan
+$sidecarLoop = @"
+`$env:FEF_PROVIDER_QUANTDATA='$QuantDataMode'
+`$env:FEF_PROVIDER_IBKR='$IbkrMode'
+`$env:FEF_LOOP_INTERVAL_SEC='$LoopIntervalSec'
+Set-Location '$repo\sidecar'
+& .\.venv\Scripts\Activate.ps1
+while (`$true) {
+  Write-Host "[watchdog] Starting fef-sidecar at `$(Get-Date -Format 'HH:mm:ss')..." -ForegroundColor Yellow
+  fef-sidecar
+  Write-Host "[watchdog] Sidecar exited (code `$LASTEXITCODE). Restarting in 3s..." -ForegroundColor Red
+  Start-Sleep -Seconds 3
+}
+"@
+Start-Process $psExe -ArgumentList "-NoExit", "-Command", $sidecarLoop -WindowStyle Normal
 
 # Wait for /healthz
 Write-Host "[FEF] Waiting for sidecar /healthz..." -ForegroundColor Cyan

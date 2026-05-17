@@ -303,6 +303,124 @@ async def apply_preset(preset_id: int, request: Request) -> dict[str, Any]:
         }
 
 
+# IMPROVEMENTS #Q: chart annotations — user-marked horizontal levels
+@router.get("/annotations")
+async def list_annotations() -> list[dict[str, Any]]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import ChartAnnotation
+
+    async with get_session() as session:
+        rows = (await session.exec(select(ChartAnnotation))).all()
+        return [
+            {
+                "id": a.id,
+                "price": a.price,
+                "label": a.label,
+                "color": a.color,
+                "line_style": a.line_style,
+            }
+            for a in rows
+        ]
+
+
+@router.post("/annotations")
+async def create_annotation(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import ChartAnnotation
+
+    async with get_session() as session:
+        a = ChartAnnotation(
+            price=float(body["price"]),
+            label=str(body.get("label", "")),
+            color=str(body.get("color", "#d29922")),
+            line_style=str(body.get("line_style", "dashed")),
+        )
+        session.add(a)
+        await session.flush()
+        return {"ok": True, "id": a.id}
+
+
+@router.delete("/annotations/{annotation_id}")
+async def delete_annotation(annotation_id: int) -> dict[str, Any]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import ChartAnnotation
+
+    async with get_session() as session:
+        a = (await session.exec(select(ChartAnnotation).where(ChartAnnotation.id == annotation_id))).first()
+        if a is None:
+            raise HTTPException(404, f"Annotation {annotation_id} not found")
+        await session.delete(a)
+        return {"ok": True}
+
+
+# IMPROVEMENTS #D: option chain ladder — N strikes around spot for 0DTE expiry
+@router.get("/option_chain")
+async def option_chain(
+    request: Request,
+    strike_range: int = 30,
+    expiry: str | None = None,
+) -> dict[str, Any]:
+    """Return calls + puts at strikes within ±strike_range of current SPX.
+
+    expiry: YYYYMMDD; defaults to today's session_date for 0DTE.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from fef_sidecar.ibkr.models import Contract, ContractKind
+
+    s = _state(request)
+    if expiry is None:
+        et = timezone(timedelta(hours=-4))
+        expiry = datetime.now(et).strftime("%Y%m%d")
+
+    spx = s.last_spx_price or 7400.0
+    # Round to nearest 5 then ±strike_range in 5-pt steps
+    center = round(spx / 5) * 5
+    strikes = [center + d for d in range(-strike_range, strike_range + 1, 5)]
+
+    calls: list[dict[str, Any]] = []
+    puts: list[dict[str, Any]] = []
+
+    async def _fetch(strike: float, right: str):
+        contract = Contract(
+            symbol="SPX",
+            kind=ContractKind.OPTION,
+            exchange="CBOE",
+            expiry=expiry,
+            strike=strike,
+            right=right,
+        )
+        try:
+            q = await s.ibkr.get_option_quote(contract)
+            return {
+                "strike": strike,
+                "right": right,
+                "last": q.last,
+                "bid": q.bid,
+                "ask": q.ask,
+                "delta": q.delta,
+            }
+        except Exception:
+            return None
+
+    import asyncio as _asyncio
+
+    call_results = await _asyncio.gather(*[_fetch(k, "C") for k in strikes])
+    put_results = await _asyncio.gather(*[_fetch(k, "P") for k in strikes])
+    for r in call_results:
+        if r:
+            calls.append(r)
+    for r in put_results:
+        if r:
+            puts.append(r)
+
+    return {"spx_price": spx, "expiry": expiry, "calls": calls, "puts": puts}
+
+
 # IMPROVEMENTS #19: replay a past session — return all iters in order
 @router.get("/history/replay/{date}")
 async def replay_session(date: str) -> list[dict[str, Any]]:

@@ -142,6 +142,19 @@ class StrategyPreset(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
+class ChartAnnotation(SQLModel, table=True):
+    """IMPROVEMENTS #Q — user-marked horizontal levels persisted to the chart."""
+
+    __tablename__ = "chart_annotation"
+
+    id: int | None = Field(default=None, primary_key=True)
+    price: float
+    label: str = Field(default="")
+    color: str = Field(default="#d29922")  # amber default
+    line_style: str = Field(default="dashed")  # solid | dashed | dotted
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 class DailySession(SQLModel, table=True):
     """Per-session aggregates, updated incrementally during the day."""
 

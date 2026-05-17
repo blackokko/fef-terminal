@@ -1,5 +1,7 @@
+import { ChartAnnotationsPanel } from "../panels/ChartAnnotationsPanel";
 import { FEFVerdictPanel } from "../panels/FEFVerdictPanel";
 import { GlossaryPanel } from "../panels/GlossaryPanel";
+import { OptionChainPanel } from "../panels/OptionChainPanel";
 import { OrderTicketPanel } from "../panels/OrderTicketPanel";
 import { QuantDataPanel } from "../panels/QuantDataPanel";
 import { ReplayPanel } from "../panels/ReplayPanel";
@@ -12,9 +14,11 @@ export function Sidebar() {
     <aside className="sidebar">
       <FEFVerdictPanel />
       <OrderTicketPanel />
+      <OptionChainPanel />
       <QuantDataPanel />
       <SignalLogPanel />
       <StrategyPresetsPanel />
+      <ChartAnnotationsPanel />
       <ReplayPanel />
       <SettingsPanel />
       <GlossaryPanel />
