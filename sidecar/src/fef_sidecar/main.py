@@ -111,13 +111,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="fef-sidecar", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:1420",
-        "http://127.0.0.1:1420",
-        "tauri://localhost",
-        "https://tauri.localhost",
-    ],
-    allow_credentials=True,
+    # Sidecar binds 127.0.0.1 only — no risk from external origins. Wildcard
+    # covers every Tauri scheme/host combination across Windows/macOS/Linux,
+    # dev mode, release mode, and any future origin changes from Tauri.
+    allow_origins=["*"],
+    allow_credentials=False,  # can't be True with wildcard origin
     allow_methods=["*"],
     allow_headers=["*"],
 )

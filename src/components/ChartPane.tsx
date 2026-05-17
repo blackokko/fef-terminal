@@ -156,17 +156,27 @@ export function ChartPane() {
   }, []);
 
   // Poll /bars every 3s. Refetches immediately when symbol/timeframe change.
+  const [fetchError, setFetchError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     const fetchBars = async () => {
       try {
-        const r = await fetch(
-          `${API_BASE}/bars?symbol=${symbol}&bar_size=${encodeURIComponent(timeframe)}&duration=1 D`,
-        );
-        if (!r.ok || cancelled) return;
+        const url = `${API_BASE}/bars?symbol=${encodeURIComponent(symbol)}&bar_size=${encodeURIComponent(timeframe)}`;
+        const r = await fetch(url);
+        if (cancelled) return;
+        if (!r.ok) {
+          setFetchError(`HTTP ${r.status}`);
+          return;
+        }
         const data = (await r.json()) as FetchedBar[];
-        if (!cancelled) setBars(data);
-      } catch {}
+        if (!cancelled) {
+          setBars(data);
+          setFetchError(null);
+        }
+      } catch (e) {
+        setFetchError(`fetch failed: ${(e as Error).message}`);
+        console.error("bars fetch failed:", e);
+      }
     };
     // Reset render state on symbol/timeframe change so we re-setData
     renderedBarCountRef.current = 0;
@@ -305,7 +315,17 @@ export function ChartPane() {
       <div ref={containerRef} className="chart-container" />
       {bars.length === 0 && (
         <div className="chart-overlay-empty">
-          <p>Loading {symbol} {timeframe}…</p>
+          {fetchError ? (
+            <>
+              <p style={{ color: "var(--color-red)" }}>Chart fetch error</p>
+              <p className="chart-placeholder-hint">{fetchError}</p>
+              <p className="chart-placeholder-hint">
+                Check the sidecar console + restart the app
+              </p>
+            </>
+          ) : (
+            <p>Loading {symbol} {timeframe}…</p>
+          )}
         </div>
       )}
     </div>
