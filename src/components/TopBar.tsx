@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { useSidecar } from "../context/WebSocketContext";
 import { popoutChart } from "../lib/popoutChart";
 
@@ -9,16 +10,58 @@ const connectionColor: Record<string, string> = {
 };
 
 export function TopBar() {
-  const { connection, lastTick, lastIter, lastStatus } = useSidecar();
-
+  const { connection, lastTick, lastIter, lastStatus, lastSnapshot } = useSidecar();
   const spx = lastTick?.spx_price ?? lastIter?.spx_price;
+
+  // IMPROVEMENTS #I: price flash on tick — micro-flash green/red on direction
+  const prevSpxRef = useRef<number | undefined>(spx);
+  const [flash, setFlash] = useState<"up" | "down" | null>(null);
+  useEffect(() => {
+    if (spx == null || prevSpxRef.current == null) {
+      prevSpxRef.current = spx;
+      return;
+    }
+    if (spx > prevSpxRef.current) {
+      setFlash("up");
+    } else if (spx < prevSpxRef.current) {
+      setFlash("down");
+    }
+    prevSpxRef.current = spx;
+    const t = window.setTimeout(() => setFlash(null), 300);
+    return () => window.clearTimeout(t);
+  }, [spx]);
+
+  // IMPROVEMENTS #N: stale-data audio chime if QuantData snapshot stalls >60s
+  const staleAlertedRef = useRef(false);
+  useEffect(() => {
+    if (!lastSnapshot) return;
+    const interval = window.setInterval(() => {
+      const age = Date.now() - lastSnapshot.timestamp_ms;
+      if (age > 60_000 && !staleAlertedRef.current) {
+        staleAlertedRef.current = true;
+        void import("../lib/audioAlert").then((m) =>
+          m.playTones?.([392, 311.13], 0.25, 0.18),
+        );  // descending warning tone
+      } else if (age < 30_000) {
+        staleAlertedRef.current = false;
+      }
+    }, 5000);
+    return () => window.clearInterval(interval);
+  }, [lastSnapshot]);
 
   return (
     <header className="topbar">
       <div className="topbar-section">
         <span className="topbar-label">SPX</span>
-        <span className="topbar-price">
+        <span className={`topbar-price ${flash ? `flash-${flash}` : ""}`}>
           {spx != null ? spx.toFixed(2) : "—"}
+        </span>
+      </div>
+
+      <div className="topbar-section">
+        <span className="topbar-label">VIX</span>
+        <span className="topbar-value">
+          {(lastStatus as any)?.vix != null ? (lastStatus as any).vix.toFixed(2) : "—"}
         </span>
       </div>
 
@@ -50,7 +93,7 @@ export function TopBar() {
           ⧉ Pop chart
         </button>
         {lastStatus?.quantdata?.startsWith("Mock") && lastStatus?.ibkr === "connected" && (
-          <span className="all-mock-banner" title="Both providers are mock — signals are replay only, not live data">
+          <span className="all-mock-banner" title="Both providers are mock — signals are replay only">
             ⚠ ALL MOCK
           </span>
         )}

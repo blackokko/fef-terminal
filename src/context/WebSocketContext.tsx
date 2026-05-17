@@ -91,6 +91,109 @@ export function SidecarProvider({
     });
   }, []);
 
+  // Pre-fetch initial state on mount so the UI populates immediately
+  // instead of waiting for WS events to trickle in.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [statusR, signalsR] = await Promise.all([
+          fetch("http://127.0.0.1:8765/status"),
+          fetch("http://127.0.0.1:8765/history/signals?limit=10"),
+        ]);
+        if (cancelled) return;
+        if (statusR.ok) {
+          const s = await statusR.json();
+          // Synthesize a StatusEvent from /status payload
+          setState((prev) => ({
+            ...prev,
+            lastStatus: {
+              type: "status",
+              timestamp_ms: Date.now(),
+              quantdata: s.quantdata,
+              ibkr: s.ibkr,
+              engine: s.engine_history_size > 0 ? "running" : "stopped",
+              history_size: s.engine_history_size,
+            },
+          }));
+        }
+        if (signalsR.ok) {
+          const signals = await signalsR.json();
+          if (signals.length > 0) {
+            // signals are descending — first is newest
+            const newest = signals[0];
+            // Build a synthetic IterEvent from the most recent SignalIter row
+            setState((prev) => ({
+              ...prev,
+              lastIter: {
+                type: "iter",
+                timestamp_ms: newest.timestamp ? new Date(newest.timestamp).getTime() : Date.now(),
+                iter_num: newest.iter_num,
+                session_date: newest.session_date,
+                spx_price: newest.spx_price,
+                verdict: {
+                  direction: newest.direction,
+                  confidence: newest.confidence,
+                  reasoning: newest.reasoning,
+                  ...(newest.extras || {}),
+                  suggested_qty: newest.extras?.suggested_qty ?? null,
+                  strike_rec: newest.extras?.strike_rec ?? null,
+                  t1: newest.extras?.t1 ?? null,
+                  t2: newest.extras?.t2 ?? null,
+                  t3: newest.extras?.t3 ?? null,
+                  stop: newest.extras?.stop ?? null,
+                  delta_price: newest.extras?.delta_price ?? null,
+                  delta_drift_m: newest.extras?.delta_drift_m ?? null,
+                  fe_ratio: newest.extras?.fe_ratio ?? null,
+                  aligned: newest.extras?.aligned ?? false,
+                  absorption: newest.extras?.absorption ?? false,
+                  wall_proximity_skip: newest.extras?.wall_proximity_skip ?? false,
+                  wall_collapse_trigger: newest.extras?.wall_collapse_trigger ?? false,
+                  nearest_wall_strike: newest.extras?.nearest_wall_strike ?? null,
+                  nearest_wall_distance: newest.extras?.nearest_wall_distance ?? null,
+                  secondary_scores: newest.extras?.secondary_scores ?? {},
+                  option_pricing: newest.extras?.option_pricing ?? null,
+                },
+                snapshot: {
+                  top_gex: newest.top_gex_walls || [],
+                  top_dex: newest.top_dex_walls || [],
+                  drift: { cum_net_m: newest.drift_cum_net_m, bias: newest.drift_bias },
+                  ntm_max_pain: newest.ntm_max_pain,
+                  raw_max_pain: newest.raw_max_pain,
+                  aggression: newest.aggression_call_pct != null ? {
+                    call_pct: newest.aggression_call_pct,
+                    put_pct: newest.aggression_put_pct,
+                  } : null,
+                },
+              },
+              recentIters: signals.reverse().map((r: any) => ({
+                type: "iter",
+                timestamp_ms: r.timestamp ? new Date(r.timestamp).getTime() : Date.now(),
+                iter_num: r.iter_num,
+                session_date: r.session_date,
+                spx_price: r.spx_price,
+                verdict: { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning },
+                snapshot: {
+                  top_gex: r.top_gex_walls || [],
+                  top_dex: r.top_dex_walls || [],
+                  drift: { cum_net_m: r.drift_cum_net_m, bias: r.drift_bias },
+                  ntm_max_pain: r.ntm_max_pain,
+                  raw_max_pain: r.raw_max_pain,
+                  aggression: null,
+                },
+              })),
+            }));
+          }
+        }
+      } catch (e) {
+        // Sidecar not up yet — WS connect will retry
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 

@@ -34,7 +34,11 @@ param(
     [ValidateSet("mock", "live")]
     [string]$IbkrMode = "mock",
 
-    [int]$LoopIntervalSec = 120
+    [int]$LoopIntervalSec = 120,
+
+    # Default to the release build for fast startup. Pass -Dev to use
+    # `npm run tauri dev` instead (HMR + dev tools, slower).
+    [switch]$Dev
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,10 +113,20 @@ if (-not $ready) {
     Write-Host "[OK] Sidecar ready" -ForegroundColor Green
 }
 
-# Spawn Tauri dev
-Write-Host "[FEF] Launching Tauri app..." -ForegroundColor Cyan
-$tauriCmd = "Set-Location '$repo'; `$env:Path = '$cargoBin;' + `$env:Path; npm run tauri dev"
-Start-Process $psExe -ArgumentList "-NoExit", "-Command", $tauriCmd -WindowStyle Normal
+# Spawn Tauri app — release exe by default (fast), dev mode if -Dev passed
+$releaseExe = "D:\fef-terminal-builds\target\release\fef-terminal.exe"
+if ($Dev -or -not (Test-Path $releaseExe)) {
+    if (-not (Test-Path $releaseExe)) {
+        Write-Warning "Release exe not found at $releaseExe — falling back to dev mode."
+        Write-Warning "Run 'npm run tauri build' from $repo to produce the release build."
+    }
+    Write-Host "[FEF] Launching Tauri DEV..." -ForegroundColor Cyan
+    $tauriCmd = "Set-Location '$repo'; `$env:Path = '$cargoBin;' + `$env:Path; npm run tauri dev"
+    Start-Process $psExe -ArgumentList "-NoExit", "-Command", $tauriCmd -WindowStyle Normal
+} else {
+    Write-Host "[FEF] Launching Tauri release: $releaseExe" -ForegroundColor Cyan
+    Start-Process $releaseExe
+}
 
 Write-Host ""
 Write-Host "[FEF] All processes started. Close each window to stop." -ForegroundColor Green

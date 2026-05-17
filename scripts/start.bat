@@ -29,8 +29,15 @@ start "fef-sidecar" /D "%REPO%\sidecar" cmd /k ".venv\Scripts\activate && fef-si
 REM Give sidecar a moment to bind 127.0.0.1:8765
 timeout /t 3 /nobreak >nul
 
-echo [FEF] Launching Tauri app...
-start "fef-terminal" /D "%REPO%" cmd /k "npm run tauri dev"
+REM Prefer the release exe if it exists; fall back to dev mode otherwise.
+set RELEASE_EXE=D:\fef-terminal-builds\target\release\fef-terminal.exe
+if exist "%RELEASE_EXE%" (
+  echo [FEF] Launching Tauri release: %RELEASE_EXE%
+  start "" "%RELEASE_EXE%"
+) else (
+  echo [FEF] Release exe not found, launching dev mode (slower startup)...
+  start "fef-terminal" /D "%REPO%" cmd /k "npm run tauri dev"
+)
 
 echo [FEF] Both processes started. Close each console window to stop.
 endlocal

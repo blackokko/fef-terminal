@@ -25,7 +25,7 @@ export function playBearishChime(): void {
   playTones([783.99, 523.25], 0.18);  // G5, C5
 }
 
-function playTones(frequencies: number[], duration: number, volume = 0.15): void {
+export function playTones(frequencies: number[], duration: number, volume = 0.15): void {
   const c = ctx();
   if (!c) return;
   if (c.state === "suspended") {

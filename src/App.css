@@ -107,6 +107,17 @@ body,
 .topbar-price {
   font-size: 18px;
   font-weight: 600;
+  transition: color 0.15s, text-shadow 0.15s;
+}
+
+.topbar-price.flash-up {
+  color: var(--color-green);
+  text-shadow: 0 0 8px rgba(63, 185, 80, 0.5);
+}
+
+.topbar-price.flash-down {
+  color: var(--color-red);
+  text-shadow: 0 0 8px rgba(248, 81, 73, 0.5);
 }
 
 .topbar-value {
@@ -248,6 +259,43 @@ body,
   flex-direction: column;
   gap: 4px;
 }
+
+/* Toasts */
+
+.toast-container {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 9999;
+  pointer-events: none;
+}
+
+.toast {
+  padding: 10px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: var(--font-sans);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  background: var(--color-bg-elevated);
+  border-left: 3px solid var(--color-blue);
+  color: var(--color-text);
+  min-width: 200px;
+  max-width: 400px;
+  animation: toast-slide-in 0.2s ease;
+}
+
+@keyframes toast-slide-in {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.toast-success { border-left-color: var(--color-green); }
+.toast-error   { border-left-color: var(--color-red); }
+.toast-warn    { border-left-color: var(--color-amber); }
+.toast-info    { border-left-color: var(--color-blue); }
 
 /* Chart pane */
 
