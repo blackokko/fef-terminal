@@ -278,6 +278,42 @@ async def delete_preset(preset_id: int) -> dict[str, Any]:
         return {"ok": True}
 
 
+@router.post("/presets/seed_defaults")
+async def seed_default_presets() -> dict[str, Any]:
+    """Insert built-in strategy presets if not already present (idempotent)."""
+    from datetime import UTC, datetime
+
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import StrategyPreset
+    from fef_sidecar.engine.preset_templates import DEFAULT_PRESETS
+
+    added = []
+    async with get_session() as session:
+        for tpl in DEFAULT_PRESETS:
+            existing = (
+                await session.exec(select(StrategyPreset).where(StrategyPreset.name == tpl["name"]))
+            ).first()
+            if existing:
+                continue
+            session.add(
+                StrategyPreset(
+                    name=tpl["name"],
+                    description=tpl["description"],
+                    fef_loop_interval_sec=tpl["fef_loop_interval_sec"],
+                    wall_proximity_pts=tpl["wall_proximity_pts"],
+                    wall_collapse_pct=tpl["wall_collapse_pct"],
+                    wall_collapse_floor_m=tpl["wall_collapse_floor_m"],
+                    absorption_fe_ratio_min=tpl["absorption_fe_ratio_min"],
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            added.append(tpl["name"])
+    return {"ok": True, "added": added}
+
+
 @router.post("/presets/{preset_id}/apply")
 async def apply_preset(preset_id: int, request: Request) -> dict[str, Any]:
     """Hot-apply preset thresholds to the live engine."""
@@ -768,6 +804,157 @@ async def seed_default_patterns() -> dict[str, Any]:
             )
             added.append(tpl["name"])
     return {"ok": True, "added": added}
+
+
+# Pattern backtest — run conditions against historical signals + return stats
+@router.post("/patterns/{pattern_id}/backtest")
+async def backtest_pattern(pattern_id: int, days: int = 30) -> dict[str, Any]:
+    """Walk every SignalIter in the window, eval pattern conditions, aggregate
+    matches + outcomes from linked TradeTickets."""
+    from datetime import UTC, datetime, timedelta
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern, SignalIter, TicketStatus, TradeTicket
+    from fef_sidecar.engine.backtest import TradeOutcome, aggregate_backtest
+    from fef_sidecar.engine.patterns import evaluate_pattern
+
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+    async with get_session() as session:
+        pattern = (await session.exec(select(Pattern).where(Pattern.id == pattern_id))).first()
+        if pattern is None:
+            raise HTTPException(404, f"Pattern {pattern_id} not found")
+
+        iters = (await session.exec(
+            select(SignalIter).where(SignalIter.timestamp >= cutoff)  # type: ignore[arg-type]
+        )).all()
+
+        matches: list[int] = []
+        for s in iters:
+            # Reconstruct field_values from stored row (matches extract_fields output)
+            extras = s.extras or {}
+            fields = {
+                "spx_price": s.spx_price,
+                "drift_cum_net_m": s.drift_cum_net_m,
+                "drift_bias": s.drift_bias,
+                "ntm_max_pain": s.ntm_max_pain,
+                "ntm_mp_distance": s.spx_price - s.ntm_max_pain,
+                "ntm_mp_distance_abs": abs(s.spx_price - s.ntm_max_pain),
+                "raw_max_pain": s.raw_max_pain,
+                "top_gex_strike": (s.top_gex_walls[0]["strike"] if s.top_gex_walls else None),
+                "top_gex_net_m": (s.top_gex_walls[0]["net_m"] if s.top_gex_walls else None),
+                "top_dex_strike": (s.top_dex_walls[0]["strike"] if s.top_dex_walls else None),
+                "top_dex_net_m": (s.top_dex_walls[0]["net_m"] if s.top_dex_walls else None),
+                "wall_proximity_pts": extras.get("nearest_wall_distance"),
+                "aggression_call_pct": s.aggression_call_pct,
+                "aggression_put_pct": s.aggression_put_pct,
+                "aggression_diff": (
+                    s.aggression_call_pct - s.aggression_put_pct
+                    if s.aggression_call_pct is not None and s.aggression_put_pct is not None
+                    else None
+                ),
+                "iv_rank_call_pct": s.iv_rank_call_pct,
+                "iv_rank_put_pct": s.iv_rank_put_pct,
+                "delta_price": extras.get("delta_price"),
+                "delta_drift_m": extras.get("delta_drift_m"),
+                "fe_ratio": extras.get("fe_ratio"),
+                "aligned": extras.get("aligned", False),
+                "absorption": extras.get("absorption", False),
+                "direction": s.direction.value,
+                "confidence": s.confidence.value,
+                "iter_num": s.iter_num,
+                "minutes_since_open": None,  # not stored; skip time-based conditions
+                "vix": None,                  # not stored per iter; skip vix conditions
+            }
+            matched, _ = evaluate_pattern(pattern.conditions or [], fields)
+            if matched and s.id is not None:
+                matches.append(s.id)
+
+        # Pull outcomes for matched signal iters
+        outcomes: list[TradeOutcome] = []
+        if matches:
+            tickets = (await session.exec(
+                select(TradeTicket).where(
+                    TradeTicket.signal_iter_id.in_(matches)  # type: ignore[attr-defined]
+                )
+            )).all()
+            iter_by_id = {s.id: s for s in iters if s.id is not None}
+            for t in tickets:
+                if t.status not in (TicketStatus.CLOSED, TicketStatus.STOPPED):
+                    continue
+                pnl = t.pnl_dollars or 0.0
+                sig = iter_by_id.get(t.signal_iter_id)
+                if not sig:
+                    continue
+                outcomes.append(TradeOutcome(
+                    iter_id=sig.id or 0,
+                    iter_num=sig.iter_num,
+                    session_date=sig.session_date,
+                    pnl_dollars=pnl,
+                    won=pnl > 0,
+                ))
+
+        unique_dates = len({s.session_date for s in iters})
+        result = aggregate_backtest(
+            pattern_id=pattern_id,
+            pattern_name=pattern.name,
+            window_days=days,
+            total_iters_scanned=len(iters),
+            matches=matches,
+            outcomes=outcomes,
+            unique_dates=unique_dates,
+        )
+
+        return {
+            "pattern_id": result.pattern_id,
+            "pattern_name": result.pattern_name,
+            "window_days": result.window_days,
+            "total_iters_scanned": result.total_iters_scanned,
+            "total_matches": result.total_matches,
+            "matches_with_trades": result.matches_with_trades,
+            "matches_per_day": result.matches_per_day,
+            "wins": result.wins,
+            "losses": result.losses,
+            "win_rate_pct": result.win_rate_pct,
+            "win_rate_ci_low": result.win_rate_ci_low,
+            "win_rate_ci_high": result.win_rate_ci_high,
+            "total_pnl": result.total_pnl,
+            "avg_pnl_per_trade": result.avg_pnl_per_trade,
+            "best_trade": result.best_trade,
+            "worst_trade": result.worst_trade,
+            "max_drawdown": result.max_drawdown,
+            "sharpe_ratio": result.sharpe_ratio,
+            "t_stat_vs_zero": result.t_stat_vs_zero,
+            "cumulative_pnl_curve": result.cumulative_pnl_curve,
+        }
+
+
+# Risk overlay — configurable daily loss cap, max position size, circuit breaker
+@router.get("/risk/state")
+async def get_risk_state(request: Request) -> dict[str, Any]:
+    s = _state(request)
+    from fef_sidecar.config_store import load_config
+
+    cfg = load_config()
+    daily_pnl = (s.last_account.daily_pnl if s.last_account else None) or 0.0
+    cap = getattr(cfg, "daily_loss_cap_dollars", None)
+    max_pos = getattr(cfg, "max_position_dollars", None)
+    max_contracts = getattr(cfg, "max_contracts_per_trade", 25)
+
+    cap_used_pct = None
+    if cap and cap > 0:
+        cap_used_pct = round(min(100.0, abs(min(0, daily_pnl)) / cap * 100), 1)
+    breached = bool(cap and cap > 0 and daily_pnl <= -cap)
+
+    return {
+        "daily_pnl": daily_pnl,
+        "daily_loss_cap": cap,
+        "cap_used_pct": cap_used_pct,
+        "breached": breached,
+        "max_position_dollars": max_pos,
+        "max_contracts_per_trade": max_contracts,
+    }
 
 
 # Analytics — aggregated stats across stored signals + trades

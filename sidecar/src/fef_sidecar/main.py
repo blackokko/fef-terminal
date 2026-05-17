@@ -43,10 +43,52 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _seed_defaults_on_first_run() -> None:
+    """On startup, ensure the DB has the built-in patterns + presets. Idempotent."""
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern, StrategyPreset
+    from fef_sidecar.engine.patterns import DEFAULT_TEMPLATES
+    from fef_sidecar.engine.preset_templates import DEFAULT_PRESETS
+
+    from datetime import UTC, datetime
+
+    async with get_session() as session:
+        pattern_count = len((await session.exec(select(Pattern))).all())
+        preset_count = len((await session.exec(select(StrategyPreset))).all())
+
+        if pattern_count == 0:
+            for tpl in DEFAULT_TEMPLATES:
+                session.add(Pattern(
+                    name=tpl["name"],
+                    description=tpl["description"],
+                    conditions=tpl["conditions"],
+                    enabled=True,
+                ))
+            logger.info("Seeded %d default patterns", len(DEFAULT_TEMPLATES))
+
+        if preset_count == 0:
+            for tpl in DEFAULT_PRESETS:
+                session.add(StrategyPreset(
+                    name=tpl["name"],
+                    description=tpl["description"],
+                    fef_loop_interval_sec=tpl["fef_loop_interval_sec"],
+                    wall_proximity_pts=tpl["wall_proximity_pts"],
+                    wall_collapse_pct=tpl["wall_collapse_pct"],
+                    wall_collapse_floor_m=tpl["wall_collapse_floor_m"],
+                    absorption_fe_ratio_min=tpl["absorption_fe_ratio_min"],
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                ))
+            logger.info("Seeded %d default presets", len(DEFAULT_PRESETS))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("fef-sidecar starting up")
     await init_db()
+    await _seed_defaults_on_first_run()
 
     state = AppState.build()
     app.state.fef = state

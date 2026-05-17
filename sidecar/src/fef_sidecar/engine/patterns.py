@@ -196,9 +196,36 @@ def evaluate_pattern(
 
 
 DEFAULT_TEMPLATES: tuple[dict[str, Any], ...] = (
+    # ---------- FEF core setups ----------
     {
-        "name": "Bullish absorption setup",
-        "description": "Drift accumulating bullishly but price refusing — reversal candidate",
+        "name": "FEF: Aligned HIGH long calls",
+        "description": "Model fired HIGH-conviction LONG_CALLS — aligned ΔPrice + ΔDrift, all gates passed",
+        "conditions": [
+            {"field": "aligned", "operator": "==", "value": True},
+            {"field": "confidence", "operator": "==", "value": "HIGH"},
+            {"field": "direction", "operator": "==", "value": "LONG_CALLS"},
+        ],
+    },
+    {
+        "name": "FEF: Aligned HIGH long puts",
+        "description": "Model fired HIGH-conviction LONG_PUTS — aligned ΔPrice + ΔDrift, all gates passed",
+        "conditions": [
+            {"field": "aligned", "operator": "==", "value": True},
+            {"field": "confidence", "operator": "==", "value": "HIGH"},
+            {"field": "direction", "operator": "==", "value": "LONG_PUTS"},
+        ],
+    },
+    {
+        "name": "FEF: Wall collapse special",
+        "description": "Dominant wall lost >20% in one iter — HIGH conviction without alignment requirement",
+        "conditions": [
+            {"field": "confidence", "operator": "==", "value": "HIGH"},
+            {"field": "aligned", "operator": "==", "value": False},
+        ],
+    },
+    {
+        "name": "FEF: Bullish absorption",
+        "description": "Drift accumulating bullishly but price refusing — reversal candidate brewing",
         "conditions": [
             {"field": "drift_bias", "operator": "==", "value": "BULLISH"},
             {"field": "drift_cum_net_m", "operator": ">", "value": 20.0},
@@ -207,8 +234,45 @@ DEFAULT_TEMPLATES: tuple[dict[str, Any], ...] = (
         ],
     },
     {
-        "name": "Wall test bounce",
-        "description": "Spot near dominant call wall with bullish bias — fade defense",
+        "name": "FEF: Bearish absorption",
+        "description": "Drift accumulating bearishly but price refusing — reversal candidate brewing",
+        "conditions": [
+            {"field": "drift_bias", "operator": "==", "value": "BEARISH"},
+            {"field": "drift_cum_net_m", "operator": "<", "value": -20.0},
+            {"field": "aligned", "operator": "==", "value": False},
+            {"field": "fe_ratio", "operator": ">", "value": 5.0},
+        ],
+    },
+    {
+        "name": "FEF: FE explosion (no alignment yet)",
+        "description": "Extreme effort/result mismatch — big drift, small price move. Watch for the resolution",
+        "conditions": [
+            {"field": "fe_ratio", "operator": ">", "value": 10.0},
+            {"field": "aligned", "operator": "==", "value": False},
+        ],
+    },
+    # ---------- Wall structure setups ----------
+    {
+        "name": "Wall: Bullish wall stack",
+        "description": "Top GEX call wall AND top DEX call wall both stacked above spot — strong floor",
+        "conditions": [
+            {"field": "top_gex_net_m", "operator": ">", "value": 30.0},
+            {"field": "top_dex_net_m", "operator": ">", "value": 500.0},
+            {"field": "drift_bias", "operator": "==", "value": "BULLISH"},
+        ],
+    },
+    {
+        "name": "Wall: Bearish wall stack",
+        "description": "Top GEX put wall AND top DEX put wall stacked below spot — strong ceiling",
+        "conditions": [
+            {"field": "top_gex_net_m", "operator": "<", "value": -30.0},
+            {"field": "top_dex_net_m", "operator": "<", "value": -500.0},
+            {"field": "drift_bias", "operator": "==", "value": "BEARISH"},
+        ],
+    },
+    {
+        "name": "Wall: Test + bullish bias",
+        "description": "Spot pinned near dominant wall, bullish drift confirming defense",
         "conditions": [
             {"field": "wall_proximity_pts", "operator": "<", "value": 8.0},
             {"field": "drift_bias", "operator": "==", "value": "BULLISH"},
@@ -216,37 +280,82 @@ DEFAULT_TEMPLATES: tuple[dict[str, Any], ...] = (
         ],
     },
     {
-        "name": "Pin regime entry",
-        "description": "Tight pin near wall, no absorption — sit out",
+        "name": "Pin: regime entry",
+        "description": "Tight pin near wall, no absorption — sit out, classic pin day",
         "conditions": [
             {"field": "absorption", "operator": "==", "value": False},
             {"field": "wall_proximity_pts", "operator": "<", "value": 10.0},
             {"field": "fe_ratio", "operator": "<", "value": 1.0},
         ],
     },
+    # ---------- Time-of-day setups ----------
     {
-        "name": "Aligned HIGH-conviction breakout",
-        "description": "FEF model fired HIGH actionable — confirmation alert",
+        "name": "Time: AM trend reversal candidate",
+        "description": "After 10:00 ET, drift opposes price direction with magnitude — reversal brewing",
         "conditions": [
+            {"field": "minutes_since_open", "operator": ">", "value": 30},
+            {"field": "minutes_since_open", "operator": "<", "value": 120},
+            {"field": "absorption", "operator": "==", "value": True},
+            {"field": "fe_ratio", "operator": ">", "value": 6.0},
+        ],
+    },
+    {
+        "name": "Time: Lunchtime coil",
+        "description": "11:00-13:00 ET, tight range, low aggression — position for afternoon",
+        "conditions": [
+            {"field": "minutes_since_open", "operator": "between", "value": [90, 210]},
+            {"field": "fe_ratio", "operator": "<", "value": 2.0},
+            {"field": "wall_proximity_pts", "operator": "<", "value": 12.0},
+            {"field": "drift_bias", "operator": "==", "value": "NEUTRAL"},
+        ],
+    },
+    {
+        "name": "Time: Power hour MP magnet",
+        "description": "After 14:30 ET, spot stretched from NTM MP, neutral/weak drift — mean revert candidate",
+        "conditions": [
+            {"field": "minutes_since_open", "operator": ">", "value": 300},
+            {"field": "ntm_mp_distance_abs", "operator": ">", "value": 15.0},
+            {"field": "drift_bias", "operator": "in", "value": ["NEUTRAL", "BEARISH"]},
+        ],
+    },
+    {
+        "name": "Time: Power hour bull breakout",
+        "description": "After 14:00 ET, aligned HIGH long calls — afternoon trend continuation",
+        "conditions": [
+            {"field": "minutes_since_open", "operator": ">", "value": 270},
             {"field": "aligned", "operator": "==", "value": True},
             {"field": "confidence", "operator": "==", "value": "HIGH"},
+            {"field": "direction", "operator": "==", "value": "LONG_CALLS"},
         ],
     },
     {
-        "name": "Mean revert toward NTM MP",
-        "description": "Spot stretched >20pts from NTM MP, neutral drift — late-day gravity setup",
+        "name": "Time: Power hour bear breakout",
+        "description": "After 14:00 ET, aligned HIGH long puts — afternoon trend continuation",
         "conditions": [
-            {"field": "ntm_mp_distance_abs", "operator": ">", "value": 20.0},
-            {"field": "drift_bias", "operator": "==", "value": "NEUTRAL"},
-            {"field": "minutes_since_open", "operator": ">", "value": 240},
-        ],
-    },
-    {
-        "name": "Wall collapse special",
-        "description": "Engine flagged wall collapse — high-conviction directional fire",
-        "conditions": [
+            {"field": "minutes_since_open", "operator": ">", "value": 270},
+            {"field": "aligned", "operator": "==", "value": True},
             {"field": "confidence", "operator": "==", "value": "HIGH"},
-            {"field": "aligned", "operator": "==", "value": False},  # collapse fires without alignment
+            {"field": "direction", "operator": "==", "value": "LONG_PUTS"},
+        ],
+    },
+    # ---------- Vol / aggression setups ----------
+    {
+        "name": "Vol: VIX-confirmed bullish break",
+        "description": "VIX > 18 + aligned HIGH long calls — vol expansion confirming directional move",
+        "conditions": [
+            {"field": "vix", "operator": ">", "value": 18.0},
+            {"field": "aligned", "operator": "==", "value": True},
+            {"field": "confidence", "operator": "==", "value": "HIGH"},
+            {"field": "direction", "operator": "==", "value": "LONG_CALLS"},
+        ],
+    },
+    {
+        "name": "Vol: Aggression spike bullish",
+        "description": "Call aggression > put aggression by 8%+ with bullish drift — buyers chasing",
+        "conditions": [
+            {"field": "aggression_diff", "operator": ">", "value": 8.0},
+            {"field": "drift_bias", "operator": "==", "value": "BULLISH"},
+            {"field": "drift_cum_net_m", "operator": ">", "value": 10.0},
         ],
     },
 )

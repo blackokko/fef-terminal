@@ -27,6 +27,11 @@ class UIConfig(BaseModel):
     default_qty: int = Field(default=15, ge=1, le=100)
     audio_alerts: bool = Field(default=True)
 
+    # Risk overlay — null = no limit
+    daily_loss_cap_dollars: float | None = Field(default=None, ge=0)
+    max_position_dollars: float | None = Field(default=None, ge=0)
+    max_contracts_per_trade: int = Field(default=25, ge=1, le=200)
+
 
 def load_config() -> UIConfig:
     if not CONFIG_PATH.exists():

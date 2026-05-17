@@ -45,12 +45,27 @@ export function StrategyPresetsPanel() {
     }
   };
 
+  const seedDefaults = async () => {
+    const r = await fetch(`${API_BASE}/presets/seed_defaults`, { method: "POST" });
+    if (r.ok) {
+      const data = await r.json();
+      void reload();
+      toast.show(`Seeded ${data.added.length} default presets`, { variant: "success" });
+    }
+  };
+
   return (
     <details className="sidebar-section">
       <summary className="sidebar-section-title">Strategy presets</summary>
       <div className="presets-body">
+        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+          <button onClick={() => void seedDefaults()}>+ Seed defaults</button>
+          {!showCreate && (
+            <button onClick={() => setShowCreate(true)}>+ New preset</button>
+          )}
+        </div>
         {presets.length === 0 && !showCreate ? (
-          <p className="muted small">no presets yet</p>
+          <p className="muted small">no presets yet — click 'Seed defaults' for 6 starter presets</p>
         ) : (
           <ul className="presets-list">
             {presets.map((p) => (
@@ -71,7 +86,7 @@ export function StrategyPresetsPanel() {
             ))}
           </ul>
         )}
-        {showCreate ? (
+        {showCreate && (
           <CreatePresetForm
             onCreate={async () => {
               await reload();
@@ -80,10 +95,6 @@ export function StrategyPresetsPanel() {
             }}
             onCancel={() => setShowCreate(false)}
           />
-        ) : (
-          <button onClick={() => setShowCreate(true)} style={{ marginTop: 8 }}>
-            + New preset
-          </button>
         )}
       </div>
     </details>

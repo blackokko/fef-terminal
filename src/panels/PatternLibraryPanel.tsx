@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useToast } from "../components/Toast";
 import { useSidecar } from "../context/WebSocketContext";
 import { playTones, flashTitle } from "../lib/audioAlert";
+import { formatDollars } from "../lib/format";
 
 // IMPROVEMENTS #R: pattern library — feature-loaded for codifying discretionary setups.
 
@@ -100,19 +101,31 @@ export function PatternLibraryPanel() {
     }
   };
 
+  const [backtest, setBacktest] = useState<{ pattern_id: number; result: any } | null>(null);
+  const runBacktest = async (id: number, name: string) => {
+    setBacktest({ pattern_id: id, result: null });
+    const r = await fetch(`${API_BASE}/patterns/${id}/backtest?days=30`, { method: "POST" });
+    if (r.ok) {
+      const data = await r.json();
+      setBacktest({ pattern_id: id, result: data });
+      toast.show(`Backtest done: ${name}`, { variant: "info" });
+    }
+  };
+
   return (
     <details className="sidebar-section">
       <summary className="sidebar-section-title">
         Pattern library {patterns.length > 0 && `· ${patterns.length}`}
       </summary>
       <div className="patterns-body">
+        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+          <button onClick={() => void seedDefaults()}>+ Seed defaults</button>
+          {!showCreate && !editing && (
+            <button onClick={() => setShowCreate(true)}>+ New pattern</button>
+          )}
+        </div>
         {patterns.length === 0 ? (
-          <div>
-            <p className="muted small">no patterns yet</p>
-            <button onClick={() => void seedDefaults()} style={{ marginTop: 6 }}>
-              Seed defaults
-            </button>
-          </div>
+          <p className="muted small">no patterns yet — click 'Seed defaults' for 17 starter setups</p>
         ) : (
           <ul className="patterns-list">
             {patterns.map((p) => (
@@ -126,9 +139,13 @@ export function PatternLibraryPanel() {
                   />
                   <span className="pattern-name">{p.name}</span>
                   <span className="muted small">{p.match_count}× today</span>
+                  <button className="annotation-delete" title="Backtest" onClick={() => void runBacktest(p.id, p.name)}>📊</button>
                   <button className="annotation-delete" onClick={() => setEditing(p)}>✎</button>
                   <button className="annotation-delete" onClick={() => void remove(p.id, p.name)}>×</button>
                 </div>
+                {backtest?.pattern_id === p.id && (
+                  <BacktestResultBlock result={backtest.result} onClose={() => setBacktest(null)} />
+                )}
                 {p.description && <div className="muted small">{p.description}</div>}
                 <div className="pattern-conditions small">
                   {p.conditions.map((c, i) => (
@@ -140,12 +157,6 @@ export function PatternLibraryPanel() {
               </li>
             ))}
           </ul>
-        )}
-
-        {!showCreate && !editing && patterns.length > 0 && (
-          <button onClick={() => setShowCreate(true)} style={{ marginTop: 8 }}>
-            + New pattern
-          </button>
         )}
 
         {(showCreate || editing) && (
@@ -183,6 +194,51 @@ export function PatternLibraryPanel() {
         )}
       </div>
     </details>
+  );
+}
+
+function BacktestResultBlock({ result, onClose }: { result: any; onClose: () => void }) {
+  if (!result) return <div className="muted small">running backtest…</div>;
+  const sigColor = result.t_stat_vs_zero != null && Math.abs(result.t_stat_vs_zero) >= 2
+    ? "var(--color-green)" : "var(--color-text-muted)";
+  return (
+    <div className="backtest-result">
+      <div className="backtest-header">
+        <strong>{result.window_days}d backtest</strong>
+        <button className="annotation-delete" onClick={onClose}>×</button>
+      </div>
+      <div className="backtest-grid">
+        <Stat label="Iters scanned" value={result.total_iters_scanned} />
+        <Stat label="Matches" value={result.total_matches} />
+        <Stat label="Matches/day" value={result.matches_per_day} />
+        <Stat label="With trades" value={result.matches_with_trades} />
+        <Stat label="Win rate" value={`${result.win_rate_pct}%`}
+          extra={`95% CI ${result.win_rate_ci_low}-${result.win_rate_ci_high}`} />
+        <Stat label="Wins / losses" value={`${result.wins}W / ${result.losses}L`} />
+        <Stat label="Total P/L" value={formatDollars(result.total_pnl, { sign: true })}
+          color={result.total_pnl >= 0 ? "var(--color-green)" : "var(--color-red)"} />
+        <Stat label="Avg / trade" value={formatDollars(result.avg_pnl_per_trade, { sign: true })} />
+        <Stat label="Best / worst" value={`${formatDollars(result.best_trade, { sign: true })} / ${formatDollars(result.worst_trade, { sign: true })}`} />
+        <Stat label="Max drawdown" value={formatDollars(result.max_drawdown)} color="var(--color-red)" />
+        <Stat label="Sharpe (ann)" value={result.sharpe_ratio ?? "n/a"} />
+        <Stat label="t-stat vs 0" value={result.t_stat_vs_zero ?? "n/a"}
+          color={sigColor}
+          extra={result.t_stat_vs_zero != null && Math.abs(result.t_stat_vs_zero) >= 2 ? "significant" : ""} />
+      </div>
+      {result.matches_with_trades === 0 && (
+        <p className="muted small">No closed-trade outcomes for these matches yet — fire the pattern, then close trades to build stats.</p>
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value, extra, color }: { label: string; value: any; extra?: string; color?: string }) {
+  return (
+    <div className="backtest-stat">
+      <div className="backtest-stat-label">{label}</div>
+      <div className="backtest-stat-value" style={color ? { color } : undefined}>{value}</div>
+      {extra && <div className="backtest-stat-extra">{extra}</div>}
+    </div>
   );
 }
 

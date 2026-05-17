@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { ChartAnnotationsPanel } from "../panels/ChartAnnotationsPanel";
+import { RiskOverlayPanel } from "../panels/RiskOverlayPanel";
 import { FEFVerdictPanel } from "../panels/FEFVerdictPanel";
 import { GlossaryPanel } from "../panels/GlossaryPanel";
 import { OptionChainPanel } from "../panels/OptionChainPanel";
@@ -45,6 +46,7 @@ export function Sidebar() {
         {tab === "trade" && (
           <>
             <AccountScorecardPanel />
+            <RiskOverlayPanel />
             <RegimePanel />
             <FEFVerdictPanel />
             <OrderTicketPanel />
