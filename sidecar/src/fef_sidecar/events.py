@@ -79,6 +79,25 @@ class StatusEvent(BaseModel):
     vix: float | None = None  # IMPROVEMENTS #M — last VIX quote
 
 
+class RegimeEvent(BaseModel):
+    """IMPROVEMENTS: market regime classification + recommendations.
+
+    Broadcast every iter so the regime banner stays current. UI can also
+    detect transitions (compare regime to previous) for toast alerts.
+    """
+
+    type: Literal["regime"] = "regime"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    regime: str
+    label: str
+    confidence: float
+    rationale: str
+    recommended_preset_hint: str = ""
+    recommended_patterns: list[str] = Field(default_factory=list)
+    bias: str = "NEUTRAL"
+    sizing: str = "STANDARD"
+
+
 class PatternMatchEvent(BaseModel):
     """IMPROVEMENTS #R — fires when a user-defined pattern matches an iter."""
 
@@ -94,7 +113,15 @@ class PatternMatchEvent(BaseModel):
     toast_alert: bool = True
 
 
-Event = TickEvent | IterEvent | TicketEvent | StatusEvent | SnapshotEvent | PatternMatchEvent
+Event = (
+    TickEvent
+    | IterEvent
+    | TicketEvent
+    | StatusEvent
+    | SnapshotEvent
+    | PatternMatchEvent
+    | RegimeEvent
+)
 
 
 class EventBroadcaster:

@@ -5,6 +5,7 @@ import { OptionChainPanel } from "../panels/OptionChainPanel";
 import { OrderTicketPanel } from "../panels/OrderTicketPanel";
 import { PatternLibraryPanel } from "../panels/PatternLibraryPanel";
 import { QuantDataPanel } from "../panels/QuantDataPanel";
+import { RegimePanel } from "../panels/RegimePanel";
 import { ReplayPanel } from "../panels/ReplayPanel";
 import { SettingsPanel } from "../panels/SettingsPanel";
 import { SignalLogPanel } from "../panels/SignalLogPanel";
@@ -13,6 +14,7 @@ import { StrategyPresetsPanel } from "../panels/StrategyPresetsPanel";
 export function Sidebar() {
   return (
     <aside className="sidebar">
+      <RegimePanel />
       <FEFVerdictPanel />
       <OrderTicketPanel />
       <OptionChainPanel />

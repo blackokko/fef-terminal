@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from fef_sidecar.engine import FEFEngine
+from fef_sidecar.engine.regime import RegimeAssessment, RegimeDetector
 from fef_sidecar.events import EventBroadcaster
 from fef_sidecar.ibkr import IBKRProvider, LiveIBKRProvider, MockIBKRProvider
 from fef_sidecar.quantdata import MockQuantDataClient, QuantDataClient
@@ -52,6 +53,7 @@ class AppState:
     quantdata: QuantDataProvider
     ibkr: IBKRProvider
     engine: FEFEngine
+    regime_detector: RegimeDetector
     broadcaster: EventBroadcaster
     loop_task: object | None = None
     bar_task: object | None = None
@@ -67,6 +69,7 @@ class AppState:
     session_date: str = ""  # IMPROVEMENTS #22 — tracks current session for reset detection
     last_vix: float | None = None  # IMPROVEMENTS #M
     vix_task: object | None = None
+    last_regime: RegimeAssessment | None = None
 
     @classmethod
     def build(cls) -> AppState:
@@ -74,6 +77,9 @@ class AppState:
             quantdata=make_quantdata_client(),
             ibkr=make_ibkr_provider(),
             engine=_make_engine(),
+            regime_detector=RegimeDetector(
+                window_size=int(os.environ.get("FEF_REGIME_WINDOW", "12"))
+            ),
             broadcaster=EventBroadcaster(),
         )
 

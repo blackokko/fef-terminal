@@ -92,6 +92,19 @@ export interface SnapshotEvent {
   aggression: { call_pct: number; put_pct: number } | null;
 }
 
+export interface RegimeEvent {
+  type: "regime";
+  timestamp_ms: number;
+  regime: string;
+  label: string;
+  confidence: number;
+  rationale: string;
+  recommended_preset_hint: string;
+  recommended_patterns: string[];
+  bias: string;
+  sizing: string;
+}
+
 export interface PatternMatchEvent {
   type: "pattern_match";
   timestamp_ms: number;
@@ -137,4 +150,5 @@ export type SidecarEvent =
   | TicketEvent
   | StatusEvent
   | SnapshotEvent
-  | PatternMatchEvent;
+  | PatternMatchEvent
+  | RegimeEvent;

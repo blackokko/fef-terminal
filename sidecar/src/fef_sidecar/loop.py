@@ -30,7 +30,14 @@ from fef_sidecar.db import (
 from fef_sidecar.engine.fef import snapshot_to_inputs
 from fef_sidecar.engine.option_targets import OptionTargets, build_option_targets
 from fef_sidecar.engine.patterns import evaluate_pattern, extract_fields
-from fef_sidecar.events import IterEvent, PatternMatchEvent, SnapshotEvent, TickEvent
+from fef_sidecar.engine.regime import RegimeSample, now_minutes_since_open_et
+from fef_sidecar.events import (
+    IterEvent,
+    PatternMatchEvent,
+    RegimeEvent,
+    SnapshotEvent,
+    TickEvent,
+)
 from fef_sidecar.ibkr import Contract, ContractKind
 
 if TYPE_CHECKING:
@@ -282,6 +289,39 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     t0 = _time.perf_counter()
     await _evaluate_patterns(state, inputs, verdict, signal.id, signal.iter_num)
     perf["pattern_eval_ms"] = (_time.perf_counter() - t0) * 1000
+
+    # Market regime detection — push this iter, broadcast updated assessment
+    t0 = _time.perf_counter()
+    state.regime_detector.push(
+        RegimeSample(
+            spx_price=inputs.spx_price,
+            drift_cum_net_m=inputs.drift_cum_net_m,
+            wall_proximity_pts=verdict.nearest_wall_distance,
+            aligned=verdict.aligned,
+            absorption=verdict.absorption,
+            direction=verdict.direction.value,
+            confidence=verdict.confidence.value,
+            fe_ratio=verdict.fe_ratio,
+            minutes_since_open=now_minutes_since_open_et(),
+            vix=state.last_vix,
+        )
+    )
+    assessment = state.regime_detector.assess()
+    assessment.detected_at_iter = signal.iter_num
+    state.last_regime = assessment
+    await state.broadcaster.publish(
+        RegimeEvent(
+            regime=assessment.regime,
+            label=assessment.label,
+            confidence=assessment.confidence,
+            rationale=assessment.rationale,
+            recommended_preset_hint=assessment.recommended_preset_hint,
+            recommended_patterns=assessment.recommended_patterns,
+            bias=assessment.bias,
+            sizing=assessment.sizing,
+        )
+    )
+    perf["regime_ms"] = (_time.perf_counter() - t0) * 1000
 
     perf["total_ms"] = (_time.perf_counter() - t_start) * 1000
     state.last_iter_perf_ms = {k: round(v, 2) for k, v in perf.items()}

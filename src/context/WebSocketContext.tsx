@@ -11,6 +11,7 @@ import type {
   Bar,
   IterEvent,
   PatternMatchEvent,
+  RegimeEvent,
   SidecarEvent,
   SnapshotEvent,
   StatusEvent,
@@ -28,6 +29,7 @@ interface SidecarState {
   lastIter: IterEvent | null;
   lastSnapshot: SnapshotEvent | null;
   lastStatus: StatusEvent | null;
+  lastRegime: RegimeEvent | null;
   recentTicks: TickEvent[];
   recentIters: IterEvent[];
   recentBars: Bar[];
@@ -41,6 +43,7 @@ const initialState: SidecarState = {
   lastIter: null,
   lastSnapshot: null,
   lastStatus: null,
+  lastRegime: null,
   recentTicks: [],
   recentIters: [],
   recentBars: [],
@@ -88,6 +91,8 @@ export function SidecarProvider({
             ...prev,
             recentPatternMatches: [...prev.recentPatternMatches, event].slice(-RECENT_LIMIT),
           };
+        case "regime":
+          return { ...prev, lastRegime: event };
         case "ticket":
           return {
             ...prev,
