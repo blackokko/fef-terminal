@@ -92,6 +92,23 @@ export interface SnapshotEvent {
   aggression: { call_pct: number; put_pct: number } | null;
 }
 
+export interface MicrostructureEvent {
+  type: "microstructure";
+  timestamp_ms: number;
+  ofi_window: number;
+  avi_pct: number;
+  aggressive_buy_volume: number;
+  aggressive_sell_volume: number;
+  microprice: number | null;
+  last_trade_price: number | null;
+  microprice_deviation_bp: number | null;
+  direction: string;
+  confidence: string;
+  reasoning: string;
+  quote_count: number;
+  trade_count: number;
+}
+
 export interface AccountEvent {
   type: "account";
   timestamp_ms: number;
@@ -168,4 +185,5 @@ export type SidecarEvent =
   | SnapshotEvent
   | PatternMatchEvent
   | RegimeEvent
-  | AccountEvent;
+  | AccountEvent
+  | MicrostructureEvent;

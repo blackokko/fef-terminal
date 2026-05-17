@@ -64,6 +64,7 @@ export function OrderTicketPanel() {
 
   const side = v.direction === "LONG_CALLS" ? "C" : "P";
   const opt = v.option_pricing ?? null;
+  const spread = (v as any).spread_recommendation ?? null;
 
   const ticketText = formatTicketText(
     v.direction === "LONG_CALLS" ? "CALL" : "PUT",
@@ -133,6 +134,15 @@ export function OrderTicketPanel() {
       <h3 className="sidebar-section-title">Order Ticket</h3>
 
       <div className="ticket-block">
+        {spread && (spread.kind === "PCS" || spread.kind === "CCS") && (
+          <div className="ticket-spread-banner">
+            <div className="ticket-spread-kind">{spread.kind}: SELL {spread.short_strike?.toFixed(0)} / BUY {spread.long_strike?.toFixed(0)}</div>
+            <div className="muted small">
+              credit ~${(spread.estimated_credit_per_contract / 100).toFixed(2)} · max profit ${spread.max_profit_per_contract?.toFixed(0)} · max loss ${spread.max_loss_per_contract?.toFixed(0)} · BE ${spread.breakeven?.toFixed(0)}
+            </div>
+            <div className="muted small">{spread.reasoning}</div>
+          </div>
+        )}
         <div className="ticket-main">
           BUY × <input
             type="number"

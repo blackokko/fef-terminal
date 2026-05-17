@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { ChartAnnotationsPanel } from "../panels/ChartAnnotationsPanel";
+import { MicrostructurePanel } from "../panels/MicrostructurePanel";
 import { OptimizePanel } from "../panels/OptimizePanel";
 import { RiskOverlayPanel } from "../panels/RiskOverlayPanel";
 import { TournamentPanel } from "../panels/TournamentPanel";
@@ -51,6 +52,7 @@ export function Sidebar() {
             <RiskOverlayPanel />
             <RegimePanel />
             <FEFVerdictPanel />
+            <MicrostructurePanel />
             <OrderTicketPanel />
             <OptionChainPanel />
           </>

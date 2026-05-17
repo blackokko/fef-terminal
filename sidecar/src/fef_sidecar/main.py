@@ -29,6 +29,7 @@ from fef_sidecar.loop import (
     bar_stream_loop,
     fef_tick_loop,
     ibkr_health_check_loop,
+    microstructure_loop,
     quantdata_poll_loop,
     tick_stream_loop,
     vix_poll_loop,
@@ -111,6 +112,9 @@ async def lifespan(app: FastAPI):
         )
         state.vix_task = asyncio.create_task(vix_poll_loop(state), name="vix-poll-loop")
         state.account_task = asyncio.create_task(account_poll_loop(state), name="account-poll-loop")
+        state.microstructure_task = asyncio.create_task(
+            microstructure_loop(state), name="microstructure-loop"
+        )
 
     logger.info(
         "fef-sidecar ready (QD=%s, IBKR=%s, auto_loops=%s)",
@@ -131,6 +135,7 @@ async def lifespan(app: FastAPI):
             state.health_check_task,
             state.vix_task,
             state.account_task,
+            state.microstructure_task,
         ):
             if task is not None:
                 task.cancel()  # type: ignore[attr-defined]

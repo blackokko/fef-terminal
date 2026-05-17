@@ -41,6 +41,21 @@ class Contract(BaseModel):
         return cls(symbol="ES", kind=ContractKind.FUTURE, exchange="CME")
 
     @classmethod
+    def qqq_stock(cls) -> Contract:
+        """QQQ — Invesco Nasdaq-100 ETF. Heavy 0DTE option volume."""
+        return cls(symbol="QQQ", kind=ContractKind.STOCK, exchange="SMART")
+
+    @classmethod
+    def iwm_stock(cls) -> Contract:
+        """IWM — iShares Russell 2000 ETF. Small-cap exposure."""
+        return cls(symbol="IWM", kind=ContractKind.STOCK, exchange="SMART")
+
+    @classmethod
+    def spy_stock(cls) -> Contract:
+        """SPY — SPDR S&P 500 ETF. SPX proxy, better tick data, has shares."""
+        return cls(symbol="SPY", kind=ContractKind.STOCK, exchange="SMART")
+
+    @classmethod
     def for_symbol(cls, symbol: str) -> Contract:
         s = symbol.upper()
         if s == "SPX":
@@ -49,6 +64,12 @@ class Contract(BaseModel):
             return cls.es_future()
         if s == "VIX":
             return cls.vix_index()
+        if s == "QQQ":
+            return cls.qqq_stock()
+        if s == "IWM":
+            return cls.iwm_stock()
+        if s == "SPY":
+            return cls.spy_stock()
         raise ValueError(f"Unsupported symbol: {symbol}")
 
 

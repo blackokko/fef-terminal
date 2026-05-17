@@ -79,6 +79,29 @@ class StatusEvent(BaseModel):
     vix: float | None = None  # IMPROVEMENTS #M — last VIX quote
 
 
+class MicrostructureEvent(BaseModel):
+    """Sub-second order flow / aggression / microprice signal.
+
+    Based on established microstructure literature (OFI/Cont-Kukanov-Stoikov,
+    AVI/Lee-Ready, Microprice/Stoikov). Independent of FEF model.
+    """
+
+    type: Literal["microstructure"] = "microstructure"
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    ofi_window: float
+    avi_pct: float
+    aggressive_buy_volume: float
+    aggressive_sell_volume: float
+    microprice: float | None = None
+    last_trade_price: float | None = None
+    microprice_deviation_bp: float | None = None
+    direction: str  # BULLISH_PRESSURE / BEARISH_PRESSURE / BALANCED
+    confidence: str  # HIGH / MEDIUM / LOW
+    reasoning: str
+    quote_count: int
+    trade_count: int
+
+
 class TournamentEvent(BaseModel):
     """Parallel-strategy verdicts — side-by-side what each preset would fire."""
 
@@ -152,6 +175,7 @@ Event = (
     | RegimeEvent
     | AccountEvent
     | TournamentEvent
+    | MicrostructureEvent
 )
 
 

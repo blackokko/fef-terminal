@@ -481,20 +481,29 @@ async def get_bars(
     import os as _os
 
     if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
-        # Cap at how far the bar stream has progressed so chart grows
-        # bar-by-bar as the day plays (instead of dumping all 190 at once)
         max_frame = getattr(s.ibkr, "_scripted_index", 0) + 1
         bars = _aggregate_scripted_bars(symbol, bar_size, max_frame=max_frame)
     elif type(s.ibkr).__name__ == "MockIBKRProvider":
-        # Static morning bars from mock, optionally offset for ES
-        offset = -5.0 if symbol.upper() == "ES" else 0.0
+        # Static morning bars from mock with per-symbol offset/scale
+        sym = symbol.upper()
+        # QQQ ~ SPX / 14.5, IWM ~ SPX / 33, SPY ~ SPX / 10, ES = SPX - 5
+        if sym == "QQQ":
+            transform = lambda v: round(v / 14.5, 2)
+        elif sym == "IWM":
+            transform = lambda v: round(v / 33.0, 2)
+        elif sym == "SPY":
+            transform = lambda v: round(v / 10.0, 2)
+        elif sym == "ES":
+            transform = lambda v: round(v - 5.0, 2)
+        else:
+            transform = lambda v: v
         bars = [
             {
                 "timestamp_ms": int(b.timestamp.timestamp() * 1000),
-                "open": b.open + offset,
-                "high": b.high + offset,
-                "low": b.low + offset,
-                "close": b.close + offset,
+                "open": transform(b.open),
+                "high": transform(b.high),
+                "low": transform(b.low),
+                "close": transform(b.close),
                 "volume": b.volume,
             }
             for b in s.ibkr._bars  # type: ignore[attr-defined]
@@ -532,8 +541,9 @@ async def get_bars(
 def _aggregate_scripted_bars(symbol: str, bar_size: str, max_frame: int | None = None) -> list[dict[str, Any]]:
     """Aggregate the scripted day script into bars at the requested timeframe.
 
-    Each frame is 2 simulated minutes. ES adds a -5pt basis offset.
-    max_frame: only include frames up to this index (1-based). None = all.
+    Each frame is 2 simulated minutes. Per-symbol transform: QQQ ~ SPX/14.5,
+    IWM ~ SPX/33, SPY ~ SPX/10, ES = SPX - 5. max_frame: only include
+    frames up to this index (1-based). None = all.
     """
     from datetime import datetime, time, timedelta
 
@@ -545,7 +555,17 @@ def _aggregate_scripted_bars(symbol: str, bar_size: str, max_frame: int | None =
     }.get(bar_size, 2)
     frames_per_bar = max(1, round(size_minutes / 2))
 
-    offset = -5.0 if symbol.upper() == "ES" else 0.0
+    sym = symbol.upper()
+    if sym == "QQQ":
+        transform = lambda v: round(v / 14.5, 2)
+    elif sym == "IWM":
+        transform = lambda v: round(v / 33.0, 2)
+    elif sym == "SPY":
+        transform = lambda v: round(v / 10.0, 2)
+    elif sym == "ES":
+        transform = lambda v: round(v - 5.0, 2)
+    else:
+        transform = lambda v: v
     today = datetime.now().date()
     market_open = datetime.combine(today, time(9, 30))
 
@@ -557,17 +577,17 @@ def _aggregate_scripted_bars(symbol: str, bar_size: str, max_frame: int | None =
         chunk = frames[i : i + frames_per_bar]
         if not chunk:
             continue
-        opens = chunk[0].spx + offset
-        closes = chunk[-1].spx + offset
-        highs = max(f.spx for f in chunk) + offset + 0.5
-        lows = min(f.spx for f in chunk) + offset - 0.5
+        opens = transform(chunk[0].spx)
+        closes = transform(chunk[-1].spx)
+        highs = transform(max(f.spx for f in chunk)) + 0.5
+        lows = transform(min(f.spx for f in chunk)) - 0.5
         ts = market_open + timedelta(minutes=chunk[0].minutes_since_open)
         out.append({
             "timestamp_ms": int(ts.timestamp() * 1000),
-            "open": round(opens, 2),
-            "high": round(highs, 2),
-            "low": round(lows, 2),
-            "close": round(closes, 2),
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
             "volume": 1000 * frames_per_bar,
         })
     return out

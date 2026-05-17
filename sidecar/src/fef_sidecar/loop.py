@@ -283,6 +283,42 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             else None,
         },
     )
+    # Spread recommendation — added to verdict as a separate field
+    try:
+        from fef_sidecar.engine.spread_recommender import recommend as recommend_spread
+
+        top_dex_call = next(
+            (w.strike for w in inputs.top_dex_walls if w.net_m > 0), None
+        )
+        top_dex_put = next(
+            (w.strike for w in inputs.top_dex_walls if w.net_m < 0), None
+        )
+        sim_minutes = getattr(snap, "simulated_minutes_since_open", None)
+        spread_rec = recommend_spread(
+            direction=verdict.direction.value,
+            confidence=verdict.confidence.value,
+            spx_price=inputs.spx_price,
+            ntm_max_pain=inputs.ntm_max_pain,
+            top_dex_call_strike=top_dex_call,
+            top_dex_put_strike=top_dex_put,
+            iv_rank_call_pct=inputs.iv_rank_call_pct,
+            iv_rank_put_pct=inputs.iv_rank_put_pct,
+            minutes_since_open=sim_minutes if sim_minutes is not None else now_minutes_since_open_et(),
+        )
+        event.verdict["spread_recommendation"] = {
+            "kind": spread_rec.kind,
+            "reasoning": spread_rec.reasoning,
+            "short_strike": spread_rec.short_strike,
+            "long_strike": spread_rec.long_strike,
+            "spread_width": spread_rec.spread_width,
+            "estimated_credit_per_contract": spread_rec.estimated_credit_per_contract,
+            "max_profit_per_contract": spread_rec.max_profit_per_contract,
+            "max_loss_per_contract": spread_rec.max_loss_per_contract,
+            "breakeven": spread_rec.breakeven,
+        }
+    except Exception:
+        logger.exception("Spread recommendation failed")
+
     state.last_verdict = event.verdict
     t0 = _time.perf_counter()
     await state.broadcaster.publish(event)
@@ -628,6 +664,86 @@ async def account_poll_loop(state: AppState) -> None:
         except Exception:
             logger.exception("Account poll iteration failed")
         await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# Microstructure loop — sub-second OFI / AVI / Microprice signal
+# ---------------------------------------------------------------------------
+
+
+async def microstructure_loop(state: AppState) -> None:
+    """Synthesize quote + trade events from the tick stream and broadcast a
+    MicrostructureSignal every FEF_MICRO_INTERVAL_SEC (default 0.5s).
+
+    Mock mode: derives quote sizes + aggressor from synthetic random walks
+    around the current SPX price. Live mode would subscribe to
+    reqTickByTickData and reqMktData L1 events.
+    """
+    import asyncio as _asyncio
+    import random as _random
+    import time as _time
+
+    from fef_sidecar.engine.microstructure import (
+        QuoteUpdate,
+        TradePrint,
+        assess,
+        classify_trade,
+        push_quote,
+        push_trade,
+    )
+    from fef_sidecar.events import MicrostructureEvent
+
+    interval = float(os.environ.get("FEF_MICRO_INTERVAL_SEC", "0.5"))
+    rng = _random.Random()
+    logger.info("Starting microstructure loop (interval=%.2fs)", interval)
+
+    while True:
+        try:
+            # In mock, use last_spx_price as the anchor. Synthesize a quote
+            # with random spread + sizes, and a trade with random aggressor.
+            spx = state.last_spx_price or 7400.0
+            now_ms = int(_time.time() * 1000)
+
+            # Quote: tight spread, sizes biased by current "trend" (we just
+            # use sin of current second for variation)
+            spread = round(rng.uniform(0.05, 0.25), 2)
+            bid = round(spx - spread / 2, 2)
+            ask = round(spx + spread / 2, 2)
+            bid_size = float(rng.randint(50, 500))
+            ask_size = float(rng.randint(50, 500))
+            push_quote(state.microstructure_state, QuoteUpdate(
+                timestamp_ms=now_ms, bid=bid, ask=ask, bid_size=bid_size, ask_size=ask_size,
+            ))
+
+            # Trade: random price near mid + classify via Lee-Ready
+            trade_price = round(spx + rng.uniform(-spread / 2, spread / 2), 2)
+            trade_size = float(rng.randint(1, 50))
+            agg = classify_trade(trade_price, bid, ask)
+            push_trade(state.microstructure_state, TradePrint(
+                timestamp_ms=now_ms, price=trade_price, size=trade_size, aggressor=agg,
+            ))
+
+            sig = assess(state.microstructure_state, now_ms)
+            await state.broadcaster.publish(MicrostructureEvent(
+                timestamp_ms=sig.timestamp_ms,
+                ofi_window=sig.ofi_window,
+                avi_pct=sig.avi_pct,
+                aggressive_buy_volume=sig.aggressive_buy_volume,
+                aggressive_sell_volume=sig.aggressive_sell_volume,
+                microprice=sig.microprice,
+                last_trade_price=sig.last_trade_price,
+                microprice_deviation_bp=sig.microprice_deviation_bp,
+                direction=sig.direction,
+                confidence=sig.confidence,
+                reasoning=sig.reasoning,
+                quote_count=sig.quote_count,
+                trade_count=sig.trade_count,
+            ))
+        except _asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Microstructure iteration failed")
+        await _asyncio.sleep(interval)
 
 
 async def tick_stream_loop(state: AppState) -> None:

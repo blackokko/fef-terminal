@@ -11,6 +11,7 @@ import type {
   AccountEvent,
   Bar,
   IterEvent,
+  MicrostructureEvent,
   PatternMatchEvent,
   RegimeEvent,
   SidecarEvent,
@@ -32,6 +33,7 @@ interface SidecarState {
   lastStatus: StatusEvent | null;
   lastRegime: RegimeEvent | null;
   lastAccount: AccountEvent | null;
+  lastMicrostructure: MicrostructureEvent | null;
   recentTicks: TickEvent[];
   recentIters: IterEvent[];
   recentBars: Bar[];
@@ -47,6 +49,7 @@ const initialState: SidecarState = {
   lastStatus: null,
   lastRegime: null,
   lastAccount: null,
+  lastMicrostructure: null,
   recentTicks: [],
   recentIters: [],
   recentBars: [],
@@ -98,6 +101,8 @@ export function SidecarProvider({
           return { ...prev, lastRegime: event };
         case "account":
           return { ...prev, lastAccount: event };
+        case "microstructure":
+          return { ...prev, lastMicrostructure: event };
         case "ticket":
           return {
             ...prev,

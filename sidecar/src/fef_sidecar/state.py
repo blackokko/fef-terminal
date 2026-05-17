@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from fef_sidecar.engine import FEFEngine
+from fef_sidecar.engine.microstructure import MicrostructureState
 from fef_sidecar.engine.mock_autotrader import MockAutoTraderState
 from fef_sidecar.engine.regime import RegimeAssessment, RegimeDetector
 from fef_sidecar.engine.tournament import DEFAULT_VARIANTS, TournamentRunner
@@ -76,6 +77,8 @@ class AppState:
     last_regime: RegimeAssessment | None = None
     account_task: object | None = None
     last_account: object | None = None  # AccountSummary or None
+    microstructure_state: MicrostructureState = field(default_factory=MicrostructureState)
+    microstructure_task: object | None = None
 
     @classmethod
     def build(cls) -> AppState:
