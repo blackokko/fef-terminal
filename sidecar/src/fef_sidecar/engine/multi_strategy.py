@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fef_sidecar.engine import FEFEngine
-from fef_sidecar.engine.tournament import TournamentRunner, TournamentVariant
+from fef_sidecar.engine.tournament import TournamentRunner, VariantConfig
 
 
 @dataclass(frozen=True)
@@ -83,13 +83,12 @@ def build_multi_strategy_tournament(configs: list[StrategyConfig] | None = None)
     up in the Tournament panel + on the WS as TournamentEvents."""
     cfgs = configs or DEFAULT_STRATEGIES
     variants = [
-        TournamentVariant(
+        VariantConfig(
             name=c.name,
             wall_proximity_pts=c.wall_proximity_pts,
             wall_collapse_pct=c.wall_collapse_pct,
             wall_collapse_floor_m=c.wall_collapse_floor_m,
             absorption_fe_ratio_min=c.absorption_fe_ratio_min,
-            threshold_scale=c.threshold_scale,
         )
         for c in cfgs
     ]
