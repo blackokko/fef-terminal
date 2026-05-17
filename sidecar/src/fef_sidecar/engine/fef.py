@@ -60,13 +60,30 @@ class FEFEngine:
         history_window: int = 3,
         wall_proximity_pts: float = 5.0,
         wall_collapse_pct: float = 0.20,
+        wall_collapse_floor_m: float = 5.0,
         absorption_fe_ratio_min: float = 5.0,
+        threshold_scale: float = 1.0,
     ) -> None:
+        """
+        Args:
+            history_window: 3-iter rolling delta window.
+            wall_proximity_pts: skip-trade radius around dominant wall.
+            wall_collapse_pct: collapse trigger threshold (e.g., 0.20 = 20%).
+            wall_collapse_floor_m: minimum prior |net_m| in $M required for a
+                wall collapse to fire — filters noise on minor walls
+                (IMPROVEMENTS #7).
+            absorption_fe_ratio_min: minimum FE ratio for absorption flag.
+            threshold_scale: scales the magnitude thresholds for ΔPrice/ΔDrift
+                (IMPROVEMENTS #2). If FEF runs at non-default cadence, set this
+                to (interval_sec / 120) so thresholds stay calibrated.
+        """
         self._history: deque[FEFInputs] = deque(maxlen=history_window + 1)
         self._history_window = history_window
         self._wall_proximity_pts = wall_proximity_pts
         self._wall_collapse_pct = wall_collapse_pct
+        self._wall_collapse_floor_m = wall_collapse_floor_m
         self._absorption_fe_min = absorption_fe_ratio_min
+        self._threshold_scale = max(0.01, threshold_scale)
 
     # ------------------------------------------------------------------
     # Public API
@@ -287,6 +304,10 @@ class FEFEngine:
         cur_abs = abs(current_same.net_m)
         if prior_abs <= 0:
             return False, None
+        # IMPROVEMENTS #7: require absolute floor — a $50M -> $40M drop is noise,
+        # a $50M -> $5M drop is meaningful. Filter walls with insufficient mass.
+        if prior_abs < self._wall_collapse_floor_m:
+            return False, None
         loss_pct = (prior_abs - cur_abs) / prior_abs
         if loss_pct < self._wall_collapse_pct:
             return False, None
@@ -303,11 +324,32 @@ class FEFEngine:
         delta_drift_m: float,
         fe_ratio: float,
     ) -> FEFConfidence:
-        if abs(delta_price) >= 5 and abs(delta_drift_m) >= 10 and fe_ratio >= 1.0:
+        # IMPROVEMENTS #2: scale magnitude thresholds by interval.
+        # Default thresholds were tuned for 2-min cadence — running at 30s
+        # should require ~25% the magnitude to fire HIGH/MEDIUM.
+        scale = self._threshold_scale
+        if (
+            abs(delta_price) >= 5 * scale
+            and abs(delta_drift_m) >= 10 * scale
+            and fe_ratio >= 1.0
+        ):
             return FEFConfidence.HIGH
-        if abs(delta_price) >= 2 and abs(delta_drift_m) >= 3:
+        if abs(delta_price) >= 2 * scale and abs(delta_drift_m) >= 3 * scale:
             return FEFConfidence.MEDIUM
         return FEFConfidence.LOW
+
+    @staticmethod
+    def _qty_for_confidence(confidence: FEFConfidence) -> int:
+        """IMPROVEMENTS #5: suggest position size based on confidence.
+
+        Defaults match user-trading-style memory (typical 10-20 contracts).
+        HIGH = 15 (full size), MEDIUM = 10, LOW = 5 (scale-in toe-dip).
+        """
+        return {
+            FEFConfidence.HIGH: 15,
+            FEFConfidence.MEDIUM: 10,
+            FEFConfidence.LOW: 5,
+        }.get(confidence, 0)
 
     def _secondary_scores(self, inputs: FEFInputs) -> dict[str, float]:
         """6-factor secondary scorer (informational, not gating)."""
@@ -383,6 +425,7 @@ class FEFEngine:
             confidence=confidence,
             reasoning=reasoning,
             strike_rec=plan.strike_rec,
+            suggested_qty=self._qty_for_confidence(confidence),
             t1=plan.t1,
             t2=plan.t2,
             t3=plan.t3,

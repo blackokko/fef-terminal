@@ -36,6 +36,7 @@ export interface FEFVerdict {
   confidence: FEFConfidence;
   reasoning: string;
   strike_rec: number | null;
+  suggested_qty: number | null;
   t1: number | null;
   t2: number | null;
   t3: number | null;

@@ -52,6 +52,21 @@ def _next_wall_in_direction(
     return max(candidates)
 
 
+def _walls_in_direction_sorted(
+    walls: list[ExposureRow],
+    spot: float,
+    direction: FEFDirection,
+    min_distance: float = 2.0,
+) -> list[float]:
+    """All wall strikes in the trade direction, sorted nearest-first."""
+    if direction == FEFDirection.LONG_CALLS:
+        candidates = [w.strike for w in walls if w.strike > spot + min_distance]
+        return sorted(candidates)
+    else:
+        candidates = [w.strike for w in walls if w.strike < spot - min_distance]
+        return sorted(candidates, reverse=True)
+
+
 def build_plan(
     spot: float,
     direction: FEFDirection,
@@ -60,25 +75,49 @@ def build_plan(
     top_dex_walls: list[ExposureRow],
     ntm_max_pain: float | None = None,
 ) -> StrikePlan:
-    """Build a staged-exit plan around current spot + market structure.
+    """Build a staged-exit plan anchored on real market structure (walls + NTM MP).
 
-    Targets are SPX index price levels. Stop is also an SPX level.
-    The user maps these to option exits manually in v1 (clearer with the
-    option-chain integration coming in Task #3).
+    IMPROVEMENTS #6: T1 = nearest wall in direction (if within reasonable
+    distance), T2 = next wall after that, T3 = NTM MP if reachable else
+    third wall / fixed offset. Falls back to fixed offsets when wall map
+    is sparse.
     """
     strike = _nearest_otm_5pt(spot, direction)
 
-    next_wall = _next_wall_in_direction(top_gex_walls + top_dex_walls, spot, direction)
+    all_walls = top_gex_walls + top_dex_walls
+    walls_dir = _walls_in_direction_sorted(all_walls, spot, direction)
 
-    if direction == FEFDirection.LONG_CALLS:
-        t1 = spot + 10
-        t2 = next_wall if next_wall else (spot + 20)
-        t3 = ntm_max_pain if (ntm_max_pain and ntm_max_pain > spot + 25) else (spot + 35)
-        stop = spot - 10
+    is_long_calls = direction == FEFDirection.LONG_CALLS
+
+    # T1: nearest wall, but not more than ~25pts away (else use +10 fallback)
+    if walls_dir and abs(walls_dir[0] - spot) <= 25:
+        t1 = walls_dir[0]
     else:
-        t1 = spot - 10
-        t2 = next_wall if next_wall else (spot - 20)
-        t3 = ntm_max_pain if (ntm_max_pain and ntm_max_pain < spot - 25) else (spot - 35)
-        stop = spot + 10
+        t1 = spot + 10 if is_long_calls else spot - 10
+
+    # T2: next wall after T1 (skip duplicates near T1)
+    t2_candidates = [w for w in walls_dir if abs(w - t1) > 3]
+    if t2_candidates and abs(t2_candidates[0] - spot) <= 40:
+        t2 = t2_candidates[0]
+    else:
+        t2 = spot + 20 if is_long_calls else spot - 20
+
+    # T3: NTM max pain if reachable in direction, else third wall, else fixed
+    if is_long_calls:
+        if ntm_max_pain and ntm_max_pain > t2 + 3:
+            t3 = ntm_max_pain
+        elif len(walls_dir) > 2 and walls_dir[2] > t2:
+            t3 = walls_dir[2]
+        else:
+            t3 = spot + 35
+    else:
+        if ntm_max_pain and ntm_max_pain < t2 - 3:
+            t3 = ntm_max_pain
+        elif len(walls_dir) > 2 and walls_dir[2] < t2:
+            t3 = walls_dir[2]
+        else:
+            t3 = spot - 35
+
+    stop = spot - 10 if is_long_calls else spot + 10
 
     return StrikePlan(strike_rec=strike, t1=t1, t2=t2, t3=t3, stop=stop)

@@ -69,6 +69,20 @@ class AppState:
         return cls(
             quantdata=make_quantdata_client(),
             ibkr=make_ibkr_provider(),
-            engine=FEFEngine(),
+            engine=_make_engine(),
             broadcaster=EventBroadcaster(),
         )
+
+
+def _make_engine() -> FEFEngine:
+    """Engine factory honoring env-var thresholds (IMPROVEMENTS #2 + #7)."""
+    interval = float(os.environ.get("FEF_LOOP_INTERVAL_SEC", "120"))
+    # Auto-scale magnitude thresholds by interval (default 120s = scale 1.0)
+    threshold_scale = max(0.1, interval / 120.0)
+    return FEFEngine(
+        wall_proximity_pts=float(os.environ.get("FEF_WALL_PROXIMITY_PTS", "5.0")),
+        wall_collapse_pct=float(os.environ.get("FEF_WALL_COLLAPSE_PCT", "0.20")),
+        wall_collapse_floor_m=float(os.environ.get("FEF_WALL_COLLAPSE_FLOOR_M", "5.0")),
+        absorption_fe_ratio_min=float(os.environ.get("FEF_ABSORPTION_FE_MIN", "5.0")),
+        threshold_scale=threshold_scale,
+    )

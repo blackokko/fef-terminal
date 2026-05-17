@@ -37,6 +37,7 @@ class FEFVerdict:
 
     # Trade plan (only set when direction != WAIT)
     strike_rec: float | None = None
+    suggested_qty: int | None = None  # sized by confidence
     t1: float | None = None
     t2: float | None = None
     t3: float | None = None
@@ -72,6 +73,7 @@ class FEFVerdict:
             "nearest_wall_distance": self.nearest_wall_distance,
             "secondary_scores": self.secondary_scores,
             "strike_rec": self.strike_rec,
+            "suggested_qty": self.suggested_qty,
             "t1": self.t1,
             "t2": self.t2,
             "t3": self.t3,

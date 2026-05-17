@@ -7,6 +7,19 @@ export function OrderTicketPanel() {
   const { lastIter } = useSidecar();
   const [qty, setQty] = useState<number>(DEFAULT_QTY);
   const [copied, setCopied] = useState(false);
+  const [qtyUserOverridden, setQtyUserOverridden] = useState(false);
+
+  // Update default qty to track verdict's suggested_qty when it changes,
+  // unless the user has manually edited it for this verdict.
+  useEffect(() => {
+    if (!qtyUserOverridden && lastIter?.verdict.suggested_qty) {
+      setQty(lastIter.verdict.suggested_qty);
+    }
+  }, [lastIter?.iter_num, lastIter?.verdict.suggested_qty, qtyUserOverridden]);
+
+  useEffect(() => {
+    setQtyUserOverridden(false);
+  }, [lastIter?.iter_num]);
 
   useEffect(() => {
     if (!copied) return;
@@ -64,7 +77,10 @@ export function OrderTicketPanel() {
             min={1}
             max={100}
             className="qty-input"
-            onChange={(e) => setQty(Number(e.target.value) || DEFAULT_QTY)}
+            onChange={(e) => {
+              setQty(Number(e.target.value) || DEFAULT_QTY);
+              setQtyUserOverridden(true);
+            }}
           /> SPX {v.strike_rec.toFixed(0)}{side}
           {opt && (
             <span className="ticket-option-entry">
@@ -77,6 +93,9 @@ export function OrderTicketPanel() {
           expiry {lastIter.session_date} · 0DTE
           {opt && opt.delta != null && (
             <> · delta {opt.delta.toFixed(2)}</>
+          )}
+          {v.suggested_qty != null && qty !== v.suggested_qty && (
+            <> · model suggests {v.suggested_qty}× (based on {v.confidence})</>
           )}
         </div>
 
