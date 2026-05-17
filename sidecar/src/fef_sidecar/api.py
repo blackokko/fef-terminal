@@ -838,10 +838,41 @@ async def get_bars(
     # the default static bars.
     import os as _os
 
-    if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
-        max_frame = getattr(s.ibkr, "_scripted_index", 0) + 1
-        bars = _aggregate_scripted_bars(symbol, bar_size, max_frame=max_frame)
-    elif type(s.ibkr).__name__ == "MockIBKRProvider":
+    if type(s.ibkr).__name__ == "MockIBKRProvider":
+        # Coherent mock — use PriceTrack so bar timestamps + prices align
+        # with what the chart's live ticks see at the same moment.
+        from fef_sidecar.mock import get_track
+        track = get_track()
+        bar_size_minutes = {
+            "1 min": 1, "2 mins": 2, "5 mins": 5, "15 mins": 15, "30 mins": 30,
+            "1 hour": 60, "4 hours": 240, "1 day": 390, "1 week": 1950,
+        }.get(bar_size, 1)
+        bars_raw = track.build_bars(bar_size_minutes=bar_size_minutes)
+        sym = symbol.upper()
+        if sym == "QQQ":
+            transform = lambda v: round(v / 14.5, 2)
+        elif sym == "IWM":
+            transform = lambda v: round(v / 33.0, 2)
+        elif sym == "SPY":
+            transform = lambda v: round(v / 10.0, 2)
+        elif sym == "ES":
+            transform = lambda v: round(v - 5.0, 2)
+        else:
+            transform = lambda v: v
+        bars = [
+            {
+                "timestamp_ms": b["timestamp_ms"],
+                "open": transform(b["open"]),
+                "high": transform(b["high"]),
+                "low": transform(b["low"]),
+                "close": transform(b["close"]),
+                "volume": b["volume"],
+            }
+            for b in bars_raw
+        ]
+        # Skip the old aggregation branches below
+        return bars
+    elif False:
         # Static morning bars from mock with per-symbol offset/scale
         sym = symbol.upper()
         # QQQ ~ SPX / 14.5, IWM ~ SPX / 33, SPY ~ SPX / 10, ES = SPX - 5

@@ -57,17 +57,27 @@ class MockIBKRProvider:
         bars: list[Bar] | None = None,
         *,
         playback_interval: float = 0.0,
+        use_coherent_track: bool | None = None,
     ) -> None:
         """
         Args:
-            bars: Scripted bar sequence. Defaults to the 5/15 SPX morning arc.
-            playback_interval: Seconds between yielded bars during streaming.
-                Set to 0 for tests, >0 for realistic replay in dev.
+            bars: Scripted bar sequence (test-mode: yields these once then ends).
+                If None, the coherent PriceTrack streams indefinitely (production mode).
+            playback_interval: Seconds between yielded bars in test mode.
+            use_coherent_track: Force track mode on/off. Default None = auto
+                (track when bars is None, replay when bars provided).
         """
+        self._bars_explicit = bars is not None
         self._bars = bars if bars is not None else _default_spx_5_15_bars()
         self._playback_interval = playback_interval
         self._connected = False
-        self._scripted_index = 0  # tracks the latest scripted-day frame for tick base
+        self._scripted_index = 0  # legacy — kept for backwards compat with /bars endpoint
+        # Coherent track mode is opt-in via env (production) or explicit ctor arg.
+        # Default to OFF so existing test assertions (15 default bars, last=7439)
+        # continue to hold.
+        import os as _os
+        env_coherent = _os.environ.get("FEF_MOCK_COHERENT", "false").lower() in ("true", "1", "yes", "on")
+        self._use_coherent_track = use_coherent_track if use_coherent_track is not None else env_coherent
 
     @property
     def is_connected(self) -> bool:
@@ -86,20 +96,62 @@ class MockIBKRProvider:
         bar_size: str = "2 mins",
         duration: str = "1 D",
     ) -> AsyncIterator[Bar]:
+        """Production mode (default): emit bars from the coherent PriceTrack
+        at REAL timestamps so chart bars + live ticks always align.
+        Test mode (explicit bars=...): replay the passed bars once and exit."""
         if not self._connected:
             await self.connect()
 
-        import os as _os
-
-        if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
-            async for bar in self._scripted_day_bars():
+        # Test path — explicit bars replayed once
+        if not self._use_coherent_track:
+            for bar in self._bars:
                 yield bar
+                if self._playback_interval > 0:
+                    await asyncio.sleep(self._playback_interval)
             return
 
-        for bar in self._bars:
-            yield bar
-            if self._playback_interval > 0:
-                await asyncio.sleep(self._playback_interval)
+        import os as _os
+        from datetime import datetime as _dt
+
+        from fef_sidecar.mock import MockClock, get_track
+
+        track = get_track()
+        bar_size_minutes = {
+            "1 min": 1, "2 mins": 2, "5 mins": 5, "15 mins": 15, "30 mins": 30,
+            "1 hour": 60, "4 hours": 240, "1 day": 390,
+        }.get(bar_size, 1)
+
+        # Real seconds per bar = bar_size_minutes / speedup
+        real_seconds_per_bar = max(0.5, bar_size_minutes * 60 / MockClock.speedup())
+
+        last_yielded_minute = -1.0
+        while True:
+            sim_min = MockClock.simulated_minutes_since_open()
+            # Emit a new bar each time we cross a bar boundary
+            current_bar_idx = int(sim_min // bar_size_minutes)
+            if current_bar_idx > int(last_yielded_minute // bar_size_minutes):
+                bar_end_min = current_bar_idx * bar_size_minutes
+                bar_start_min = bar_end_min - bar_size_minutes
+                if bar_start_min >= 0:
+                    open_ = track.price_at_minute(bar_start_min)
+                    close = track.price_at_minute(bar_end_min)
+                    # Sample 5 points for high/low
+                    samples = [track.price_at_minute(bar_start_min + bar_size_minutes * k / 5)
+                               for k in range(6)]
+                    yield Bar(
+                        timestamp=_dt.now(),
+                        open=round(open_, 2),
+                        high=round(max(samples) + 0.2, 2),
+                        low=round(min(samples) - 0.2, 2),
+                        close=round(close, 2),
+                        volume=1500,
+                    )
+                    last_yielded_minute = bar_end_min
+            if MockClock.is_session_complete():
+                # Wait then re-check (in case speedup changes)
+                await asyncio.sleep(5)
+                continue
+            await asyncio.sleep(real_seconds_per_bar)
 
     async def _scripted_day_bars(self) -> AsyncIterator[Bar]:
         """Generate bars from the DAY_SCRIPT — ONE-SHOT replay.
@@ -168,14 +220,22 @@ class MockIBKRProvider:
                 bid_size=10,
                 ask_size=10,
             )
+        # Coherent mode: live PriceTrack price. Test mode: last static bar.
+        if self._use_coherent_track:
+            from datetime import datetime as _dt
+
+            from fef_sidecar.mock import get_track
+            price = get_track().price_now()
+            return Quote(
+                timestamp=_dt.now(), last=round(price, 2),
+                bid=round(price - 0.25, 2), ask=round(price + 0.25, 2),
+                bid_size=10, ask_size=10,
+            )
         last_bar = self._bars[-1]
         return Quote(
-            timestamp=last_bar.timestamp,
-            last=last_bar.close,
-            bid=last_bar.close - 0.25,
-            ask=last_bar.close + 0.25,
-            bid_size=10,
-            ask_size=10,
+            timestamp=last_bar.timestamp, last=last_bar.close,
+            bid=last_bar.close - 0.25, ask=last_bar.close + 0.25,
+            bid_size=10, ask_size=10,
         )
 
     async def get_option_quote(self, contract: Contract) -> OptionQuote:
@@ -190,7 +250,8 @@ class MockIBKRProvider:
 
         from datetime import datetime as _dt
 
-        spx = self._bars[-1].close
+        from fef_sidecar.mock import get_track
+        spx = get_track().price_now()
         strike = contract.strike
         is_call = contract.right == "C"
 
@@ -274,42 +335,25 @@ class MockIBKRProvider:
         self,
         contract: Contract,
     ) -> AsyncIterator[Quote]:
-        """Emit synthetic ticks every FEF_TICK_INTERVAL_SEC (default 2s).
-
-        In scripted-day mode, the random walk tracks the latest scripted
-        frame's SPX so ticks reflect where the day is in its arc. Otherwise,
-        mean-reverts to the last static bar's close.
-        """
+        """Emit ticks from the coherent PriceTrack — price always matches
+        what bars / QuantData / microstructure see at the same instant."""
         import os
-        import random
         from datetime import datetime
+
+        from fef_sidecar.mock import get_track
 
         if not self._connected:
             await self.connect()
-        interval = float(os.environ.get("FEF_TICK_INTERVAL_SEC", "2"))
-        is_scripted = os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in (
-            "true",
-            "1",
-            "yes",
-        )
+        interval = float(os.environ.get("FEF_TICK_INTERVAL_SEC", "0.5"))
+        track = get_track()
 
-        if is_scripted:
-            from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
-
-        price = self._bars[-1].close
         while True:
-            if is_scripted:
-                base_price = DAY_SCRIPT[self._scripted_index % len(DAY_SCRIPT)].spx
-            else:
-                base_price = self._bars[-1].close
-            step = random.uniform(-0.5, 0.5)
-            drift = (base_price - price) * 0.3  # tighter pull so ticks track the arc
-            price = round(price + step + drift, 2)
+            price = track.price_with_tick_noise()
             yield Quote(
                 timestamp=datetime.now(),
                 last=price,
-                bid=price - 0.25,
-                ask=price + 0.25,
+                bid=round(price - 0.25, 2),
+                ask=round(price + 0.25, 2),
                 bid_size=10,
                 ask_size=10,
             )

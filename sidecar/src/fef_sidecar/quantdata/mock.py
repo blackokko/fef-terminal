@@ -190,12 +190,20 @@ class MockQuantDataClient:
 
         self._fetch_count += 1
 
-        # ----- Scripted day mode -----
-        if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
+        # ----- Coherent mock mode (production default) -----
+        # When FEF_MOCK_COHERENT=true (set automatically by make_quantdata_client),
+        # use the shared PriceTrack so this snapshot's spx_price matches
+        # the live chart + ticks + microstructure at the same moment.
+        _coherent = _os.environ.get("FEF_MOCK_COHERENT", "false").lower() in ("true", "1", "yes", "on")
+        if _coherent:
+            from fef_sidecar.mock import MockClock, get_track
             from fef_sidecar.quantdata.mock_day import frame_at
 
-            frame = frame_at(self._fetch_count - 1)
-            spx_now = frame.spx
+            track = get_track()
+            sim_min = MockClock.simulated_minutes_since_open()
+            spx_now = round(track.price_now(), 2)
+            frame_idx = max(0, int(sim_min / 2))
+            frame = frame_at(frame_idx)
             self._cum_drift_m = frame.drift_cum_net_m
             drift = DriftSummary(
                 entries=list(_DRIFT_ENTRIES),
@@ -233,6 +241,39 @@ class MockQuantDataClient:
                         b=(100 - agg_put) * 4e8,
                         bb=(100 - agg_put) * 1e7,
                     ),
+                ) if include_aggression else None,
+                iv_rank=await self.get_iv_rank() if include_iv_rank else None,
+                oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
+                simulated_minutes_since_open=frame.minutes_since_open,
+                simulated_phase_label=frame.label,
+                simulated_vix=frame.vix,
+            )
+
+        # ----- Scripted day mode (legacy, fetch-count-paced) -----
+        if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
+            from fef_sidecar.quantdata.mock_day import frame_at
+
+            frame = frame_at(self._fetch_count - 1)
+            spx_now = frame.spx
+            self._cum_drift_m = frame.drift_cum_net_m
+            drift = DriftSummary(
+                entries=list(_DRIFT_ENTRIES),
+                cumulative_call_m=max(0.0, frame.drift_cum_net_m) + 5.0,
+                cumulative_put_m=min(0.0, -frame.drift_cum_net_m / 2) - 5.0,
+                cumulative_net_m=frame.drift_cum_net_m,
+                bias=frame.drift_bias,
+            )
+            gex = StrikeExposureSnapshot(greek=GreekType.GAMMA, spx_price=spx_now, rows=list(_GEX_ROWS))
+            dex = StrikeExposureSnapshot(greek=GreekType.DELTA, spx_price=spx_now, rows=list(_DEX_ROWS))
+            agg_call = getattr(frame, "aggression_call_pct", 41.0)
+            agg_put = getattr(frame, "aggression_put_pct", 41.0)
+            return MarketSnapshot(
+                fetched_at_ms=int(time.time() * 1000),
+                spx_price=spx_now, gex=gex, dex=dex, drift=drift,
+                max_pain=MaxPainSnapshot(max_pain=7000.0, spx_price=spx_now),
+                aggression=AggressionStats(
+                    call=ContractAggression(side="CALL", aa=agg_call * 1e8, a=agg_call * 5e8, mid=2.5e10, b=(100 - agg_call) * 4e8, bb=(100 - agg_call) * 1e7),
+                    put=ContractAggression(side="PUT", aa=agg_put * 1e8, a=agg_put * 5e8, mid=2.5e10, b=(100 - agg_put) * 4e8, bb=(100 - agg_put) * 1e7),
                 ) if include_aggression else None,
                 iv_rank=await self.get_iv_rank() if include_iv_rank else None,
                 oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,

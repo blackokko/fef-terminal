@@ -38,13 +38,18 @@ def _env_use_mock(key: str, default: bool = True) -> bool:
 
 def make_quantdata_client() -> QuantDataProvider:
     if _env_use_mock("FEF_PROVIDER_QUANTDATA", default=True):
+        # Enable coherent track so this mock returns a price that matches
+        # the IBKR mock + tick stream + microstructure at the same moment.
+        os.environ.setdefault("FEF_MOCK_COHERENT", "true")
         return MockQuantDataClient()  # type: ignore[return-value]
     return QuantDataClient()  # type: ignore[return-value]
 
 
 def make_ibkr_provider() -> IBKRProvider:
     if _env_use_mock("FEF_PROVIDER_IBKR", default=True):
-        return MockIBKRProvider()
+        # Production mock: coherent PriceTrack so chart bars + ticks +
+        # QuantData + microstructure all show the same price.
+        return MockIBKRProvider(use_coherent_track=True)
     host = os.environ.get("FEF_IBKR_HOST", "127.0.0.1")
     port = int(os.environ.get("FEF_IBKR_PORT", "7497"))
     client_id = int(os.environ.get("FEF_IBKR_CLIENT_ID", "1"))
