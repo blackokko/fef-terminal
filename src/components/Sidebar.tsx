@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { AttributionPanel } from "../panels/AttributionPanel";
+import { AutoTradePanel } from "../panels/AutoTradePanel";
 import { AuditLogPanel } from "../panels/AuditLogPanel";
 import { CalendarPanel } from "../panels/CalendarPanel";
 import { DataMaintenancePanel } from "../panels/DataMaintenancePanel";
@@ -74,6 +75,7 @@ export function Sidebar() {
             <Safe name="Microstructure"><MicrostructurePanel /></Safe>
             <Safe name="CrossSymbol"><CrossSymbolPanel /></Safe>
             <Safe name="OrderTicket"><OrderTicketPanel /></Safe>
+            <Safe name="AutoTrade"><AutoTradePanel /></Safe>
             <Safe name="LiveExecution"><LiveExecutionPanel /></Safe>
             <Safe name="LivePositions"><LivePositionsPanel /></Safe>
             <Safe name="OptionChain"><OptionChainPanel /></Safe>

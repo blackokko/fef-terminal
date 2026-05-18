@@ -94,6 +94,17 @@ class AppState:
     tick_quote_count_live: int = 0
     tick_trade_count_live: int = 0
     depth_update_count_live: int = 0
+
+    # Auto-trade controls — OFF by default. Toggled via /auto_trade/toggle.
+    # When ON, every iter that produces a verdict meeting all safety
+    # criteria triggers an automatic bracket order via place_bracket().
+    auto_trade_enabled: bool = False
+    auto_trade_confidence_floor: str = "HIGH"   # 'HIGH' / 'MEDIUM' / 'LOW'
+    auto_trade_cool_down_sec: int = 300         # min seconds between auto fires
+    auto_trade_max_per_session: int = 5         # hard cap per sidecar session
+    auto_trade_count_session: int = 0           # bumped after each successful fire
+    auto_trade_last_at_ms: int = 0              # epoch ms of last fire
+    auto_trade_last_block_reason: str = ""      # why most-recent eligible signal was skipped
     position_task: object | None = None
     auto_wf_task: object | None = None
     # Active symbol — drives which contract is fed to bar/tick/iter loops and

@@ -17,6 +17,8 @@ export function OrderTicketPanel() {
   const [ticketId, setTicketId] = useState<number | null>(null);
   const [showOutcomeForm, setShowOutcomeForm] = useState(false);
   const [outcomeStatus, setOutcomeStatus] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const [sendResult, setSendResult] = useState<{ ok: boolean; message: string } | null>(null);
 
   // Update default qty to track verdict's suggested_qty when it changes,
   // unless the user has manually edited it for this verdict.
@@ -111,6 +113,58 @@ export function OrderTicketPanel() {
     }
   };
 
+  const handleSendToIBKR = async () => {
+    if (!lastIter || !opt) return;
+    const v = lastIter.verdict;
+    if (!v.strike_rec) return;
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const direction = v.direction;
+    const right = direction === "LONG_CALLS" ? "C" : "P";
+    // Two-stage confirm
+    const ok = window.confirm(
+      `Place BRACKET ORDER via IBKR?\n\n` +
+      `  BUY ${qty} SPX ${today} ${v.strike_rec}${right} @ $${opt.entry_limit.toFixed(2)}\n` +
+      `  T1 (1/3 qty): $${opt.t1.toFixed(2)}\n` +
+      `  T2 (1/3 qty): $${opt.t2.toFixed(2)}\n` +
+      `  T3 (1/3 qty): $${opt.t3.toFixed(2)}\n` +
+      `  STOP (all):   $${opt.stop.toFixed(2)}\n\n` +
+      `Requires FEF_LIVE_TRADING=true env. Otherwise this is DRY_RUN (no real order).`
+    );
+    if (!ok) return;
+    setSending(true);
+    setSendResult(null);
+    try {
+      const r = await fetch(`${API_BASE}/live/place_bracket`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: "SPX", strike: v.strike_rec, right, expiry: today,
+          qty,
+          entry_limit: opt.entry_limit,
+          t1_limit: opt.t1, t2_limit: opt.t2, t3_limit: opt.t3,
+          stop_limit: opt.stop,
+          confirm: true,
+          ticket_id: ticketId,
+        }),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        setSendResult({
+          ok: true,
+          message: data.dry_run
+            ? `DRY_RUN — wrote order #${data.parent_order_id} (FEF_LIVE_TRADING not set)`
+            : `LIVE order placed — parent #${data.parent_order_id}`,
+        });
+      } else {
+        setSendResult({ ok: false, message: data.error || data.reason || "submission failed" });
+      }
+    } catch (e) {
+      setSendResult({ ok: false, message: (e as Error).message });
+    } finally {
+      setSending(false);
+    }
+  };
+
   const submitOutcome = async (fields: Record<string, number | string>) => {
     if (ticketId === null) return;
     try {
@@ -195,10 +249,26 @@ export function OrderTicketPanel() {
           <button onClick={() => void handleCopy()}>
             {copied ? "✓ Copied" : "Copy to clipboard"}
           </button>
+          <button
+            onClick={() => void handleSendToIBKR()}
+            disabled={sending || !opt}
+            title={opt ? "Place bracket order via IBKR (requires FEF_LIVE_TRADING=true)" : "No option pricing available"}
+            style={{ background: "var(--color-blue)", color: "white", fontWeight: 600 }}
+          >
+            {sending ? "Sending…" : "📤 Send to IBKR"}
+          </button>
           {ticketId !== null && !showOutcomeForm && (
             <button onClick={() => setShowOutcomeForm(true)}>Record outcome</button>
           )}
         </div>
+        {sendResult && (
+          <div className="small" style={{
+            color: sendResult.ok ? "var(--color-green)" : "var(--color-red)",
+            marginTop: 6, fontFamily: "var(--font-mono)",
+          }}>
+            {sendResult.ok ? "✓" : "✗"} {sendResult.message}
+          </div>
+        )}
 
         {outcomeStatus && (
           <div className="small" style={{ color: "var(--color-green)", marginTop: 6 }}>

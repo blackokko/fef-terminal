@@ -1407,6 +1407,36 @@ button:active {
   cursor: pointer;
 }
 
+/* Auto-trade panel */
+
+.auto-trade-panel { background: var(--color-bg); }
+.auto-trade-hero {
+  padding: 8px 10px;
+  background: var(--color-bg-elevated);
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+.auto-trade-settings {
+  width: 100%;
+  font-size: 11px;
+  border-collapse: collapse;
+}
+.auto-trade-settings td {
+  padding: 4px 4px;
+}
+.auto-trade-settings td:last-child {
+  text-align: right;
+}
+.auto-trade-counters {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 8px;
+  background: var(--color-bg-elevated);
+  padding: 6px 10px;
+  border-radius: 4px;
+  margin-top: 6px;
+}
+
 /* Data maintenance */
 
 .db-counts-table {

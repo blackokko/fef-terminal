@@ -409,6 +409,95 @@ async def quote(request: Request, symbol: str) -> dict[str, Any]:
     }
 
 
+@router.get("/auto_trade/status")
+async def auto_trade_status(request: Request) -> dict[str, Any]:
+    s = _state(request)
+    from fef_sidecar.engine.live_trading import is_live_trading_enabled
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    elapsed = (now_ms - s.auto_trade_last_at_ms) / 1000 if s.auto_trade_last_at_ms else None
+    cool_remaining = max(0, s.auto_trade_cool_down_sec - elapsed) if elapsed is not None else 0
+    return {
+        "enabled": s.auto_trade_enabled,
+        "live_trading_env": is_live_trading_enabled(),
+        "confidence_floor": s.auto_trade_confidence_floor,
+        "cool_down_sec": s.auto_trade_cool_down_sec,
+        "cool_down_remaining_sec": int(cool_remaining),
+        "max_per_session": s.auto_trade_max_per_session,
+        "count_session": s.auto_trade_count_session,
+        "last_at_ms": s.auto_trade_last_at_ms,
+        "last_block_reason": s.auto_trade_last_block_reason,
+        "session_cap_reached": s.auto_trade_count_session >= s.auto_trade_max_per_session,
+    }
+
+
+@router.post("/auto_trade/toggle")
+async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Turn auto-trade on/off + optionally update settings.
+
+    Body: {enabled: bool, confirm: bool, [confidence_floor], [cool_down_sec],
+           [max_per_session]}
+
+    confirm=true required when enabling (defensive — prevent accidental
+    enabling via a stale fetch or replay)."""
+    from fef_sidecar.engine.live_trading import is_live_trading_enabled
+    from fef_sidecar.db.repository import SignalIterRepository
+
+    s = _state(request)
+    new_enabled = bool(body.get("enabled"))
+    if new_enabled and not body.get("confirm"):
+        raise HTTPException(400, "confirm=true required when enabling auto-trade")
+    if new_enabled and not is_live_trading_enabled():
+        raise HTTPException(
+            400,
+            "FEF_LIVE_TRADING env not set — auto-trade can't fire real orders. "
+            "Restart sidecar with FEF_LIVE_TRADING=true first."
+        )
+
+    old_enabled = s.auto_trade_enabled
+    s.auto_trade_enabled = new_enabled
+    if "confidence_floor" in body:
+        s.auto_trade_confidence_floor = str(body["confidence_floor"]).upper()
+    if "cool_down_sec" in body:
+        s.auto_trade_cool_down_sec = max(60, int(body["cool_down_sec"]))
+    if "max_per_session" in body:
+        s.auto_trade_max_per_session = max(1, min(50, int(body["max_per_session"])))
+
+    await SignalIterRepository.write_audit_log(
+        category="auto_trade_toggle", actor="user",
+        summary=f"Auto-trade {'ENABLED' if new_enabled else 'DISABLED'} "
+                f"(was {'on' if old_enabled else 'off'}) — floor={s.auto_trade_confidence_floor}, "
+                f"cool_down={s.auto_trade_cool_down_sec}s, max={s.auto_trade_max_per_session}",
+        details={
+            "enabled": new_enabled, "confidence_floor": s.auto_trade_confidence_floor,
+            "cool_down_sec": s.auto_trade_cool_down_sec,
+            "max_per_session": s.auto_trade_max_per_session,
+        },
+    )
+    return {
+        "ok": True, "enabled": s.auto_trade_enabled,
+        "confidence_floor": s.auto_trade_confidence_floor,
+        "cool_down_sec": s.auto_trade_cool_down_sec,
+        "max_per_session": s.auto_trade_max_per_session,
+    }
+
+
+@router.post("/auto_trade/reset_session")
+async def auto_trade_reset_session(request: Request) -> dict[str, Any]:
+    """Reset the per-session auto-trade counter (lets you fire more if you've
+    hit the cap and want to continue). Audit-logged."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    s = _state(request)
+    old = s.auto_trade_count_session
+    s.auto_trade_count_session = 0
+    s.auto_trade_last_at_ms = 0
+    await SignalIterRepository.write_audit_log(
+        category="auto_trade_reset", actor="user",
+        summary=f"Reset auto-trade session counter (was {old}/{s.auto_trade_max_per_session})",
+    )
+    return {"ok": True, "old_count": old}
+
+
 @router.post("/live/place_bracket")
 async def live_place_bracket(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Place a bracket order. Two-gate safety:

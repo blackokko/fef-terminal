@@ -377,6 +377,17 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     await state.broadcaster.publish(event)
     perf["broadcast_ms"] = (_time.perf_counter() - t0) * 1000
 
+    # Auto-trade evaluation — checks all gates, may place a bracket order.
+    # Defensive: never let an auto-trade exception break the iter pipeline.
+    try:
+        from fef_sidecar.engine.auto_trader import maybe_auto_trade
+        decision = await maybe_auto_trade(state, event.verdict)
+        state.auto_trade_last_block_reason = decision.reason
+        if decision.fired and decision.order_result:
+            logger.info("auto_trade fired: %s", decision.order_result)
+    except Exception:
+        logger.exception("Auto-trade evaluation failed")
+
     # IMPROVEMENTS #R: evaluate user-defined patterns against this iter
     t0 = _time.perf_counter()
     await _evaluate_patterns(state, inputs, verdict, signal.id, signal.iter_num)
