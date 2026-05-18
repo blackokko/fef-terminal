@@ -1093,6 +1093,8 @@ async def get_bars(
                 contract, bar_size=bar_size, duration=duration,
                 use_rth=False, what_to_show="TRADES",
             )
+        except TimeoutError as e:
+            raise HTTPException(504, str(e)) from e
         except Exception as e:
             raise HTTPException(503, f"IBKR historical fetch failed for {symbol}: {e}") from e
         scale = 1.0  # no scaling — real prices

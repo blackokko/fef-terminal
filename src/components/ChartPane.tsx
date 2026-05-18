@@ -76,18 +76,21 @@ const TIMEFRAMES = [
   { label: "1W", value: "1 week" },
 ];
 
-// Smart default lookback per timeframe — picks a window that:
-//   (a) fits within IBKR's per-request max for that bar size, and
-//   (b) gives a useful contextual view (e.g. 5m bars → 1 week of context)
-// User can override via the Lookback dropdown.
+// Smart default lookback per timeframe. Conservative — picks the largest
+// window that's KNOWN to stay within IBKR's per-request max for ALL symbols
+// (SPX index, ES futures, etc.). Empirically verified:
+//   1h × 6M+ → IBKR times out for ES
+//   4h × 1Y  → IBKR times out for ES
+// So defaults stay below those caps. User can override via Lookback dropdown
+// for individual fetches (which may then fail per IBKR rules).
 const DEFAULT_LOOKBACK_BY_TIMEFRAME: Record<string, string> = {
   "1 min":  "1 D",
   "2 mins": "2 D",
   "5 mins": "1 W",
   "15 mins": "2 W",
   "30 mins": "1 M",
-  "1 hour": "3 M",
-  "4 hours": "1 Y",
+  "1 hour": "1 M",
+  "4 hours": "3 M",
   "1 day":  "5 Y",
   "1 week": "10 Y",
 };

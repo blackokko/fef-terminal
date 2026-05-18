@@ -121,21 +121,48 @@ class LiveIBKRProvider:
             return self._ib_hist
 
     async def fetch_historical_bars(self, contract: Contract, *, bar_size: str, duration: str,
-                                    use_rth: bool = False, what_to_show: str = "TRADES") -> list[Bar]:
-        """One-shot historical bar fetch using the dedicated historical connection.
+                                    use_rth: bool = False, what_to_show: str = "TRADES",
+                                    timeout_seconds: float = 20.0) -> list[Bar]:
+        """One-shot historical bar fetch using the dedicated historical
+        connection.
 
-        Use this for /bars endpoint or any other ad-hoc query. The streaming
-        bar_stream_loop uses self._ib (separate connection) so the two don't
-        block each other."""
+        Hard timeout via asyncio.wait_for so a too-large duration+bar_size
+        combo (e.g. ES 4h × 1Y exceeds IBKR's per-request cap) can't wedge
+        the connection. On timeout, the historical conn is discarded so the
+        next call gets a fresh one — prevents the chart from going dark
+        permanently after one bad request."""
         ib = await self._ensure_hist_connected()
         ib_contract = _to_ib_contract(contract)
-        await ib.qualifyContractsAsync(ib_contract)
-        bars = await ib.reqHistoricalDataAsync(
-            ib_contract, endDateTime="", durationStr=duration,
-            barSizeSetting=bar_size, whatToShow=what_to_show,
-            useRTH=use_rth, formatDate=2,
-        )
-        return [_bar_from_ib(b) for b in bars]
+        try:
+            await asyncio.wait_for(
+                ib.qualifyContractsAsync(ib_contract), timeout=timeout_seconds,
+            )
+            bars = await asyncio.wait_for(
+                ib.reqHistoricalDataAsync(
+                    ib_contract, endDateTime="", durationStr=duration,
+                    barSizeSetting=bar_size, whatToShow=what_to_show,
+                    useRTH=use_rth, formatDate=2,
+                ),
+                timeout=timeout_seconds,
+            )
+            return [_bar_from_ib(b) for b in bars]
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Historical fetch timed out (%s × %s on %s) — resetting hist connection",
+                bar_size, duration, contract.symbol,
+            )
+            # Discard the wedged connection so next call gets a fresh one
+            try:
+                if self._ib_hist is not None and self._ib_hist.isConnected():
+                    self._ib_hist.disconnect()
+            except Exception:
+                pass
+            self._ib_hist = None
+            raise TimeoutError(
+                f"IBKR historical fetch timed out after {timeout_seconds}s for "
+                f"{contract.symbol} {bar_size} × {duration}. "
+                f"Try a shorter lookback."
+            )
 
     async def disconnect(self) -> None:
         if self._ib is not None and self._ib.isConnected():
