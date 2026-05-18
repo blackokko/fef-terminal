@@ -1157,32 +1157,66 @@ async def microstructure_loop(state: AppState) -> None:
 
 
 async def tick_stream_loop(state: AppState) -> None:
+    """Stream last-price ticks. Watchdog: if no tick arrives within
+    TICK_STALL_THRESHOLD_SEC we treat the IBKR subscription as wedged
+    and force a reconnect — silent stalls used to leave the Live Quote
+    panel frozen until manual app restart.
+    """
+    import time as _t
     symbol = state.active_symbol
-    logger.info("Starting tick stream loop for %s", symbol)
+    stall_threshold = int(os.environ.get("FEF_TICK_STALL_THRESHOLD_SEC", "30"))
+    logger.info("Starting tick stream loop for %s (stall watchdog=%ds)", symbol, stall_threshold)
     while True:
         try:
             await state.ibkr.connect()
-            async for quote in state.ibkr.stream_last_price(Contract.for_symbol(symbol)):
-                state.last_spx_price = quote.last
-                # Tracked separately so _run_one_iter can prefer this over the
-                # (up to 15s stale) QuantData snapshot price.
-                state.last_live_tick_spx = quote.last
-                state.last_live_tick_ms = int(quote.timestamp.timestamp() * 1000)
-                event = TickEvent(
-                    timestamp_ms=int(quote.timestamp.timestamp() * 1000),
-                    spx_price=quote.last,
-                    bar=None,  # tick without a bar — just a price update
-                    bid=quote.bid, ask=quote.ask,
-                    bid_size=quote.bid_size, ask_size=quote.ask_size,
-                    symbol=symbol,
-                    prior_close=state.prior_close_by_symbol.get(symbol),
-                )
-                await state.broadcaster.publish(event)
+            async def _stream():
+                async for q in state.ibkr.stream_last_price(Contract.for_symbol(symbol)):
+                    yield q
+            agen = _stream()
+            try:
+                while True:
+                    try:
+                        quote = await asyncio.wait_for(
+                            agen.__anext__(), timeout=stall_threshold,
+                        )
+                    except (asyncio.TimeoutError, TimeoutError):
+                        logger.warning(
+                            "Tick stream stalled for >%ds on %s — forcing reconnect",
+                            stall_threshold, symbol,
+                        )
+                        raise
+                    except StopAsyncIteration:
+                        logger.info("Tick stream generator ended — restarting")
+                        break
+                    state.last_spx_price = quote.last
+                    state.last_live_tick_spx = quote.last
+                    state.last_live_tick_ms = int(quote.timestamp.timestamp() * 1000)
+                    event = TickEvent(
+                        timestamp_ms=int(quote.timestamp.timestamp() * 1000),
+                        spx_price=quote.last, bar=None,
+                        bid=quote.bid, ask=quote.ask,
+                        bid_size=quote.bid_size, ask_size=quote.ask_size,
+                        symbol=symbol,
+                        prior_close=state.prior_close_by_symbol.get(symbol),
+                    )
+                    await state.broadcaster.publish(event)
+            finally:
+                try:
+                    await agen.aclose()
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             logger.info("Tick stream cancelled — exiting")
             raise
         except Exception:
             logger.exception("Tick stream failed — reconnecting in 5s")
+            # Force a fresh main IBKR connection so the next stream_last_price
+            # subscription gets a clean reqMktData slot.
+            try:
+                if hasattr(state.ibkr, "_ib") and state.ibkr._ib is not None:  # type: ignore[attr-defined]
+                    state.ibkr._ib.disconnect()  # type: ignore[attr-defined]
+            except Exception:
+                pass
             await asyncio.sleep(5)
 
 

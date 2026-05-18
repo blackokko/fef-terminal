@@ -40,7 +40,11 @@ def build_option_targets(
     spx_t2: float,
     spx_t3: float,
     spx_stop: float,
-) -> OptionTargets:
+) -> OptionTargets | None:
+    """Return None when the quote can't yield a valid limit price — IBKR will
+    silently reject a LMT order with NaN/0, so the caller must skip.
+    """
+    import math as _math
     if quote.contract.strike is None or quote.contract.right is None:
         raise ValueError("OptionQuote.contract must have strike + right")
 
@@ -49,6 +53,9 @@ def build_option_targets(
     # mode — diverge from the QuantData provider's SPX, breaking target ordering.
     spx = current_spx
     entry = quote.ask if quote.ask and quote.ask > 0 else quote.last
+
+    if entry is None or not _math.isfinite(entry) or entry <= 0:
+        return None
 
     return OptionTargets(
         contract_strike=quote.contract.strike,

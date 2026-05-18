@@ -89,10 +89,17 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
             False, f"session cap reached ({state.auto_trade_max_per_session})"
         )
 
-    # Gate 8: option pricing available
+    # Gate 8: option pricing available — note NaN is truthy in Python, so
+    # explicit isfinite() guard is required (IBKR silently rejects LMT orders
+    # built from NaN entry_limit).
+    import math as _math
     opt = verdict_dict.get("option_pricing")
-    if not opt or not all(opt.get(k) for k in ("entry_limit", "t1", "t2", "t3", "stop")):
+    if not opt:
         return AutoTradeDecision(False, "no option pricing on verdict")
+    for k in ("entry_limit", "t1", "t2", "t3", "stop"):
+        v = opt.get(k)
+        if v is None or not isinstance(v, (int, float)) or not _math.isfinite(v) or v <= 0:
+            return AutoTradeDecision(False, f"invalid option_pricing.{k}={v!r}")
 
     strike = verdict_dict.get("strike_rec")
     qty = verdict_dict.get("suggested_qty") or 15
