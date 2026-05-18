@@ -332,6 +332,17 @@ class LiveIBKRProvider:
         except Exception:
             pass
 
+        # Enable delayed market data globally — required for paper accounts
+        # without OPRA/Cboe live subscription. Returns 15-min delayed
+        # bid/ask/last (and live greeks computed from IV). One-shot per
+        # connection; subsequent calls are no-ops.
+        if not getattr(self, "_market_data_type_set", False):
+            try:
+                self._ib.reqMarketDataType(3)  # 3 = delayed
+                self._market_data_type_set = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
         # No generic tick list for OPT contracts — IBKR rejects "13" (stocks-only)
         # with error 321. modelGreeks (delta/gamma/vega/theta/IV) stream
         # automatically via tickOptionComputation events on the Ticker.
@@ -363,11 +374,29 @@ class LiveIBKRProvider:
                 pass
             raise RuntimeError("; ".join(captured_errors))
 
-        last = float(ticker.last) if ticker.last and ticker.last > 0 else float(
-            ticker.close or 0
-        )
-        bid = float(ticker.bid) if ticker.bid and ticker.bid > 0 else None
-        ask = float(ticker.ask) if ticker.ask and ticker.ask > 0 else None
+        # Also accept delayed-data fields when live ticks aren't subscribed.
+        # tickType 68 = delayedLast, 66 = delayedBid, 67 = delayedAsk.
+        def _pick(*candidates: Any) -> float | None:
+            for c in candidates:
+                try:
+                    f = float(c) if c is not None else None
+                except (TypeError, ValueError):
+                    continue
+                if f is not None and f == f and f > 0:
+                    return f
+            return None
+        last = _pick(ticker.last, ticker.close, getattr(ticker, "delayedLast", None))
+        bid = _pick(ticker.bid, getattr(ticker, "delayedBid", None))
+        ask = _pick(ticker.ask, getattr(ticker, "delayedAsk", None))
+        # Final fallback: model theoretical price (when chain data is missing
+        # entirely — paper account, illiquid strike, etc.)
+        if last is None and bid is None and ask is None:
+            opt_price = (
+                ticker.modelGreeks.optPrice
+                if ticker.modelGreeks and ticker.modelGreeks.optPrice is not None
+                else None
+            )
+            last = _pick(opt_price)
         delta = (
             float(ticker.modelGreeks.delta)
             if ticker.modelGreeks and ticker.modelGreeks.delta is not None
