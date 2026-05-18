@@ -210,6 +210,18 @@ async def fef_tick_loop(state: AppState) -> None:
         await asyncio.sleep(interval)
 
 
+def _current_provider_mode(state: AppState) -> str:
+    """'live' / 'mock' / 'mixed' — tag for the SignalIter row so analytics
+    can later filter out test data."""
+    qd_mock = type(state.quantdata).__name__.startswith("Mock")
+    ibkr_mock = type(state.ibkr).__name__.startswith("Mock")
+    if qd_mock and ibkr_mock:
+        return "mock"
+    if not qd_mock and not ibkr_mock:
+        return "live"
+    return "mixed"
+
+
 async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     """One FEF iter — uses cached snapshot if available, else fetches fresh.
 
@@ -262,6 +274,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             "option_pricing": _option_pricing_dict(option_targets),
         },
         session_date=_today_et(),
+        provider_mode=_current_provider_mode(state),
     )
     state.last_iter_num = signal.iter_num
 
@@ -762,11 +775,35 @@ async def hft_loop(state: AppState) -> None:
             state.active_symbol, state.active_symbol)
         try:
             await state.ibkr.connect()
+
+            def _on_book(ts, b, a):
+                update_book(state.depth_state, b, a, ts)
+                state.depth_update_count_live += 1
+
             cancel_depth = await state.ibkr.subscribe_depth(
-                Contract.for_symbol(depth_symbol),
-                lambda ts, b, a: update_book(state.depth_state, b, a, ts),  # type: ignore[arg-type]
+                Contract.for_symbol(depth_symbol), _on_book,
             )
             logger.info("HFT loop subscribed to LIVE depth on %s", depth_symbol)
+
+            # Watchdog: if no depth events arrive within 30s, your account
+            # likely lacks the CME depth data package. Log a clear warning
+            # so you know the panel showing 0/BALANCED is data-permission,
+            # not a code bug.
+            async def _depth_subscription_watchdog():
+                await asyncio.sleep(30)
+                if state.depth_update_count_live == 0:
+                    logger.warning(
+                        "L2 depth subscription on %s delivered 0 events in 30s. "
+                        "Likely missing CME depth data subscription on this IBKR "
+                        "account. HFT panel L2 Depth will show 0/BALANCED until "
+                        "the subscription is added.", depth_symbol,
+                    )
+                else:
+                    logger.info(
+                        "L2 depth subscription on %s healthy: %d events in 30s",
+                        depth_symbol, state.depth_update_count_live,
+                    )
+            asyncio.create_task(_depth_subscription_watchdog(), name="depth-watchdog")
         except Exception:
             logger.exception("Live depth subscription failed — using synth")
             cancel_depth = None
@@ -802,9 +839,11 @@ async def hft_loop(state: AppState) -> None:
                             for i in range(1, 11)]
                     update_book(state.depth_state, bids, asks, now_ms)
                 else:
-                    # Live: push current spx as a tick + count microstructure events as quotes
+                    # Live: push current spx for vol calc. Stuffing state is
+                    # already being fed from microstructure_loop's tick
+                    # subscription (real quotes + real trades) — DON'T push
+                    # synthetic quote ticks here or we'd double-count.
                     vol_push(state.vol_state, now_ms, spx)
-                    stuffing_push_quote(state.stuffing_state, now_ms)
 
                 vol = vol_assess(state.vol_state, now_ms)
                 stuff = stuffing_assess(state.stuffing_state, now_ms)
@@ -836,6 +875,27 @@ async def hft_loop(state: AppState) -> None:
 
                 fired_on = ",".join(flips) if flips else "poll"
 
+                # Data source determination for the HFT panel badges:
+                is_live = isinstance(state.ibkr, LiveIBKRProvider)
+                vol_source = "live_sampled" if is_live else "synth"
+                if is_live:
+                    # If the tick subscription is delivering quotes + trades,
+                    # stuffing is live. If quotes but no trades, EMPTY
+                    # (tick-by-tick subscription missing for trades).
+                    if state.tick_quote_count_live > 0 and state.tick_trade_count_live > 0:
+                        stuffing_source = "live"
+                    elif state.tick_quote_count_live > 0:
+                        stuffing_source = "empty_trades"
+                    else:
+                        stuffing_source = "empty"
+                    if state.depth_update_count_live > 0:
+                        depth_source = "live"
+                    else:
+                        depth_source = "empty"
+                else:
+                    stuffing_source = "synth"
+                    depth_source = "synth"
+
                 await state.broadcaster.publish(HFTEvent(
                     timestamp_ms=now_ms,
                     short_vol_pts=vol.short_vol_pts, long_vol_pts=vol.long_vol_pts,
@@ -847,6 +907,8 @@ async def hft_loop(state: AppState) -> None:
                     book_direction=depth.direction, book_confidence=depth.confidence,
                     weighted_mid_price=depth.weighted_mid_price, book_spread=depth.spread,
                     composite_direction=composite, fired_on=fired_on,
+                    vol_source=vol_source, stuffing_source=stuffing_source,
+                    depth_source=depth_source,
                 ))
             except _asyncio.CancelledError:
                 raise
@@ -893,15 +955,30 @@ async def microstructure_loop(state: AppState) -> None:
     last_persisted_ms = 0
     rng = _random.Random()
 
+    # Both callbacks ALSO feed the stuffing state (single tick stream,
+    # multiple consumers). HFT loop reads state.stuffing_state for its
+    # cancel-to-trade ratio — without this, live stuffing detection was
+    # broken (only quotes, never trades).
+    from fef_sidecar.engine.quote_stuffing import (
+        push_quote as _stuff_push_quote,
+        push_trade as _stuff_push_trade,
+    )
+
     def _on_quote(ts_ms: int, bid: float, ask: float, bs: float, as_: float) -> None:
         push_quote(state.microstructure_state, QuoteUpdate(
             timestamp_ms=ts_ms, bid=bid, ask=ask, bid_size=bs, ask_size=as_,
         ))
+        if state.stuffing_state is not None:
+            _stuff_push_quote(state.stuffing_state, ts_ms)
+        state.tick_quote_count_live += 1
 
     def _on_trade(ts_ms: int, price: float, size: float, aggressor: str) -> None:
         push_trade(state.microstructure_state, TradePrint(
             timestamp_ms=ts_ms, price=price, size=size, aggressor=aggressor,  # type: ignore[arg-type]
         ))
+        if state.stuffing_state is not None:
+            _stuff_push_trade(state.stuffing_state, ts_ms)
+        state.tick_trade_count_live += 1
 
     # Microstructure proxy mapping — futures lead their cash/ETF counterparts.
     # ES is the source of truth for S&P 500 order flow (24h tape, consolidated

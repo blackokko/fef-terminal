@@ -108,6 +108,11 @@ class HFTEvent(BaseModel):
     book_spread: float | None = None
     composite_direction: str = "NEUTRAL"
     fired_on: str = "poll"
+    # Per-subsystem data source so the UI badge can show LIVE / EMPTY / SYNTH.
+    # Driven by counters in AppState that the actual subscriptions bump.
+    vol_source: str = "synth"        # live_sampled / synth
+    stuffing_source: str = "synth"   # live / empty / synth
+    depth_source: str = "synth"      # live / empty / synth
 
 
 class MicrostructureEvent(BaseModel):

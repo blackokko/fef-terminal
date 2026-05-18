@@ -1377,6 +1377,22 @@ button:active {
   cursor: pointer;
 }
 
+/* Data maintenance */
+
+.db-counts-table {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  border-collapse: collapse;
+}
+.db-counts-table td {
+  padding: 2px 4px;
+}
+.db-counts-table td:last-child {
+  text-align: right;
+  font-weight: 600;
+}
+
 /* Live quote panel */
 .live-quote-panel { background: var(--color-bg); }
 .live-quote-source {

@@ -115,6 +115,9 @@ export interface HFTEvent {
   book_spread: number | null;
   composite_direction: string;
   fired_on: string;
+  vol_source?: string;
+  stuffing_source?: string;
+  depth_source?: string;
 }
 
 export interface MicrostructureEvent {

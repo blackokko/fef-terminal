@@ -89,6 +89,11 @@ class AppState:
     stuffing_state: object | None = None  # StuffingState
     depth_state: object | None = None  # DepthState
     hft_task: object | None = None
+    # Update counters per data source — used by HFT panel badges to show
+    # LIVE / EMPTY / SYNTH. Bumped from the actual subscription callbacks.
+    tick_quote_count_live: int = 0
+    tick_trade_count_live: int = 0
+    depth_update_count_live: int = 0
     position_task: object | None = None
     auto_wf_task: object | None = None
     # Active symbol — drives which contract is fed to bar/tick/iter loops and

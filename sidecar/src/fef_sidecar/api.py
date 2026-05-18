@@ -44,6 +44,52 @@ async def status(request: Request) -> dict[str, Any]:
         "last_iter_perf_ms": s.last_iter_perf_ms,  # IMPROVEMENTS #10
         "active_symbol": s.active_symbol,
         "available_symbols": s.available_symbols,
+        "live_data_health": {
+            "tick_quote_count": s.tick_quote_count_live,
+            "tick_trade_count": s.tick_trade_count_live,
+            "depth_update_count": s.depth_update_count_live,
+        },
+    }
+
+
+@router.get("/diag/depth")
+async def diag_depth(request: Request, symbol: str = "ES", wait_seconds: int = 5) -> dict[str, Any]:
+    """One-shot diagnostic: subscribe to L2 depth for `wait_seconds`, report
+    how many book updates were received. Use this to verify your IBKR account
+    has the depth data subscription for the exchange."""
+    import asyncio as _asyncio
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from fef_sidecar.ibkr.models import Contract
+
+    s = _state(request)
+    if not isinstance(s.ibkr, LiveIBKRProvider):
+        return {"ok": False, "error": "Not in live IBKR mode"}
+
+    events: list[dict[str, Any]] = []
+    def _on_book(ts, bids, asks):
+        events.append({
+            "ts": ts, "n_bids": len(bids), "n_asks": len(asks),
+            "top_bid": (bids[0].price if bids else None),
+            "top_ask": (asks[0].price if asks else None),
+        })
+
+    try:
+        cancel = await s.ibkr.subscribe_depth(Contract.for_symbol(symbol), _on_book)
+        await _asyncio.sleep(wait_seconds)
+        await cancel()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    return {
+        "ok": True, "symbol": symbol, "wait_seconds": wait_seconds,
+        "events_received": len(events),
+        "events_per_sec": round(len(events) / max(1, wait_seconds), 1),
+        "first_event": events[0] if events else None,
+        "last_event": events[-1] if events else None,
+        "verdict": (
+            "SUBSCRIBED — depth feed is live" if len(events) > 0
+            else "NOT SUBSCRIBED — IBKR returned 0 events, your account likely lacks the depth data subscription for this exchange"
+        ),
     }
 
 
@@ -139,6 +185,99 @@ async def engine_state(request: Request) -> dict[str, Any]:
         "buffer": buffer,
         "last_verdict": s.last_verdict,
     }
+
+
+@router.post("/db/clear_mock_history")
+async def clear_mock_history(request: Request) -> dict[str, Any]:
+    """Delete every historical row tagged provider_mode='mock' from the
+    persisted tables. Use this ONCE after switching to live mode to clear
+    the accumulated mock testing data so analytics/attribution/walk-forward
+    show only real signals.
+
+    Rows with provider_mode=NULL (pre-tag) are ALSO deleted — they predate
+    the tagging system and we can't tell live from mock retrospectively.
+
+    Returns counts of deleted rows per table. Irreversible."""
+    from sqlmodel import select, delete
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import (FlowSnapshot, HistoricalBar,
+                                        MicrostructureSample, SignalIter,
+                                        TradeTicket, VixSample)
+
+    counts: dict[str, int] = {}
+    async with get_session() as session:
+        # Find signal_iter ids to delete (mock or untagged)
+        sigs_to_delete = list((await session.exec(
+            select(SignalIter).where(
+                (SignalIter.provider_mode == "mock") | (SignalIter.provider_mode == None)  # noqa: E711
+            )
+        )).all())
+        sig_ids = [s.id for s in sigs_to_delete if s.id is not None]
+        counts["signal_iter"] = len(sig_ids)
+        # Delete trade tickets attached to those signals
+        if sig_ids:
+            tickets = list((await session.exec(
+                select(TradeTicket).where(TradeTicket.signal_iter_id.in_(sig_ids))  # type: ignore[attr-defined]
+            )).all())
+            counts["trade_ticket"] = len(tickets)
+            for t in tickets:
+                await session.delete(t)
+        for s in sigs_to_delete:
+            await session.delete(s)
+        # All-tables clear of historical sidecar data — these aren't
+        # per-row tagged but they're all from old mock sessions.
+        for cls, name in ((HistoricalBar, "historical_bar"),
+                          (FlowSnapshot, "flow_snapshot"),
+                          (MicrostructureSample, "microstructure_sample"),
+                          (VixSample, "vix_sample")):
+            rows = list((await session.exec(select(cls))).all())
+            counts[name] = len(rows)
+            for r in rows:
+                await session.delete(r)
+    # Audit log entry
+    from fef_sidecar.db.repository import SignalIterRepository as R
+    await R.write_audit_log(
+        category="db_clear", actor="user",
+        summary=f"Cleared mock/untagged history: {sum(counts.values())} rows",
+        details=counts,
+    )
+    return {"ok": True, "deleted": counts, "total": sum(counts.values())}
+
+
+@router.get("/db/row_counts")
+async def db_row_counts() -> dict[str, Any]:
+    """Quick inventory of each table — useful before clearing mock data."""
+    from sqlmodel import select
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import (FlowSnapshot, HistoricalBar,
+                                        MicrostructureSample, SignalIter,
+                                        TradeTicket, VixSample)
+    out: dict[str, int] = {}
+    async with get_session() as session:
+        for cls, name in (
+            (SignalIter, "signal_iter"),
+            (TradeTicket, "trade_ticket"),
+            (HistoricalBar, "historical_bar"),
+            (FlowSnapshot, "flow_snapshot"),
+            (MicrostructureSample, "microstructure_sample"),
+            (VixSample, "vix_sample"),
+        ):
+            out[name] = len(list((await session.exec(select(cls))).all()))
+        # SignalIter by provider_mode
+        mock_rows = list((await session.exec(
+            select(SignalIter).where(SignalIter.provider_mode == "mock")
+        )).all())
+        live_rows = list((await session.exec(
+            select(SignalIter).where(SignalIter.provider_mode == "live")
+        )).all())
+        untagged_rows = list((await session.exec(
+            select(SignalIter).where(SignalIter.provider_mode == None)  # noqa: E711
+        )).all())
+        out["signal_iter_by_mode"] = {  # type: ignore[assignment]
+            "live": len(live_rows), "mock": len(mock_rows),
+            "untagged_pre_tag_system": len(untagged_rows),
+        }
+    return out
 
 
 @router.post("/walk_forward/run_now")

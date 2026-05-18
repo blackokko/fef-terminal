@@ -79,6 +79,11 @@ class SignalIter(SQLModel, table=True):
     # Full reasoning context — anything the engine wants to recall later
     extras: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
 
+    # Provider mode at write time — 'live', 'mock', or 'mixed' (one live + one
+    # mock provider). Lets analytics/attribution filter out test/mock rows.
+    # NULL on rows created before this column existed.
+    provider_mode: str | None = Field(default=None, index=True)
+
 
 class TradeTicket(SQLModel, table=True):
     """Order ticket generated from an actionable FEF signal.

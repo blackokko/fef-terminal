@@ -70,6 +70,7 @@ class SignalIterRepository:
         iv_rank_put_pct: float | None = None,
         extras: dict[str, Any] | None = None,
         session_date: str | None = None,
+        provider_mode: str | None = None,
     ) -> SignalIter:
         """Persist one FEF iter and bump the DailySession counters atomically."""
         date = session_date or _today_et()
@@ -93,6 +94,7 @@ class SignalIterRepository:
             iv_rank_call_pct=iv_rank_call_pct,
             iv_rank_put_pct=iv_rank_put_pct,
             extras=extras or {},
+            provider_mode=provider_mode,
         )
 
         async with get_session() as session:

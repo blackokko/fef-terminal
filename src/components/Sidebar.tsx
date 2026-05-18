@@ -4,6 +4,7 @@ import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { AttributionPanel } from "../panels/AttributionPanel";
 import { AuditLogPanel } from "../panels/AuditLogPanel";
 import { CalendarPanel } from "../panels/CalendarPanel";
+import { DataMaintenancePanel } from "../panels/DataMaintenancePanel";
 import { CrossSymbolPanel } from "../panels/CrossSymbolPanel";
 import { HFTPanel } from "../panels/HFTPanel";
 import { LiveExecutionPanel } from "../panels/LiveExecutionPanel";
@@ -106,6 +107,7 @@ export function Sidebar() {
           <>
             <Safe name="Settings"><SettingsPanel /></Safe>
             <Safe name="Calendar"><CalendarPanel /></Safe>
+            <Safe name="DataMaintenance"><DataMaintenancePanel /></Safe>
             <Safe name="AuditLog"><AuditLogPanel /></Safe>
             <Safe name="ChartAnnotations"><ChartAnnotationsPanel /></Safe>
             <Safe name="Glossary"><GlossaryPanel /></Safe>
