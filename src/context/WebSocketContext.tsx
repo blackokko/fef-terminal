@@ -81,9 +81,15 @@ export function SidecarProvider({
     setState((prev) => {
       switch (event.type) {
         case "tick":
+          // bar_stream_loop ALSO emits TickEvent (with event.bar attached) on
+          // each bar close. Its spx_price is the bar.close which lags the
+          // live quote stream by up to a bar_size. Only update lastTick from
+          // PURE quote ticks (no bar dict) so the side panel + chart-overlay
+          // tick handler always see the freshest live price. Bar ticks still
+          // append to recentBars for chart bar rendering.
           return {
             ...prev,
-            lastTick: event,
+            lastTick: event.bar ? prev.lastTick : event,
             recentTicks: [...prev.recentTicks, event].slice(-RECENT_LIMIT),
             recentBars: event.bar
               ? [...prev.recentBars, event.bar].slice(-RECENT_LIMIT)
