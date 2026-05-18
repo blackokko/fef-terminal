@@ -193,13 +193,18 @@ export function OrderTicketPanel() {
       <h3 className="sidebar-section-title">Order Ticket</h3>
 
       <div className="ticket-block">
-        {spread && (spread.kind === "PCS" || spread.kind === "CCS") && (
+        {spread && (spread.kind === "PCS" || spread.kind === "CCS") && spread.short_strike != null && spread.long_strike != null && (
           <div className="ticket-spread-banner">
-            <div className="ticket-spread-kind">{spread.kind}: SELL {spread.short_strike?.toFixed(0)} / BUY {spread.long_strike?.toFixed(0)}</div>
-            <div className="muted small">
-              credit ~${(spread.estimated_credit_per_contract / 100).toFixed(2)} · max profit ${spread.max_profit_per_contract?.toFixed(0)} · max loss ${spread.max_loss_per_contract?.toFixed(0)} · BE ${spread.breakeven?.toFixed(0)}
+            <div className="ticket-spread-kind">
+              {spread.kind}: SELL {fmt(spread.short_strike, 0)} / BUY {fmt(spread.long_strike, 0)}
             </div>
-            <div className="muted small">{spread.reasoning}</div>
+            <div className="muted small">
+              credit ~${fmt((spread.estimated_credit_per_contract ?? 0) / 100, 2)} ·
+              max profit ${fmt(spread.max_profit_per_contract, 0)} ·
+              max loss ${fmt(spread.max_loss_per_contract, 0)} ·
+              BE ${fmt(spread.breakeven, 0)}
+            </div>
+            {spread.reasoning && <div className="muted small">{spread.reasoning}</div>}
           </div>
         )}
         <div className="ticket-main">
@@ -213,18 +218,18 @@ export function OrderTicketPanel() {
               setQty(Number(e.target.value) || DEFAULT_QTY);
               setQtyUserOverridden(true);
             }}
-          /> SPX {v.strike_rec.toFixed(0)}{side}
-          {opt && (
+          /> SPX {fmt(v.strike_rec, 0)}{side}
+          {opt && opt.entry_limit != null && (
             <span className="ticket-option-entry">
-              @ ${opt.entry_limit.toFixed(2)}
+              @ ${fmt(opt.entry_limit, 2)}
             </span>
           )}
         </div>
 
         <div className="muted small">
-          expiry {lastIter.session_date} · 0DTE
+          expiry {lastIter.session_date ?? "—"} · 0DTE
           {opt && opt.delta != null && (
-            <> · delta {opt.delta.toFixed(2)}</>
+            <> · delta {fmt(opt.delta, 2)}</>
           )}
           {v.suggested_qty != null && qty !== v.suggested_qty && (
             <> · model suggests {v.suggested_qty}× (based on {v.confidence})</>
@@ -375,12 +380,12 @@ function TargetCell({
   danger = false,
 }: {
   label: string;
-  value: number | null;
+  value: number | null | undefined;
   prefix?: string;
   suffix?: string;
   danger?: boolean;
 }) {
-  if (value == null) return null;
+  if (value == null || !Number.isFinite(value)) return null;
   return (
     <div>
       <span
@@ -396,6 +401,12 @@ function TargetCell({
       </span>
     </div>
   );
+}
+
+/** Defensive number formatter — returns "—" for null/undefined/NaN/Infinity. */
+function fmt(value: number | null | undefined, digits: number): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return value.toFixed(digits);
 }
 
 function formatTicketText(
