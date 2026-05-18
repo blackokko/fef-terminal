@@ -3,21 +3,26 @@ import { useEffect, useState } from "react";
 const API_BASE = "http://127.0.0.1:8765";
 
 interface LivePosition {
-  id: number;
+  id: number | null;
   snapshot_ts: string;
   symbol: string;
   strike: number;
   right: string;
   expiry: string;
   qty: number;
-  avg_cost: number;
-  market_price: number;
-  unrealized_pnl: number;
+  avg_cost: number | null;
+  market_price: number | null;
+  unrealized_pnl: number | null;
   delta: number | null;
   gamma: number | null;
   theta: number | null;
   vega: number | null;
   iv: number | null;
+}
+
+function fmt(v: number | null | undefined, digits: number): string {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return v.toFixed(digits);
 }
 
 export function LivePositionsPanel() {
@@ -48,7 +53,7 @@ export function LivePositionsPanel() {
   const portfolioDelta = rows.reduce((sum, p) => sum + (p.delta ?? 0) * p.qty, 0);
   const portfolioGamma = rows.reduce((sum, p) => sum + (p.gamma ?? 0) * p.qty, 0);
   const portfolioTheta = rows.reduce((sum, p) => sum + (p.theta ?? 0) * p.qty, 0);
-  const totalUnrealized = rows.reduce((sum, p) => sum + p.unrealized_pnl, 0);
+  const totalUnrealized = rows.reduce((sum, p) => sum + (p.unrealized_pnl ?? 0), 0);
 
   return (
     <section className="sidebar-section">
@@ -71,15 +76,15 @@ export function LivePositionsPanel() {
           <table className="positions-table">
             <thead><tr><th>Pos</th><th>Cost</th><th>Mkt</th><th>P/L</th><th>Δ</th><th>IV</th></tr></thead>
             <tbody>
-              {rows.map(p => (
-                <tr key={p.id}>
+              {rows.map((p, i) => (
+                <tr key={p.id ?? `${p.symbol}-${p.strike}-${p.right}-${i}`}>
                   <td>{p.qty}× {p.symbol} {p.strike}{p.right}</td>
-                  <td className="muted">${p.avg_cost.toFixed(2)}</td>
-                  <td>${p.market_price.toFixed(2)}</td>
-                  <td style={{ color: p.unrealized_pnl >= 0 ? "var(--color-green)" : "var(--color-red)" }}>
-                    {p.unrealized_pnl >= 0 ? "+" : ""}${p.unrealized_pnl.toFixed(0)}
+                  <td className="muted">${fmt(p.avg_cost, 2)}</td>
+                  <td>${fmt(p.market_price, 2)}</td>
+                  <td style={{ color: (p.unrealized_pnl ?? 0) >= 0 ? "var(--color-green)" : "var(--color-red)" }}>
+                    {p.unrealized_pnl == null ? "—" : (p.unrealized_pnl >= 0 ? "+" : "") + "$" + fmt(p.unrealized_pnl, 0)}
                   </td>
-                  <td>{p.delta?.toFixed(2) ?? "—"}</td>
+                  <td>{fmt(p.delta, 2)}</td>
                   <td className="muted">{p.iv != null ? (p.iv * 100).toFixed(1) + "%" : "—"}</td>
                 </tr>
               ))}
