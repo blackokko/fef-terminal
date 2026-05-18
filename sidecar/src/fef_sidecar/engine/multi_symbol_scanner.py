@@ -28,7 +28,6 @@ from typing import Any
 
 from fef_sidecar.db.repository import SignalIterRepository
 from fef_sidecar.engine import FEFEngine
-from fef_sidecar.events import IterEvent
 from fef_sidecar.engine.fef import snapshot_to_inputs
 
 logger = logging.getLogger(__name__)
@@ -73,47 +72,11 @@ async def _scan_one_symbol(state, symbol: str) -> None:
     inputs = snapshot_to_inputs(snap)
     verdict = engine.push(inputs)
 
-    # Build the event (mirrors _run_one_iter's broadcast structure)
-    from fef_sidecar.engine.types import FEFInputs  # noqa: F401
-    event = IterEvent(
-        iter_num=0,  # scanner uses 0 — DB iter_num is its own counter
-        session_date=_today_et(),
-        spx_price=inputs.spx_price,
-        verdict={
-            "direction": verdict.direction.value,
-            "confidence": verdict.confidence.value,
-            "reasoning": verdict.reasoning,
-            "strike_rec": verdict.strike_rec,
-            "t1": verdict.t1, "t2": verdict.t2, "t3": verdict.t3,
-            "stop": verdict.stop,
-            "delta_price": verdict.delta_price,
-            "delta_drift_m": verdict.delta_drift_m,
-            "fe_ratio": verdict.fe_ratio,
-            "aligned": verdict.aligned,
-            "absorption": verdict.absorption,
-            "wall_proximity_skip": verdict.wall_proximity_skip,
-            "wall_collapse_trigger": verdict.wall_collapse_trigger,
-            "nearest_wall_strike": verdict.nearest_wall_strike,
-            "nearest_wall_distance": verdict.nearest_wall_distance,
-            "secondary_scores": verdict.secondary_scores,
-            "scanner_symbol": symbol,
-        },
-        snapshot={
-            "top_gex": [{"strike": w.strike, "net_m": w.net_m, "side": w.side}
-                        for w in inputs.top_gex_walls],
-            "top_dex": [{"strike": w.strike, "net_m": w.net_m, "side": w.side}
-                        for w in inputs.top_dex_walls],
-            "drift": {
-                "cum_net_m": inputs.drift_cum_net_m,
-                "bias": inputs.drift_bias,
-            },
-            "ntm_max_pain": inputs.ntm_max_pain,
-            "raw_max_pain": inputs.raw_max_pain,
-            "aggression": None,
-        },
-    )
-    # Cache the verdict so the FE Scanner panel can render the latest
-    # state for each symbol without subscribing to every IterEvent.
+    # Cache the verdict for the FE Scanner panel (it polls /scanner/symbols).
+    # We do NOT broadcast IterEvent from the scanner — that would push the
+    # other symbol's walls / max-pain / drift onto the active chart since
+    # the chart subscribes to ALL iter events. The user wants scanner work
+    # to stay in the background, not pollute the chart.
     state.last_scanner_verdict_by_symbol[symbol] = {
         "direction": verdict.direction.value,
         "confidence": verdict.confidence.value,
@@ -122,12 +85,64 @@ async def _scan_one_symbol(state, symbol: str) -> None:
         "strike_rec": verdict.strike_rec,
         "timestamp_ms": int(_time.time() * 1000),
     }
-    await state.broadcaster.publish(event)
+
+    # Build a verdict dict for the auto-trader (not broadcast — local only).
+    verdict_dict = {
+        "direction": verdict.direction.value,
+        "confidence": verdict.confidence.value,
+        "reasoning": verdict.reasoning,
+        "strike_rec": verdict.strike_rec,
+        "t1": verdict.t1, "t2": verdict.t2, "t3": verdict.t3,
+        "stop": verdict.stop,
+        "delta_price": verdict.delta_price,
+        "delta_drift_m": verdict.delta_drift_m,
+        "fe_ratio": verdict.fe_ratio,
+        "aligned": verdict.aligned,
+        "absorption": verdict.absorption,
+        "wall_proximity_skip": verdict.wall_proximity_skip,
+        "wall_collapse_trigger": verdict.wall_collapse_trigger,
+        "nearest_wall_strike": verdict.nearest_wall_strike,
+        "nearest_wall_distance": verdict.nearest_wall_distance,
+        "secondary_scores": verdict.secondary_scores,
+        "scanner_symbol": symbol,
+    }
+    # Auto-trader needs option_pricing to pass gate 8. Fetch the option
+    # quote for the scanner-recommended strike here (same path as the
+    # main iter loop's _maybe_fetch_option_targets does for SPX).
+    if verdict.direction.value in ("LONG_CALLS", "LONG_PUTS") and verdict.strike_rec:
+        try:
+            from fef_sidecar.engine.option_targets import build_option_targets
+            from fef_sidecar.ibkr.models import Contract, ContractKind
+            expiry = _today_et().replace("-", "")
+            right = "C" if verdict.direction.value == "LONG_CALLS" else "P"
+            opt_contract = Contract(
+                symbol=symbol, kind=ContractKind.OPTION,
+                exchange="CBOE" if symbol == "SPX" else "SMART",
+                expiry=expiry, strike=verdict.strike_rec, right=right,
+            )
+            quote = await state.ibkr.get_option_quote(opt_contract)
+            targets = build_option_targets(
+                quote=quote, current_spx=inputs.spx_price,
+                spx_t1=verdict.t1, spx_t2=verdict.t2,
+                spx_t3=verdict.t3, spx_stop=verdict.stop,
+            )
+            if targets is not None:
+                verdict_dict["option_pricing"] = {
+                    "contract_strike": targets.contract_strike,
+                    "right": targets.right,
+                    "entry_limit": targets.entry_limit,
+                    "delta": targets.delta,
+                    "underlying_price_at_quote": targets.underlying_price_at_quote,
+                    "t1": targets.t1, "t2": targets.t2,
+                    "t3": targets.t3, "stop": targets.stop,
+                }
+        except Exception:
+            logger.exception("scanner: option quote fetch failed for %s", symbol)
 
     if symbol in OPTION_SYMBOLS:
         try:
             from fef_sidecar.engine.auto_trader import maybe_auto_trade
-            decision = await maybe_auto_trade(state, event.verdict, symbol=symbol)
+            decision = await maybe_auto_trade(state, verdict_dict, symbol=symbol)
             if decision.fired and decision.order_result:
                 logger.info("scanner: %s auto-trade fired: %s", symbol, decision.order_result)
         except Exception:
