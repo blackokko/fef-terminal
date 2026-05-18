@@ -39,15 +39,17 @@ def _today_et() -> str:
 class SignalIterRepository:
     """Writes/reads for SignalIter + cascading DailySession updates."""
 
+    # Per-process iter counter — resets to 0 on each sidecar startup so the UI
+    # shows iter #1, #2, ... fresh per launch instead of resuming today's
+    # cumulative count from the DB (which could be in the thousands after a
+    # mock-testing day).
+    _process_iter_counter: int = 0
+
     @staticmethod
     async def next_iter_num(session_date: str | None = None) -> int:
-        """Return iter_num for the next signal — 1-based per session_date."""
-        date = session_date or _today_et()
-        async with get_session() as session:
-            stmt = select(SignalIter).where(SignalIter.session_date == date)
-            result = await session.exec(stmt)
-            count = len(result.all())
-            return count + 1
+        """Return iter_num for the next signal — fresh per sidecar launch."""
+        SignalIterRepository._process_iter_counter += 1
+        return SignalIterRepository._process_iter_counter
 
     @staticmethod
     async def write_iter(
