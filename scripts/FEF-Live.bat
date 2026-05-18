@@ -9,4 +9,6 @@ REM   4. Launches the Tauri release exe
 REM
 REM Make a Desktop shortcut to this file and you're set.
 
-powershell.exe -ExecutionPolicy Bypass -NoProfile -File "%~dp0start.ps1" -IbkrMode live -QuantDataMode live
+REM Forces port 7496 (LIVE account). DRY_RUN orders only (no live trading
+REM env). For real order submission use FEF-Live-AutoTrade.bat instead.
+powershell.exe -ExecutionPolicy Bypass -NoProfile -File "%~dp0start.ps1" -IbkrMode live -QuantDataMode live -IbkrPort 7496

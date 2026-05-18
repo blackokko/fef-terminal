@@ -25,7 +25,20 @@ param(
     [string]$Archetype = "5_15_REPLAY",
 
     # Mock seed (only used with -ScriptedDay). 0 = stochastic (time-based seed)
-    [int]$MockSeed = 42
+    [int]$MockSeed = 42,
+
+    # Enable FEF_LIVE_TRADING — required for /live/place_bracket and
+    # auto-trade to actually submit orders to IBKR (paper or live account
+    # depending on which TWS port is listening). Without this switch,
+    # those calls all run in DRY_RUN mode (write records, no submission).
+    [switch]$LiveTrading,
+
+    # Force a specific IBKR port. If set, skips auto-detection. Use this
+    # via the explicit FEF-Live-*.bat / FEF-Paper-*.bat launchers so you
+    # always know which account you're connected to.
+    #   7496 = LIVE account
+    #   7497 = PAPER account
+    [int]$IbkrPort = 0
 )
 
 $ErrorActionPreference = "Continue"
@@ -68,7 +81,10 @@ Get-Process powershell, pwsh -ErrorAction SilentlyContinue | Where-Object {
 } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
 
-# Warn if live IBKR but TWS not running + auto-detect live (7496) vs paper (7497) port
+# Resolve IBKR port. Three paths:
+#   (a) -IbkrPort explicitly set → force that port (fail if not listening)
+#   (b) -IbkrMode live + no port → auto-detect (legacy, less safe)
+#   (c) -IbkrMode mock → port unused
 $ibkrPort = "7497"
 if ($IbkrMode -eq "live") {
     $tws = Get-Process -Name "tws", "ibgateway" -ErrorAction SilentlyContinue
@@ -76,16 +92,31 @@ if ($IbkrMode -eq "live") {
         Write-Warning "TWS / IB Gateway not running. Continue anyway? (Ctrl+C to abort)"
         Start-Sleep -Seconds 3
     }
-    $live = Test-NetConnection -ComputerName 127.0.0.1 -Port 7496 -InformationLevel Quiet -WarningAction SilentlyContinue
-    $paper = Test-NetConnection -ComputerName 127.0.0.1 -Port 7497 -InformationLevel Quiet -WarningAction SilentlyContinue
-    if ($live) {
-        $ibkrPort = "7496"
-        Write-Host "  IBKR port:     7496 (live account detected)" -ForegroundColor Yellow
-    } elseif ($paper) {
-        $ibkrPort = "7497"
-        Write-Host "  IBKR port:     7497 (paper account detected)" -ForegroundColor Yellow
+    if ($IbkrPort -gt 0) {
+        # Explicit port — verify it's listening and refuse if not (safer)
+        $portReachable = Test-NetConnection -ComputerName 127.0.0.1 -Port $IbkrPort -InformationLevel Quiet -WarningAction SilentlyContinue
+        if (-not $portReachable) {
+            $acctLabel = if ($IbkrPort -eq 7496) { "LIVE" } elseif ($IbkrPort -eq 7497) { "PAPER" } else { "custom" }
+            Write-Error "Forced IBKR port $IbkrPort ($acctLabel account) is not listening. Log into the right TWS account first, then re-run."
+            Start-Sleep -Seconds 5
+            exit 1
+        }
+        $ibkrPort = "$IbkrPort"
+        $label = if ($IbkrPort -eq 7496) { "LIVE account" } elseif ($IbkrPort -eq 7497) { "PAPER account" } else { "custom port" }
+        Write-Host "  IBKR port:     $IbkrPort ($label - forced)" -ForegroundColor Yellow
     } else {
-        Write-Warning "Neither 7496 (live) nor 7497 (paper) is listening. Defaulting to 7497."
+        # Auto-detect path — convenience but doesn't tell you which account
+        $live = Test-NetConnection -ComputerName 127.0.0.1 -Port 7496 -InformationLevel Quiet -WarningAction SilentlyContinue
+        $paper = Test-NetConnection -ComputerName 127.0.0.1 -Port 7497 -InformationLevel Quiet -WarningAction SilentlyContinue
+        if ($live) {
+            $ibkrPort = "7496"
+            Write-Host "  IBKR port:     7496 (live account auto-detected)" -ForegroundColor Yellow
+        } elseif ($paper) {
+            $ibkrPort = "7497"
+            Write-Host "  IBKR port:     7497 (paper account auto-detected)" -ForegroundColor Yellow
+        } else {
+            Write-Warning "Neither 7496 (live) nor 7497 (paper) is listening. Defaulting to 7497."
+        }
     }
 }
 
@@ -99,12 +130,18 @@ if ($ScriptedDay) {
     Write-Host ("  Archetype:     " + $Archetype) -ForegroundColor Magenta
     Write-Host ("  Mock seed:     " + $MockSeed + $(if ($MockSeed -eq 0) { " (stochastic)" } else { " (deterministic)" })) -ForegroundColor Magenta
 }
+$liveTradingEnv = if ($LiveTrading) {
+    Write-Host "  Live trading:  ENABLED (orders WILL submit to IBKR on port $ibkrPort)" -ForegroundColor Red
+    "`$env:FEF_LIVE_TRADING='true'; "
+} else { "" }
+
 $watchdogScript = "Set-Location '" + (Join-Path $repo "sidecar") + "'; " + `
     "& .\.venv\Scripts\Activate.ps1; " + `
     "`$env:FEF_PROVIDER_QUANTDATA='" + $QuantDataMode + "'; " + `
     "`$env:FEF_PROVIDER_IBKR='" + $IbkrMode + "'; " + `
     "`$env:FEF_IBKR_PORT='" + $ibkrPort + "'; " + `
     "`$env:FEF_LOOP_INTERVAL_SEC='" + $LoopIntervalSec + "'; " + `
+    $liveTradingEnv + `
     $scriptedDayEnv + `
     "while (`$true) { " + `
         "Write-Host '[watchdog] Starting fef-sidecar...' -ForegroundColor Yellow; " + `
