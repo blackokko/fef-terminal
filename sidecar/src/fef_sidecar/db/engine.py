@@ -83,6 +83,15 @@ async def init_db() -> None:
             ("live_order", "dynamic_stop_level", "REAL"),
             ("live_order", "be_ladder_max_step_R", "REAL DEFAULT 0.0"),
             ("live_order", "entry_spx_price", "REAL"),
+            ("daily_review", "by_direction", "JSON"),
+            ("daily_review", "by_regime", "JSON"),
+            ("daily_review", "by_wall_distance", "JSON"),
+            ("daily_review", "by_fe_ratio", "JSON"),
+            ("daily_review", "by_block_reason", "JSON"),
+            ("daily_review", "actual_trades_taken", "INTEGER DEFAULT 0"),
+            ("daily_review", "actual_wins", "INTEGER DEFAULT 0"),
+            ("daily_review", "actual_losses", "INTEGER DEFAULT 0"),
+            ("daily_review", "actual_total_R", "REAL DEFAULT 0.0"),
         ]
         for table, column, type_sql in migrations:
             try:

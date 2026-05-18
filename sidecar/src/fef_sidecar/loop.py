@@ -325,6 +325,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
         extras={
             **verdict.to_log_extras(),
             "option_pricing": _option_pricing_dict(option_targets),
+            "regime_at_fire": state.last_regime.regime if state.last_regime else None,
         },
         session_date=_today_et(),
         provider_mode=_current_provider_mode(state),

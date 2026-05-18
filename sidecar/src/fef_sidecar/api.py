@@ -1090,6 +1090,39 @@ async def update_config(
     }
 
 
+@router.get("/history/tickets")
+async def history_tickets(limit: int = 100, session_date: str | None = None) -> list[dict[str, Any]]:
+    """List TradeTicket rows. Use ?session_date=YYYY-MM-DD to filter to one
+    session, or omit for the most recent N across all sessions.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import TradeTicket
+    from sqlmodel import select as _s
+    async with _gs() as session:
+        stmt = _s(TradeTicket).order_by(TradeTicket.created_at.desc()).limit(limit)  # type: ignore[attr-defined]
+        rows = list((await session.exec(stmt)).all())
+    out = []
+    for r in rows:
+        if session_date and r.created_at.strftime("%Y-%m-%d") != session_date:
+            continue
+        out.append({
+            "id": r.id, "signal_iter_id": r.signal_iter_id,
+            "created_at": r.created_at.isoformat(),
+            "direction": r.direction.value if hasattr(r.direction, "value") else str(r.direction),
+            "contract_strike": r.contract_strike, "contract_expiry": r.contract_expiry,
+            "qty": r.qty, "entry_limit": r.entry_limit,
+            "t1": r.t1, "t2": r.t2, "t3": r.t3, "stop": r.stop,
+            "status": r.status.value if hasattr(r.status, "value") else str(r.status),
+            "filled_at": r.filled_at.isoformat() if r.filled_at else None,
+            "fill_price": r.fill_price,
+            "exit_t1_price": r.exit_t1_price, "exit_t2_price": r.exit_t2_price,
+            "exit_t3_price": r.exit_t3_price, "exit_stop_price": r.exit_stop_price,
+            "closed_at": r.closed_at.isoformat() if r.closed_at else None,
+            "pnl_dollars": r.pnl_dollars, "notes": r.notes,
+        })
+    return out
+
+
 # IMPROVEMENTS #20: create a ticket from the current actionable verdict
 @router.post("/tickets")
 async def create_ticket(

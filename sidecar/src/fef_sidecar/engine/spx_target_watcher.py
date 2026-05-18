@@ -286,8 +286,10 @@ async def spx_target_watcher_loop(state) -> None:
                     )
                     if t1_hit:
                         await _market_sell(p.spx_target_t1_qty, "T1")
+                        p.spx_target_t1_fired = True; p.spx_target_t1_at_spx = spot
                         await SignalIterRepository.update_live_order(
                             p.id, spx_target_t1_fired=True, spx_target_t1_at_spx=spot,
+                            status="PARTIAL",
                         )
 
                 # T2
@@ -298,8 +300,9 @@ async def spx_target_watcher_loop(state) -> None:
                     )
                     if t2_hit:
                         await _market_sell(p.spx_target_t2_qty, "T2")
+                        p.spx_target_t2_fired = True
                         await SignalIterRepository.update_live_order(
-                            p.id, spx_target_t2_fired=True,
+                            p.id, spx_target_t2_fired=True, status="PARTIAL",
                         )
 
                 # T3
@@ -310,8 +313,9 @@ async def spx_target_watcher_loop(state) -> None:
                     )
                     if t3_hit:
                         await _market_sell(p.spx_target_t3_qty, "T3")
+                        p.spx_target_t3_fired = True
                         await SignalIterRepository.update_live_order(
-                            p.id, spx_target_t3_fired=True,
+                            p.id, spx_target_t3_fired=True, status="PARTIAL",
                         )
 
                 # Runner protect: if T1 has fired but T2/T3 are still open
@@ -331,9 +335,15 @@ async def spx_target_watcher_loop(state) -> None:
                             runner_qty += p.spx_target_t3_qty
                         if runner_qty > 0:
                             await _market_sell(runner_qty, "RUNNER_PROTECT")
+                            p.spx_target_t2_fired = True; p.spx_target_t3_fired = True
                             await SignalIterRepository.update_live_order(
                                 p.id, spx_target_t2_fired=True, spx_target_t3_fired=True,
                             )
+
+                # Sync parent status to CLOSED once all tiers have fired
+                if (p.spx_target_t1_fired and p.spx_target_t2_fired
+                    and p.spx_target_t3_fired and p.status not in ("STOPPED", "CLOSED")):
+                    await SignalIterRepository.update_live_order(p.id, status="CLOSED")
 
         except asyncio.CancelledError:
             raise

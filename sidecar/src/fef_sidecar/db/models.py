@@ -463,6 +463,19 @@ class DailyReview(SQLModel, table=True):
     by_trigger: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     by_confidence: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     by_hour_ct: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    by_direction: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    by_regime: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    by_wall_distance: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    by_fe_ratio: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    by_block_reason: dict[str, int] = Field(default_factory=dict, sa_column=Column(JSON))
+
+    # Actual TRADES taken (from live_order rows) — distinct from signal-based
+    # theoretical outcomes above. real win rate / R can differ wildly when the
+    # user only takes a subset of signals.
+    actual_trades_taken: int = 0
+    actual_wins: int = 0
+    actual_losses: int = 0
+    actual_total_R: float = 0.0
 
 
 class LivePosition(SQLModel, table=True):

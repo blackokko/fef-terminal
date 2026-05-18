@@ -58,6 +58,7 @@ def _trace_outcome(start_ms: int, spx_entry: float, t1: float, t2: float,
 async def compute_daily_review(session_date: str) -> DailyReview:
     """Compute (or recompute) the DailyReview row for the given session_date.
     Overwrites any existing row for that date."""
+    from fef_sidecar.db.models import AuditLog, LiveOrder
     async with get_session() as session:
         sigs = list((await session.exec(
             select(SignalIter).where(SignalIter.session_date == session_date)
@@ -67,6 +68,19 @@ async def compute_daily_review(session_date: str) -> DailyReview:
             .where(HistoricalBar.symbol == "SPX")
             .where(HistoricalBar.bar_size == "1 min")
         )).all())
+        # Real trades from live_order parent rows whose submitted_at falls in session.
+        live_parents = list((await session.exec(
+            select(LiveOrder)
+            .where(LiveOrder.bracket_role == "parent")
+            .where(LiveOrder.dry_run == False)  # noqa: E712
+        )).all())
+        live_parents = [p for p in live_parents
+                        if p.submitted_at.strftime("%Y-%m-%d") == session_date]
+        # Audit blocks for block_reason summary.
+        audit = list((await session.exec(
+            select(AuditLog).where(AuditLog.category == "auto_trade_block")
+        )).all())
+        audit = [a for a in audit if a.timestamp.strftime("%Y-%m-%d") == session_date]
 
     bars.sort(key=lambda b: b.timestamp_ms)
     today_actionable = [r for r in sigs if r.direction.value in ("LONG_CALLS", "LONG_PUTS")]
@@ -74,6 +88,10 @@ async def compute_daily_review(session_date: str) -> DailyReview:
     by_trigger = {"confluence": [], "aligned_only": [], "wall_only": []}
     by_confidence = {"HIGH": [], "MEDIUM": [], "LOW": []}
     by_hour_ct: dict[str, list] = {}
+    by_direction = {"LONG_CALLS": [], "LONG_PUTS": []}
+    by_regime: dict[str, list] = {}
+    by_wall_distance = {"<5pt": [], "5-15pt": [], "15-30pt": [], ">30pt or none": []}
+    by_fe_ratio = {"<1": [], "1-3": [], "3-5": [], "5-10": [], ">=10": []}
     tier_counts = Counter()
     realized_total = 0.0
 
@@ -125,10 +143,32 @@ async def compute_daily_review(session_date: str) -> DailyReview:
             by_confidence[r.confidence.value if hasattr(r.confidence, "value") else str(r.confidence)].append(realized_R)
         except KeyError:
             pass
-        # CT hour bucketing
         ct = ts.astimezone(timezone(timedelta(hours=-5)))
         hour_key = f"{ct.hour:02d}"
         by_hour_ct.setdefault(hour_key, []).append(realized_R)
+        # By direction
+        by_direction[r.direction.value].append(realized_R)
+        # By regime (from extras if signal was demoted, else 'normal')
+        regime_at_fire = ex.get("regime_at_fire") or (
+            (ex.get("regime_demoted") or {}).get("regime") or "NORMAL"
+        )
+        by_regime.setdefault(regime_at_fire, []).append(realized_R)
+        # By wall distance (proximity to nearest dominant wall at entry)
+        nwd = ex.get("nearest_wall_distance")
+        if nwd is None: bucket = ">30pt or none"
+        elif nwd < 5: bucket = "<5pt"
+        elif nwd < 15: bucket = "5-15pt"
+        elif nwd < 30: bucket = "15-30pt"
+        else: bucket = ">30pt or none"
+        by_wall_distance[bucket].append(realized_R)
+        # By FE ratio
+        fe = ex.get("fe_ratio")
+        if fe is None: pass
+        elif fe < 1: by_fe_ratio["<1"].append(realized_R)
+        elif fe < 3: by_fe_ratio["1-3"].append(realized_R)
+        elif fe < 5: by_fe_ratio["3-5"].append(realized_R)
+        elif fe < 10: by_fe_ratio["5-10"].append(realized_R)
+        else: by_fe_ratio[">=10"].append(realized_R)
 
     n_actionable = len(today_actionable)
     wins = tier_counts.get("T1", 0) + tier_counts.get("T2", 0) + tier_counts.get("T3", 0)
@@ -140,6 +180,40 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         wn = sum(1 for r in rs if r > 0)
         return {"n": n, "wins": wn, "win_pct": round(wn / n * 100, 1) if n else 0,
                 "expectancy_r": round(sum(rs) / n, 3) if n else 0}
+
+    # Block reason aggregation
+    block_reasons = Counter()
+    for a in audit:
+        reason = (a.details or {}).get("reason", "unknown")
+        # Normalize cool-down per-symbol into one bucket
+        if "cool-down" in reason:
+            reason = "cool_down"
+        elif "below floor" in reason:
+            reason = "below_confidence_floor"
+        elif "no option pricing" in reason:
+            reason = "no_option_pricing"
+        elif "calendar pause" in reason:
+            reason = "calendar_pause"
+        elif "session cap" in reason or "sub-cap" in reason:
+            reason = "session_cap_reached"
+        elif "WAIT" in reason:
+            reason = "verdict_wait"
+        block_reasons[reason] += 1
+
+    # Actual trades (real fills) — winners vs losers from live_order status
+    actual_trades = len(live_parents)
+    actual_wins = sum(1 for p in live_parents if p.status == "CLOSED")
+    actual_losses = sum(1 for p in live_parents if p.status == "STOPPED")
+    # Approximate R: T1 hit alone ~= +0.5R (with 50/30/20 split + 1R target),
+    # full CLOSED ~= +1.1R, STOPPED = -1R. Refined when we capture fill prices.
+    actual_total_R = 0.0
+    for p in live_parents:
+        if p.status == "STOPPED":
+            actual_total_R -= 1.0
+        elif p.status == "CLOSED":
+            actual_total_R += 1.1
+        elif p.status == "PARTIAL":
+            actual_total_R += 0.5  # T1 fired, rest unknown
 
     review = DailyReview(
         session_date=session_date,
@@ -155,6 +229,15 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         by_trigger={k: _summary(v) for k, v in by_trigger.items()},
         by_confidence={k: _summary(v) for k, v in by_confidence.items()},
         by_hour_ct={k: _summary(v) for k, v in by_hour_ct.items()},
+        by_direction={k: _summary(v) for k, v in by_direction.items()},
+        by_regime={k: _summary(v) for k, v in by_regime.items()},
+        by_wall_distance={k: _summary(v) for k, v in by_wall_distance.items()},
+        by_fe_ratio={k: _summary(v) for k, v in by_fe_ratio.items()},
+        by_block_reason=dict(block_reasons),
+        actual_trades_taken=actual_trades,
+        actual_wins=actual_wins,
+        actual_losses=actual_losses,
+        actual_total_R=round(actual_total_R, 2),
     )
 
     # Upsert: delete any existing row for this date first
