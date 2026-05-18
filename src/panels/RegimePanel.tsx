@@ -127,8 +127,6 @@ export function RegimePanel() {
   );
 }
 
-const API_BASE = "http://127.0.0.1:8765";
-
 function LookbackControl() {
   const [info, setInfo] = useState<{
     window_size: number; loop_interval_sec: number;
