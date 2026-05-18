@@ -146,7 +146,13 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     if t1_qty + t2_qty + t3_qty != qty:
         t1_qty = qty - t2_qty - t3_qty
 
-    strategy = state.exit_strategy_long
+    # Auto-trade picks exit strategy by qty (not the user's panel setting).
+    # fixed_dollar needs enough contracts to make the per-contract $ math
+    # sensible (e.g. $1000/qty/100 has to be a reasonable option-price
+    # delta). Below 15 contracts, fall back to spx_points which doesn't
+    # care about per-contract sizing. The manual Send-to-IBKR button
+    # still honors state.exit_strategy_long for user discretion.
+    strategy = "fixed_dollar" if qty >= 15 else "spx_points"
 
     spx_t1 = verdict_dict.get("t1")
     spx_t2 = verdict_dict.get("t2")
