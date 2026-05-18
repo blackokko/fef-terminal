@@ -134,39 +134,48 @@ class FEFEngine:
         )
         aligned = same_sign and abs(delta_price) >= 1.0 and abs(delta_drift_m) >= 1.0
 
+        # Absorption: drift moved a lot but price didn't follow. Existing
+        # opposite-sign case stays. NEW: extreme FE >= 10 ALWAYS flags
+        # absorption regardless of sign — same-sign FE 10+ is the "drift
+        # being eaten by walls" case (today's 0/7 win rate at FE>=10).
         absorption = (
-            fe_ratio >= self._absorption_fe_min
-            and not same_sign
-            and abs(delta_drift_m) >= 3.0
+            (fe_ratio >= self._absorption_fe_min and not same_sign and abs(delta_drift_m) >= 3.0)
+            or (fe_ratio >= 10.0 and abs(delta_drift_m) >= 5.0)
         )
 
-        # Risk filters
         nearest_strike, nearest_dist = self._nearest_dominant_wall(current)
         wall_proximity_skip = (
             nearest_dist is not None and nearest_dist <= self._wall_proximity_pts
         )
         wall_collapse, collapse_dir = self._detect_wall_collapse()
 
-        # Direction decision
-        if wall_collapse and collapse_dir is not None:
-            return self._build_actionable(
-                current=current,
-                direction=collapse_dir,
-                confidence=FEFConfidence.HIGH,
-                reasoning=(
-                    f"WALL COLLAPSE — top wall lost >{int(self._wall_collapse_pct * 100)}% "
-                    f"exposure in 1 iter. Fade in direction of collapse."
-                ),
-                delta_price=delta_price,
-                delta_drift_m=delta_drift_m,
-                fe_ratio=fe_ratio,
-                aligned=aligned,
-                absorption=absorption,
-                wall_proximity_skip=False,
-                wall_collapse_trigger=True,
-                nearest_wall_strike=nearest_strike,
-                nearest_wall_distance=nearest_dist,
+        # Wall collapse REQUIRES aligned confluence. Today's data shows
+        # wall_collapse-alone at 15% win, wall_collapse + aligned at 42%.
+        # Without aligned drift agreement, the collapse signal is noise.
+        if wall_collapse and collapse_dir is not None and aligned:
+            aligned_dir = (
+                FEFDirection.LONG_CALLS if delta_price > 0 else FEFDirection.LONG_PUTS
             )
+            if aligned_dir == collapse_dir:
+                return self._build_actionable(
+                    current=current,
+                    direction=collapse_dir,
+                    confidence=FEFConfidence.HIGH,
+                    reasoning=(
+                        f"WALL COLLAPSE + ALIGNED {collapse_dir.value} — top wall lost "
+                        f">{int(self._wall_collapse_pct * 100)}% exposure in 1 iter AND "
+                        f"ΔPrice {delta_price:+.2f}pts confirms direction."
+                    ),
+                    delta_price=delta_price,
+                    delta_drift_m=delta_drift_m,
+                    fe_ratio=fe_ratio,
+                    aligned=aligned,
+                    absorption=absorption,
+                    wall_proximity_skip=False,
+                    wall_collapse_trigger=True,
+                    nearest_wall_strike=nearest_strike,
+                    nearest_wall_distance=nearest_dist,
+                )
 
         if wall_proximity_skip:
             return FEFVerdict(
@@ -344,17 +353,26 @@ class FEFEngine:
         delta_drift_m: float,
         fe_ratio: float,
     ) -> FEFConfidence:
-        # IMPROVEMENTS #2: scale magnitude thresholds by interval.
-        # Default thresholds were tuned for 2-min cadence — running at 30s
-        # should require ~25% the magnitude to fire HIGH/MEDIUM.
+        """Confidence scoring. HIGH now ALSO requires FE in a sane range
+        (1.0 .. 5.0) — outside that band today's data showed HIGH
+        underperforming LOW because magnitude alone was the trigger.
+        FE > 5 means drift is being absorbed; FE < 1 means price moved
+        without flow confirmation. Both are noise.
+        """
         scale = self._threshold_scale
+        # HIGH requires: meaningful magnitude AND FE in confirmation band
         if (
             abs(delta_price) >= 5 * scale
             and abs(delta_drift_m) >= 10 * scale
-            and fe_ratio >= 1.0
+            and 1.0 <= fe_ratio <= 5.0
         ):
             return FEFConfidence.HIGH
-        if abs(delta_price) >= 2 * scale and abs(delta_drift_m) >= 3 * scale:
+        # MEDIUM: lower magnitude OR slightly out-of-band FE
+        if (
+            abs(delta_price) >= 2 * scale
+            and abs(delta_drift_m) >= 3 * scale
+            and fe_ratio <= 8.0
+        ):
             return FEFConfidence.MEDIUM
         return FEFConfidence.LOW
 

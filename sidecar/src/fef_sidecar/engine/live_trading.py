@@ -206,6 +206,10 @@ async def place_bracket(
                 parent_order = MarketOrder("BUY", spec.qty, transmit=True)
             else:
                 parent_order = LimitOrder("BUY", spec.qty, spec.entry_limit, transmit=True)
+            # Force auto-submit even when TWS API precautions are on.
+            parent_order.tif = "DAY"
+            parent_order.outsideRth = False
+            parent_order.transmit = True
             parent_trade = ib.placeOrder(ib_contract, parent_order)
             await SignalIterRepository.update_live_order(
                 parent_saved.id, ib_order_id=parent_trade.order.orderId,
@@ -292,6 +296,8 @@ async def place_bracket(
             parent_order = MarketOrder("BUY", spec.qty, transmit=False)
         else:
             parent_order = LimitOrder("BUY", spec.qty, spec.entry_limit, transmit=False)
+        parent_order.tif = "DAY"
+        parent_order.outsideRth = False
         parent_trade = ib.placeOrder(ib_contract, parent_order)
         await SignalIterRepository.update_live_order(
             parent_saved.id, ib_order_id=parent_trade.order.orderId,
