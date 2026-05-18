@@ -68,10 +68,9 @@ async def spx_target_watcher_loop(state) -> None:
                     if qty <= 0:
                         return
                     if not isinstance(state.ibkr, LiveIBKRProvider):
-                        # Mock or no live trading — just log + audit
                         await SignalIterRepository.write_audit_log(
                             category="spx_watcher", actor="system",
-                            summary=f"[DRY] {tier_label} crossed: would market-sell {qty}× {p.symbol} {p.strike}{p.right} at SPX {spot:.2f}",
+                            summary=f"[DRY] {tier_label} crossed: would market-sell-to-close {qty}× {p.symbol} {p.strike}{p.right} at SPX {spot:.2f}",
                         )
                         return
                     try:
@@ -85,11 +84,39 @@ async def spx_target_watcher_loop(state) -> None:
                         )
                         ic = _to_ib_contract(opt_contract)
                         await ib.qualifyContractsAsync(ic)
-                        mkt = MarketOrder("SELL", qty, transmit=True)
+
+                        # SAFETY: never sell more than we own. If parent BUY
+                        # didn't fill (rejection / partial / illiquid), don't
+                        # accidentally open a SHORT by selling unbacked qty.
+                        positions = ib.positions()
+                        long_qty = 0
+                        for pos in positions:
+                            c = pos.contract
+                            if (getattr(c, "secType", "") == "OPT"
+                                and getattr(c, "symbol", "") == p.symbol
+                                and abs(float(getattr(c, "strike", 0)) - p.strike) < 0.01
+                                and getattr(c, "right", "") == p.right
+                                and getattr(c, "lastTradeDateOrContractMonth", "") == p.expiry
+                                and pos.position > 0):
+                                long_qty += int(pos.position)
+                        sell_qty = min(qty, long_qty)
+                        if sell_qty <= 0:
+                            await SignalIterRepository.write_audit_log(
+                                category="spx_watcher", actor="system",
+                                summary=f"{tier_label} SKIPPED: no long position to close for {p.symbol} {p.strike}{p.right} (requested {qty}, owned 0) — refusing to short",
+                            )
+                            return
+                        if sell_qty < qty:
+                            await SignalIterRepository.write_audit_log(
+                                category="spx_watcher", actor="system",
+                                summary=f"{tier_label} PARTIAL: only own {sell_qty}/{qty} for {p.symbol} {p.strike}{p.right} — selling owned qty only",
+                            )
+
+                        mkt = MarketOrder("SELL", sell_qty, transmit=True)
                         trade = ib.placeOrder(ic, mkt)
                         await SignalIterRepository.write_audit_log(
                             category="spx_watcher", actor="system",
-                            summary=f"{tier_label}: market-sold {qty}× {p.symbol} {p.strike}{p.right} at SPX {spot:.2f} (ib_order_id={trade.order.orderId})",
+                            summary=f"{tier_label}: market-sold-to-close {sell_qty}× {p.symbol} {p.strike}{p.right} at SPX {spot:.2f} (ib_order_id={trade.order.orderId})",
                         )
                     except Exception:
                         logger.exception("spx_watcher market sell failed")
