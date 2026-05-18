@@ -389,6 +389,31 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     except Exception:
         logger.exception("Calendar pause check failed")
 
+    # Regime gate — soft demotion when prior-iter regime was CHOP / PIN_DAY /
+    # WALL_TEST. Today's data: aligned-only signals during chop regimes had
+    # ~17% win. Demoting them keeps the verdict visible (we can still see it
+    # in the UI for manual interpretation) but lowers conviction so the
+    # auto-trade confidence floor gates them out.
+    try:
+        if (state.last_regime is not None
+            and event.verdict.get("direction") in ("LONG_CALLS", "LONG_PUTS")
+            and state.last_regime.regime in ("CHOP", "PIN_DAY", "WALL_TEST")):
+            prev_conf = event.verdict.get("confidence", "NONE")
+            new_conf = (
+                "MEDIUM" if prev_conf == "HIGH" else
+                "LOW" if prev_conf == "MEDIUM" else
+                prev_conf
+            )
+            if new_conf != prev_conf:
+                event.verdict["confidence"] = new_conf
+                event.verdict["reasoning"] = (event.verdict.get("reasoning", "")
+                    + f" [regime={state.last_regime.regime}: demoted {prev_conf}->{new_conf}]")
+                event.verdict["regime_demoted"] = {
+                    "regime": state.last_regime.regime, "from": prev_conf, "to": new_conf,
+                }
+    except Exception:
+        logger.exception("Regime gate check failed")
+
     # Spread recommendation — TA-driven entries (EMA 8/21 cross + pullback
     # engulfing on StdDev channel) with delta-targeted strikes (<=0.15 delta,
     # >=$0.70 premium). Reads cached 30-min bars; refreshes them at most

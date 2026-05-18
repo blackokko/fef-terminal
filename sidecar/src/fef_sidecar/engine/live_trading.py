@@ -94,6 +94,9 @@ class BracketSpec:
     spx_t2: float | None = None
     spx_t3: float | None = None
     spx_stop: float | None = None
+    # Spot SPX at the moment auto-trade fired — needed for MFE / R calculations
+    # in the spx_target_watcher's BE ladder. None disables the ladder.
+    entry_spx_price: float | None = None
     # When set, spx_target_watcher market-exits remaining qty if the option
     # premium drops enough that the open position is down by this many
     # dollars. Auto-trader sets this to -3000 by default. None = no $ cap.
@@ -179,6 +182,9 @@ async def place_bracket(
         spx_target_t2_qty=spec.t2_qty if spec.exit_strategy == "spx_points" else None,
         spx_target_t3_qty=spec.t3_qty if spec.exit_strategy == "spx_points" else None,
         dollar_loss_cap=spec.dollar_loss_cap,
+        # BE ladder: starts at the original stop, ratchets up as MFE grows
+        dynamic_stop_level=spec.spx_stop,
+        entry_spx_price=spec.entry_spx_price,
     )
     parent_saved = await SignalIterRepository.write_live_order(parent)
     children_saved = []

@@ -424,6 +424,45 @@ class LiveOrder(SQLModel, table=True):
     # remaining qty if the option premium drops enough that the open position
     # is down by this many dollars. None disables the check.
     dollar_loss_cap: float | None = None
+    # BE ladder state. dynamic_stop_level starts at spx_target_stop and
+    # ratchets to lock profit as MFE crosses each BE_LADDER step.
+    dynamic_stop_level: float | None = None
+    be_ladder_max_step_R: float = 0.0
+    entry_spx_price: float | None = None
+
+
+class DailyReview(SQLModel, table=True):
+    """One row per session — the model's daily report card.
+
+    Computed by engine/daily_review.py either nightly (via the
+    auto-walk-forward scheduler) or on-demand via POST /admin/daily_review.
+    Lets the user track day-over-day expectancy + win-rate as the engine
+    is iterated.
+    """
+
+    __tablename__ = "daily_review"
+
+    id: int | None = Field(default=None, primary_key=True)
+    session_date: str = Field(unique=True, index=True)  # YYYY-MM-DD
+    computed_at: datetime = Field(default_factory=_utcnow)
+
+    total_signals: int = 0
+    actionable_signals: int = 0
+    wins: int = 0
+    stops: int = 0
+    timeouts: int = 0
+    win_rate_pct: float = 0.0
+    expectancy_r: float = 0.0  # R-multiple per signal (negative = losing model)
+
+    # Tier-hit breakdown
+    t1_hits: int = 0
+    t2_hits: int = 0
+    t3_hits: int = 0
+
+    # By-trigger breakdown — JSON: {"confluence": {n,wins,exp}, "aligned_only": {...}, ...}
+    by_trigger: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    by_confidence: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    by_hour_ct: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
 
 
 class LivePosition(SQLModel, table=True):

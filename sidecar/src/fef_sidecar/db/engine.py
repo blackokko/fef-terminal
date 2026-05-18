@@ -80,6 +80,9 @@ async def init_db() -> None:
             ("live_order", "spread_long_strike", "REAL"),
             ("live_order", "spread_initial_credit", "REAL"),
             ("live_order", "dollar_loss_cap", "REAL"),
+            ("live_order", "dynamic_stop_level", "REAL"),
+            ("live_order", "be_ladder_max_step_R", "REAL DEFAULT 0.0"),
+            ("live_order", "entry_spx_price", "REAL"),
         ]
         for table, column, type_sql in migrations:
             try:

@@ -145,8 +145,55 @@ async def spx_target_watcher_loop(state) -> None:
                         state._dollar_cap_last_check_ms[p.id] = now_ms  # type: ignore[attr-defined]
                         asyncio.create_task(_check_dollar_loss(state, p))
 
+            # Default BE ladder. Configurable per-deployment via env if needed.
+            # Each tuple: (trigger_R, new_stop_at_R_from_entry)
+            # 0.5R reached -> stop to entry (BE)
+            # 1.0R reached -> stop to +0.5R (locks half)
+            # 1.5R reached -> stop to +1.0R (locks 1R)
+            BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+
             for p in parents:
                 is_long_calls = p.right == "C"
+
+                # BE ladder: check current MFE in R, ratchet stop level up.
+                # Pure state change — no IBKR call, no order placement, fast.
+                if (p.entry_spx_price is not None and p.spx_target_stop is not None
+                    and p.dynamic_stop_level is not None):
+                    risk = abs(p.entry_spx_price - p.spx_target_stop)
+                    if risk > 0:
+                        if is_long_calls:
+                            mfe_R = (spot - p.entry_spx_price) / risk
+                        else:
+                            mfe_R = (p.entry_spx_price - spot) / risk
+                        for trig_R, new_stop_R in BE_LADDER:
+                            if mfe_R >= trig_R and p.be_ladder_max_step_R < trig_R:
+                                # Ratchet stop. For longs: stop moves UP. For puts: DOWN.
+                                if is_long_calls:
+                                    new_stop = p.entry_spx_price + new_stop_R * risk
+                                    if new_stop > (p.dynamic_stop_level or -1e9):
+                                        await SignalIterRepository.update_live_order(
+                                            p.id, dynamic_stop_level=new_stop,
+                                            be_ladder_max_step_R=trig_R,
+                                        )
+                                        p.dynamic_stop_level = new_stop
+                                        p.be_ladder_max_step_R = trig_R
+                                        await SignalIterRepository.write_audit_log(
+                                            category="spx_watcher", actor="system",
+                                            summary=f"BE LADDER step {trig_R}R: stop moved to {new_stop:.2f} (locks {new_stop_R}R) on {p.symbol} {p.strike}{p.right}",
+                                        )
+                                else:
+                                    new_stop = p.entry_spx_price - new_stop_R * risk
+                                    if new_stop < (p.dynamic_stop_level or 1e9):
+                                        await SignalIterRepository.update_live_order(
+                                            p.id, dynamic_stop_level=new_stop,
+                                            be_ladder_max_step_R=trig_R,
+                                        )
+                                        p.dynamic_stop_level = new_stop
+                                        p.be_ladder_max_step_R = trig_R
+                                        await SignalIterRepository.write_audit_log(
+                                            category="spx_watcher", actor="system",
+                                            summary=f"BE LADDER step {trig_R}R: stop moved to {new_stop:.2f} (locks {new_stop_R}R) on {p.symbol} {p.strike}{p.right}",
+                                        )
 
                 async def _market_sell(qty: int, tier_label: str) -> None:
                     if qty <= 0:
@@ -205,11 +252,12 @@ async def spx_target_watcher_loop(state) -> None:
                     except Exception:
                         logger.exception("spx_watcher market sell failed")
 
-                # Stop check first (most critical)
-                if p.spx_target_stop is not None:
+                # Stop check uses the dynamic level (BE ladder ratchets it).
+                effective_stop = p.dynamic_stop_level if p.dynamic_stop_level is not None else p.spx_target_stop
+                if effective_stop is not None:
                     stop_hit = (
-                        (is_long_calls and spot <= p.spx_target_stop)
-                        or (not is_long_calls and spot >= p.spx_target_stop)
+                        (is_long_calls and spot <= effective_stop)
+                        or (not is_long_calls and spot >= effective_stop)
                     )
                     if stop_hit:
                         # Compute remaining qty across all tiers

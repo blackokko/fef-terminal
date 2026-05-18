@@ -202,10 +202,29 @@ class FEFEngine:
                 FEFDirection.LONG_CALLS if delta_price > 0 else FEFDirection.LONG_PUTS
             )
             confidence = self._classify_confidence(delta_price, delta_drift_m, fe_ratio)
+            # Drift bias agreement filter — independent confluence signal.
+            # If FEF says LONG_CALLS but the drift_bias field disagrees (BEARISH),
+            # demote one notch. We KEEP the signal (user wanted volume) but
+            # downgrade conviction so the auto-trade confidence floor can gate it.
+            bias = (current.drift_bias or "NEUTRAL").upper()
+            wants_bull = direction == FEFDirection.LONG_CALLS
+            bias_disagrees = (
+                (wants_bull and bias == "BEARISH")
+                or (not wants_bull and bias == "BULLISH")
+            )
+            if bias_disagrees:
+                # HIGH -> MEDIUM, MEDIUM -> LOW, LOW stays LOW
+                confidence = (
+                    FEFConfidence.MEDIUM if confidence == FEFConfidence.HIGH else
+                    FEFConfidence.LOW if confidence == FEFConfidence.MEDIUM else
+                    confidence
+                )
             reasoning = (
                 f"ALIGNED {direction.value} — ΔPrice {delta_price:+.2f}pts, "
                 f"ΔDrift {delta_drift_m:+.2f}M, FE {fe_ratio:.2f}, "
-                f"bias={current.drift_bias}."
+                f"bias={current.drift_bias}"
+                + (" (bias-disagrees, demoted)" if bias_disagrees else "")
+                + "."
             )
             return self._build_actionable(
                 current=current,

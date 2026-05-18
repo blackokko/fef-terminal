@@ -137,8 +137,11 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     from fef_sidecar.engine.live_trading import BracketSpec, place_bracket
 
     today = time.strftime("%Y%m%d")
-    t1_qty = max(1, round(qty * 0.85))
-    t2_qty = max(1, round(qty * 0.10))
+    # 50/30/20 split — let runners run. Today's MFE analysis: 80% of winners
+    # reach >=2R MFE, 40% reach >=3R. Old 85/10/5 was exiting most of the
+    # position at T1 (1R) leaving the bulk of the move on the table.
+    t1_qty = max(1, round(qty * 0.50))
+    t2_qty = max(1, round(qty * 0.30))
     t3_qty = max(1, qty - t1_qty - t2_qty)
     if t1_qty + t2_qty + t3_qty != qty:
         t1_qty = qty - t2_qty - t3_qty
@@ -172,17 +175,19 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
             use_market_entry=True,
         )
     elif strategy == "spx_points":
-        # Auto-trade default: market-order entry + -$3000 dollar loss cap
+        # Auto-trade default: market-order entry + -$3000 dollar loss cap +
+        # BE ladder (initialized via entry_spx_price captured from state).
         spec = BracketSpec(
             symbol=trade_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
             expiry=today, qty=qty,
-            entry_limit=float(opt["entry_limit"]),  # informational under MKT
+            entry_limit=float(opt["entry_limit"]),
             t1_limit=float(opt["t1"]), t2_limit=float(opt["t2"]),
             t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
             t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
             exit_strategy="spx_points",
             spx_t1=spx_t1, spx_t2=spx_t2, spx_t3=spx_t3, spx_stop=spx_stop,
+            entry_spx_price=state.last_spx_price,
             dollar_loss_cap=-3000.0,
             use_market_entry=True,
         )

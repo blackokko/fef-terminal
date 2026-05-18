@@ -89,35 +89,45 @@ def build_plan(
 
     is_long_calls = direction == FEFDirection.LONG_CALLS
 
-    # T1: nearest wall, but not more than ~25pts away (else use +10 fallback)
-    if walls_dir and abs(walls_dir[0] - spot) <= 25:
+    # Stop sets the R unit. Today's data showed 10pt risk + 10pt T1 = 1:1
+    # which can't be profitable at 22% win rate. New design: T1 = 1R, T2 = 2R
+    # so wins can clear the loser-magnitude in fewer hits. With 50/30/20 split
+    # the weighted reward is (0.5 * 1R) + (0.3 * 2R) + (0.2 * T3R).
+    stop_distance = 10.0
+    stop = spot - stop_distance if is_long_calls else spot + stop_distance
+
+    # T1: 1R from spot. If a wall is closer (and ahead), prefer it but never
+    # use a wall that yields <0.5R since that's a setup we can't win at.
+    one_r_offset = stop_distance  # 10pts
+    t1_fixed = spot + one_r_offset if is_long_calls else spot - one_r_offset
+    if walls_dir and abs(walls_dir[0] - spot) >= 0.5 * stop_distance and abs(walls_dir[0] - spot) <= 25:
         t1 = walls_dir[0]
     else:
-        t1 = spot + 10 if is_long_calls else spot - 10
+        t1 = t1_fixed
 
-    # T2: next wall after T1 (skip duplicates near T1)
+    # T2: 2R from spot. Wall override only if 2R <= wall <= 2.5R.
+    two_r_offset = 2 * stop_distance  # 20pts
+    t2_fixed = spot + two_r_offset if is_long_calls else spot - two_r_offset
     t2_candidates = [w for w in walls_dir if abs(w - t1) > 3]
-    if t2_candidates and abs(t2_candidates[0] - spot) <= 40:
+    if t2_candidates and 0.8 * two_r_offset <= abs(t2_candidates[0] - spot) <= 1.3 * two_r_offset:
         t2 = t2_candidates[0]
     else:
-        t2 = spot + 20 if is_long_calls else spot - 20
+        t2 = t2_fixed
 
-    # T3: NTM max pain if reachable in direction, else third wall, else fixed
+    # T3: max-pain pull or third wall, else fixed 5R for the runner
     if is_long_calls:
         if ntm_max_pain and ntm_max_pain > t2 + 3:
             t3 = ntm_max_pain
         elif len(walls_dir) > 2 and walls_dir[2] > t2:
             t3 = walls_dir[2]
         else:
-            t3 = spot + 35
+            t3 = spot + 5 * stop_distance
     else:
         if ntm_max_pain and ntm_max_pain < t2 - 3:
             t3 = ntm_max_pain
         elif len(walls_dir) > 2 and walls_dir[2] < t2:
             t3 = walls_dir[2]
         else:
-            t3 = spot - 35
-
-    stop = spot - 10 if is_long_calls else spot + 10
+            t3 = spot - 5 * stop_distance
 
     return StrikePlan(strike_rec=strike, t1=t1, t2=t2, t3=t3, stop=stop)

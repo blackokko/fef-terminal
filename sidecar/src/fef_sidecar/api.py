@@ -620,6 +620,45 @@ async def scanner_symbols_set(request: Request, body: dict[str, Any] = Body(...)
     }
 
 
+@router.get("/history/reviews")
+async def history_reviews(limit: int = 30) -> list[dict[str, Any]]:
+    """Return recent DailyReview rows (most-recent first)."""
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import DailyReview
+    from sqlmodel import select as _s
+    async with _gs() as session:
+        rows = list((await session.exec(
+            _s(DailyReview).order_by(DailyReview.session_date.desc()).limit(limit)  # type: ignore[attr-defined]
+        )).all())
+    return [
+        {"id": r.id, "session_date": r.session_date,
+         "computed_at": r.computed_at.isoformat(),
+         "total_signals": r.total_signals,
+         "actionable_signals": r.actionable_signals,
+         "wins": r.wins, "stops": r.stops, "timeouts": r.timeouts,
+         "win_rate_pct": r.win_rate_pct, "expectancy_r": r.expectancy_r,
+         "t1_hits": r.t1_hits, "t2_hits": r.t2_hits, "t3_hits": r.t3_hits,
+         "by_trigger": r.by_trigger, "by_confidence": r.by_confidence,
+         "by_hour_ct": r.by_hour_ct}
+        for r in rows
+    ]
+
+
+@router.post("/admin/daily_review")
+async def admin_daily_review(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """On-demand DailyReview compute. Body: {session_date?: 'YYYY-MM-DD'}.
+    Defaults to today (ET)."""
+    from fef_sidecar.engine.daily_review import compute_daily_review
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    et = _tz(_td(hours=-4))
+    session_date = body.get("session_date") or _dt.now(et).strftime("%Y-%m-%d")
+    review = await compute_daily_review(session_date)
+    return {"ok": True, "session_date": review.session_date,
+            "win_rate_pct": review.win_rate_pct,
+            "expectancy_r": review.expectancy_r,
+            "actionable_signals": review.actionable_signals}
+
+
 @router.post("/auto_trade/reset_session")
 async def auto_trade_reset_session(request: Request) -> dict[str, Any]:
     """Reset the per-session auto-trade counter (lets you fire more if you've

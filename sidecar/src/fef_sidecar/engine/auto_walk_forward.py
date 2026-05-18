@@ -140,6 +140,15 @@ async def nightly_scheduler(state) -> None:
         try:
             await asyncio.sleep(sleep_seconds)
             await run_auto_walk_forward(state)
+            # Also compute today's daily review (feedback loop for FEF tuning)
+            try:
+                from fef_sidecar.engine.daily_review import compute_daily_review
+                from datetime import timezone as _tz
+                et = _tz(__import__("datetime").timedelta(hours=-4))
+                session_date = datetime.now(et).strftime("%Y-%m-%d")
+                await compute_daily_review(session_date)
+            except Exception:
+                logger.exception("daily_review compute failed")
         except asyncio.CancelledError:
             raise
         except Exception:
