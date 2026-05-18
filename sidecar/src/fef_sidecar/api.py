@@ -608,6 +608,30 @@ async def live_place_bracket(request: Request, body: dict[str, Any] = Body(...))
     )
 
 
+@router.post("/live/place_spread")
+async def live_place_spread(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Place a credit spread (CCS or PCS) via IBKR Bag/ComboLegs.
+    Same two-gate safety as place_bracket: FEF_LIVE_TRADING=true + confirm=true."""
+    from fef_sidecar.engine.live_trading import SpreadSpec, place_credit_spread
+
+    s = _state(request)
+    spec = SpreadSpec(
+        symbol=body["symbol"],
+        expiry=body["expiry"],
+        kind=body["kind"],  # 'CCS' or 'PCS'
+        short_strike=float(body["short_strike"]),
+        long_strike=float(body["long_strike"]),
+        qty=int(body["qty"]),
+        entry_credit=float(body["entry_credit"]),
+        stop_multiplier=float(body.get("stop_multiplier", s.spread_stop_multiplier)),
+        tp_close_debit=float(body.get("tp_close_debit", s.spread_tp_close_debit)),
+    )
+    return await place_credit_spread(
+        s.ibkr, spec, confirm=body.get("confirm", False),
+        ticket_id=body.get("ticket_id"),
+    )
+
+
 @router.post("/live/kill")
 async def live_kill(request: Request) -> dict[str, Any]:
     """Cancel every working IBKR order under this client_id."""

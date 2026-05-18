@@ -170,6 +170,59 @@ export function OrderTicketPanel() {
     }
   };
 
+  const handleSendSpreadToIBKR = async () => {
+    if (!lastIter || !spread) return;
+    if (spread.kind !== "PCS" && spread.kind !== "CCS") return;
+    if (spread.short_strike == null || spread.long_strike == null) return;
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const credit = (spread.estimated_credit_per_contract ?? 0) / 100;
+    const ok = window.confirm(
+      `Place ${spread.kind} CREDIT SPREAD via IBKR?\n\n` +
+      `  SELL ${qty}× SPX ${today} ${spread.short_strike}${spread.kind === "CCS" ? "C" : "P"}\n` +
+      `  BUY  ${qty}× SPX ${today} ${spread.long_strike}${spread.kind === "CCS" ? "C" : "P"}\n` +
+      `  Net credit per spread: ~$${credit.toFixed(2)}\n` +
+      `  Total credit (× ${qty}): ~$${(credit * qty * 100).toFixed(0)}\n` +
+      `  Max loss (× ${qty}): ~$${((spread.max_loss_per_contract ?? 0) * qty).toFixed(0)}\n\n` +
+      `Spread exit watcher will close at $0.05 debit (TP) or 4× credit (STOP).\n\n` +
+      `Requires FEF_LIVE_TRADING=true env. Otherwise DRY_RUN.`
+    );
+    if (!ok) return;
+    setSending(true);
+    setSendResult(null);
+    try {
+      const r = await fetch(`${API_BASE}/live/place_spread`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: "SPX",
+          expiry: today,
+          kind: spread.kind,
+          short_strike: spread.short_strike,
+          long_strike: spread.long_strike,
+          qty,
+          entry_credit: credit,
+          confirm: true,
+          ticket_id: ticketId,
+        }),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        setSendResult({
+          ok: true,
+          message: data.dry_run
+            ? `DRY_RUN — wrote spread #${data.parent_order_id} (FEF_LIVE_TRADING not set)`
+            : `LIVE ${spread.kind} placed — order #${data.parent_order_id}`,
+        });
+      } else {
+        setSendResult({ ok: false, message: data.error || data.reason || "submission failed" });
+      }
+    } catch (e) {
+      setSendResult({ ok: false, message: (e as Error).message });
+    } finally {
+      setSending(false);
+    }
+  };
+
   const submitOutcome = async (fields: Record<string, number | string>) => {
     if (ticketId === null) return;
     try {
@@ -205,6 +258,17 @@ export function OrderTicketPanel() {
               BE ${fmt(spread.breakeven, 0)}
             </div>
             {spread.reasoning && <div className="muted small">{spread.reasoning}</div>}
+            <button
+              onClick={() => void handleSendSpreadToIBKR()}
+              disabled={sending}
+              title="Place this credit spread as a combo order via IBKR"
+              style={{
+                marginTop: 6, width: "100%", padding: 6,
+                background: "var(--color-purple)", color: "white", fontWeight: 600,
+              }}
+            >
+              {sending ? "Sending…" : `📤 Send ${spread.kind} to IBKR`}
+            </button>
           </div>
         )}
         <div className="ticket-main">

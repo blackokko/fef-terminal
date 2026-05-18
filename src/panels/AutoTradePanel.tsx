@@ -116,18 +116,33 @@ export function AutoTradePanel() {
     <section className="sidebar-section auto-trade-panel">
       <h3 className="sidebar-section-title">Auto-trade</h3>
 
-      <div className="auto-trade-hero" style={{ borderLeft: `3px solid ${heroColor}` }}>
-        <div style={{ color: heroColor, fontWeight: 700, fontSize: 14, fontFamily: "var(--font-mono)" }}>
+      <div className="auto-trade-hero" style={{ borderLeft: `4px solid ${heroColor}` }}>
+        <div style={{ color: heroColor, fontWeight: 700, fontSize: 15, fontFamily: "var(--font-mono)" }}>
           {status.enabled ? "🔴 LIVE — AUTO ORDERS ON"
-           : status.live_trading_env ? "⚠ OFF (live env ready)"
-           : "◌ OFF (FEF_LIVE_TRADING not set)"}
+           : status.live_trading_env ? "⚠ OFF — LIVE ENV READY"
+           : "◌ OFF — LIVE ENV NOT SET"}
         </div>
         <div className="muted small">
           {status.enabled
             ? "Every qualifying verdict fires a REAL bracket order"
-            : "Toggle on to enable automatic order placement on HIGH-conviction fires"}
+            : status.live_trading_env
+              ? "Toggle ON to start auto-firing orders on HIGH-conviction signals"
+              : "Restart sidecar via FEF-Paper-AutoTrade.bat (or FEF-Live-AutoTrade.bat) to enable"}
         </div>
       </div>
+
+      {!status.live_trading_env && !status.enabled && (
+        <div style={{
+          background: "var(--color-bg-elevated)",
+          borderLeft: "3px solid var(--color-red)",
+          padding: "6px 10px", marginBottom: 8, fontSize: 11,
+        }}>
+          <strong style={{ color: "var(--color-red)" }}>Button disabled.</strong>{" "}
+          The sidecar wasn't launched with FEF_LIVE_TRADING=true. Close the app
+          and relaunch via <code>FEF-Paper-AutoTrade.bat</code> (paper account,
+          safe) or <code>FEF-Live-AutoTrade.bat</code> (real money).
+        </div>
+      )}
 
       <button
         onClick={() => void handleToggle()}
@@ -135,11 +150,18 @@ export function AutoTradePanel() {
         className={status.enabled ? "kill-switch-button" : ""}
         style={{
           width: "100%", marginBottom: 8,
-          background: status.enabled ? "var(--color-red)" : "var(--color-green)",
-          color: "white", fontWeight: 700, padding: 8,
+          background: !status.live_trading_env && !status.enabled
+            ? "var(--color-bg-elevated)"
+            : status.enabled ? "var(--color-red)" : "var(--color-green)",
+          color: !status.live_trading_env && !status.enabled
+            ? "var(--color-text-muted)" : "white",
+          fontWeight: 700, padding: 10, fontSize: 13,
+          cursor: !status.live_trading_env && !status.enabled ? "not-allowed" : "pointer",
         }}
       >
-        {busy ? "…" : status.enabled ? "🛑 DISABLE AUTO-TRADE" : "▶ ENABLE AUTO-TRADE"}
+        {busy ? "…" :
+         !status.live_trading_env && !status.enabled ? "ENABLE AUTO-TRADE (live env required)" :
+         status.enabled ? "🛑 DISABLE AUTO-TRADE" : "▶ ENABLE AUTO-TRADE"}
       </button>
 
       <table className="auto-trade-settings">
