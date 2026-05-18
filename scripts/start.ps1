@@ -5,11 +5,13 @@
 #   2. Tauri app — release build by default (instant), or dev mode with -Dev
 
 param(
+    # Defaults to LIVE for both — if you want mock, pass -QuantDataMode mock
+    # and -IbkrMode mock (or use scripts\FEF-Mock.bat).
     [ValidateSet("mock", "live")]
-    [string]$QuantDataMode = "mock",
+    [string]$QuantDataMode = "live",
 
     [ValidateSet("mock", "live")]
-    [string]$IbkrMode = "mock",
+    [string]$IbkrMode = "live",
 
     [int]$LoopIntervalSec = 120,
 
@@ -53,6 +55,18 @@ if (-not (Test-Path $venvPython)) {
     Start-Sleep -Seconds 5
     exit 1
 }
+
+# Kill any existing sidecar / fef-terminal so we don't accidentally connect
+# to a stale mock instance from a previous session.
+Write-Host "[FEF] Stopping any existing FEF processes..." -ForegroundColor DarkGray
+Stop-Process -Name fef-terminal -Force -ErrorAction SilentlyContinue
+$pid_holding = (Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess
+if ($pid_holding) { Stop-Process -Id $pid_holding -Force -ErrorAction SilentlyContinue }
+$me = $PID
+Get-Process powershell, pwsh -ErrorAction SilentlyContinue | Where-Object {
+    $_.Id -ne $me -and (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine -match 'fef-sidecar|fef_sidecar'
+} | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 2
 
 # Warn if live IBKR but TWS not running + auto-detect live (7496) vs paper (7497) port
 $ibkrPort = "7497"
