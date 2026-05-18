@@ -244,6 +244,24 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
 
     t0 = _time.perf_counter()
     inputs = snapshot_to_inputs(snap)  # type: ignore[arg-type]
+
+    # Live-price overlay: prefer the freshest IBKR tick over the QuantData
+    # snapshot's spx_price (which can be 15+s stale by the time we evaluate).
+    # Keeps exposure structure (walls/drift/MP) from QuantData but uses live
+    # spot for distance calculations so 'nearest_wall_distance' etc. are
+    # accurate to the moment of the verdict.
+    if state.last_live_tick_spx > 0 and state.last_live_tick_ms > 0:
+        age_ms = int(_time.time() * 1000) - state.last_live_tick_ms
+        if age_ms < 60_000:  # only trust ticks <60s old
+            from dataclasses import replace
+            snap_spx = inputs.spx_price
+            live_spx = state.last_live_tick_spx
+            # Only override if the live price is materially different (>0.5pt)
+            # to avoid micro-jitter in the verdict reasoning
+            if abs(live_spx - snap_spx) > 0.5:
+                inputs = replace(inputs, spx_price=live_spx)
+                perf["live_price_overlay_pts"] = round(live_spx - snap_spx, 2)
+
     verdict = state.engine.push(inputs)
     perf["fef_compute_ms"] = (_time.perf_counter() - t0) * 1000
     state.last_spx_price = inputs.spx_price
@@ -1094,6 +1112,10 @@ async def tick_stream_loop(state: AppState) -> None:
             await state.ibkr.connect()
             async for quote in state.ibkr.stream_last_price(Contract.for_symbol(symbol)):
                 state.last_spx_price = quote.last
+                # Tracked separately so _run_one_iter can prefer this over the
+                # (up to 15s stale) QuantData snapshot price.
+                state.last_live_tick_spx = quote.last
+                state.last_live_tick_ms = int(quote.timestamp.timestamp() * 1000)
                 event = TickEvent(
                     timestamp_ms=int(quote.timestamp.timestamp() * 1000),
                     spx_price=quote.last,

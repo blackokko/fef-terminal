@@ -71,6 +71,13 @@ class AppState:
     quantdata_poll_task: object | None = None
     health_check_task: object | None = None
     last_spx_price: float = 0.0
+    # Live tick from IBKR (tick_stream_loop) — set ONLY by that loop, never
+    # overwritten by QuantData fetches. Used by _run_one_iter to override the
+    # snapshot's spx_price with the freshest possible spot, so the engine
+    # evaluates wall distance / MP gravity / etc. against current price
+    # instead of the up-to-15s-stale QuantData snapshot price.
+    last_live_tick_spx: float = 0.0
+    last_live_tick_ms: int = 0
     last_iter_num: int = 0
     last_verdict: dict[str, object] = field(default_factory=dict)
     last_snapshot: object | None = None  # cached MarketSnapshot for FEF to consume
