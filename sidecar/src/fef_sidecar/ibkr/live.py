@@ -304,7 +304,13 @@ class LiveIBKRProvider:
         )
 
     async def get_option_quote(self, contract: Contract) -> OptionQuote:
-        """Fetch option price + greeks via reqMktData (genericTickList='106' for IV)."""
+        """Fetch option price + greeks via reqMktData (genericTickList='106' for IV).
+
+        Captures IBKR error events so 'no market data subscription' shows up
+        as an exception rather than silent NaN — paper accounts without an
+        SPX options data subscription get error 354 'Requested market data
+        is not subscribed' that we previously swallowed.
+        """
         if contract.kind != ContractKind.OPTION:
             raise ValueError(f"Expected OPTION contract, got {contract.kind}")
         await self._ensure_connected()
@@ -313,13 +319,47 @@ class LiveIBKRProvider:
         ib_contract = _to_ib_contract(contract)
         await self._ib.qualifyContractsAsync(ib_contract)
 
+        # Capture per-contract IBKR errors during this reqMktData lifecycle
+        captured_errors: list[str] = []
+
+        def _on_error(reqId, errorCode, errorString, *_a):  # type: ignore
+            if errorCode in (354, 10089, 10090, 10091, 10092, 10167, 10168, 200):
+                captured_errors.append(f"IBKR error {errorCode}: {errorString}")
+            elif errorCode < 2000:
+                captured_errors.append(f"IBKR error {errorCode}: {errorString}")
+        try:
+            self._ib.errorEvent += _on_error  # type: ignore[operator]
+        except Exception:
+            pass
+
         # genericTickList='13' = model option computation (delta/gamma/vega/theta/IV)
         ticker = self._ib.reqMktData(ib_contract, "13", False, False)
-        # Wait briefly for the greeks to populate (TWS streams them)
-        for _ in range(20):
+        # Wait up to 5s for any of: last/bid/ask/modelGreeks
+        for _ in range(50):
             await asyncio.sleep(0.1)
-            if ticker.modelGreeks is not None or (ticker.last and ticker.last > 0):
+            has_price = (ticker.last and ticker.last > 0) or \
+                        (ticker.bid and ticker.bid > 0) or \
+                        (ticker.ask and ticker.ask > 0)
+            if has_price or ticker.modelGreeks is not None:
                 break
+        try:
+            self._ib.errorEvent -= _on_error  # type: ignore[operator]
+        except Exception:
+            pass
+
+        # If we got NO data AND captured any IBKR errors, raise — otherwise
+        # the silent NaN return makes the caller think the contract was bad.
+        if (
+            (not ticker.last or ticker.last <= 0 or (isinstance(ticker.last, float) and ticker.last != ticker.last))
+            and not (ticker.bid and ticker.bid > 0)
+            and not (ticker.ask and ticker.ask > 0)
+            and captured_errors
+        ):
+            try:
+                self._ib.cancelMktData(ib_contract)
+            except Exception:
+                pass
+            raise RuntimeError("; ".join(captured_errors))
 
         last = float(ticker.last) if ticker.last and ticker.last > 0 else float(
             ticker.close or 0

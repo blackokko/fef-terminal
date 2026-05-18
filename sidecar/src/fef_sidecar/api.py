@@ -612,6 +612,57 @@ async def live_place_bracket(request: Request, body: dict[str, Any] = Body(...))
     )
 
 
+@router.get("/diag/option_quote")
+async def diag_option_quote(
+    request: Request,
+    symbol: str = "SPX", strike: float = 7400, right: str = "C",
+    expiry: str | None = None,
+) -> dict[str, Any]:
+    """Diagnostic: try to fetch an option quote and report what came back.
+
+    Use this to test whether your IBKR account has the right market-data
+    subscription. SPX options need 'Cboe One' or 'Cboe Hybrid' (not just
+    OPRA). SPY options usually work with US Securities Snapshot bundle.
+
+    Usage: GET /diag/option_quote?symbol=SPX&strike=7400&right=C
+    """
+    import time as _t
+    from fef_sidecar.ibkr.models import Contract, ContractKind
+
+    s = _state(request)
+    expiry = expiry or _t.strftime("%Y%m%d")
+    contract = Contract(
+        symbol=symbol, kind=ContractKind.OPTION,
+        exchange="CBOE" if symbol == "SPX" else "SMART",
+        expiry=expiry, strike=strike, right=right,
+    )
+    t0 = _t.perf_counter()
+    try:
+        quote = await s.ibkr.get_option_quote(contract)
+        elapsed_ms = round((_t.perf_counter() - t0) * 1000)
+        return {
+            "ok": True,
+            "elapsed_ms": elapsed_ms,
+            "symbol": symbol, "strike": strike, "right": right, "expiry": expiry,
+            "last": quote.last, "bid": quote.bid, "ask": quote.ask,
+            "delta": quote.delta, "iv": quote.iv,
+            "underlying_price": quote.underlying_price,
+            "usable": bool(quote.bid and quote.ask and quote.bid > 0 and quote.ask > 0),
+        }
+    except Exception as e:
+        elapsed_ms = round((_t.perf_counter() - t0) * 1000)
+        return {
+            "ok": False, "elapsed_ms": elapsed_ms,
+            "error_type": type(e).__name__, "error": str(e),
+            "hint": (
+                "If error mentions 'not subscribed' / 354 / 10089: your IBKR "
+                "account needs the relevant options market-data subscription. "
+                "SPX requires 'Cboe One' or 'Cboe Hybrid'. SPY usually works "
+                "with the default US Securities Snapshot bundle."
+            ),
+        }
+
+
 @router.post("/live/place_spread")
 async def live_place_spread(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Place a credit spread (CCS or PCS) via IBKR Bag/ComboLegs.
