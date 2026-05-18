@@ -1,8 +1,9 @@
 import { AppShell } from "./components/AppShell";
 import { ChartPane } from "./components/ChartPane";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { SymbolSelector } from "./components/SymbolSelector";
 import { ToastProvider } from "./components/Toast";
-import { SidecarProvider } from "./context/WebSocketContext";
+import { SidecarProvider, useSidecar } from "./context/WebSocketContext";
 import { isChartOnlyView } from "./lib/popoutChart";
 import "./App.css";
 
@@ -17,6 +18,31 @@ if (typeof window !== "undefined") {
   });
 }
 
+function PopoutChartShell() {
+  const { lastTick, activeSymbol } = useSidecar();
+  const symbol = activeSymbol ?? "SPX";
+  const price = lastTick?.spx_price;
+  return (
+    <div className="chart-only-shell">
+      <header className="popout-chart-bar">
+        <SymbolSelector />
+        <div className="popout-chart-price">
+          <span className="topbar-label">PRICE</span>
+          <span className="topbar-price" style={{ marginLeft: 6 }}>
+            {price != null ? price.toFixed(2) : "—"}
+          </span>
+        </div>
+        <div className="popout-chart-symbol-current">
+          {symbol}
+        </div>
+      </header>
+      <div className="popout-chart-body">
+        <ErrorBoundary label="chart"><ChartPane /></ErrorBoundary>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const chartOnly = isChartOnlyView();
   return (
@@ -24,9 +50,7 @@ function App() {
       <ToastProvider>
         <SidecarProvider>
           {chartOnly ? (
-            <div className="chart-only-shell">
-              <ErrorBoundary label="chart"><ChartPane /></ErrorBoundary>
-            </div>
+            <PopoutChartShell />
           ) : (
             <ErrorBoundary label="shell"><AppShell /></ErrorBoundary>
           )}

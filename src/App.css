@@ -134,6 +134,36 @@ body,
 .chart-only-shell {
   width: 100vw;
   height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.popout-chart-bar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  height: var(--topbar-height);
+  padding: 0 16px;
+  background: var(--color-bg-elevated);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+.popout-chart-price {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.popout-chart-symbol-current {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--color-text-muted);
+  letter-spacing: 0.5px;
+}
+.popout-chart-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .topbar-button {
