@@ -150,6 +150,15 @@ async def lifespan(app: FastAPI):
     state = AppState.build()
     app.state.fef = state
 
+    # Live QuantDataClient needs its httpx session initialized via __aenter__.
+    # Mock is a no-op. Done here so all loops can call set_page_filter/fetch
+    # without each one wrapping in 'async with'.
+    if hasattr(state.quantdata, "__aenter__"):
+        try:
+            await state.quantdata.__aenter__()
+        except Exception:
+            logger.exception("QuantData __aenter__ failed — calls will error")
+
     auto_loops = os.environ.get("FEF_DISABLE_AUTO_LOOP", "false").lower() not in (
         "true",
         "1",

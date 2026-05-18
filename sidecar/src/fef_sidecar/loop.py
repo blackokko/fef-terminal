@@ -1037,6 +1037,13 @@ async def ibkr_health_check_loop(state: AppState) -> None:
     interval = float(os.environ.get("FEF_IBKR_HEALTHCHECK_SEC", "30"))
     logger.info("Starting IBKR health check loop (interval=%.1fs)", interval)
 
+    # Wait for the initial connect race (bar/tick/quantdata loops all calling
+    # connect() simultaneously) to settle before starting health checks.
+    # Without this, ping fires while ib_async is mid-connect and returns
+    # False → forces a disconnect that fights with the in-flight connect,
+    # cascading into a never-stable state.
+    await asyncio.sleep(interval)
+
     last_status = state.ibkr_status
 
     async def _publish(current: str) -> None:

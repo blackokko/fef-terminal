@@ -98,7 +98,10 @@ class AppState:
     # Symbols allowed in the UI selector (env-overridable for users with
     # extra QuantData subscriptions). Default = SPX + the new equity tickers.
     available_symbols: list[str] = field(default_factory=lambda: [
-        s.strip().upper() for s in os.environ.get("FEF_AVAILABLE_SYMBOLS", "SPX,QQQ,IWM,SPY").split(",") if s.strip()
+        s.strip().upper() for s in os.environ.get(
+            "FEF_AVAILABLE_SYMBOLS",
+            "SPX,SPY,QQQ,IWM,ES,NQ,RTY"
+        ).split(",") if s.strip()
     ])
 
     @classmethod

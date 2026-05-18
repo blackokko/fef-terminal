@@ -76,25 +76,29 @@ class LiveIBKRProvider:
         self._max_reconnect = max_reconnect_attempts
         self._reconnect_base = reconnect_base_delay
         self._ib = None  # lazy-imported
+        self._connect_lock = asyncio.Lock()  # serialize connect() across loops
 
     @property
     def is_connected(self) -> bool:
         return self._ib is not None and self._ib.isConnected()
 
     async def connect(self) -> None:
-        if self.is_connected:
-            return
-        from ib_async import IB
+        # Serialize so the 11 background loops don't all race connectAsync()
+        # at startup (which TWS handles poorly and ends up rejecting all of them).
+        async with self._connect_lock:
+            if self.is_connected:
+                return
+            from ib_async import IB
 
-        if self._ib is None:
-            self._ib = IB()
-        await self._ib.connectAsync(self.host, self.port, clientId=self.client_id)
-        logger.info(
-            "IBKR connected: host=%s port=%d client_id=%d",
-            self.host,
-            self.port,
-            self.client_id,
-        )
+            if self._ib is None:
+                self._ib = IB()
+            await self._ib.connectAsync(self.host, self.port, clientId=self.client_id)
+            logger.info(
+                "IBKR connected: host=%s port=%d client_id=%d",
+                self.host,
+                self.port,
+                self.client_id,
+            )
 
     async def disconnect(self) -> None:
         if self._ib is not None and self._ib.isConnected():

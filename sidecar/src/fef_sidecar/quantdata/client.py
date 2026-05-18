@@ -68,6 +68,32 @@ def _today_et() -> str:
     return datetime.now(et).strftime("%Y-%m-%d")
 
 
+def _most_recent_trading_day_et() -> str:
+    """Return the most recent US equity-options trading day in YYYY-MM-DD ET.
+
+    Weekends roll back to Friday. Before 9:30 ET on a weekday rolls back to
+    the previous trading day (since today's session hasn't opened — QuantData
+    has no fresh snapshot data). Used by set_page_filter so weekend/pre-open
+    requests don't 404 on endpoints that key off the session_date filter."""
+    et = timezone(timedelta(hours=-4))
+    now = datetime.now(et)
+    # weekday(): Mon=0..Sun=6
+    if now.weekday() == 5:        # Saturday
+        days_back = 1
+    elif now.weekday() == 6:      # Sunday
+        days_back = 2
+    elif now.weekday() == 0 and now.hour < 9 or (now.weekday() == 0 and now.hour == 9 and now.minute < 30):
+        # Monday before open → Friday
+        days_back = 3
+    elif now.hour < 9 or (now.hour == 9 and now.minute < 30):
+        # Tue-Fri before open → previous weekday
+        days_back = 1
+    else:
+        days_back = 0
+    target = now - timedelta(days=days_back)
+    return target.strftime("%Y-%m-%d")
+
+
 class QuantDataClient:
     """Async HTTP client for the QuantData REST API."""
 
@@ -197,8 +223,9 @@ class QuantDataClient:
         """Set page-level filters so subsequent fetches use the right session.
 
         Idempotent — skipped if the same (date, ticker) was already set.
-        """
-        date = session_date or _today_et()
+        Defaults to the most recent trading day (skips weekends + pre-open)
+        so SPX endpoints don't 404 on closed markets."""
+        date = session_date or _most_recent_trading_day_et()
         if self._page_filter_set == (date, ticker):
             return
 
