@@ -150,10 +150,8 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     trade_symbol = sym
 
     if strategy == "fixed_dollar":
-        # Translate $ targets to option-price levels via current delta.
         delta = abs(opt.get("delta") or 0.40)
         per_contract_dollar = lambda d: d / max(1, qty) / 100.0
-        # For longs: positive move = option price up. Stop is negative dollar.
         t1_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t1) / max(delta, 0.05) * delta
         t2_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t2) / max(delta, 0.05) * delta
         t3_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t3) / max(delta, 0.05) * delta
@@ -167,6 +165,8 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
             t3_limit=round(t3_opt, 2), stop_limit=round(stop_opt, 2),
             t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
             exit_strategy="fixed_dollar",
+            dollar_loss_cap=-3000.0,
+            use_market_entry=True,
         )
     elif strategy == "spx_points":
         # Auto-trade default: market-order entry + -$3000 dollar loss cap
@@ -193,6 +193,8 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
             t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
             t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
             exit_strategy="option_price",
+            dollar_loss_cap=-3000.0,
+            use_market_entry=True,
         )
 
     try:

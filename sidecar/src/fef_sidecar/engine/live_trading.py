@@ -242,13 +242,15 @@ async def place_bracket(
         child_saved = await SignalIterRepository.write_live_order(child)
         children_saved.append(child_saved)
 
+    entry_desc = "MARKET" if spec.use_market_entry else f"LMT @ ${spec.entry_limit:.2f}"
     await SignalIterRepository.write_audit_log(
         category="order", actor="user" if confirm else "system",
-        summary=f"{'DRY_RUN' if dry_run else 'PLACED'} bracket: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} @ ${spec.entry_limit:.2f}",
+        summary=f"{'DRY_RUN' if dry_run else 'PLACED'} bracket: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}",
         details={
             "parent_order_id": parent_saved.id, "children": [c.id for c in children_saved],
             "spec": {"qty": spec.qty, "t1": spec.t1_limit, "t2": spec.t2_limit,
                      "t3": spec.t3_limit, "stop": spec.stop_limit},
+            "order_type": "MKT" if spec.use_market_entry else "LMT",
         },
     )
 
@@ -274,7 +276,7 @@ async def place_bracket(
     #                              will market-exit T2/T3 separately if a
     #                              retrace below T1 fill is detected)
     try:
-        from ib_async import LimitOrder, StopOrder
+        from ib_async import LimitOrder, MarketOrder, StopOrder
 
         ib = ibkr._ib  # type: ignore[attr-defined]
         ib_contract = ibkr._to_ib_contract(contract) if hasattr(ibkr, "_to_ib_contract") else None
@@ -283,7 +285,13 @@ async def place_bracket(
             ib_contract = _to_ib_contract(contract)
         await ib.qualifyContractsAsync(ib_contract)
 
-        parent_order = LimitOrder("BUY", spec.qty, spec.entry_limit, transmit=False)
+        # Honor use_market_entry on EVERY exit strategy path. Without this,
+        # switching exit_strategy off spx_points reverted entries back to
+        # LimitOrder and premium would walk away from the limit.
+        if spec.use_market_entry:
+            parent_order = MarketOrder("BUY", spec.qty, transmit=False)
+        else:
+            parent_order = LimitOrder("BUY", spec.qty, spec.entry_limit, transmit=False)
         parent_trade = ib.placeOrder(ib_contract, parent_order)
         await SignalIterRepository.update_live_order(
             parent_saved.id, ib_order_id=parent_trade.order.orderId,
