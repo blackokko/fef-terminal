@@ -420,6 +420,10 @@ class LiveOrder(SQLModel, table=True):
     spread_short_strike: float | None = None
     spread_long_strike: float | None = None
     spread_initial_credit: float | None = None
+    # Auto-trade dollar-loss cap. When set, spx_target_watcher market-exits
+    # remaining qty if the option premium drops enough that the open position
+    # is down by this many dollars. None disables the check.
+    dollar_loss_cap: float | None = None
 
 
 class LivePosition(SQLModel, table=True):

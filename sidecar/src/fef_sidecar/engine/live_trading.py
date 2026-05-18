@@ -94,6 +94,14 @@ class BracketSpec:
     spx_t2: float | None = None
     spx_t3: float | None = None
     spx_stop: float | None = None
+    # When set, spx_target_watcher market-exits remaining qty if the option
+    # premium drops enough that the open position is down by this many
+    # dollars. Auto-trader sets this to -3000 by default. None = no $ cap.
+    dollar_loss_cap: float | None = None
+    # When true (default for auto-trade), submit a MarketOrder for the parent
+    # BUY instead of a LimitOrder. Limit orders frequently miss fast-moving
+    # 0DTE setups because premium ticks past the limit before the broker hits.
+    use_market_entry: bool = False
 
 
 @dataclass(frozen=True)
@@ -161,7 +169,8 @@ async def place_bracket(
     parent = LiveOrder(
         ticket_id=ticket_id, symbol=spec.symbol, strike=spec.strike,
         right=spec.right, expiry=spec.expiry, action="BUY", qty=spec.qty,
-        order_type="LMT", limit_price=spec.entry_limit,
+        order_type="MKT" if spec.use_market_entry else "LMT",
+        limit_price=spec.entry_limit,  # informational when market order
         bracket_role="parent", dry_run=dry_run, status="DRY_RUN" if dry_run else "SUBMITTED",
         exit_strategy=spec.exit_strategy,
         spx_target_t1=spec.spx_t1, spx_target_t2=spec.spx_t2,
@@ -169,6 +178,7 @@ async def place_bracket(
         spx_target_t1_qty=spec.t1_qty if spec.exit_strategy == "spx_points" else None,
         spx_target_t2_qty=spec.t2_qty if spec.exit_strategy == "spx_points" else None,
         spx_target_t3_qty=spec.t3_qty if spec.exit_strategy == "spx_points" else None,
+        dollar_loss_cap=spec.dollar_loss_cap,
     )
     parent_saved = await SignalIterRepository.write_live_order(parent)
     children_saved = []
@@ -187,12 +197,15 @@ async def place_bracket(
             }
         # Live SPX-points: place ONLY the parent buy. Watcher handles exits.
         try:
-            from ib_async import LimitOrder
+            from ib_async import LimitOrder, MarketOrder
             ib = ibkr._ib  # type: ignore[attr-defined]
             from fef_sidecar.ibkr.live import _to_ib_contract
             ib_contract = _to_ib_contract(contract)
             await ib.qualifyContractsAsync(ib_contract)
-            parent_order = LimitOrder("BUY", spec.qty, spec.entry_limit, transmit=True)
+            if spec.use_market_entry:
+                parent_order = MarketOrder("BUY", spec.qty, transmit=True)
+            else:
+                parent_order = LimitOrder("BUY", spec.qty, spec.entry_limit, transmit=True)
             parent_trade = ib.placeOrder(ib_contract, parent_order)
             await SignalIterRepository.update_live_order(
                 parent_saved.id, ib_order_id=parent_trade.order.orderId,

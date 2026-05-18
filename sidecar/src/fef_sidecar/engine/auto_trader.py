@@ -155,17 +155,19 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
             exit_strategy="fixed_dollar",
         )
     elif strategy == "spx_points":
+        # Auto-trade default: market-order entry + -$3000 dollar loss cap
         spec = BracketSpec(
             symbol=state.active_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
             expiry=today, qty=qty,
-            entry_limit=float(opt["entry_limit"]),
-            # These option-price fields ignored by spx_points but required by dataclass
+            entry_limit=float(opt["entry_limit"]),  # informational under MKT
             t1_limit=float(opt["t1"]), t2_limit=float(opt["t2"]),
             t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
             t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
             exit_strategy="spx_points",
             spx_t1=spx_t1, spx_t2=spx_t2, spx_t3=spx_t3, spx_stop=spx_stop,
+            dollar_loss_cap=-3000.0,
+            use_market_entry=True,
         )
     else:  # 'option_price' (legacy default)
         spec = BracketSpec(
