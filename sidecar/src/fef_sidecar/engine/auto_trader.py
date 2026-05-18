@@ -41,11 +41,16 @@ class AutoTradeDecision:
     order_result: dict | None = None
 
 
-async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
+async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = None) -> AutoTradeDecision:
     """Evaluate gates + maybe place a bracket order.
 
     verdict_dict: the verdict from _run_one_iter (with direction, confidence,
-    strike_rec, option_pricing, suggested_qty, t1/t2/t3/stop)."""
+    strike_rec, option_pricing, suggested_qty, t1/t2/t3/stop).
+
+    symbol: optional override. When provided (from multi-symbol scanner),
+    counters check both the GLOBAL session cap AND the per-symbol sub-cap."""
+
+    sym = (symbol or state.active_symbol).upper()
 
     # Gate 1: toggle
     if not state.auto_trade_enabled:
@@ -83,10 +88,17 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
             False, f"cool-down ({state.auto_trade_cool_down_sec - int(elapsed_sec)}s remaining)"
         )
 
-    # Gate 7: session cap
+    # Gate 7a: GLOBAL session cap (across all symbols)
     if state.auto_trade_count_session >= state.auto_trade_max_per_session:
         return AutoTradeDecision(
-            False, f"session cap reached ({state.auto_trade_max_per_session})"
+            False, f"global session cap reached ({state.auto_trade_max_per_session})"
+        )
+
+    # Gate 7b: per-symbol session sub-cap
+    sym_count = state.auto_trade_count_by_symbol.get(sym, 0)
+    if sym_count >= state.auto_trade_max_per_symbol:
+        return AutoTradeDecision(
+            False, f"{sym} sub-cap reached ({state.auto_trade_max_per_symbol})"
         )
 
     # Gate 8: option pricing available — note NaN is truthy in Python, so
@@ -117,23 +129,20 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
     from fef_sidecar.engine.live_trading import BracketSpec, place_bracket
 
     today = time.strftime("%Y%m%d")
-    # 85/10/5 split per user trading style — lock in 85% at T1, 15% runners.
     t1_qty = max(1, round(qty * 0.85))
     t2_qty = max(1, round(qty * 0.10))
     t3_qty = max(1, qty - t1_qty - t2_qty)
     if t1_qty + t2_qty + t3_qty != qty:
         t1_qty = qty - t2_qty - t3_qty
 
-    # Read the user's chosen exit strategy
-    strategy = state.exit_strategy_long  # 'spx_points' | 'fixed_dollar' | 'option_price'
+    strategy = state.exit_strategy_long
 
-    # Need the FEF verdict's raw SPX targets (in points) — pulled from the
-    # signal_iter row. The verdict_dict from event.verdict has t1/t2/t3 as
-    # SPX targets (the engine outputs those before option_targets converts).
     spx_t1 = verdict_dict.get("t1")
     spx_t2 = verdict_dict.get("t2")
     spx_t3 = verdict_dict.get("t3")
     spx_stop = verdict_dict.get("stop")
+    # Use the scanner-provided symbol if present, else fall back to active
+    trade_symbol = sym
 
     if strategy == "fixed_dollar":
         # Translate $ targets to option-price levels via current delta.
@@ -145,7 +154,7 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
         t3_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t3) / max(delta, 0.05) * delta
         stop_opt = max(0.05, float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_stop) / max(delta, 0.05) * delta)
         spec = BracketSpec(
-            symbol=state.active_symbol, strike=float(strike),
+            symbol=trade_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
             expiry=today, qty=qty,
             entry_limit=float(opt["entry_limit"]),
@@ -157,7 +166,7 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
     elif strategy == "spx_points":
         # Auto-trade default: market-order entry + -$3000 dollar loss cap
         spec = BracketSpec(
-            symbol=state.active_symbol, strike=float(strike),
+            symbol=trade_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
             expiry=today, qty=qty,
             entry_limit=float(opt["entry_limit"]),  # informational under MKT
@@ -171,7 +180,7 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
         )
     else:  # 'option_price' (legacy default)
         spec = BracketSpec(
-            symbol=state.active_symbol, strike=float(strike),
+            symbol=trade_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
             expiry=today, qty=qty,
             entry_limit=float(opt["entry_limit"]),
@@ -187,16 +196,19 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
         logger.exception("Auto-trade place_bracket failed")
         return AutoTradeDecision(False, f"place_bracket error: {e}")
 
-    # Bump counters on successful submission
+    # Bump counters on successful submission — both global AND per-symbol
     if result.get("ok"):
         state.auto_trade_last_at_ms = now_ms
         state.auto_trade_count_session += 1
+        state.auto_trade_count_by_symbol[sym] = state.auto_trade_count_by_symbol.get(sym, 0) + 1
         logger.warning(
-            "AUTO-TRADE FIRED: %s %d %s %s%.0f @ $%.2f (session count: %d/%d)",
-            direction, qty, state.active_symbol,
+            "AUTO-TRADE FIRED: %s %d %s %s%.0f @ $%.2f "
+            "(global %d/%d, %s sub %d/%d)",
+            direction, qty, sym,
             "C" if direction == "LONG_CALLS" else "P",
             strike, opt["entry_limit"],
             state.auto_trade_count_session, state.auto_trade_max_per_session,
+            sym, state.auto_trade_count_by_symbol[sym], state.auto_trade_max_per_symbol,
         )
 
     return AutoTradeDecision(True, "fired", order_result=result)

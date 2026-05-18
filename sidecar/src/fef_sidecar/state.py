@@ -172,6 +172,22 @@ class AppState:
     # the trigger hasn't moved.
     last_spread_recommendation: dict[str, object] | None = None
 
+    # ---- Multi-symbol scanner ----
+    # Scanner runs FEF iters for each symbol in scan_enabled_symbols every
+    # FEF_SCAN_INTERVAL_SEC seconds (default 60s). Independent of the
+    # active_symbol / chart symbol. Each enabled symbol gets its own
+    # FEFEngine in scanner_engines (lazy-created on first scan).
+    scan_enabled_symbols: dict[str, bool] = field(default_factory=lambda: {
+        "SPX": False, "SPY": False, "QQQ": False, "IWM": False,
+        "MES": False, "MNQ": False, "M2K": False,
+    })
+    scanner_engines: dict[str, object] = field(default_factory=dict)
+    scanner_task: object | None = None
+    # Per-symbol auto-trade fire counters — used for the hybrid cap
+    # (global max_per_session AND per-symbol max_per_symbol).
+    auto_trade_count_by_symbol: dict[str, int] = field(default_factory=dict)
+    auto_trade_max_per_symbol: int = 2
+
     @classmethod
     def build(cls) -> AppState:
         return cls(

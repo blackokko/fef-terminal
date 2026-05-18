@@ -193,6 +193,10 @@ def spawn_data_loops(state: AppState) -> None:
     state.spread_exit_task = asyncio.create_task(
         spread_exit_watcher_loop(state), name="spread-exit-watcher-loop"
     )
+    from fef_sidecar.engine.multi_symbol_scanner import multi_symbol_scanner_loop
+    state.scanner_task = asyncio.create_task(
+        multi_symbol_scanner_loop(state), name="multi-symbol-scanner-loop"
+    )
 
 
 async def cancel_data_loops(state: AppState) -> None:

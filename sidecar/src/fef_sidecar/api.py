@@ -569,6 +569,42 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
     }
 
 
+@router.get("/scanner/symbols")
+async def scanner_symbols_get(request: Request) -> dict[str, Any]:
+    """Return per-symbol scanner enable state + caps."""
+    s = _state(request)
+    return {
+        "enabled": dict(s.scan_enabled_symbols),
+        "max_per_symbol": s.auto_trade_max_per_symbol,
+        "max_per_session_global": s.auto_trade_max_per_session,
+        "count_global": s.auto_trade_count_session,
+        "count_by_symbol": dict(s.auto_trade_count_by_symbol),
+    }
+
+
+@router.post("/scanner/symbols")
+async def scanner_symbols_set(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Toggle a scanner symbol on/off, or update the per-symbol cap.
+
+    Body fields (any subset):
+      enabled: {"SPX": true, "QQQ": false, ...} — partial dict; merges
+      max_per_symbol: int (1..50)
+    """
+    s = _state(request)
+    if "enabled" in body and isinstance(body["enabled"], dict):
+        for sym, on in body["enabled"].items():
+            sym_u = str(sym).upper()
+            if sym_u in s.scan_enabled_symbols:
+                s.scan_enabled_symbols[sym_u] = bool(on)
+    if "max_per_symbol" in body:
+        s.auto_trade_max_per_symbol = max(1, min(50, int(body["max_per_symbol"])))
+    return {
+        "ok": True,
+        "enabled": dict(s.scan_enabled_symbols),
+        "max_per_symbol": s.auto_trade_max_per_symbol,
+    }
+
+
 @router.post("/auto_trade/reset_session")
 async def auto_trade_reset_session(request: Request) -> dict[str, Any]:
     """Reset the per-session auto-trade counter (lets you fire more if you've
@@ -577,6 +613,7 @@ async def auto_trade_reset_session(request: Request) -> dict[str, Any]:
     s = _state(request)
     old = s.auto_trade_count_session
     s.auto_trade_count_session = 0
+    s.auto_trade_count_by_symbol.clear()
     s.auto_trade_last_at_ms = 0
     await SignalIterRepository.write_audit_log(
         category="auto_trade_reset", actor="user",
