@@ -92,6 +92,7 @@ async def init_db() -> None:
             ("daily_review", "actual_wins", "INTEGER DEFAULT 0"),
             ("daily_review", "actual_losses", "INTEGER DEFAULT 0"),
             ("daily_review", "actual_total_R", "REAL DEFAULT 0.0"),
+            ("audit_log", "block_reason_code", "TEXT"),
         ]
         for table, column, type_sql in migrations:
             try:

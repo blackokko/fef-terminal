@@ -697,6 +697,129 @@ def list_available_data() -> dict[str, Any]:
     }
 
 
+@mcp.tool()
+def get_daily_reviews(limit: int = 30) -> list[dict[str, Any]]:
+    """Return the most recent DailyReview rows (one per session).
+
+    Each row has: session_date, total_signals, actionable_signals, wins/stops/
+    timeouts, win_rate_pct, expectancy_r, t1/t2/t3 hit counts, plus by_X
+    breakdowns (by_trigger, by_confidence, by_hour_ct, by_direction,
+    by_regime, by_wall_distance, by_fe_ratio, by_block_reason), and
+    actual_trades_taken / actual_wins / actual_losses / actual_total_R.
+
+    Use this as the entry point for any cross-session analysis.
+    """
+    from fef_sidecar.db.models import DailyReview
+    with _get_session() as session:
+        rows = session.exec(
+            select(DailyReview).order_by(DailyReview.session_date.desc()).limit(limit)  # type: ignore[attr-defined]
+        ).all()
+    return [
+        {"id": r.id, "session_date": r.session_date,
+         "computed_at": r.computed_at.isoformat(),
+         "total_signals": r.total_signals,
+         "actionable_signals": r.actionable_signals,
+         "wins": r.wins, "stops": r.stops, "timeouts": r.timeouts,
+         "win_rate_pct": r.win_rate_pct, "expectancy_r": r.expectancy_r,
+         "t1_hits": r.t1_hits, "t2_hits": r.t2_hits, "t3_hits": r.t3_hits,
+         "by_trigger": r.by_trigger, "by_confidence": r.by_confidence,
+         "by_hour_ct": r.by_hour_ct, "by_direction": r.by_direction,
+         "by_regime": r.by_regime, "by_wall_distance": r.by_wall_distance,
+         "by_fe_ratio": r.by_fe_ratio, "by_block_reason": r.by_block_reason,
+         "actual_trades_taken": r.actual_trades_taken,
+         "actual_wins": r.actual_wins, "actual_losses": r.actual_losses,
+         "actual_total_R": r.actual_total_R}
+        for r in rows
+    ]
+
+
+@mcp.tool()
+def get_engine_changes(limit: int = 100) -> list[dict[str, Any]]:
+    """Return EngineChange rows ordered by applied_at desc.
+
+    Each row documents a semantic engine change with: name, category
+    (gate/threshold/exit/safety/scoring/data), description, expected_impact,
+    measured_impact_r (filled in post-hoc), and git_commit_sha. Cross-reference
+    with DailyReview rows to compute the pre/post impact of each change.
+    """
+    from fef_sidecar.db.models import EngineChange
+    with _get_session() as session:
+        rows = session.exec(
+            select(EngineChange).order_by(EngineChange.applied_at.desc()).limit(limit)  # type: ignore[attr-defined]
+        ).all()
+    return [
+        {"id": r.id, "applied_at": r.applied_at.isoformat(),
+         "name": r.name, "description": r.description, "category": r.category,
+         "expected_impact": r.expected_impact,
+         "measured_impact_r": r.measured_impact_r,
+         "git_commit_sha": r.git_commit_sha}
+        for r in rows
+    ]
+
+
+@mcp.tool()
+def get_tuning_recommendations(status: str = "OPEN",
+                                limit: int = 50) -> list[dict[str, Any]]:
+    """Return TuningRecommendation rows.
+
+    status: 'OPEN' (active recommendations from the latest auto-eval),
+            'APPLIED' (user shipped), 'DISMISSED' (user rejected),
+            'SUPERSEDED' (replaced by a newer eval), or 'all'.
+
+    kind field is one of: STATE_OF_MODEL (always emitted, has backing_data.state
+    of GREEN/AMBER/RED), FREEZE (3+ sessions of -0.5R), ELIGIBLE_FOR_CHANGE
+    (confluence stable + 5+ days since last change), PROPOSE_GATE (feature
+    bucket has 25+pp separation), ROLLBACK_CANDIDATE (post-change expectancy
+    dropped >0.2R).
+    """
+    from fef_sidecar.db.models import TuningRecommendation
+    with _get_session() as session:
+        stmt = select(TuningRecommendation).order_by(TuningRecommendation.generated_at.desc()).limit(limit)  # type: ignore[attr-defined]
+        if status != "all":
+            stmt = stmt.where(TuningRecommendation.status == status)
+        rows = session.exec(stmt).all()
+    return [
+        {"id": r.id, "generated_at": r.generated_at.isoformat(),
+         "based_on_sessions": r.based_on_sessions,
+         "based_on_window_start": r.based_on_window_start,
+         "based_on_window_end": r.based_on_window_end,
+         "kind": r.kind, "priority": r.priority,
+         "title": r.title, "body": r.body, "backing_data": r.backing_data,
+         "status": r.status}
+        for r in rows
+    ]
+
+
+@mcp.tool()
+def get_shadow_comparisons(session_date: str | None = None,
+                            limit: int = 200) -> list[dict[str, Any]]:
+    """Return ShadowComparison rows — A/B test of production vs shadow engine.
+
+    Use this when shadow mode is enabled (POST /shadow/enable on the sidecar)
+    to analyze whether a proposed engine config would produce different signals.
+    Each row records production direction/confidence + shadow direction/confidence
+    + agreement flags.
+    """
+    from fef_sidecar.db.models import ShadowComparison
+    with _get_session() as session:
+        stmt = select(ShadowComparison).order_by(ShadowComparison.iter_timestamp.desc()).limit(limit)  # type: ignore[attr-defined]
+        if session_date:
+            stmt = stmt.where(ShadowComparison.session_date == session_date)
+        rows = session.exec(stmt).all()
+    return [
+        {"id": r.id, "iter_timestamp": r.iter_timestamp.isoformat(),
+         "session_date": r.session_date, "iter_num": r.iter_num,
+         "production_direction": r.production_direction.value if hasattr(r.production_direction, "value") else str(r.production_direction),
+         "production_confidence": r.production_confidence.value if hasattr(r.production_confidence, "value") else str(r.production_confidence),
+         "shadow_label": r.shadow_label,
+         "shadow_direction": r.shadow_direction.value if hasattr(r.shadow_direction, "value") else str(r.shadow_direction),
+         "shadow_confidence": r.shadow_confidence.value if hasattr(r.shadow_confidence, "value") else str(r.shadow_confidence),
+         "direction_agree": r.direction_agree,
+         "confidence_agree": r.confidence_agree}
+        for r in rows
+    ]
+
+
 def main() -> None:
     """Entry point for the `fef-mcp` console script."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")

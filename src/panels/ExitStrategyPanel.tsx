@@ -53,7 +53,7 @@ export function ExitStrategyPanel() {
       <h3 className="sidebar-section-title">Exit strategy</h3>
 
       <div className="muted small" style={{ marginBottom: 4, fontWeight: 600, color: "var(--color-text)" }}>
-        Long calls / puts
+        Long calls / puts (auto-trade picks based on size)
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         <label className="exit-strat-radio">
@@ -62,8 +62,8 @@ export function ExitStrategyPanel() {
                  onChange={() => void update({ long_strategy: "spx_points" })}
                  disabled={busy} />
           <span>
-            <strong>SPX-points (Option C)</strong>
-            <div className="muted small">Watcher fires market sells when SPX crosses T1 / T2 / T3 / stop. Exact, no gamma/theta approximation.</div>
+            <strong>SPX-points</strong>
+            <div className="muted small">Watcher fires market sells when SPX crosses T1 / T2 / T3 / stop. Exact, no gamma/theta approximation. Auto-trade uses this for qty &lt; 15.</div>
           </span>
         </label>
         <label className="exit-strat-radio">
@@ -72,8 +72,8 @@ export function ExitStrategyPanel() {
                  onChange={() => void update({ long_strategy: "fixed_dollar" })}
                  disabled={busy} />
           <span>
-            <strong>Fixed dollar (Option A)</strong>
-            <div className="muted small">$ profit/loss targets translated to option-price bracket via current delta. Standard IBKR bracket.</div>
+            <strong>Fixed dollar</strong>
+            <div className="muted small">$ profit/loss targets translated to option-price bracket via current delta. Standard IBKR bracket. Auto-trade uses this only for qty ≥ 15.</div>
           </span>
         </label>
       </div>

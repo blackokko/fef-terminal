@@ -644,6 +644,317 @@ async def history_reviews(limit: int = 30) -> list[dict[str, Any]]:
     ]
 
 
+@router.get("/tuning/recommendations")
+async def tuning_recommendations(status: str = "OPEN", limit: int = 50) -> list[dict[str, Any]]:
+    """Return TuningRecommendation rows. Default status=OPEN returns the
+    currently-active batch (most recent generation, not yet APPLIED/DISMISSED).
+    Use status=all to see history.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import TuningRecommendation as _TR
+    from sqlmodel import select as _s
+    async with _gs() as session:
+        stmt = _s(_TR).order_by(_TR.generated_at.desc()).limit(limit)  # type: ignore[attr-defined]
+        if status != "all":
+            stmt = stmt.where(_TR.status == status)
+        rows = list((await session.exec(stmt)).all())
+    return [
+        {"id": r.id, "generated_at": r.generated_at.isoformat(),
+         "based_on_sessions": r.based_on_sessions,
+         "based_on_window_start": r.based_on_window_start,
+         "based_on_window_end": r.based_on_window_end,
+         "kind": r.kind, "priority": r.priority,
+         "title": r.title, "body": r.body, "backing_data": r.backing_data,
+         "status": r.status,
+         "applied_engine_change_id": r.applied_engine_change_id,
+         "decided_at": r.decided_at.isoformat() if r.decided_at else None,
+         "decided_by": r.decided_by}
+        for r in rows
+    ]
+
+
+@router.post("/tuning/recompute")
+async def tuning_recompute(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Re-run the tuning recommender over a date range (or all data if no range)."""
+    from fef_sidecar.engine.tuning_runner import run_tuning_recommendations
+    start = body.get("start"); end = body.get("end")
+    return await run_tuning_recommendations(start=start, end=end)
+
+
+@router.post("/tuning/decide")
+async def tuning_decide(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Mark a TuningRecommendation as APPLIED or DISMISSED.
+    Body: {recommendation_id: int, decision: 'APPLIED'|'DISMISSED', applied_engine_change_id?: int}
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import TuningRecommendation as _TR
+    from sqlmodel import select as _s
+    import datetime as _dt
+    rec_id = int(body["recommendation_id"])
+    decision = body["decision"]
+    if decision not in ("APPLIED", "DISMISSED"):
+        raise HTTPException(400, "decision must be APPLIED or DISMISSED")
+    async with _gs() as session:
+        r = (await session.exec(_s(_TR).where(_TR.id == rec_id))).first()
+        if r is None:
+            raise HTTPException(404, f"recommendation {rec_id} not found")
+        r.status = decision
+        r.decided_at = _dt.datetime.now(_dt.timezone.utc)
+        r.decided_by = body.get("decided_by", "user")
+        if "applied_engine_change_id" in body:
+            r.applied_engine_change_id = body["applied_engine_change_id"]
+        session.add(r)
+        await session.commit()
+    return {"ok": True, "id": rec_id, "status": decision}
+
+
+@router.get("/engine/changes")
+async def engine_changes(limit: int = 100) -> list[dict[str, Any]]:
+    """Return EngineChange rows ordered by applied_at desc."""
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import EngineChange as _EC
+    from sqlmodel import select as _s
+    async with _gs() as session:
+        rows = list((await session.exec(
+            _s(_EC).order_by(_EC.applied_at.desc()).limit(limit)  # type: ignore[attr-defined]
+        )).all())
+    return [
+        {"id": r.id, "applied_at": r.applied_at.isoformat(),
+         "name": r.name, "description": r.description, "category": r.category,
+         "expected_impact": r.expected_impact,
+         "measured_impact_r": r.measured_impact_r,
+         "rollback_condition": r.rollback_condition,
+         "git_commit_sha": r.git_commit_sha}
+        for r in rows
+    ]
+
+
+@router.post("/engine/changes")
+async def engine_change_log(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Log a new EngineChange row. Called manually or from scripts."""
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import EngineChange as _EC
+    row = _EC(
+        name=body["name"], description=body.get("description", ""),
+        category=body.get("category", "gate"),
+        expected_impact=body.get("expected_impact", ""),
+        rollback_condition=body.get("rollback_condition", ""),
+        git_commit_sha=body.get("git_commit_sha"),
+    )
+    async with _gs() as session:
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    return {"ok": True, "id": row.id}
+
+
+@router.get("/diag/streams")
+async def diag_streams(request: Request) -> dict[str, Any]:
+    """Per-stream health snapshot. Returns last-activity timestamp + task
+    status for each background loop. Used by the StreamHealthPanel."""
+    import time as _t
+    s = _state(request)
+    now_ms = int(_t.time() * 1000)
+
+    def _state_of(task) -> str:
+        if task is None: return "NOT_STARTED"
+        try:
+            if task.done(): return "DONE"
+            if task.cancelled(): return "CANCELLED"
+            return "RUNNING"
+        except Exception:
+            return "UNKNOWN"
+
+    tick_age_ms = (now_ms - s.last_live_tick_ms) if s.last_live_tick_ms > 0 else None
+    return {
+        "now_ms": now_ms,
+        "loops": {
+            "tick_stream": {
+                "status": _state_of(s.tick_task),
+                "tick_quote_count": s.tick_quote_count_live,
+                "tick_trade_count": s.tick_trade_count_live,
+                "last_tick_age_ms": tick_age_ms,
+            },
+            "bar_stream": {"status": _state_of(s.bar_task)},
+            "quantdata_poll": {"status": _state_of(s.quantdata_poll_task)},
+            "fef_tick": {"status": _state_of(s.loop_task)},
+            "health_check": {"status": _state_of(s.health_check_task)},
+            "vix_poll": {"status": _state_of(s.vix_task)},
+            "account_poll": {"status": _state_of(s.account_task)},
+            "microstructure": {"status": _state_of(s.microstructure_task)},
+            "hft": {"status": _state_of(s.hft_task)},
+            "position_monitor": {"status": _state_of(s.position_task)},
+            "auto_walk_forward": {"status": _state_of(s.auto_wf_task)},
+            "runner_protector": {"status": _state_of(s.runner_protect_task)},
+            "spx_target_watcher": {"status": _state_of(s.spx_target_task)},
+            "spread_exit_watcher": {"status": _state_of(s.spread_exit_task)},
+            "scanner": {"status": _state_of(s.scanner_task)},
+        },
+        "depth_update_count": s.depth_update_count_live,
+        "ibkr": s.ibkr_status,
+    }
+
+
+@router.post("/panic/flat")
+async def panic_flat(request: Request) -> dict[str, Any]:
+    """FLAT EVERYTHING. Composite action:
+      1. Cancel all working orders (kill_all_orders)
+      2. Disable auto-trade
+      3. Market-sell every open option position
+      4. Disable all scanner symbols
+    Returns counts + per-step results. Idempotent."""
+    from fef_sidecar.engine.live_trading import kill_all_orders
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    s = _state(request)
+    result: dict[str, Any] = {"steps": {}}
+
+    # 1. Cancel orders
+    try:
+        result["steps"]["cancel_orders"] = await kill_all_orders(s.ibkr)
+    except Exception as e:
+        result["steps"]["cancel_orders"] = {"ok": False, "error": str(e)}
+
+    # 2. Disable auto-trade
+    s.auto_trade_enabled = False
+    result["steps"]["auto_trade_disabled"] = True
+
+    # 3. Market-sell all open option positions
+    sells = []
+    if isinstance(s.ibkr, LiveIBKRProvider) and s.ibkr._ib is not None:  # type: ignore[attr-defined]
+        ib = s.ibkr._ib  # type: ignore[attr-defined]
+        if ib.isConnected():
+            try:
+                from ib_async import MarketOrder
+                for p in ib.positions():
+                    if getattr(p.contract, "secType", "") != "OPT": continue
+                    qty = int(p.position)
+                    if abs(qty) < 1: continue
+                    action = "SELL" if qty > 0 else "BUY"
+                    try:
+                        order = MarketOrder(action, abs(qty), transmit=True)
+                        t = ib.placeOrder(p.contract, order)
+                        sells.append({
+                            "contract": f"{p.contract.symbol} {p.contract.strike}{p.contract.right}",
+                            "qty": abs(qty), "action": action,
+                            "ib_order_id": t.order.orderId,
+                        })
+                    except Exception as e:
+                        sells.append({"error": str(e)})
+            except Exception as e:
+                result["steps"]["flat_positions_error"] = str(e)
+    result["steps"]["positions_flat"] = sells
+
+    # 4. Disable scanner symbols
+    for sym in list(s.scan_enabled_symbols.keys()):
+        s.scan_enabled_symbols[sym] = False
+    result["steps"]["scanner_disabled"] = True
+
+    try:
+        await SignalIterRepository.write_audit_log(
+            category="panic_flat", actor="user",
+            summary=f"PANIC FLAT triggered — cancelled orders, disabled auto-trade, "
+                    f"market-sold {len(sells)} positions, disabled scanner",
+            details=result,
+        )
+    except Exception:
+        pass
+    return {"ok": True, **result}
+
+
+@router.post("/engine/backtest")
+async def engine_backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Replay signals through a proposed filter stack.
+
+    Body: {filters: ['confluence_only', 'fe_band_1_3', ...], session_date?: 'YYYY-MM-DD'}
+
+    Returns baseline vs filtered stats: win rate, expectancy R, total R,
+    expectancy delta. Use to preview a gate before shipping it.
+    """
+    from fef_sidecar.engine.what_if_backtest import what_if, FILTERS
+    filters = body.get("filters", [])
+    if not isinstance(filters, list):
+        raise HTTPException(400, "filters must be a list of filter names")
+    try:
+        return await what_if(filters, session_date=body.get("session_date"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.get("/engine/backtest/filters")
+async def engine_backtest_filters() -> list[str]:
+    """Available filter names for the backtest endpoint."""
+    from fef_sidecar.engine.what_if_backtest import FILTERS
+    return list(FILTERS.keys())
+
+
+@router.post("/shadow/enable")
+async def shadow_enable(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Enable shadow engine with overridden parameters.
+    Body: {label: 'tighter_collapse', wall_proximity_pts?, wall_collapse_pct?,
+           wall_collapse_floor_m?, absorption_fe_ratio_min?}
+    """
+    from fef_sidecar.engine import FEFEngine
+    s = _state(request)
+    s.shadow_label = body.get("label", "shadow")
+    s.shadow_engine = FEFEngine(
+        wall_proximity_pts=float(body.get("wall_proximity_pts", 5.0)),
+        wall_collapse_pct=float(body.get("wall_collapse_pct", 0.20)),
+        wall_collapse_floor_m=float(body.get("wall_collapse_floor_m", 5.0)),
+        absorption_fe_ratio_min=float(body.get("absorption_fe_ratio_min", 5.0)),
+    )
+    return {"ok": True, "label": s.shadow_label}
+
+
+@router.post("/shadow/disable")
+async def shadow_disable(request: Request) -> dict[str, Any]:
+    s = _state(request)
+    label = s.shadow_label
+    s.shadow_engine = None
+    s.shadow_label = ""
+    return {"ok": True, "was_label": label}
+
+
+@router.get("/shadow/comparisons")
+async def shadow_comparisons(limit: int = 200, session_date: str | None = None) -> list[dict[str, Any]]:
+    """List ShadowComparison rows. Filter by session_date or take latest N."""
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import ShadowComparison as _SC
+    from sqlmodel import select as _s
+    async with _gs() as session:
+        stmt = _s(_SC).order_by(_SC.iter_timestamp.desc()).limit(limit)  # type: ignore[attr-defined]
+        if session_date:
+            stmt = stmt.where(_SC.session_date == session_date)
+        rows = list((await session.exec(stmt)).all())
+    return [
+        {"id": r.id, "iter_timestamp": r.iter_timestamp.isoformat(),
+         "session_date": r.session_date, "iter_num": r.iter_num,
+         "production_direction": r.production_direction.value if hasattr(r.production_direction, "value") else str(r.production_direction),
+         "production_confidence": r.production_confidence.value if hasattr(r.production_confidence, "value") else str(r.production_confidence),
+         "shadow_label": r.shadow_label,
+         "shadow_direction": r.shadow_direction.value if hasattr(r.shadow_direction, "value") else str(r.shadow_direction),
+         "shadow_confidence": r.shadow_confidence.value if hasattr(r.shadow_confidence, "value") else str(r.shadow_confidence),
+         "direction_agree": r.direction_agree,
+         "confidence_agree": r.confidence_agree}
+        for r in rows
+    ]
+
+
+@router.post("/admin/backfill_regime")
+async def admin_backfill_regime(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Backfill extras.regime_at_fire on historical signal_iter rows."""
+    from fef_sidecar.engine.regime_backfill import backfill_regime_at_fire
+    session_date = body.get("session_date")
+    return await backfill_regime_at_fire(session_date=session_date)
+
+
+@router.post("/admin/backfill_engine_changes")
+async def admin_backfill_engine_changes() -> dict[str, Any]:
+    """One-shot: insert EngineChange rows for the semantic changes shipped
+    today (mid-session). Idempotent — skips rows whose name already exists."""
+    from fef_sidecar.engine.engine_change_backfill import backfill_engine_changes
+    return await backfill_engine_changes()
+
+
 @router.post("/admin/daily_review")
 async def admin_daily_review(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
     """On-demand DailyReview compute. Body: {session_date?: 'YYYY-MM-DD'}.

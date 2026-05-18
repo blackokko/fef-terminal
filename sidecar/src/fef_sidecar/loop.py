@@ -317,6 +317,31 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     perf["fef_compute_ms"] = (_time.perf_counter() - t0) * 1000
     state.last_spx_price = inputs.spx_price
 
+    # Shadow engine: parallel eval. Auto-trade ignores its output;
+    # ShadowComparison row written for later analysis.
+    if state.shadow_engine is not None:
+        try:
+            shadow_verdict = state.shadow_engine.push(inputs)  # type: ignore[attr-defined]
+            from fef_sidecar.db.engine import get_session as _sgs
+            from fef_sidecar.db.models import ShadowComparison
+            async with _sgs() as _ss:
+                _ss.add(ShadowComparison(
+                    session_date=_today_et(),
+                    iter_num=state.last_iter_num + 1,
+                    production_direction=verdict.direction,
+                    production_confidence=verdict.confidence,
+                    production_reasoning=verdict.reasoning[:500],
+                    shadow_label=state.shadow_label,
+                    shadow_direction=shadow_verdict.direction,
+                    shadow_confidence=shadow_verdict.confidence,
+                    shadow_reasoning=shadow_verdict.reasoning[:500],
+                    direction_agree=(verdict.direction == shadow_verdict.direction),
+                    confidence_agree=(verdict.confidence == shadow_verdict.confidence),
+                ))
+                await _ss.commit()
+        except Exception:
+            logger.exception("shadow engine eval failed")
+
     # When verdict is actionable, also pull the option chain quote for the
     # recommended strike and compute target option prices via delta.
     t0 = _time.perf_counter()
@@ -512,6 +537,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
                         "confidence": event.verdict.get("confidence"),
                         "strike_rec": event.verdict.get("strike_rec"),
                         "reason": decision.reason,
+                        "reason_code": decision.reason_code,
                     },
                 )
             except Exception:

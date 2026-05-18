@@ -4,6 +4,10 @@ import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { AttributionPanel } from "../panels/AttributionPanel";
 import { AutoTradePanel } from "../panels/AutoTradePanel";
 import { ScannerPanel } from "../panels/ScannerPanel";
+import { TuningPanel } from "../panels/TuningPanel";
+import { VerdictTimelinePanel } from "../panels/VerdictTimelinePanel";
+import { ModelEvolutionPanel } from "../panels/ModelEvolutionPanel";
+import { StreamHealthPanel } from "../panels/StreamHealthPanel";
 import { AuditLogPanel } from "../panels/AuditLogPanel";
 import { CalendarPanel } from "../panels/CalendarPanel";
 import { DataMaintenancePanel } from "../panels/DataMaintenancePanel";
@@ -81,6 +85,7 @@ export function Sidebar() {
             <Safe name="ExitStrategy"><ExitStrategyPanel /></Safe>
             <Safe name="AutoTrade"><AutoTradePanel /></Safe>
             <Safe name="Scanner"><ScannerPanel /></Safe>
+            <Safe name="Tuning"><TuningPanel /></Safe>
             <Safe name="LiveExecution"><LiveExecutionPanel /></Safe>
             <Safe name="LivePositions"><LivePositionsPanel /></Safe>
             <Safe name="OptionChain"><OptionChainPanel /></Safe>
@@ -103,6 +108,9 @@ export function Sidebar() {
         )}
         {tab === "history" && (
           <>
+            <Safe name="VerdictTimeline"><VerdictTimelinePanel /></Safe>
+            <Safe name="ModelEvolution"><ModelEvolutionPanel /></Safe>
+            <Safe name="StreamHealth"><StreamHealthPanel /></Safe>
             <Safe name="Analytics"><AnalyticsPanel /></Safe>
             <Safe name="Attribution"><AttributionPanel /></Safe>
             <Safe name="WalkForward"><WalkForwardPanel /></Safe>

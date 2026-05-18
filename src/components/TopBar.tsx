@@ -10,6 +10,49 @@ const connectionColor: Record<string, string> = {
   error: "var(--color-red)",
 };
 
+const stateColor: Record<string, string> = {
+  GREEN: "var(--color-green)",
+  AMBER: "var(--color-amber)",
+  RED: "var(--color-red)",
+  NO_DATA: "var(--color-text-muted)",
+};
+
+function ModelStatePill() {
+  const [state, setState] = useState<string>("NO_DATA");
+  const [expectancy, setExpectancy] = useState<number | null>(null);
+
+  useEffect(() => {
+    const refresh = async () => {
+      try {
+        const r = await fetch("http://127.0.0.1:8765/tuning/recommendations?status=OPEN");
+        if (!r.ok) return;
+        const recs = await r.json();
+        const sm = recs.find((x: any) => x.kind === "STATE_OF_MODEL");
+        if (sm) {
+          setState(sm.backing_data?.state ?? "NO_DATA");
+          setExpectancy(sm.backing_data?.expectancy_avg_r ?? null);
+        }
+      } catch {}
+    };
+    void refresh();
+    const id = window.setInterval(refresh, 60000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  return (
+    <span title={`Model state — last 5 sessions avg expectancy ${expectancy != null ? expectancy.toFixed(2) + "R" : "—"}`}
+          style={{
+            display: "inline-block", padding: "2px 8px", marginLeft: 6,
+            borderRadius: 3, fontSize: 10, fontWeight: 700,
+            fontFamily: "var(--font-mono)",
+            background: stateColor[state],
+            color: state === "AMBER" ? "var(--color-bg)" : "white",
+          }}>
+      MDL {state}
+    </span>
+  );
+}
+
 export function TopBar() {
   const { connection, lastTick, lastIter, lastStatus, lastSnapshot, lastAccount } = useSidecar();
   const spx = lastTick?.spx_price ?? lastIter?.spx_price;
@@ -87,6 +130,7 @@ export function TopBar() {
             ? `#${lastIter.iter_num} ${lastIter.verdict.direction}`
             : "—"}
         </span>
+        <ModelStatePill />
       </div>
 
       <div className="topbar-section">
@@ -100,6 +144,25 @@ export function TopBar() {
       </div>
 
       <div className="topbar-section topbar-section-right">
+        <button
+          className="topbar-button"
+          style={{ background: "var(--color-red)", color: "white", fontWeight: 700 }}
+          onClick={async () => {
+            if (!window.confirm("FLAT EVERYTHING?\n\n- Cancel all working orders\n- Disable auto-trade\n- Market-sell all open option positions\n- Disable scanner symbols\n\nIrreversible. Continue?")) return;
+            try {
+              const r = await fetch("http://127.0.0.1:8765/panic/flat", { method: "POST" });
+              const data = await r.json();
+              const sold = (data?.steps?.positions_flat ?? []).length;
+              const cancelled = data?.steps?.cancel_orders?.cancelled ?? 0;
+              window.alert(`FLAT done.\nOrders cancelled: ${cancelled}\nPositions sold: ${sold}\nAuto-trade & scanner disabled.`);
+            } catch (e) {
+              window.alert(`FLAT failed: ${(e as Error).message}`);
+            }
+          }}
+          title="Cancel all orders + disable auto-trade + market-sell all positions + disable scanner"
+        >
+          🚨 FLAT
+        </button>
         <button
           className="topbar-button"
           onClick={() => void popoutChart()}

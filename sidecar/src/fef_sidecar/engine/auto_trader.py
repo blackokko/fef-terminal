@@ -34,10 +34,30 @@ logger = logging.getLogger(__name__)
 _CONFIDENCE_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
 
+class BlockReason:
+    """Canonical block reason codes — written alongside the human reason
+    string so DailyReview.by_block_reason aggregates cleanly without
+    fuzzy string matching."""
+    DISABLED = "DISABLED"
+    ENV_NOT_SET = "ENV_NOT_SET"
+    VERDICT_WAIT = "VERDICT_WAIT"
+    BELOW_FLOOR = "BELOW_FLOOR"
+    CALENDAR_PAUSE = "CALENDAR_PAUSE"
+    COOL_DOWN = "COOL_DOWN"
+    GLOBAL_CAP = "GLOBAL_CAP"
+    SYMBOL_CAP = "SYMBOL_CAP"
+    NO_OPTION_PRICING = "NO_OPTION_PRICING"
+    INVALID_PRICING = "INVALID_PRICING"
+    NO_STRIKE = "NO_STRIKE"
+    PLACE_ERROR = "PLACE_ERROR"
+    FIRED = "FIRED"
+
+
 @dataclass(frozen=True)
 class AutoTradeDecision:
     fired: bool
     reason: str
+    reason_code: str = BlockReason.FIRED
     order_result: dict | None = None
 
 
@@ -54,29 +74,32 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
 
     # Gate 1: toggle
     if not state.auto_trade_enabled:
-        return AutoTradeDecision(False, "auto_trade disabled")
+        return AutoTradeDecision(False, "auto_trade disabled", BlockReason.DISABLED)
 
     # Gate 2: live trading env
     from fef_sidecar.engine.live_trading import is_live_trading_enabled
     if not is_live_trading_enabled():
-        return AutoTradeDecision(False, "FEF_LIVE_TRADING env not set")
+        return AutoTradeDecision(False, "FEF_LIVE_TRADING env not set", BlockReason.ENV_NOT_SET)
 
     # Gate 3: actionable verdict
     direction = verdict_dict.get("direction", "WAIT")
     if direction not in ("LONG_CALLS", "LONG_PUTS"):
-        return AutoTradeDecision(False, f"verdict is {direction}")
+        return AutoTradeDecision(False, f"verdict is {direction}", BlockReason.VERDICT_WAIT)
 
     # Gate 4: confidence floor
     conf = verdict_dict.get("confidence", "NONE")
     if _CONFIDENCE_RANK.get(conf, 0) < _CONFIDENCE_RANK.get(state.auto_trade_confidence_floor, 3):
-        return AutoTradeDecision(False, f"{conf} below floor {state.auto_trade_confidence_floor}")
+        return AutoTradeDecision(False,
+            f"{conf} below floor {state.auto_trade_confidence_floor}",
+            BlockReason.BELOW_FLOOR)
 
     # Gate 5: calendar pause window
     try:
         from fef_sidecar.engine.calendar import is_pause_window
         pause = await is_pause_window()
         if pause.paused:
-            return AutoTradeDecision(False, f"calendar pause: {pause.reason}")
+            return AutoTradeDecision(False, f"calendar pause: {pause.reason}",
+                                     BlockReason.CALENDAR_PAUSE)
     except Exception:
         pass
 
@@ -90,20 +113,22 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     if sym_last > 0 and elapsed_sec < state.auto_trade_cool_down_sec:
         remaining = state.auto_trade_cool_down_sec - int(elapsed_sec)
         return AutoTradeDecision(
-            False, f"{sym} cool-down ({remaining}s remaining)"
+            False, f"{sym} cool-down ({remaining}s remaining)", BlockReason.COOL_DOWN
         )
 
     # Gate 7a: GLOBAL session cap (across all symbols)
     if state.auto_trade_count_session >= state.auto_trade_max_per_session:
         return AutoTradeDecision(
-            False, f"global session cap reached ({state.auto_trade_max_per_session})"
+            False, f"global session cap reached ({state.auto_trade_max_per_session})",
+            BlockReason.GLOBAL_CAP
         )
 
     # Gate 7b: per-symbol session sub-cap
     sym_count = state.auto_trade_count_by_symbol.get(sym, 0)
     if sym_count >= state.auto_trade_max_per_symbol:
         return AutoTradeDecision(
-            False, f"{sym} sub-cap reached ({state.auto_trade_max_per_symbol})"
+            False, f"{sym} sub-cap reached ({state.auto_trade_max_per_symbol})",
+            BlockReason.SYMBOL_CAP
         )
 
     # Gate 8: option pricing available — note NaN is truthy in Python, so
@@ -112,19 +137,18 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     import math as _math
     opt = verdict_dict.get("option_pricing")
     if not opt:
-        return AutoTradeDecision(False, "no option pricing on verdict")
+        return AutoTradeDecision(False, "no option pricing on verdict", BlockReason.NO_OPTION_PRICING)
     for k in ("entry_limit", "t1", "t2", "t3", "stop"):
         v = opt.get(k)
         if v is None or not isinstance(v, (int, float)) or not _math.isfinite(v) or v <= 0:
-            return AutoTradeDecision(False, f"invalid option_pricing.{k}={v!r}")
+            return AutoTradeDecision(False, f"invalid option_pricing.{k}={v!r}",
+                                     BlockReason.INVALID_PRICING)
 
     strike = verdict_dict.get("strike_rec")
-    # User override on the AutoTrade panel takes precedence over FEF's
-    # confidence-tier suggested qty. 0 = use suggested.
     override = getattr(state, "auto_trade_qty_override", 0)
     qty = override if override > 0 else (verdict_dict.get("suggested_qty") or 15)
     if not strike:
-        return AutoTradeDecision(False, "no strike_rec on verdict")
+        return AutoTradeDecision(False, "no strike_rec on verdict", BlockReason.NO_STRIKE)
 
     # Gate 9: risk caps — limit qty if it would breach max_contracts_per_trade
     max_contracts = int(os.environ.get("FEF_MAX_CONTRACTS_PER_TRADE", "20"))
@@ -215,7 +239,7 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
         result = await place_bracket(state.ibkr, spec, confirm=True)
     except Exception as e:
         logger.exception("Auto-trade place_bracket failed")
-        return AutoTradeDecision(False, f"place_bracket error: {e}")
+        return AutoTradeDecision(False, f"place_bracket error: {e}", BlockReason.PLACE_ERROR)
 
     # Bump counters on successful submission — global + per-symbol counts
     # AND per-symbol last-fire time (for the per-symbol cool-down clock).
@@ -234,4 +258,4 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
             sym, state.auto_trade_count_by_symbol[sym], state.auto_trade_max_per_symbol,
         )
 
-    return AutoTradeDecision(True, "fired", order_result=result)
+    return AutoTradeDecision(True, "fired", BlockReason.FIRED, order_result=result)

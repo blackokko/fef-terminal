@@ -191,6 +191,14 @@ class AppState:
     # (global max_per_session AND per-symbol max_per_symbol).
     auto_trade_count_by_symbol: dict[str, int] = field(default_factory=dict)
     auto_trade_max_per_symbol: int = 2
+
+    # Shadow engine — parallel evaluator for A/B-testing engine changes.
+    # When set, every iter is pushed to BOTH the production engine and the
+    # shadow. Auto-trade still uses production. Verdicts are compared and
+    # logged to ShadowComparison so the user can see whether the shadow
+    # config would have produced different (better?) signals.
+    shadow_engine: object | None = None
+    shadow_label: str = ""
     # Per-symbol last-fire timestamps — drives per-symbol cool-down. The
     # global auto_trade_last_at_ms stays as a backstop; each symbol's
     # cool-down clock is independent so SPX firing doesn't block QQQ.

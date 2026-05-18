@@ -478,6 +478,78 @@ class DailyReview(SQLModel, table=True):
     actual_total_R: float = 0.0
 
 
+class EngineChange(SQLModel, table=True):
+    """One row per engine semantic change. Lets the TuningRecommender
+    correlate pre/post-change DailyReview rows to measure the impact of
+    each change. Backfilled from git history for older changes; auto-
+    logged going forward via /admin/engine_change."""
+
+    __tablename__ = "engine_change"
+
+    id: int | None = Field(default=None, primary_key=True)
+    applied_at: datetime = Field(default_factory=_utcnow, index=True)
+    name: str  # e.g. "wall_collapse_requires_aligned"
+    description: str = ""
+    category: str = "gate"  # gate / threshold / exit / safety / scoring / data
+    expected_impact: str = ""  # human-written hypothesis
+    measured_impact_r: float | None = None  # filled in post-hoc
+    rollback_condition: str = ""
+    git_commit_sha: str | None = None
+
+
+class ShadowComparison(SQLModel, table=True):
+    """One row per iter when shadow mode is active. Records what the
+    production engine produced vs what the shadow engine would have
+    produced. Used to A/B test engine changes without risking real
+    money.
+    """
+
+    __tablename__ = "shadow_comparison"
+
+    id: int | None = Field(default=None, primary_key=True)
+    iter_timestamp: datetime = Field(default_factory=_utcnow, index=True)
+    session_date: str = Field(index=True)
+    iter_num: int
+
+    production_direction: FEFDirection
+    production_confidence: FEFConfidence
+    production_reasoning: str = ""
+
+    shadow_label: str = "default"  # name of the shadow config
+    shadow_direction: FEFDirection
+    shadow_confidence: FEFConfidence
+    shadow_reasoning: str = ""
+
+    # Did they agree? Easy filter for analysis.
+    direction_agree: bool = False
+    confidence_agree: bool = False
+
+
+class TuningRecommendation(SQLModel, table=True):
+    """Auto-generated recommendation from the rule engine. Reviewed by
+    user, then either applied (logged as EngineChange) or dismissed."""
+
+    __tablename__ = "tuning_recommendation"
+
+    id: int | None = Field(default=None, primary_key=True)
+    generated_at: datetime = Field(default_factory=_utcnow, index=True)
+    based_on_sessions: int = 0  # how many sessions of DailyReview backed it
+    based_on_window_start: str = ""  # YYYY-MM-DD
+    based_on_window_end: str = ""
+
+    kind: str  # "PROPOSE_GATE" / "TIGHTEN_GATE" / "ROLLBACK_CANDIDATE" / "FREEZE" / "ELIGIBLE_FOR_CHANGE" / "STATE_OF_MODEL"
+    priority: str = "MEDIUM"  # HIGH / MEDIUM / LOW
+    title: str
+    body: str  # markdown-style explanation
+    backing_data: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+
+    # Lifecycle
+    status: str = Field(default="OPEN", index=True)  # OPEN / APPLIED / DISMISSED / SUPERSEDED
+    applied_engine_change_id: int | None = None
+    decided_at: datetime | None = None
+    decided_by: str = ""  # "user" / "system"
+
+
 class LivePosition(SQLModel, table=True):
     """Snapshot of an open position with live greeks. Refreshed by the
     position monitor loop."""

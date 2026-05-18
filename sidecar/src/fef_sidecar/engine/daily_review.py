@@ -181,23 +181,30 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         return {"n": n, "wins": wn, "win_pct": round(wn / n * 100, 1) if n else 0,
                 "expectancy_r": round(sum(rs) / n, 3) if n else 0}
 
-    # Block reason aggregation
+    # Block reason aggregation — prefers the structured reason_code from
+    # AutoTradeDecision (BlockReason enum). Falls back to fuzzy string
+    # match on the human reason for older rows pre-enum refactor.
     block_reasons = Counter()
     for a in audit:
-        reason = (a.details or {}).get("reason", "unknown")
-        # Normalize cool-down per-symbol into one bucket
-        if "cool-down" in reason:
-            reason = "cool_down"
-        elif "below floor" in reason:
-            reason = "below_confidence_floor"
-        elif "no option pricing" in reason:
-            reason = "no_option_pricing"
-        elif "calendar pause" in reason:
-            reason = "calendar_pause"
-        elif "session cap" in reason or "sub-cap" in reason:
-            reason = "session_cap_reached"
-        elif "WAIT" in reason:
-            reason = "verdict_wait"
+        details = a.details or {}
+        code = details.get("reason_code")
+        if code:
+            block_reasons[code] += 1
+            continue
+        reason = details.get("reason", "unknown")
+        if "cool-down" in reason: reason = "COOL_DOWN"
+        elif "below floor" in reason: reason = "BELOW_FLOOR"
+        elif "no option pricing" in reason: reason = "NO_OPTION_PRICING"
+        elif "invalid option_pricing" in reason: reason = "INVALID_PRICING"
+        elif "calendar pause" in reason: reason = "CALENDAR_PAUSE"
+        elif "global session cap" in reason: reason = "GLOBAL_CAP"
+        elif "sub-cap" in reason: reason = "SYMBOL_CAP"
+        elif "WAIT" in reason: reason = "VERDICT_WAIT"
+        elif "no strike_rec" in reason: reason = "NO_STRIKE"
+        elif "place_bracket" in reason: reason = "PLACE_ERROR"
+        elif "FEF_LIVE_TRADING" in reason: reason = "ENV_NOT_SET"
+        elif "disabled" in reason: reason = "DISABLED"
+        else: reason = "UNKNOWN"
         block_reasons[reason] += 1
 
     # Actual trades (real fills) — winners vs losers from live_order status

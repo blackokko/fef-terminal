@@ -143,12 +143,15 @@ async def nightly_scheduler(state) -> None:
             # Also compute today's daily review (feedback loop for FEF tuning)
             try:
                 from fef_sidecar.engine.daily_review import compute_daily_review
+                from fef_sidecar.engine.tuning_runner import run_tuning_recommendations
                 from datetime import timezone as _tz
                 et = _tz(__import__("datetime").timedelta(hours=-4))
                 session_date = datetime.now(et).strftime("%Y-%m-%d")
                 await compute_daily_review(session_date)
+                # Auto-run the tuning recommender after each DailyReview computes.
+                await run_tuning_recommendations()
             except Exception:
-                logger.exception("daily_review compute failed")
+                logger.exception("daily_review / tuning compute failed")
         except asyncio.CancelledError:
             raise
         except Exception:
