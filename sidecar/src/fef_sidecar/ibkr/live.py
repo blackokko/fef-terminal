@@ -404,17 +404,16 @@ class LiveIBKRProvider:
         )
 
     async def get_account_summary(self) -> AccountSummary | None:
-        """Pulls accountSummary + positions via ib_async.
+        """Pulls accountSummary + reqPnL streaming + positions via ib_async.
 
-        accountSummary returns ~30 tags per account; we pick the ones that
-        matter for a live trading scorecard. P/L tags are auto-updated by
-        TWS as positions move + fills happen.
+        accountSummary returns balance/buying-power tags but NOT live P&L —
+        IBKR exposes DailyPnL/RealizedPnL/UnrealizedPnL only via reqPnL(),
+        which is a streaming subscription. We subscribe once per account
+        and read the cached PnL object on each poll.
         """
         await self._ensure_connected()
         assert self._ib is not None
 
-        # accountSummaryAsync returns list[AccountValue] for all accounts.
-        # Most retail users have one account; we aggregate if multiple.
         try:
             values = await self._ib.accountSummaryAsync()
         except Exception as e:
@@ -424,7 +423,6 @@ class LiveIBKRProvider:
         if not values:
             return None
 
-        # Pick the first account's tags (or 'All' if it's the only one)
         account_id = values[0].account if values else "DEFAULT"
         by_tag: dict[str, float] = {}
         for v in values:
@@ -433,7 +431,40 @@ class LiveIBKRProvider:
             try:
                 by_tag[v.tag] = float(v.value)
             except (ValueError, TypeError):
-                pass  # non-numeric tag (currency string, etc.)
+                pass
+
+        # Subscribe to reqPnL streaming once per account, then read cached
+        # P&L on every poll. Without this, RealizedPnL/UnrealizedPnL are
+        # ALWAYS None — accountSummaryAsync doesn't include them.
+        if not hasattr(self, "_pnl_subscriptions"):
+            self._pnl_subscriptions: dict[str, Any] = {}  # type: ignore[attr-defined]
+        if account_id not in self._pnl_subscriptions and account_id != "All":
+            try:
+                pnl_obj = self._ib.reqPnL(account_id)
+                self._pnl_subscriptions[account_id] = pnl_obj
+                # Brief wait for TWS to send the first PnL snapshot
+                for _ in range(20):
+                    await asyncio.sleep(0.1)
+                    if pnl_obj.dailyPnL == pnl_obj.dailyPnL:  # not NaN
+                        break
+            except Exception as e:
+                logger.warning("reqPnL subscribe failed for %s: %s", account_id, e)
+        pnl = self._pnl_subscriptions.get(account_id)
+
+        def _finite(v: Any) -> float | None:
+            try:
+                f = float(v)
+                return f if f == f else None  # filter NaN
+            except (ValueError, TypeError):
+                return None
+
+        daily = _finite(pnl.dailyPnL) if pnl else None
+        realized = _finite(pnl.realizedPnL) if pnl else None
+        unrealized = _finite(pnl.unrealizedPnL) if pnl else None
+        if daily is None:
+            r = realized or 0.0
+            u = unrealized or 0.0
+            daily = r + u if (realized is not None or unrealized is not None) else None
 
         positions = self._ib.positions()
         open_positions = [p for p in positions if abs(p.position) > 0]
@@ -447,11 +478,9 @@ class LiveIBKRProvider:
             net_liquidation=by_tag.get("NetLiquidation"),
             buying_power=by_tag.get("BuyingPower"),
             available_funds=by_tag.get("AvailableFunds"),
-            daily_pnl=by_tag.get("DailyPnL") or (
-                (by_tag.get("RealizedPnL", 0) or 0) + (by_tag.get("UnrealizedPnL", 0) or 0)
-            ),
-            realized_pnl=by_tag.get("RealizedPnL"),
-            unrealized_pnl=by_tag.get("UnrealizedPnL"),
+            daily_pnl=daily,
+            realized_pnl=realized,
+            unrealized_pnl=unrealized,
             gross_position_value=by_tag.get("GrossPositionValue"),
             open_positions_count=len(open_positions),
             open_options_count=len(open_options),
