@@ -29,7 +29,7 @@ from typing import Any
 from fef_sidecar.db.repository import SignalIterRepository
 from fef_sidecar.engine import FEFEngine
 from fef_sidecar.events import IterEvent
-from fef_sidecar.quantdata.adapters import snapshot_to_inputs
+from fef_sidecar.engine.fef import snapshot_to_inputs
 
 logger = logging.getLogger(__name__)
 
