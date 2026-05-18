@@ -124,9 +124,9 @@ export function AutoTradePanel() {
         </div>
         <div className="muted small">
           {status.enabled
-            ? "Every qualifying verdict fires a REAL bracket order"
+            ? `Every qualifying verdict fires a REAL bracket order (>= ${status.confidence_floor} conviction)`
             : status.live_trading_env
-              ? "Toggle ON to start auto-firing orders on HIGH-conviction signals"
+              ? `Toggle ON to start auto-firing orders on ${status.confidence_floor}-conviction signals`
               : "Restart sidecar via FEF-Paper-AutoTrade.bat (or FEF-Live-AutoTrade.bat) to enable"}
         </div>
       </div>
