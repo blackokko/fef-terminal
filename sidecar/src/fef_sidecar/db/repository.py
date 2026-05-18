@@ -123,13 +123,18 @@ class SignalIterRepository:
 
     @staticmethod
     async def recent(limit: int = 50, session_date: str | None = None) -> list[SignalIter]:
-        """Return most recent iters for the given session (default: today)."""
+        """Return most recent iters for the given session (default: today).
+
+        Order by id desc, NOT iter_num desc: iter_num is a per-process counter
+        that resets each sidecar launch, so iter#28 from an earlier process
+        would otherwise sort above iter#5 from the freshest one.
+        """
         date = session_date or _today_et()
         async with get_session() as session:
             stmt = (
                 select(SignalIter)
                 .where(SignalIter.session_date == date)
-                .order_by(SignalIter.iter_num.desc())  # type: ignore[attr-defined]
+                .order_by(SignalIter.id.desc())  # type: ignore[attr-defined]
                 .limit(limit)
             )
             result = await session.exec(stmt)

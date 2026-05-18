@@ -454,6 +454,26 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
         state.auto_trade_last_block_reason = decision.reason
         if decision.fired and decision.order_result:
             logger.info("auto_trade fired: %s", decision.order_result)
+        elif (
+            state.auto_trade_enabled
+            and event.verdict.get("direction") in ("LONG_CALLS", "LONG_PUTS")
+            and decision.reason != "auto_trade disabled"
+        ):
+            # Auto-trade was on AND verdict was actionable but we blocked it.
+            # Write to audit so the user can see WHY without polling status.
+            try:
+                await SignalIterRepository.write_audit_log(
+                    category="auto_trade_block", actor="system",
+                    summary=f"BLOCKED {event.verdict.get('direction')} {event.verdict.get('confidence')}: {decision.reason}",
+                    details={
+                        "direction": event.verdict.get("direction"),
+                        "confidence": event.verdict.get("confidence"),
+                        "strike_rec": event.verdict.get("strike_rec"),
+                        "reason": decision.reason,
+                    },
+                )
+            except Exception:
+                pass
     except Exception:
         logger.exception("Auto-trade evaluation failed")
 
