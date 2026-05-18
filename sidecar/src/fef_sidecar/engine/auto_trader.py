@@ -119,7 +119,10 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
             return AutoTradeDecision(False, f"invalid option_pricing.{k}={v!r}")
 
     strike = verdict_dict.get("strike_rec")
-    qty = verdict_dict.get("suggested_qty") or 15
+    # User override on the AutoTrade panel takes precedence over FEF's
+    # confidence-tier suggested qty. 0 = use suggested.
+    override = getattr(state, "auto_trade_qty_override", 0)
+    qty = override if override > 0 else (verdict_dict.get("suggested_qty") or 15)
     if not strike:
         return AutoTradeDecision(False, "no strike_rec on verdict")
 

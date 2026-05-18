@@ -15,6 +15,7 @@ interface AutoTradeStatus {
   last_block_reason: string;
   session_cap_reached: boolean;
   runner_protect_enabled: boolean;
+  qty_override: number;
 }
 
 export function AutoTradePanel() {
@@ -197,6 +198,19 @@ export function AutoTradePanel() {
                      value={status.max_per_session}
                      onChange={(e) => void updateSetting("max_per_session", Number(e.target.value))}
                      disabled={busy} className="settings-input" style={{ width: 80 }} />
+            </td>
+          </tr>
+          <tr>
+            <td>Contracts per fire</td>
+            <td>
+              <input type="number" min={0} max={100}
+                     value={status.qty_override}
+                     onChange={(e) => void updateSetting("qty_override", Number(e.target.value))}
+                     disabled={busy} className="settings-input" style={{ width: 80 }}
+                     title="Fixed contract size for every auto-trade fire. 0 = use FEF's confidence-tier default (HIGH=15, MEDIUM=10, LOW=5)" />
+              <span className="muted small" style={{ marginLeft: 6 }}>
+                {status.qty_override === 0 ? "(auto: 15/10/5 by conf)" : `fixed`}
+              </span>
             </td>
           </tr>
         </tbody>

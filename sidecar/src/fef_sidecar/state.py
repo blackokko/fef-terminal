@@ -112,6 +112,11 @@ class AppState:
     auto_trade_count_session: int = 0           # bumped after each successful fire
     auto_trade_last_at_ms: int = 0              # epoch ms of last fire
     auto_trade_last_block_reason: str = ""      # why most-recent eligible signal was skipped
+    # Override the FEF engine's suggested_qty (which is 15/10/5 by
+    # HIGH/MEDIUM/LOW confidence). 0 = use suggested. Otherwise fixed
+    # contracts per fire across all confidences. Capped by
+    # FEF_MAX_CONTRACTS_PER_TRADE env.
+    auto_trade_qty_override: int = 0
 
     # Runner protector — after T1 fills, market-exit remaining T2/T3 qty if
     # the option premium retraces back below the T1 fill price. Locks in the

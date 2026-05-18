@@ -465,6 +465,7 @@ async def auto_trade_status(request: Request) -> dict[str, Any]:
         "last_at_ms": s.auto_trade_last_at_ms,
         "last_block_reason": s.auto_trade_last_block_reason,
         "session_cap_reached": s.auto_trade_count_session >= s.auto_trade_max_per_session,
+        "qty_override": s.auto_trade_qty_override,
         "runner_protect_enabled": s.runner_protect_enabled,
     }
 
@@ -549,6 +550,8 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
         s.auto_trade_cool_down_sec = max(60, int(body["cool_down_sec"]))
     if "max_per_session" in body:
         s.auto_trade_max_per_session = max(1, min(50, int(body["max_per_session"])))
+    if "qty_override" in body:
+        s.auto_trade_qty_override = max(0, min(100, int(body["qty_override"])))
 
     await SignalIterRepository.write_audit_log(
         category="auto_trade_toggle", actor="user",
