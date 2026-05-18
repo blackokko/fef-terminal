@@ -32,13 +32,88 @@ import os
 logger = logging.getLogger(__name__)
 
 
+async def _check_dollar_loss(state, p) -> None:
+    """Out-of-band dollar-loss cap check. Spawned as a background task so
+    it never blocks the SPX target evaluation loop. If the option premium
+    has dropped enough that open-qty loss exceeds the cap, market-exit
+    remaining qty.
+    """
+    from fef_sidecar.db.repository import SignalIterRepository
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from fef_sidecar.ibkr.models import Contract, ContractKind
+    try:
+        opt_quote = await state.ibkr.get_option_quote(Contract(
+            symbol=p.symbol, kind=ContractKind.OPTION,
+            exchange="CBOE" if p.symbol == "SPX" else "SMART",
+            expiry=p.expiry, strike=p.strike, right=p.right,
+        ))
+        mid = opt_quote.mid
+        if mid is None or mid <= 0:
+            return
+        open_qty = 0
+        if not p.spx_target_t1_fired and p.spx_target_t1_qty:
+            open_qty += p.spx_target_t1_qty
+        if not p.spx_target_t2_fired and p.spx_target_t2_qty:
+            open_qty += p.spx_target_t2_qty
+        if not p.spx_target_t3_fired and p.spx_target_t3_qty:
+            open_qty += p.spx_target_t3_qty
+        if open_qty <= 0:
+            return
+        pnl = (mid - p.limit_price) * open_qty * 100
+        if pnl > p.dollar_loss_cap:
+            return
+        # Cap breached — fire market sell directly (mirrors the watcher's
+        # _market_sell logic but inlined since we're out-of-band).
+        if not isinstance(state.ibkr, LiveIBKRProvider):
+            await SignalIterRepository.write_audit_log(
+                category="spx_watcher", actor="system",
+                summary=f"[DRY] DOLLAR_STOP(${pnl:.0f}): would market-sell {open_qty}× {p.symbol} {p.strike}{p.right}",
+            )
+            return
+        from ib_async import MarketOrder
+        from fef_sidecar.ibkr.live import _to_ib_contract
+        ib = state.ibkr._ib  # type: ignore[attr-defined]
+        opt_contract = Contract(
+            symbol=p.symbol, kind=ContractKind.OPTION,
+            exchange="CBOE" if p.symbol == "SPX" else "SMART",
+            expiry=p.expiry, strike=p.strike, right=p.right,
+        )
+        ic = _to_ib_contract(opt_contract)
+        await ib.qualifyContractsAsync(ic)
+        positions = ib.positions()
+        long_qty = sum(
+            int(pos.position) for pos in positions
+            if (getattr(pos.contract, "secType", "") == "OPT"
+                and getattr(pos.contract, "symbol", "") == p.symbol
+                and abs(float(getattr(pos.contract, "strike", 0)) - p.strike) < 0.01
+                and getattr(pos.contract, "right", "") == p.right
+                and getattr(pos.contract, "lastTradeDateOrContractMonth", "") == p.expiry
+                and pos.position > 0)
+        )
+        sell_qty = min(open_qty, long_qty)
+        if sell_qty <= 0:
+            return
+        mkt = MarketOrder("SELL", sell_qty, transmit=True)
+        trade = ib.placeOrder(ic, mkt)
+        await SignalIterRepository.update_live_order(
+            p.id, status="STOPPED",
+            spx_target_t1_fired=True, spx_target_t2_fired=True, spx_target_t3_fired=True,
+        )
+        await SignalIterRepository.write_audit_log(
+            category="spx_watcher", actor="system",
+            summary=f"DOLLAR_STOP(${pnl:.0f}): market-sold-to-close {sell_qty}× {p.symbol} {p.strike}{p.right} (ib_order_id={trade.order.orderId})",
+        )
+    except Exception:
+        logger.exception("dollar-loss check failed for parent %s", p.id)
+
+
 async def spx_target_watcher_loop(state) -> None:
     from fef_sidecar.db.models import LiveOrder
     from fef_sidecar.db.repository import SignalIterRepository
     from fef_sidecar.ibkr.live import LiveIBKRProvider
     from fef_sidecar.ibkr.models import Contract, ContractKind
 
-    interval = float(os.environ.get("SPX_WATCHER_INTERVAL_SEC", "2"))
+    interval = float(os.environ.get("SPX_WATCHER_INTERVAL_SEC", "0.5"))
     logger.info("SPX target watcher loop starting (interval=%.1fs)", interval)
 
     while True:
@@ -55,11 +130,20 @@ async def spx_target_watcher_loop(state) -> None:
                 and o.status in ("SUBMITTED", "FILLED", "PARTIAL")
             ]
 
-            # Throttle dollar-loss premium fetches — once every ~10s per parent
-            # to avoid hammering IBKR with option_quote calls.
             now_ms = int(asyncio.get_running_loop().time() * 1000)
             if not hasattr(state, "_dollar_cap_last_check_ms"):
                 state._dollar_cap_last_check_ms = {}  # type: ignore[attr-defined]
+
+            # Spawn dollar-loss-cap check as a background task per parent.
+            # Doesn't block SPX-target evaluation, throttled per parent to 10s.
+            for p in parents:
+                if (p.dollar_loss_cap is not None
+                    and p.limit_price is not None
+                    and p.status not in ("STOPPED",)):
+                    last_check = state._dollar_cap_last_check_ms.get(p.id, 0)  # type: ignore[attr-defined]
+                    if now_ms - last_check >= 10000:
+                        state._dollar_cap_last_check_ms[p.id] = now_ms  # type: ignore[attr-defined]
+                        asyncio.create_task(_check_dollar_loss(state, p))
 
             for p in parents:
                 is_long_calls = p.right == "C"
@@ -120,43 +204,6 @@ async def spx_target_watcher_loop(state) -> None:
                         )
                     except Exception:
                         logger.exception("spx_watcher market sell failed")
-
-                # Dollar-loss cap (CRITICAL — checked first, before SPX stop)
-                if (p.dollar_loss_cap is not None
-                    and p.limit_price is not None
-                    and p.status not in ("STOPPED",)):
-                    last_check = state._dollar_cap_last_check_ms.get(p.id, 0)  # type: ignore[attr-defined]
-                    if now_ms - last_check >= 10000:  # every 10s
-                        state._dollar_cap_last_check_ms[p.id] = now_ms  # type: ignore[attr-defined]
-                        try:
-                            opt_quote = await state.ibkr.get_option_quote(Contract(
-                                symbol=p.symbol, kind=ContractKind.OPTION,
-                                exchange="CBOE" if p.symbol == "SPX" else "SMART",
-                                expiry=p.expiry, strike=p.strike, right=p.right,
-                            ))
-                            mid = opt_quote.mid
-                            if mid is not None and mid > 0:
-                                # Compute open-position $ loss vs entry. Sum unfired qty.
-                                open_qty = 0
-                                if not p.spx_target_t1_fired and p.spx_target_t1_qty:
-                                    open_qty += p.spx_target_t1_qty
-                                if not p.spx_target_t2_fired and p.spx_target_t2_qty:
-                                    open_qty += p.spx_target_t2_qty
-                                if not p.spx_target_t3_fired and p.spx_target_t3_qty:
-                                    open_qty += p.spx_target_t3_qty
-                                if open_qty > 0:
-                                    pnl = (mid - p.limit_price) * open_qty * 100
-                                    if pnl <= p.dollar_loss_cap:
-                                        await _market_sell(open_qty, f"DOLLAR_STOP(${pnl:.0f})")
-                                        await SignalIterRepository.update_live_order(
-                                            p.id, status="STOPPED",
-                                            spx_target_t1_fired=True,
-                                            spx_target_t2_fired=True,
-                                            spx_target_t3_fired=True,
-                                        )
-                                        continue
-                        except Exception:
-                            logger.exception("dollar_loss_cap check failed for parent %s", p.id)
 
                 # Stop check first (most critical)
                 if p.spx_target_stop is not None:
