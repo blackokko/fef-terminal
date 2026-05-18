@@ -179,7 +179,6 @@ class AppState:
     # FEFEngine in scanner_engines (lazy-created on first scan).
     scan_enabled_symbols: dict[str, bool] = field(default_factory=lambda: {
         "SPX": False, "SPY": False, "QQQ": False, "IWM": False,
-        "MES": False, "MNQ": False, "M2K": False,
     })
     scanner_engines: dict[str, object] = field(default_factory=dict)
     scanner_task: object | None = None
@@ -187,6 +186,14 @@ class AppState:
     # (global max_per_session AND per-symbol max_per_symbol).
     auto_trade_count_by_symbol: dict[str, int] = field(default_factory=dict)
     auto_trade_max_per_symbol: int = 2
+    # Per-symbol last-fire timestamps — drives per-symbol cool-down. The
+    # global auto_trade_last_at_ms stays as a backstop; each symbol's
+    # cool-down clock is independent so SPX firing doesn't block QQQ.
+    auto_trade_last_at_ms_by_symbol: dict[str, int] = field(default_factory=dict)
+    # Last verdict cache per scanner symbol — feeds the FE ScannerPanel
+    # tiles so each symbol shows its most recent direction/confidence
+    # without subscribing to every IterEvent in render.
+    last_scanner_verdict_by_symbol: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def build(cls) -> AppState:

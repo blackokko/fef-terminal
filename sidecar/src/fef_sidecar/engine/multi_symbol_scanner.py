@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 
 
 OPTION_SYMBOLS = {"SPX", "SPY", "QQQ", "IWM"}
-FUTURES_SYMBOLS = {"MES", "MNQ", "M2K"}
 
 
 def _make_engine_for(symbol: str) -> FEFEngine:
@@ -113,9 +112,18 @@ async def _scan_one_symbol(state, symbol: str) -> None:
             "aggression": None,
         },
     )
+    # Cache the verdict so the FE Scanner panel can render the latest
+    # state for each symbol without subscribing to every IterEvent.
+    state.last_scanner_verdict_by_symbol[symbol] = {
+        "direction": verdict.direction.value,
+        "confidence": verdict.confidence.value,
+        "reasoning": verdict.reasoning,
+        "spx_price": inputs.spx_price,
+        "strike_rec": verdict.strike_rec,
+        "timestamp_ms": int(_time.time() * 1000),
+    }
     await state.broadcaster.publish(event)
 
-    # Auto-trade evaluation per symbol — options symbols only for now
     if symbol in OPTION_SYMBOLS:
         try:
             from fef_sidecar.engine.auto_trader import maybe_auto_trade
@@ -124,18 +132,6 @@ async def _scan_one_symbol(state, symbol: str) -> None:
                 logger.info("scanner: %s auto-trade fired: %s", symbol, decision.order_result)
         except Exception:
             logger.exception("scanner: auto-trade evaluation failed for %s", symbol)
-    elif symbol in FUTURES_SYMBOLS:
-        if verdict.direction.value in ("LONG_CALLS", "LONG_PUTS"):
-            try:
-                await SignalIterRepository.write_audit_log(
-                    category="scanner", actor="system",
-                    summary=(
-                        f"{symbol} verdict {verdict.direction.value} {verdict.confidence.value} "
-                        f"would fire if futures auto-trade were wired (not yet implemented)"
-                    ),
-                )
-            except Exception:
-                pass
 
 
 def _today_et() -> str:

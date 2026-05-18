@@ -80,12 +80,17 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     except Exception:
         pass
 
-    # Gate 6: cool-down
+    # Gate 6: per-symbol cool-down. Each symbol's clock is independent so
+    # SPX firing doesn't gate out a fresh QQQ signal. The global
+    # auto_trade_last_at_ms is still updated for visibility but isn't a
+    # blocking gate here (multi-symbol scanning needs per-symbol isolation).
     now_ms = int(time.time() * 1000)
-    elapsed_sec = (now_ms - state.auto_trade_last_at_ms) / 1000
-    if state.auto_trade_last_at_ms > 0 and elapsed_sec < state.auto_trade_cool_down_sec:
+    sym_last = state.auto_trade_last_at_ms_by_symbol.get(sym, 0)
+    elapsed_sec = (now_ms - sym_last) / 1000
+    if sym_last > 0 and elapsed_sec < state.auto_trade_cool_down_sec:
+        remaining = state.auto_trade_cool_down_sec - int(elapsed_sec)
         return AutoTradeDecision(
-            False, f"cool-down ({state.auto_trade_cool_down_sec - int(elapsed_sec)}s remaining)"
+            False, f"{sym} cool-down ({remaining}s remaining)"
         )
 
     # Gate 7a: GLOBAL session cap (across all symbols)
@@ -196,9 +201,11 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
         logger.exception("Auto-trade place_bracket failed")
         return AutoTradeDecision(False, f"place_bracket error: {e}")
 
-    # Bump counters on successful submission — both global AND per-symbol
+    # Bump counters on successful submission — global + per-symbol counts
+    # AND per-symbol last-fire time (for the per-symbol cool-down clock).
     if result.get("ok"):
         state.auto_trade_last_at_ms = now_ms
+        state.auto_trade_last_at_ms_by_symbol[sym] = now_ms
         state.auto_trade_count_session += 1
         state.auto_trade_count_by_symbol[sym] = state.auto_trade_count_by_symbol.get(sym, 0) + 1
         logger.warning(

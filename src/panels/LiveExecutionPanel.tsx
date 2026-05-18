@@ -122,7 +122,9 @@ export function LiveExecutionPanel() {
                   {o.dry_run && <span className="live-order-dryrun"> DRY</span>}
                 </div>
                 <div className="muted small">
-                  {o.status} · ${o.limit_price?.toFixed(2) ?? "—"} · {
+                  {o.status} · {o.order_type === "MKT"
+                    ? "MARKET"
+                    : `LMT @ $${o.limit_price?.toFixed(2) ?? "—"}`} · {
                     new Date(o.submitted_at + (o.submitted_at.endsWith("Z") ? "" : "Z"))
                       .toLocaleTimeString("en-US", {
                         timeZone: "America/Chicago",

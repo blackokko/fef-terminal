@@ -573,12 +573,24 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
 async def scanner_symbols_get(request: Request) -> dict[str, Any]:
     """Return per-symbol scanner enable state + caps."""
     s = _state(request)
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    cool_remaining_by_symbol: dict[str, int] = {}
+    for sym, last in s.auto_trade_last_at_ms_by_symbol.items():
+        if last <= 0:
+            continue
+        remaining = s.auto_trade_cool_down_sec - int((now_ms - last) / 1000)
+        if remaining > 0:
+            cool_remaining_by_symbol[sym] = remaining
     return {
         "enabled": dict(s.scan_enabled_symbols),
         "max_per_symbol": s.auto_trade_max_per_symbol,
         "max_per_session_global": s.auto_trade_max_per_session,
         "count_global": s.auto_trade_count_session,
         "count_by_symbol": dict(s.auto_trade_count_by_symbol),
+        "cool_down_sec": s.auto_trade_cool_down_sec,
+        "cool_remaining_by_symbol": cool_remaining_by_symbol,
+        "last_verdict_by_symbol": dict(s.last_scanner_verdict_by_symbol),
     }
 
 
@@ -615,6 +627,7 @@ async def auto_trade_reset_session(request: Request) -> dict[str, Any]:
     s.auto_trade_count_session = 0
     s.auto_trade_count_by_symbol.clear()
     s.auto_trade_last_at_ms = 0
+    s.auto_trade_last_at_ms_by_symbol.clear()
     await SignalIterRepository.write_audit_log(
         category="auto_trade_reset", actor="user",
         summary=f"Reset auto-trade session counter (was {old}/{s.auto_trade_max_per_session})",

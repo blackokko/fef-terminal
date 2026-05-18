@@ -211,10 +211,12 @@ async def place_bracket(
                 parent_saved.id, ib_order_id=parent_trade.order.orderId,
                 ib_perm_id=parent_trade.order.permId,
             )
+            entry_desc = "MARKET" if spec.use_market_entry else f"LMT @ ${spec.entry_limit:.2f}"
             await SignalIterRepository.write_audit_log(
                 category="order", actor="user",
-                summary=f"PLACED spx_points entry: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} @ ${spec.entry_limit:.2f}. Watcher fires at SPX T1/T2/T3/STOP={spec.spx_t1}/{spec.spx_t2}/{spec.spx_t3}/{spec.spx_stop}",
-                details={"parent_order_id": parent_saved.id, "exit_strategy": "spx_points"},
+                summary=f"PLACED spx_points entry: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}. Watcher fires at SPX T1/T2/T3/STOP={spec.spx_t1}/{spec.spx_t2}/{spec.spx_t3}/{spec.spx_stop}",
+                details={"parent_order_id": parent_saved.id, "exit_strategy": "spx_points",
+                         "order_type": "MKT" if spec.use_market_entry else "LMT"},
             )
             return {"ok": True, "dry_run": False, "parent_order_id": parent_saved.id,
                     "exit_strategy": "spx_points"}

@@ -3,6 +3,7 @@ import { ErrorBoundary } from "./ErrorBoundary";
 import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { AttributionPanel } from "../panels/AttributionPanel";
 import { AutoTradePanel } from "../panels/AutoTradePanel";
+import { ScannerPanel } from "../panels/ScannerPanel";
 import { AuditLogPanel } from "../panels/AuditLogPanel";
 import { CalendarPanel } from "../panels/CalendarPanel";
 import { DataMaintenancePanel } from "../panels/DataMaintenancePanel";
@@ -79,6 +80,7 @@ export function Sidebar() {
             <Safe name="OrderTicket"><OrderTicketPanel /></Safe>
             <Safe name="ExitStrategy"><ExitStrategyPanel /></Safe>
             <Safe name="AutoTrade"><AutoTradePanel /></Safe>
+            <Safe name="Scanner"><ScannerPanel /></Safe>
             <Safe name="LiveExecution"><LiveExecutionPanel /></Safe>
             <Safe name="LivePositions"><LivePositionsPanel /></Safe>
             <Safe name="OptionChain"><OptionChainPanel /></Safe>
