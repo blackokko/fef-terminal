@@ -304,29 +304,65 @@ export function ChartPane() {
       if (ema8SeriesRef.current) ema8SeriesRef.current.setData(ema(8));
       if (ema21SeriesRef.current) ema21SeriesRef.current.setData(ema(21));
 
-      // Standard deviation channels — 20-period SMA ± 1σ / 2σ / 3σ
-      const period = 20;
-      const mid: LineData[] = [];
-      const up1: LineData[] = []; const up2: LineData[] = []; const up3: LineData[] = [];
-      const dn1: LineData[] = []; const dn2: LineData[] = []; const dn3: LineData[] = [];
-      for (let i = period - 1; i < closes.length; i++) {
-        const window = closes.slice(i - period + 1, i + 1);
-        const sma = window.reduce((s, x) => s + x, 0) / period;
-        const variance = window.reduce((s, x) => s + (x - sma) ** 2, 0) / period;
-        const sd = Math.sqrt(variance);
-        const t = times[i];
-        mid.push({ time: t, value: sma });
-        up1.push({ time: t, value: sma + sd });
-        up2.push({ time: t, value: sma + 2 * sd });
-        up3.push({ time: t, value: sma + 3 * sd });
-        dn1.push({ time: t, value: sma - sd });
-        dn2.push({ time: t, value: sma - 2 * sd });
-        dn3.push({ time: t, value: sma - 3 * sd });
+      // Standard Deviation Channel — TOS-style.
+      //
+      // Per ThinkOrSwim Learning Center: 'composed of two parallel lines to
+      // the Linear Regression trendline and distanced from it by [N] standard
+      // deviations'.
+      //
+      // Definition:
+      //   1. Fit OLS linear regression (y = m·x + b) over the last `length` bars.
+      //   2. Center line = that regression line.
+      //   3. σ = stddev of the RESIDUALS (close - predicted) across the window.
+      //   4. Bands at ±1σ / ±2σ / ±3σ run parallel to the regression line.
+      //   5. Channel is drawn only across the regression window — earlier
+      //      bars have no channel (the window slides forward each new bar).
+      const length = 20;  // TOS default
+      const channelData: {
+        mid: LineData[]; up1: LineData[]; up2: LineData[]; up3: LineData[];
+        dn1: LineData[]; dn2: LineData[]; dn3: LineData[];
+      } = { mid: [], up1: [], up2: [], up3: [], dn1: [], dn2: [], dn3: [] };
+
+      if (closes.length >= length) {
+        const start = closes.length - length;
+        const ys = closes.slice(start);
+        const n = ys.length;
+        // x = 0..n-1 relative position within window
+        let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+        for (let i = 0; i < n; i++) {
+          sumX += i; sumY += ys[i]; sumXY += i * ys[i]; sumX2 += i * i;
+        }
+        const denom = n * sumX2 - sumX * sumX;
+        const m = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
+        const b = (sumY - m * sumX) / n;
+        // Residuals + population σ (TOS uses N, not N-1, for the stddev)
+        let ssq = 0;
+        for (let i = 0; i < n; i++) {
+          const pred = m * i + b;
+          ssq += (ys[i] - pred) ** 2;
+        }
+        const sd_ = Math.sqrt(ssq / n);
+        // Build the 7 parallel lines across the window
+        for (let i = 0; i < n; i++) {
+          const t = times[start + i];
+          const y = m * i + b;
+          channelData.mid.push({ time: t, value: y });
+          channelData.up1.push({ time: t, value: y + sd_ });
+          channelData.up2.push({ time: t, value: y + 2 * sd_ });
+          channelData.up3.push({ time: t, value: y + 3 * sd_ });
+          channelData.dn1.push({ time: t, value: y - sd_ });
+          channelData.dn2.push({ time: t, value: y - 2 * sd_ });
+          channelData.dn3.push({ time: t, value: y - 3 * sd_ });
+        }
       }
       const sd = sdRefs.current;
-      sd.mid?.setData(mid);
-      sd.up1?.setData(up1); sd.up2?.setData(up2); sd.up3?.setData(up3);
-      sd.dn1?.setData(dn1); sd.dn2?.setData(dn2); sd.dn3?.setData(dn3);
+      sd.mid?.setData(channelData.mid);
+      sd.up1?.setData(channelData.up1);
+      sd.up2?.setData(channelData.up2);
+      sd.up3?.setData(channelData.up3);
+      sd.dn1?.setData(channelData.dn1);
+      sd.dn2?.setData(channelData.dn2);
+      sd.dn3?.setData(channelData.dn3);
       renderedBarCountRef.current = deduped.length;
       // Fit only ONCE per symbol/timeframe load
       if (!hasFittedOnce && chartRef.current) {
@@ -434,7 +470,7 @@ export function ChartPane() {
             EMA
           </button>
           <button className={`chart-toolbar-btn ${showSD ? "active" : ""}`}
-                  onClick={() => setShowSD(s => !s)} title="Std Dev channels 20-period (1σ gray · 2σ amber · 3σ red)">
+                  onClick={() => setShowSD(s => !s)} title="StandardDevChannel — TOS-style linear regression channel, 20-bar, ±1σ / 2σ / 3σ">
             STD
           </button>
         </div>
