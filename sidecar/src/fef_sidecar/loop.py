@@ -269,6 +269,22 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     perf: dict[str, float] = {}
     t_start = _time.perf_counter()
 
+    # SPX sanity guard — when active_symbol is a futures contract (ES/NQ/RTY)
+    # QuantData sometimes returns a snapshot with spx_price near zero or wildly
+    # stale. Comparing against the live IBKR tick catches it. If the snapshot
+    # price diverges >50% from the live tick, skip this iter — the engine
+    # would otherwise compute garbage deltas (e.g. dPrice=-7341pts).
+    if state.last_snapshot is not None and state.last_live_tick_spx > 0:
+        snap_spx = getattr(state.last_snapshot, "spx_price", 0)
+        if snap_spx > 0 and abs(snap_spx - state.last_live_tick_spx) > state.last_live_tick_spx * 0.5:
+            logger.warning(
+                "Skip iter: snapshot spx_price=%.2f diverges from live tick %.2f "
+                "(>50%% — stale/garbage data, likely from futures symbol)",
+                snap_spx, state.last_live_tick_spx,
+            )
+            state.last_snapshot = None  # force re-fetch next iter
+            return
+
     snap = state.last_snapshot
     if snap is None or force_fresh:
         t0 = _time.perf_counter()
