@@ -332,8 +332,10 @@ class LiveIBKRProvider:
         except Exception:
             pass
 
-        # genericTickList='13' = model option computation (delta/gamma/vega/theta/IV)
-        ticker = self._ib.reqMktData(ib_contract, "13", False, False)
+        # No generic tick list for OPT contracts — IBKR rejects "13" (stocks-only)
+        # with error 321. modelGreeks (delta/gamma/vega/theta/IV) stream
+        # automatically via tickOptionComputation events on the Ticker.
+        ticker = self._ib.reqMktData(ib_contract, "", False, False)
         # Wait up to 5s for any of: last/bid/ask/modelGreeks
         for _ in range(50):
             await asyncio.sleep(0.1)
