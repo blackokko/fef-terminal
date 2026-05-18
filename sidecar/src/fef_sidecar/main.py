@@ -86,6 +86,58 @@ async def _seed_defaults_on_first_run() -> None:
             logger.info("Seeded %d default presets", len(DEFAULT_PRESETS))
 
 
+async def backfill_regime_from_db(state: AppState) -> None:
+    """Reconstruct RegimeSamples from today's SignalIter rows and seed the
+    regime detector. Lets the regime panel show a real assessment on app
+    load instead of waiting through warmup iters."""
+    from datetime import datetime, timezone
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import SignalIter
+    from fef_sidecar.engine.regime import RegimeSample
+    from sqlmodel import select
+
+    def _today_et() -> str:
+        et = timezone(__import__("datetime").timedelta(hours=-4))
+        return datetime.now(et).strftime("%Y-%m-%d")
+
+    try:
+        date = _today_et()
+        async with get_session() as session:
+            stmt = (
+                select(SignalIter)
+                .where(SignalIter.session_date == date)
+                .order_by(SignalIter.id.desc())  # type: ignore[attr-defined]
+                .limit(state.regime_detector._window_size)
+            )
+            rows = list((await session.exec(stmt)).all())
+        rows.reverse()  # oldest -> newest
+        samples: list[RegimeSample] = []
+        for r in rows:
+            extras = r.extras or {}
+            ts = r.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            et = ts.astimezone(timezone(__import__("datetime").timedelta(hours=-4)))
+            mins = (et.hour - 9) * 60 + (et.minute - 30)
+            samples.append(RegimeSample(
+                spx_price=r.spx_price,
+                drift_cum_net_m=r.drift_cum_net_m,
+                drift_bias=r.drift_bias,
+                wall_proximity_pts=extras.get("nearest_wall_distance"),
+                aligned=bool(extras.get("aligned", False)),
+                absorption=bool(extras.get("absorption", False)),
+                direction=r.direction.value if hasattr(r.direction, "value") else str(r.direction),
+                confidence=r.confidence.value if hasattr(r.confidence, "value") else str(r.confidence),
+                fe_ratio=extras.get("fe_ratio"),
+                minutes_since_open=max(0, mins),
+                vix=None,
+            ))
+        state.regime_detector.backfill(samples)
+        logger.info("Regime detector backfilled with %d samples from DB", len(samples))
+    except Exception:
+        logger.exception("backfill_regime_from_db failed")
+
+
 async def refresh_prior_close(state: AppState) -> None:
     """Fetch prior-day close for the active symbol and cache it on state.
     Best-effort: silently leaves None on failure (panel falls back to no %).
@@ -196,6 +248,7 @@ async def lifespan(app: FastAPI):
     if auto_loops:
         spawn_data_loops(state)
         asyncio.create_task(refresh_prior_close(state), name="refresh-prior-close")
+        asyncio.create_task(backfill_regime_from_db(state), name="backfill-regime")
 
     logger.info(
         "fef-sidecar ready (QD=%s, IBKR=%s, auto_loops=%s)",

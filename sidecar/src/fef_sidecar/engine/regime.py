@@ -172,6 +172,28 @@ class RegimeDetector:
         self._window = new_window
         self._window_size = new_window_size
 
+    def backfill(self, samples: list[RegimeSample]) -> None:
+        """Prepend historical samples (oldest first) up to the window cap.
+        Called on sidecar startup so the regime is already meaningful when
+        you load the app mid-day instead of waiting through warmup iters.
+
+        Samples already in the deque are kept — backfill only fills empty
+        slots on the left.
+        """
+        if not samples:
+            return
+        existing = list(self._window)
+        free = self._window_size - len(existing)
+        if free <= 0:
+            return
+        # Keep the most-recent `free` historical samples
+        tail = samples[-free:] if len(samples) > free else samples
+        self._window.clear()
+        for s in tail:
+            self._window.append(s)
+        for s in existing:
+            self._window.append(s)
+
     @property
     def n(self) -> int:
         return len(self._window)

@@ -143,10 +143,14 @@ async def get_regime_lookback(request: Request) -> dict[str, Any]:
 
 @router.post("/regime/lookback")
 async def set_regime_lookback(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Resize the regime detector's rolling window at runtime."""
+    """Resize the regime detector's rolling window at runtime + re-backfill
+    from DB so the new (possibly larger) window is filled immediately
+    without waiting for new iters."""
+    from fef_sidecar.main import backfill_regime_from_db
     s = _state(request)
     new_size = int(body["window_size"])
     s.regime_detector.resize(new_size)
+    await backfill_regime_from_db(s)
     return {
         "ok": True,
         "window_size": s.regime_detector._window_size,  # type: ignore[attr-defined]
