@@ -45,7 +45,8 @@ export function AuditLogPanel() {
     <section className="sidebar-section">
       <h3 className="sidebar-section-title">Audit log ({entries.length})</h3>
       <select value={filterCat} onChange={e => setFilterCat(e.target.value)}
-              style={{ marginBottom: 8 }} className="settings-input">
+              style={{ marginBottom: 8, width: "100%", textAlign: "left" }}
+              className="settings-input">
         <option value="">All categories</option>
         {categories.map(c => <option key={c} value={c}>{c}</option>)}
       </select>
