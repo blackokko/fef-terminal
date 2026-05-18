@@ -77,6 +77,11 @@ class LiveIBKRProvider:
         self._reconnect_base = reconnect_base_delay
         self._ib = None  # lazy-imported
         self._connect_lock = asyncio.Lock()  # serialize connect() across loops
+        # Second connection dedicated to one-shot historical fetches so they
+        # don't conflict with the streaming bar_stream_loop's keepUpToDate
+        # subscription on the same contract.
+        self._ib_hist = None
+        self._hist_connect_lock = asyncio.Lock()
 
     @property
     def is_connected(self) -> bool:
@@ -100,10 +105,45 @@ class LiveIBKRProvider:
                 self.client_id,
             )
 
+    async def _ensure_hist_connected(self):
+        """Get/create a dedicated IB connection for one-shot historical fetches.
+
+        Uses client_id + 100 so it doesn't collide with the streaming one.
+        Created lazily on first call. Single shared instance for all
+        historical requests."""
+        async with self._hist_connect_lock:
+            if self._ib_hist is not None and self._ib_hist.isConnected():
+                return self._ib_hist
+            from ib_async import IB
+            self._ib_hist = IB()
+            await self._ib_hist.connectAsync(self.host, self.port, clientId=self.client_id + 100)
+            logger.info("IBKR historical conn ready (client_id=%d)", self.client_id + 100)
+            return self._ib_hist
+
+    async def fetch_historical_bars(self, contract: Contract, *, bar_size: str, duration: str,
+                                    use_rth: bool = False, what_to_show: str = "TRADES") -> list[Bar]:
+        """One-shot historical bar fetch using the dedicated historical connection.
+
+        Use this for /bars endpoint or any other ad-hoc query. The streaming
+        bar_stream_loop uses self._ib (separate connection) so the two don't
+        block each other."""
+        ib = await self._ensure_hist_connected()
+        ib_contract = _to_ib_contract(contract)
+        await ib.qualifyContractsAsync(ib_contract)
+        bars = await ib.reqHistoricalDataAsync(
+            ib_contract, endDateTime="", durationStr=duration,
+            barSizeSetting=bar_size, whatToShow=what_to_show,
+            useRTH=use_rth, formatDate=2,
+        )
+        return [_bar_from_ib(b) for b in bars]
+
     async def disconnect(self) -> None:
         if self._ib is not None and self._ib.isConnected():
             self._ib.disconnect()
         self._ib = None
+        if self._ib_hist is not None and self._ib_hist.isConnected():
+            self._ib_hist.disconnect()
+        self._ib_hist = None
 
     async def _ensure_connected(self) -> None:
         for attempt in range(self._max_reconnect):
@@ -138,13 +178,16 @@ class LiveIBKRProvider:
         ib_contract = _to_ib_contract(contract)
         await self._ib.qualifyContractsAsync(ib_contract)
 
+        # TRADES works for everything we care about including indices (SPX
+        # returns OHLC with volume=0). MIDPOINT returns 0 bars on SPX,
+        # counterintuitively. useRTH=False so futures get overnight bars.
         bars = await self._ib.reqHistoricalDataAsync(
             ib_contract,
             endDateTime="",
             durationStr=duration,
             barSizeSetting=bar_size,
-            whatToShow="TRADES" if contract.kind == ContractKind.STOCK else "MIDPOINT",
-            useRTH=True,
+            whatToShow="TRADES",
+            useRTH=False,
             formatDate=2,
             keepUpToDate=True,
         )

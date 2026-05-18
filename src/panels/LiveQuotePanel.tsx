@@ -64,7 +64,7 @@ export function LiveQuotePanel() {
         <div className={`live-quote-last ${flash ? `flash-${flash}` : ""}`}>
           {last != null ? last.toFixed(2) : "—"}
         </div>
-        <div className="muted small">updated {new Date(lastTick.timestamp_ms).toLocaleTimeString()}</div>
+        <div className="muted small">updated {new Date(lastTick.timestamp_ms).toLocaleTimeString("en-US", { timeZone: "America/Chicago", hour12: false })} CT</div>
       </div>
 
       <div className="live-quote-book">

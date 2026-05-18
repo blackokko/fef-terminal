@@ -20,6 +20,19 @@ import { formatExposureM } from "../lib/format";
 
 const API_BASE = "http://127.0.0.1:8765";
 
+// Display chart times in America/Chicago (CST/CDT) so the bar axis matches
+// the LiveQuote panel + the trader's local clock. lightweight-charts stores
+// epoch seconds internally — the formatter only changes the DISPLAYED string.
+const _CST_TIME_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/Chicago",
+  hour: "2-digit", minute: "2-digit", hour12: false,
+});
+const _CST_DATETIME_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/Chicago",
+  month: "short", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+});
+
 const DARK_THEME = {
   layout: {
     background: { type: ColorType.Solid, color: "#0e1116" },
@@ -28,8 +41,14 @@ const DARK_THEME = {
   },
   grid: { vertLines: { color: "#1c222b" }, horzLines: { color: "#1c222b" } },
   crosshair: { mode: CrosshairMode.Normal },
-  timeScale: { borderColor: "#2a323e", timeVisible: true, secondsVisible: false },
+  timeScale: {
+    borderColor: "#2a323e", timeVisible: true, secondsVisible: false,
+    tickMarkFormatter: (time: number) => _CST_TIME_FMT.format(new Date(time * 1000)),
+  },
   rightPriceScale: { borderColor: "#2a323e" },
+  localization: {
+    timeFormatter: (time: number) => _CST_DATETIME_FMT.format(new Date(time * 1000)) + " CT",
+  },
 };
 
 const CANDLE_OPTIONS = {
@@ -55,6 +74,40 @@ const TIMEFRAMES = [
   { label: "4h", value: "4 hours" },
   { label: "1D", value: "1 day" },
   { label: "1W", value: "1 week" },
+];
+
+// Smart default lookback per timeframe — picks a window that:
+//   (a) fits within IBKR's per-request max for that bar size, and
+//   (b) gives a useful contextual view (e.g. 5m bars → 1 week of context)
+// User can override via the Lookback dropdown.
+const DEFAULT_LOOKBACK_BY_TIMEFRAME: Record<string, string> = {
+  "1 min":  "1 D",
+  "2 mins": "2 D",
+  "5 mins": "1 W",
+  "15 mins": "2 W",
+  "30 mins": "1 M",
+  "1 hour": "3 M",
+  "4 hours": "1 Y",
+  "1 day":  "5 Y",
+  "1 week": "10 Y",
+};
+
+// All lookback options the user can pick from. IBKR enforces per-bar-size
+// maxes — if you pick a window larger than allowed, the request errors and
+// the chart shows the error.
+const LOOKBACK_OPTIONS = [
+  { label: "1D", value: "1 D" },
+  { label: "2D", value: "2 D" },
+  { label: "1W", value: "1 W" },
+  { label: "2W", value: "2 W" },
+  { label: "1M", value: "1 M" },
+  { label: "3M", value: "3 M" },
+  { label: "6M", value: "6 M" },
+  { label: "1Y", value: "1 Y" },
+  { label: "2Y", value: "2 Y" },
+  { label: "5Y", value: "5 Y" },
+  { label: "10Y", value: "10 Y" },
+  { label: "20Y", value: "20 Y" },
 ];
 
 const MIN_Y_RANGE_PTS = 50;
@@ -116,6 +169,11 @@ export function ChartPane() {
   // YYYY-MM-DD or "" (today/live)
   const [historicalDate, setHistoricalDate] = useState<string>("");
   const [availableDates, setAvailableDates] = useState<string[]>([]);
+  // "" = use smart default per timeframe; explicit value = user override.
+  const [lookbackOverride, setLookbackOverride] = useState<string>("");
+  const effectiveLookback = lookbackOverride
+    || DEFAULT_LOOKBACK_BY_TIMEFRAME[timeframe]
+    || "1 D";
 
   // Create chart once
   useEffect(() => {
@@ -206,7 +264,7 @@ export function ChartPane() {
           const dayEnd = dayStart + 86_400_000;
           url = `${API_BASE}/history/bars?symbol=${encodeURIComponent(symbol)}&bar_size=${encodeURIComponent(timeframe)}&from_ms=${dayStart}&to_ms=${dayEnd}&limit=5000`;
         } else {
-          url = `${API_BASE}/bars?symbol=${encodeURIComponent(symbol)}&bar_size=${encodeURIComponent(timeframe)}`;
+          url = `${API_BASE}/bars?symbol=${encodeURIComponent(symbol)}&bar_size=${encodeURIComponent(timeframe)}&duration=${encodeURIComponent(effectiveLookback)}`;
         }
         const r = await fetch(url);
         if (cancelled) return;
@@ -235,7 +293,7 @@ export function ChartPane() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [symbol, timeframe, historicalDate]);
+  }, [symbol, timeframe, historicalDate, effectiveLookback]);
 
   // Refresh available historical dates whenever symbol changes
   useEffect(() => {
@@ -461,6 +519,18 @@ export function ChartPane() {
             <option value="">Live ({symbol})</option>
             {availableDates.map((d) => (
               <option key={d} value={d}>{d}</option>
+            ))}
+          </select>
+          <select
+            value={lookbackOverride}
+            onChange={(e) => setLookbackOverride(e.target.value)}
+            className="chart-date-select"
+            title={`How far back to fetch. Default for ${timeframe}: ${DEFAULT_LOOKBACK_BY_TIMEFRAME[timeframe]}. Larger windows may hit IBKR per-bar-size limits.`}
+            disabled={!!historicalDate}
+          >
+            <option value="">auto ({DEFAULT_LOOKBACK_BY_TIMEFRAME[timeframe] ?? "1 D"})</option>
+            {LOOKBACK_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
         </div>

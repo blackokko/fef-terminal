@@ -944,30 +944,26 @@ async def get_bars(
             for b in s.ibkr._bars  # type: ignore[attr-defined]
         ]
     else:
-        # Live IBKR: do a one-shot historical fetch with REAL data — no
-        # proxies, no scaling. The user explicitly wants the actual brokerage
-        # price. Note: SPX (Index) uses TRADES which returns valid OHLC with
-        # volume=0 (indices have no shares, only computed values from members).
-        # MIDPOINT returns 0 bars for SPX — counter-intuitive but verified.
-        from fef_sidecar.ibkr.live import _to_ib_contract
-
-        ib_contract = _to_ib_contract(contract)
-        await s.ibkr._ensure_connected()  # type: ignore[attr-defined]
-        ib = s.ibkr._ib  # type: ignore[attr-defined]
-        await ib.qualifyContractsAsync(ib_contract)
+        # Live IBKR: use the dedicated historical connection (client_id+100)
+        # so this doesn't conflict with the streaming bar_stream_loop's
+        # keepUpToDate subscription on the main connection. Without this,
+        # daily-timeframe requests on the same contract as the active
+        # bar_stream silently return 0 bars.
         try:
-            ib_bars = await ib.reqHistoricalDataAsync(
-                ib_contract,
-                endDateTime="",
-                durationStr=duration,
-                barSizeSetting=bar_size,
-                whatToShow="TRADES",
-                useRTH=False,  # include futures overnight session
-                formatDate=2,
+            hist_bars = await s.ibkr.fetch_historical_bars(  # type: ignore[attr-defined]
+                contract, bar_size=bar_size, duration=duration,
+                use_rth=False, what_to_show="TRADES",
             )
         except Exception as e:
             raise HTTPException(503, f"IBKR historical fetch failed for {symbol}: {e}") from e
         scale = 1.0  # no scaling — real prices
+        # Re-wrap as objects with .date/.open/etc. attrs so the loop below
+        # (shared with mock paths) doesn't need to branch
+        ib_bars = [
+            type("X", (), {"date": b.timestamp, "open": b.open, "high": b.high,
+                            "low": b.low, "close": b.close, "volume": b.volume})()
+            for b in hist_bars
+        ]
         from datetime import datetime as _dt
         bars = []
         for b in ib_bars:
