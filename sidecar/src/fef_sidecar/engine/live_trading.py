@@ -429,8 +429,14 @@ async def place_credit_spread(
 
 
 async def kill_all_orders(ibkr) -> dict:
-    """Cancel every working IBKR order under this client_id.
-    Always logs to audit_log."""
+    """Cancel every working IBKR order for this account.
+
+    Refreshes IBKR's open-order list before cancelling — ib.openTrades()
+    only returns trades the current connection knows about, which is
+    empty right after a sidecar restart even when orders are still
+    working at IBKR. We also call reqGlobalCancel() as a backstop.
+    """
+    import asyncio
     from fef_sidecar.ibkr.live import LiveIBKRProvider
 
     if not isinstance(ibkr, LiveIBKRProvider):
@@ -440,23 +446,47 @@ async def kill_all_orders(ibkr) -> dict:
         )
         return {"ok": True, "mock": True, "cancelled": 0}
 
-    cancelled = 0
     try:
         ib = ibkr._ib  # type: ignore[attr-defined]
-        if ib is None:
+        if ib is None or not ib.isConnected():
             return {"ok": False, "error": "Not connected"}
+
+        # Refresh from IBKR — pulls orders submitted by ANY client_id under
+        # this account so we can cancel them even after a sidecar restart.
+        try:
+            await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), timeout=5.0)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("reqAllOpenOrdersAsync timed out; using cached openTrades")
+        except Exception:
+            logger.exception("reqAllOpenOrdersAsync failed; using cached openTrades")
+
+        cancelled = 0
+        attempted = 0
         for trade in ib.openTrades():
+            attempted += 1
             try:
                 ib.cancelOrder(trade.order)
                 cancelled += 1
             except Exception:
                 logger.exception("Failed to cancel order %s", trade.order.orderId)
+
+        # Backstop: ask IBKR to globally cancel everything bound to this
+        # client_id. Idempotent with the per-trade cancels above.
+        try:
+            ib.reqGlobalCancel()
+        except Exception:
+            logger.exception("reqGlobalCancel failed")
+
     except Exception as e:
+        await SignalIterRepository.write_audit_log(
+            category="kill_switch", actor="user",
+            summary=f"Kill switch ERROR: {e}",
+        )
         return {"ok": False, "error": str(e)}
 
     await SignalIterRepository.write_audit_log(
         category="kill_switch", actor="user",
-        summary=f"Kill switch — cancelled {cancelled} working orders",
-        details={"cancelled_count": cancelled},
+        summary=f"Kill switch — cancelled {cancelled}/{attempted} working orders + reqGlobalCancel sent",
+        details={"cancelled_count": cancelled, "attempted_count": attempted},
     )
-    return {"ok": True, "cancelled": cancelled}
+    return {"ok": True, "cancelled": cancelled, "attempted": attempted}
