@@ -397,6 +397,30 @@ class LiveOrder(SQLModel, table=True):
     # If DRY_RUN, we wrote the row but never submitted to IBKR
     dry_run: bool = Field(default=True)
 
+    # Exit strategy this order was placed with: 'option_price' / 'spx_points' /
+    # 'fixed_dollar' / 'spread_premium'. Watchers use this to decide how to
+    # fire exits.
+    exit_strategy: str | None = Field(default=None)
+    # SPX target levels stored on the PARENT order when exit_strategy='spx_points'.
+    # NULL for option_price brackets.
+    spx_target_t1: float | None = None
+    spx_target_t2: float | None = None
+    spx_target_t3: float | None = None
+    spx_target_stop: float | None = None
+    spx_target_t1_qty: int | None = None
+    spx_target_t2_qty: int | None = None
+    spx_target_t3_qty: int | None = None
+    # SPX target watcher state — bumped as each tier fires
+    spx_target_t1_fired: bool = Field(default=False)
+    spx_target_t2_fired: bool = Field(default=False)
+    spx_target_t3_fired: bool = Field(default=False)
+    spx_target_t1_at_spx: float | None = None  # spot when T1 fired (for retrace)
+    # Spread metadata when exit_strategy='spread_premium'
+    spread_kind: str | None = None       # 'PCS' or 'CCS'
+    spread_short_strike: float | None = None
+    spread_long_strike: float | None = None
+    spread_initial_credit: float | None = None
+
 
 class LivePosition(SQLModel, table=True):
     """Snapshot of an open position with live greeks. Refreshed by the

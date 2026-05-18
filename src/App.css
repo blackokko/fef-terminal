@@ -1407,6 +1407,33 @@ button:active {
   cursor: pointer;
 }
 
+/* Exit strategy panel */
+.exit-strat-radio {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px;
+  background: var(--color-bg-elevated);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.exit-strat-radio input { margin-top: 3px; }
+.exit-strat-radio:has(input:checked) {
+  outline: 1px solid var(--color-blue);
+}
+.exit-strat-table {
+  width: 100%;
+  font-size: 11px;
+  margin-top: 6px;
+}
+.exit-strat-table td {
+  padding: 3px 4px;
+}
+.exit-strat-table td:last-child {
+  text-align: right;
+}
+
 /* Auto-trade panel */
 
 .auto-trade-panel { background: var(--color-bg); }

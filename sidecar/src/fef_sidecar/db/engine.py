@@ -62,6 +62,23 @@ async def init_db() -> None:
         migrations: list[tuple[str, str, str]] = [
             ("signal_iter", "provider_mode", "TEXT"),
             ("daily_session", "updated_at", "DATETIME"),
+            # LiveOrder columns for exit-strategy + SPX-target watcher + spreads
+            ("live_order", "exit_strategy", "TEXT"),
+            ("live_order", "spx_target_t1", "REAL"),
+            ("live_order", "spx_target_t2", "REAL"),
+            ("live_order", "spx_target_t3", "REAL"),
+            ("live_order", "spx_target_stop", "REAL"),
+            ("live_order", "spx_target_t1_qty", "INTEGER"),
+            ("live_order", "spx_target_t2_qty", "INTEGER"),
+            ("live_order", "spx_target_t3_qty", "INTEGER"),
+            ("live_order", "spx_target_t1_fired", "INTEGER DEFAULT 0"),
+            ("live_order", "spx_target_t2_fired", "INTEGER DEFAULT 0"),
+            ("live_order", "spx_target_t3_fired", "INTEGER DEFAULT 0"),
+            ("live_order", "spx_target_t1_at_spx", "REAL"),
+            ("live_order", "spread_kind", "TEXT"),
+            ("live_order", "spread_short_strike", "REAL"),
+            ("live_order", "spread_long_strike", "REAL"),
+            ("live_order", "spread_initial_credit", "REAL"),
         ]
         for table, column, type_sql in migrations:
             try:

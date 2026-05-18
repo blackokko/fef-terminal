@@ -117,6 +117,14 @@ def spawn_data_loops(state: AppState) -> None:
     state.runner_protect_task = asyncio.create_task(
         runner_protector_loop(state), name="runner-protector-loop"
     )
+    from fef_sidecar.engine.spx_target_watcher import spx_target_watcher_loop
+    state.spx_target_task = asyncio.create_task(
+        spx_target_watcher_loop(state), name="spx-target-watcher-loop"
+    )
+    from fef_sidecar.engine.spread_exit_watcher import spread_exit_watcher_loop
+    state.spread_exit_task = asyncio.create_task(
+        spread_exit_watcher_loop(state), name="spread-exit-watcher-loop"
+    )
 
 
 async def cancel_data_loops(state: AppState) -> None:

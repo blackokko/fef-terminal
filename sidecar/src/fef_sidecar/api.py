@@ -432,6 +432,40 @@ async def auto_trade_status(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/exit_strategy")
+async def get_exit_strategy(request: Request) -> dict[str, Any]:
+    s = _state(request)
+    return {
+        "long": {
+            "strategy": s.exit_strategy_long,
+            "dollar_t1": s.exit_dollar_t1,
+            "dollar_t2": s.exit_dollar_t2,
+            "dollar_t3": s.exit_dollar_t3,
+            "dollar_stop": s.exit_dollar_stop,
+        },
+        "spread": {
+            "stop_multiplier": s.spread_stop_multiplier,
+            "tp_close_debit": s.spread_tp_close_debit,
+        },
+    }
+
+
+@router.post("/exit_strategy")
+async def set_exit_strategy(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    s = _state(request)
+    if "long_strategy" in body:
+        v = str(body["long_strategy"])
+        if v in ("spx_points", "fixed_dollar", "option_price"):
+            s.exit_strategy_long = v
+    if "dollar_t1" in body: s.exit_dollar_t1 = float(body["dollar_t1"])
+    if "dollar_t2" in body: s.exit_dollar_t2 = float(body["dollar_t2"])
+    if "dollar_t3" in body: s.exit_dollar_t3 = float(body["dollar_t3"])
+    if "dollar_stop" in body: s.exit_dollar_stop = float(body["dollar_stop"])
+    if "spread_stop_multiplier" in body: s.spread_stop_multiplier = float(body["spread_stop_multiplier"])
+    if "spread_tp_close_debit" in body: s.spread_tp_close_debit = float(body["spread_tp_close_debit"])
+    return {"ok": True}
+
+
 @router.post("/auto_trade/runner_protect")
 async def auto_trade_runner_protect(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Toggle the runner_protector loop. When ON (default), after T1 fills

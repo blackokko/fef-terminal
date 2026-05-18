@@ -6,6 +6,7 @@ import { AutoTradePanel } from "../panels/AutoTradePanel";
 import { AuditLogPanel } from "../panels/AuditLogPanel";
 import { CalendarPanel } from "../panels/CalendarPanel";
 import { DataMaintenancePanel } from "../panels/DataMaintenancePanel";
+import { ExitStrategyPanel } from "../panels/ExitStrategyPanel";
 import { CrossSymbolPanel } from "../panels/CrossSymbolPanel";
 import { HFTPanel } from "../panels/HFTPanel";
 import { LiveExecutionPanel } from "../panels/LiveExecutionPanel";
@@ -76,6 +77,7 @@ export function Sidebar() {
             <Safe name="Microstructure"><MicrostructurePanel /></Safe>
             <Safe name="CrossSymbol"><CrossSymbolPanel /></Safe>
             <Safe name="OrderTicket"><OrderTicketPanel /></Safe>
+            <Safe name="ExitStrategy"><ExitStrategyPanel /></Safe>
             <Safe name="AutoTrade"><AutoTradePanel /></Safe>
             <Safe name="LiveExecution"><LiveExecutionPanel /></Safe>
             <Safe name="LivePositions"><LivePositionsPanel /></Safe>

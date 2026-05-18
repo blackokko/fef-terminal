@@ -111,22 +111,66 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
 
     today = time.strftime("%Y%m%d")
     # 85/10/5 split per user trading style — lock in 85% at T1, 15% runners.
-    # Round to keep qty whole; min 1 per child if qty >= 3.
     t1_qty = max(1, round(qty * 0.85))
     t2_qty = max(1, round(qty * 0.10))
     t3_qty = max(1, qty - t1_qty - t2_qty)
-    # If rounding pushed t1 beyond qty, rebalance
     if t1_qty + t2_qty + t3_qty != qty:
         t1_qty = qty - t2_qty - t3_qty
-    spec = BracketSpec(
-        symbol=state.active_symbol, strike=float(strike),
-        right="C" if direction == "LONG_CALLS" else "P",
-        expiry=today, qty=qty,
-        entry_limit=float(opt["entry_limit"]),
-        t1_limit=float(opt["t1"]), t2_limit=float(opt["t2"]),
-        t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
-        t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
-    )
+
+    # Read the user's chosen exit strategy
+    strategy = state.exit_strategy_long  # 'spx_points' | 'fixed_dollar' | 'option_price'
+
+    # Need the FEF verdict's raw SPX targets (in points) — pulled from the
+    # signal_iter row. The verdict_dict from event.verdict has t1/t2/t3 as
+    # SPX targets (the engine outputs those before option_targets converts).
+    spx_t1 = verdict_dict.get("t1")
+    spx_t2 = verdict_dict.get("t2")
+    spx_t3 = verdict_dict.get("t3")
+    spx_stop = verdict_dict.get("stop")
+
+    if strategy == "fixed_dollar":
+        # Translate $ targets to option-price levels via current delta.
+        delta = abs(opt.get("delta") or 0.40)
+        per_contract_dollar = lambda d: d / max(1, qty) / 100.0
+        # For longs: positive move = option price up. Stop is negative dollar.
+        t1_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t1) / max(delta, 0.05) * delta
+        t2_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t2) / max(delta, 0.05) * delta
+        t3_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t3) / max(delta, 0.05) * delta
+        stop_opt = max(0.05, float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_stop) / max(delta, 0.05) * delta)
+        spec = BracketSpec(
+            symbol=state.active_symbol, strike=float(strike),
+            right="C" if direction == "LONG_CALLS" else "P",
+            expiry=today, qty=qty,
+            entry_limit=float(opt["entry_limit"]),
+            t1_limit=round(t1_opt, 2), t2_limit=round(t2_opt, 2),
+            t3_limit=round(t3_opt, 2), stop_limit=round(stop_opt, 2),
+            t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
+            exit_strategy="fixed_dollar",
+        )
+    elif strategy == "spx_points":
+        spec = BracketSpec(
+            symbol=state.active_symbol, strike=float(strike),
+            right="C" if direction == "LONG_CALLS" else "P",
+            expiry=today, qty=qty,
+            entry_limit=float(opt["entry_limit"]),
+            # These option-price fields ignored by spx_points but required by dataclass
+            t1_limit=float(opt["t1"]), t2_limit=float(opt["t2"]),
+            t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
+            t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
+            exit_strategy="spx_points",
+            spx_t1=spx_t1, spx_t2=spx_t2, spx_t3=spx_t3, spx_stop=spx_stop,
+        )
+    else:  # 'option_price' (legacy default)
+        spec = BracketSpec(
+            symbol=state.active_symbol, strike=float(strike),
+            right="C" if direction == "LONG_CALLS" else "P",
+            expiry=today, qty=qty,
+            entry_limit=float(opt["entry_limit"]),
+            t1_limit=float(opt["t1"]), t2_limit=float(opt["t2"]),
+            t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
+            t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
+            exit_strategy="option_price",
+        )
 
     try:
         result = await place_bracket(state.ibkr, spec, confirm=True)

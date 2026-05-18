@@ -118,6 +118,27 @@ class AppState:
     # 85% T1 win without giving back gains on the 15% runners.
     runner_protect_enabled: bool = True
     runner_protect_task: object | None = None
+
+    # Exit strategy for LONG_CALLS / LONG_PUTS positions:
+    #   'spx_points'   = watcher fires market sells when SPX crosses target
+    #                     levels (no option-price bracket). Mathematically
+    #                     exact — no gamma/theta/IV approximation.
+    #   'fixed_dollar' = translate $1k / $2.5k / $5k targets to option-price
+    #                     bracket via current delta. Standard IBKR bracket.
+    exit_strategy_long: str = "spx_points"
+    # Dollar targets (per position) used when exit_strategy_long='fixed_dollar'
+    exit_dollar_t1: float = 1000.0
+    exit_dollar_t2: float = 2500.0
+    exit_dollar_t3: float = 5000.0
+    exit_dollar_stop: float = -1000.0
+    spx_target_task: object | None = None
+
+    # Spread exit rule (always premium_pct for now):
+    #   TP  = close for $0.05 debit (basically expire worthless)
+    #   Stop = close when current debit reaches stop_multiplier × initial credit
+    spread_stop_multiplier: float = 4.0
+    spread_tp_close_debit: float = 0.05
+    spread_exit_task: object | None = None
     position_task: object | None = None
     auto_wf_task: object | None = None
     # Active symbol — drives which contract is fed to bar/tick/iter loops and
