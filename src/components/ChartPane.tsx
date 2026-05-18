@@ -93,7 +93,17 @@ export function ChartPane() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const vwapSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const ema8SeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const ema21SeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  // Standard deviation channels — 1σ / 2σ / 3σ on both sides of the
+  // 20-period mean. Stored as a single object so toggle + setData is simpler.
+  const sdRefs = useRef<{
+    mid: ISeriesApi<"Line"> | null;
+    up1: ISeriesApi<"Line"> | null; up2: ISeriesApi<"Line"> | null; up3: ISeriesApi<"Line"> | null;
+    dn1: ISeriesApi<"Line"> | null; dn2: ISeriesApi<"Line"> | null; dn3: ISeriesApi<"Line"> | null;
+  }>({ mid: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null });
+  const [showEMA, setShowEMA] = useState(true);
+  const [showSD, setShowSD] = useState(false);
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const ambientLinesRef = useRef<IPriceLine[]>([]);
   const renderedBarCountRef = useRef(0);
@@ -127,13 +137,37 @@ export function ChartPane() {
         return r;
       },
     });
-    const vwap = chart.addSeries(LineSeries, {
-      color: WALL_COLORS.VWAP, lineWidth: 1, lineStyle: LineStyle.Dotted,
+    // EMA 8/21 — classic fast/slow momentum.
+    // EMA8 = orange (faster), EMA21 = cyan (slower). Cross = trend shift signal.
+    const ema8 = chart.addSeries(LineSeries, {
+      color: "#f0883e", lineWidth: 2,
       priceLineVisible: false, lastValueVisible: false,
     });
+    const ema21 = chart.addSeries(LineSeries, {
+      color: "#58a6ff", lineWidth: 2,
+      priceLineVisible: false, lastValueVisible: false,
+    });
+    // Standard deviation channels — 20-period mean ± 1σ / 2σ / 3σ both sides.
+    // 1σ = light gray (dotted), 2σ = amber (dashed), 3σ = red (solid).
+    // Outer bands are stronger visual = "extreme" zones; closer = "normal".
+    const sdLine = (color: string, width: 1 | 2, style: LineStyle) =>
+      chart.addSeries(LineSeries, {
+        color, lineWidth: width, lineStyle: style,
+        priceLineVisible: false, lastValueVisible: false, visible: false,
+      });
+    const mid = sdLine("#7d8590", 1, LineStyle.Dotted);
+    const up1 = sdLine("#a0a8b3", 1, LineStyle.Dotted);
+    const dn1 = sdLine("#a0a8b3", 1, LineStyle.Dotted);
+    const up2 = sdLine("#d29922", 1, LineStyle.Dashed);
+    const dn2 = sdLine("#d29922", 1, LineStyle.Dashed);
+    const up3 = sdLine("#f85149", 2, LineStyle.Solid);
+    const dn3 = sdLine("#f85149", 2, LineStyle.Solid);
+
     chartRef.current = chart;
     seriesRef.current = series;
-    vwapSeriesRef.current = vwap;
+    ema8SeriesRef.current = ema8;
+    ema21SeriesRef.current = ema21;
+    sdRefs.current = { mid, up1, up2, up3, dn1, dn2, dn3 };
 
     const resize = () => {
       if (containerRef.current && chartRef.current) {
@@ -150,7 +184,9 @@ export function ChartPane() {
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
-      vwapSeriesRef.current = null;
+      ema8SeriesRef.current = null;
+      ema21SeriesRef.current = null;
+      sdRefs.current = { mid: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null };
       priceLinesRef.current = [];
       ambientLinesRef.current = [];
       renderedBarCountRef.current = 0;
@@ -216,6 +252,18 @@ export function ChartPane() {
     return () => { cancelled = true; };
   }, [symbol, timeframe]);
 
+  // Toggle indicator visibility
+  useEffect(() => {
+    if (ema8SeriesRef.current) ema8SeriesRef.current.applyOptions({ visible: showEMA });
+    if (ema21SeriesRef.current) ema21SeriesRef.current.applyOptions({ visible: showEMA });
+  }, [showEMA]);
+  useEffect(() => {
+    const sd = sdRefs.current;
+    for (const ref of [sd.mid, sd.up1, sd.up2, sd.up3, sd.dn1, sd.dn2, sd.dn3]) {
+      ref?.applyOptions({ visible: showSD });
+    }
+  }, [showSD]);
+
   // Apply bars to the chart — full setData on count change, update() on the
   // last bar when count is same (in case its OHLC adjusted)
   useEffect(() => {
@@ -231,16 +279,54 @@ export function ChartPane() {
 
     if (deduped.length !== renderedBarCountRef.current) {
       seriesRef.current.setData(deduped);
-      // VWAP rebuild
-      let cumPV = 0, cumV = 0;
-      const vwapData: LineData[] = bars.map((b) => {
-        const typical = (b.high + b.low + b.close) / 3;
-        const vol = b.volume || 1;
-        cumPV += typical * vol;
-        cumV += vol;
-        return { time: Math.floor(b.timestamp_ms / 1000) as UTCTimestamp, value: cumPV / cumV };
-      });
-      if (vwapSeriesRef.current) vwapSeriesRef.current.setData(vwapData);
+      // EMA 8/21 — recursive: EMA_t = α·close + (1-α)·EMA_{t-1}, α = 2/(N+1)
+      const closes = bars.map(b => b.close);
+      const times = bars.map(b => Math.floor(b.timestamp_ms / 1000) as UTCTimestamp);
+      const ema = (period: number): LineData[] => {
+        const α = 2 / (period + 1);
+        const out: LineData[] = [];
+        let prev: number | null = null;
+        for (let i = 0; i < closes.length; i++) {
+          if (prev == null) {
+            // seed with SMA of first `period` closes
+            if (i >= period - 1) {
+              const seed = closes.slice(0, period).reduce((s, x) => s + x, 0) / period;
+              prev = seed;
+              out.push({ time: times[i], value: seed });
+            }
+          } else {
+            prev = α * closes[i] + (1 - α) * prev;
+            out.push({ time: times[i], value: prev });
+          }
+        }
+        return out;
+      };
+      if (ema8SeriesRef.current) ema8SeriesRef.current.setData(ema(8));
+      if (ema21SeriesRef.current) ema21SeriesRef.current.setData(ema(21));
+
+      // Standard deviation channels — 20-period SMA ± 1σ / 2σ / 3σ
+      const period = 20;
+      const mid: LineData[] = [];
+      const up1: LineData[] = []; const up2: LineData[] = []; const up3: LineData[] = [];
+      const dn1: LineData[] = []; const dn2: LineData[] = []; const dn3: LineData[] = [];
+      for (let i = period - 1; i < closes.length; i++) {
+        const window = closes.slice(i - period + 1, i + 1);
+        const sma = window.reduce((s, x) => s + x, 0) / period;
+        const variance = window.reduce((s, x) => s + (x - sma) ** 2, 0) / period;
+        const sd = Math.sqrt(variance);
+        const t = times[i];
+        mid.push({ time: t, value: sma });
+        up1.push({ time: t, value: sma + sd });
+        up2.push({ time: t, value: sma + 2 * sd });
+        up3.push({ time: t, value: sma + 3 * sd });
+        dn1.push({ time: t, value: sma - sd });
+        dn2.push({ time: t, value: sma - 2 * sd });
+        dn3.push({ time: t, value: sma - 3 * sd });
+      }
+      const sd = sdRefs.current;
+      sd.mid?.setData(mid);
+      sd.up1?.setData(up1); sd.up2?.setData(up2); sd.up3?.setData(up3);
+      sd.dn1?.setData(dn1); sd.dn2?.setData(dn2); sd.dn3?.setData(dn3);
       renderedBarCountRef.current = deduped.length;
       // Fit only ONCE per symbol/timeframe load
       if (!hasFittedOnce && chartRef.current) {
@@ -341,6 +427,16 @@ export function ChartPane() {
               <option key={d} value={d}>{d}</option>
             ))}
           </select>
+        </div>
+        <div className="chart-toolbar-group">
+          <button className={`chart-toolbar-btn ${showEMA ? "active" : ""}`}
+                  onClick={() => setShowEMA(s => !s)} title="EMA 8 (orange) + 21 (cyan)">
+            EMA
+          </button>
+          <button className={`chart-toolbar-btn ${showSD ? "active" : ""}`}
+                  onClick={() => setShowSD(s => !s)} title="Std Dev channels 20-period (1σ gray · 2σ amber · 3σ red)">
+            STD
+          </button>
         </div>
         <div className="chart-toolbar-info muted small">
           {bars.length} bar{bars.length === 1 ? "" : "s"}

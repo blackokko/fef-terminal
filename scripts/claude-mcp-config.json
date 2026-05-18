@@ -1,0 +1,12 @@
+{
+  "_comment": "Add this entry to your Claude Code mcp.json (~/.claude/mcp.json on Mac/Linux, %APPDATA%/claude/mcp.json on Windows). Restart Claude Code after editing. Then in a Claude Code session type: 'show me what data is available' — Claude will call fef-quant.list_available_data and report.",
+  "mcpServers": {
+    "fef-quant": {
+      "command": "C:\\Users\\diant\\projects\\fef-terminal\\sidecar\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "fef_quant_mcp.server"],
+      "env": {
+        "FEF_DB_PATH": "C:\\Users\\diant\\.fef-terminal\\signal_log.db"
+      }
+    }
+  }
+}
