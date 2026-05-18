@@ -24,6 +24,14 @@ class TickEvent(BaseModel):
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
     spx_price: float
     bar: dict[str, Any] | None = None
+    # Live bid/ask + sizes — populated by the tick stream so the LiveQuote
+    # panel can subscribe to the same WS event as the chart instead of
+    # making its own HTTP poll (which caused visible desync).
+    bid: float | None = None
+    ask: float | None = None
+    bid_size: float | None = None
+    ask_size: float | None = None
+    symbol: str | None = None
 
 
 class IterEvent(BaseModel):

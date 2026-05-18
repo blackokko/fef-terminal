@@ -1010,6 +1010,9 @@ async def tick_stream_loop(state: AppState) -> None:
                     timestamp_ms=int(quote.timestamp.timestamp() * 1000),
                     spx_price=quote.last,
                     bar=None,  # tick without a bar — just a price update
+                    bid=quote.bid, ask=quote.ask,
+                    bid_size=quote.bid_size, ask_size=quote.ask_size,
+                    symbol=symbol,
                 )
                 await state.broadcaster.publish(event)
         except asyncio.CancelledError:

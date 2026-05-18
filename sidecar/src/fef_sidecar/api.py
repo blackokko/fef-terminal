@@ -944,44 +944,30 @@ async def get_bars(
             for b in s.ibkr._bars  # type: ignore[attr-defined]
         ]
     else:
-        # Live IBKR: do a one-shot historical fetch.
-        # Indices (SPX/VIX/NDX/RUT) usually need a separate historical-data
-        # subscription many accounts don't have. Fall back to the ETF/futures
-        # proxy that tracks the index 1:1 in shape so the chart still works.
+        # Live IBKR: do a one-shot historical fetch with REAL data — no
+        # proxies, no scaling. The user explicitly wants the actual brokerage
+        # price. Note: SPX (Index) uses TRADES which returns valid OHLC with
+        # volume=0 (indices have no shares, only computed values from members).
+        # MIDPOINT returns 0 bars for SPX — counter-intuitive but verified.
         from fef_sidecar.ibkr.live import _to_ib_contract
-        from fef_sidecar.ibkr.models import Contract
 
-        # Map index → tradable proxy. Caller still labeled the chart as the
-        # original symbol so the FEF engine + QuantData stay on SPX flow.
-        INDEX_TO_PROXY = {"SPX": "SPY", "NDX": "QQQ", "RUT": "IWM"}
-        sym_u = symbol.upper()
-        fetch_contract = contract
-        fetch_label = sym_u
-        if sym_u in INDEX_TO_PROXY:
-            proxy = INDEX_TO_PROXY[sym_u]
-            fetch_contract = Contract.for_symbol(proxy)
-            fetch_label = f"{sym_u}->{proxy}"
-
-        ib_contract = _to_ib_contract(fetch_contract)
+        ib_contract = _to_ib_contract(contract)
         await s.ibkr._ensure_connected()  # type: ignore[attr-defined]
         ib = s.ibkr._ib  # type: ignore[attr-defined]
         await ib.qualifyContractsAsync(ib_contract)
-        what_to_show = "TRADES"  # we always end up on a tradable proxy now
         try:
             ib_bars = await ib.reqHistoricalDataAsync(
                 ib_contract,
                 endDateTime="",
                 durationStr=duration,
                 barSizeSetting=bar_size,
-                whatToShow=what_to_show,
+                whatToShow="TRADES",
                 useRTH=False,  # include futures overnight session
                 formatDate=2,
             )
         except Exception as e:
-            raise HTTPException(503, f"IBKR historical fetch failed for {fetch_label}: {e}") from e
-
-        # If we fetched proxy data, scale to the index price level
-        scale = 10.0 if sym_u == "SPX" else (14.5 if sym_u == "NDX" else (33.0 if sym_u == "RUT" else 1.0))
+            raise HTTPException(503, f"IBKR historical fetch failed for {symbol}: {e}") from e
+        scale = 1.0  # no scaling — real prices
         from datetime import datetime as _dt
         bars = []
         for b in ib_bars:

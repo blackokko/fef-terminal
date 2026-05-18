@@ -54,12 +54,24 @@ if (-not (Test-Path $venvPython)) {
     exit 1
 }
 
-# Warn if live IBKR but TWS not running
+# Warn if live IBKR but TWS not running + auto-detect live (7496) vs paper (7497) port
+$ibkrPort = "7497"
 if ($IbkrMode -eq "live") {
     $tws = Get-Process -Name "tws", "ibgateway" -ErrorAction SilentlyContinue
     if (-not $tws) {
         Write-Warning "TWS / IB Gateway not running. Continue anyway? (Ctrl+C to abort)"
         Start-Sleep -Seconds 3
+    }
+    $live = Test-NetConnection -ComputerName 127.0.0.1 -Port 7496 -InformationLevel Quiet -WarningAction SilentlyContinue
+    $paper = Test-NetConnection -ComputerName 127.0.0.1 -Port 7497 -InformationLevel Quiet -WarningAction SilentlyContinue
+    if ($live) {
+        $ibkrPort = "7496"
+        Write-Host "  IBKR port:     7496 (live account detected)" -ForegroundColor Yellow
+    } elseif ($paper) {
+        $ibkrPort = "7497"
+        Write-Host "  IBKR port:     7497 (paper account detected)" -ForegroundColor Yellow
+    } else {
+        Write-Warning "Neither 7496 (live) nor 7497 (paper) is listening. Defaulting to 7497."
     }
 }
 
@@ -77,6 +89,7 @@ $watchdogScript = "Set-Location '" + (Join-Path $repo "sidecar") + "'; " + `
     "& .\.venv\Scripts\Activate.ps1; " + `
     "`$env:FEF_PROVIDER_QUANTDATA='" + $QuantDataMode + "'; " + `
     "`$env:FEF_PROVIDER_IBKR='" + $IbkrMode + "'; " + `
+    "`$env:FEF_IBKR_PORT='" + $ibkrPort + "'; " + `
     "`$env:FEF_LOOP_INTERVAL_SEC='" + $LoopIntervalSec + "'; " + `
     $scriptedDayEnv + `
     "while (`$true) { " + `

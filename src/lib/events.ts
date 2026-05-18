@@ -68,6 +68,11 @@ export interface TickEvent {
   timestamp_ms: number;
   spx_price: number;
   bar?: Bar | null;
+  bid?: number | null;
+  ask?: number | null;
+  bid_size?: number | null;
+  ask_size?: number | null;
+  symbol?: string | null;
 }
 
 export interface IterEvent {
