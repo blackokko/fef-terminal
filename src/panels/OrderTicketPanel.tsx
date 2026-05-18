@@ -326,6 +326,19 @@ export function OrderTicketPanel() {
           )}
         </div>
 
+        {!opt && (
+          <div style={{
+            background: "var(--color-bg-elevated)",
+            borderLeft: "3px solid var(--color-amber)",
+            padding: "6px 10px", marginBottom: 6, fontSize: 11,
+          }}>
+            <strong style={{ color: "var(--color-amber)" }}>Send disabled.</strong>{" "}
+            The option-chain quote for {v.strike_rec ?? "this strike"} came back
+            empty or NaN (no recent trade, no bid/ask). IBKR would reject a LMT
+            order without a valid price. The button will re-enable on the next
+            iter once a valid quote arrives.
+          </div>
+        )}
         <div className="ticket-actions">
           <button onClick={() => void handleCopy()}>
             {copied ? "✓ Copied" : "Copy to clipboard"}
@@ -333,10 +346,15 @@ export function OrderTicketPanel() {
           <button
             onClick={() => void handleSendToIBKR()}
             disabled={sending || !opt}
-            title={opt ? "Place bracket order via IBKR (requires FEF_LIVE_TRADING=true)" : "No option pricing available"}
-            style={{ background: "var(--color-blue)", color: "white", fontWeight: 600 }}
+            title={opt ? "Place bracket order via IBKR (requires FEF_LIVE_TRADING=true)" : "Option quote unavailable — see banner above"}
+            style={{
+              background: opt ? "var(--color-blue)" : "var(--color-bg-elevated)",
+              color: opt ? "white" : "var(--color-text-muted)",
+              fontWeight: 600,
+              cursor: opt ? "pointer" : "not-allowed",
+            }}
           >
-            {sending ? "Sending…" : "📤 Send to IBKR"}
+            {sending ? "Sending…" : opt ? "📤 Send to IBKR" : "📤 Send to IBKR (no quote)"}
           </button>
           {ticketId !== null && !showOutcomeForm && (
             <button onClick={() => setShowOutcomeForm(true)}>Record outcome</button>
