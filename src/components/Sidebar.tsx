@@ -67,6 +67,7 @@ export function Sidebar() {
         {tab === "trade" && (
           <>
             <Safe name="AccountScorecard"><AccountScorecardPanel /></Safe>
+            <Safe name="Calendar"><CalendarPanel /></Safe>
             <Safe name="RiskOverlay"><RiskOverlayPanel /></Safe>
             <Safe name="Regime"><RegimePanel /></Safe>
             <Safe name="LiveQuote"><LiveQuotePanel /></Safe>
@@ -108,7 +109,6 @@ export function Sidebar() {
         {tab === "config" && (
           <>
             <Safe name="Settings"><SettingsPanel /></Safe>
-            <Safe name="Calendar"><CalendarPanel /></Safe>
             <Safe name="DataMaintenance"><DataMaintenancePanel /></Safe>
             <Safe name="AuditLog"><AuditLogPanel /></Safe>
             <Safe name="ChartAnnotations"><ChartAnnotationsPanel /></Safe>
