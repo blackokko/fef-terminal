@@ -39,13 +39,50 @@ def _get_engine():
 
 
 async def init_db() -> None:
-    """Create all tables. Idempotent — safe to call on every startup."""
+    """Create all tables + run lightweight ALTER TABLE migrations.
+
+    Idempotent — safe to call on every startup. SQLModel's create_all only
+    creates MISSING tables; it does NOT add columns to existing tables when
+    a model gains a new field. So when we add columns over time, we need to
+    explicitly ADD COLUMN them here.
+    """
     # Import models so SQLModel.metadata picks them up.
     from fef_sidecar.db import models  # noqa: F401
+    from sqlalchemy import text
 
     engine = _get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
+
+        # ---- Forward-only schema migrations ----
+        # Each entry: (table, column, sqlite_type_sql)
+        # Add new rows here whenever a model gains a column. Wrapped in
+        # try/except so a missing table (fresh install before create_all
+        # ran in some weird order) doesn't crash startup.
+        migrations: list[tuple[str, str, str]] = [
+            ("signal_iter", "provider_mode", "TEXT"),
+            ("daily_session", "updated_at", "DATETIME"),
+        ]
+        for table, column, type_sql in migrations:
+            try:
+                # SQLite-specific PRAGMA to introspect columns
+                res = await conn.exec_driver_sql(f"PRAGMA table_info({table})")
+                existing = {row[1] for row in res.fetchall()}
+                if column not in existing:
+                    await conn.exec_driver_sql(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {type_sql}"
+                    )
+                    import logging
+                    logging.getLogger(__name__).info(
+                        "Migrated: ALTER TABLE %s ADD COLUMN %s %s",
+                        table, column, type_sql,
+                    )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Migration check %s.%s failed (likely fresh install): %s",
+                    table, column, e,
+                )
 
 
 async def dispose_db() -> None:

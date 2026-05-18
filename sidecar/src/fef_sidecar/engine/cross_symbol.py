@@ -39,7 +39,8 @@ async def compute_cross_symbol_view(window_seconds: int = 120) -> CrossSymbolVie
     column (added later) so we treat all rows as the active symbol.
     The composite is still useful for the future multi-symbol case."""
 
-    cutoff = datetime.now(UTC) - timedelta(seconds=window_seconds)
+    # Cutoff in naive UTC since DB stores naive timestamps
+    cutoff = (datetime.now(UTC) - timedelta(seconds=window_seconds)).replace(tzinfo=None)
     async with get_session() as session:
         rows = list((await session.exec(
             select(SignalIter)
@@ -57,11 +58,15 @@ async def compute_cross_symbol_view(window_seconds: int = 120) -> CrossSymbolVie
 
     # Group by symbol (use "SPX" as default since older rows lack the field)
     per_symbol: dict[str, dict] = {}
+    now = datetime.now(UTC)
     for r in rows:
         sym = getattr(r, "symbol", None) or "SPX"
         if sym in per_symbol:
             continue
-        age = (datetime.now(UTC) - r.timestamp).total_seconds()
+        # SignalIter.timestamp comes back from SQLite as timezone-naive;
+        # attach UTC before subtracting from the aware now.
+        ts = r.timestamp if r.timestamp.tzinfo else r.timestamp.replace(tzinfo=UTC)
+        age = (now - ts).total_seconds()
         per_symbol[sym] = {
             "direction": r.direction.value,
             "confidence": r.confidence.value,
