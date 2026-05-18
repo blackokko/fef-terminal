@@ -121,6 +121,35 @@ async def set_symbol(request: Request, body: dict[str, str] = Body(...)) -> dict
 
 
 # IMPROVEMENTS #9: engine state introspection — "why did/didn't FEF fire?"
+@router.get("/regime/lookback")
+async def get_regime_lookback(request: Request) -> dict[str, Any]:
+    """Current regime lookback window size + an estimate of its time coverage
+    based on the configured loop interval."""
+    s = _state(request)
+    import os as _os
+    interval_sec = float(_os.environ.get("FEF_LOOP_INTERVAL_SEC", "120"))
+    window_size = s.regime_detector._window_size  # type: ignore[attr-defined]
+    return {
+        "window_size": window_size,
+        "loop_interval_sec": interval_sec,
+        "minutes_of_context": round(window_size * interval_sec / 60, 1),
+        "samples_currently": s.regime_detector.n,
+    }
+
+
+@router.post("/regime/lookback")
+async def set_regime_lookback(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Resize the regime detector's rolling window at runtime."""
+    s = _state(request)
+    new_size = int(body["window_size"])
+    s.regime_detector.resize(new_size)
+    return {
+        "ok": True,
+        "window_size": s.regime_detector._window_size,  # type: ignore[attr-defined]
+        "samples_currently": s.regime_detector.n,
+    }
+
+
 @router.get("/regime/debug")
 async def regime_debug(request: Request) -> dict[str, Any]:
     """Inspect the regime detector's rolling window + last assessment.

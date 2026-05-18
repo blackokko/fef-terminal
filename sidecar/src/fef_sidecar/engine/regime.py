@@ -146,9 +146,13 @@ class RegimeDetector:
 
     Call `push(sample)` on each FEF iter. Then `assess()` returns the
     current best-guess regime.
+
+    Default window: 60 samples. At the standard 2-min loop cadence that's
+    2 hours of context — enough to classify pin/trend/wall-test/etc.
+    Was 12 (= 24 min) which was too short for stable classification.
     """
 
-    def __init__(self, window_size: int = 12) -> None:
+    def __init__(self, window_size: int = 60) -> None:
         self._window: deque[RegimeSample] = deque(maxlen=window_size)
         self._window_size = window_size
 
@@ -157,6 +161,16 @@ class RegimeDetector:
 
     def reset(self) -> None:
         self._window.clear()
+
+    def resize(self, new_window_size: int) -> None:
+        """Change the window cap at runtime. Preserves existing samples
+        up to the new cap (drops oldest if shrinking)."""
+        new_window_size = max(3, min(500, int(new_window_size)))
+        if new_window_size == self._window_size:
+            return
+        new_window: deque[RegimeSample] = deque(self._window, maxlen=new_window_size)
+        self._window = new_window
+        self._window_size = new_window_size
 
     @property
     def n(self) -> int:

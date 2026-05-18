@@ -161,7 +161,7 @@ class AppState:
             ibkr=make_ibkr_provider(),
             engine=_make_engine(),
             regime_detector=RegimeDetector(
-                window_size=int(os.environ.get("FEF_REGIME_WINDOW", "12"))
+                window_size=int(os.environ.get("FEF_REGIME_WINDOW", "60"))
             ),
             tournament=TournamentRunner(DEFAULT_VARIANTS),
             autotrader=MockAutoTraderState(),

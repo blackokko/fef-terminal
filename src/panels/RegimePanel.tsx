@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useToast } from "../components/Toast";
 import { useSidecar } from "../context/WebSocketContext";
 
@@ -77,6 +77,7 @@ export function RegimePanel() {
       <section className="sidebar-section regime-panel">
         <h3 className="sidebar-section-title">Market regime</h3>
         <p className="muted small">warming up…</p>
+        <LookbackControl />
       </section>
     );
   }
@@ -120,7 +121,72 @@ export function RegimePanel() {
             Apply '{lastRegime.recommended_preset_hint}' preset
           </button>
         )}
+        <LookbackControl />
       </div>
     </section>
+  );
+}
+
+const API_BASE = "http://127.0.0.1:8765";
+
+function LookbackControl() {
+  const [info, setInfo] = useState<{
+    window_size: number; loop_interval_sec: number;
+    minutes_of_context: number; samples_currently: number;
+  } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/regime/lookback`);
+      if (r.ok) setInfo(await r.json());
+    } catch {}
+  };
+  useEffect(() => {
+    void refresh();
+    const id = window.setInterval(refresh, 5000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const setWindow = async (n: number) => {
+    setBusy(true);
+    try {
+      await fetch(`${API_BASE}/regime/lookback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ window_size: n }),
+      });
+      await refresh();
+    } catch {} finally { setBusy(false); }
+  };
+
+  if (!info) return null;
+  const presets = [
+    { label: "30m", n: Math.max(3, Math.round(30 * 60 / info.loop_interval_sec)) },
+    { label: "1h",  n: Math.max(3, Math.round(60 * 60 / info.loop_interval_sec)) },
+    { label: "2h",  n: Math.max(3, Math.round(120 * 60 / info.loop_interval_sec)) },
+    { label: "4h",  n: Math.max(3, Math.round(240 * 60 / info.loop_interval_sec)) },
+    { label: "Full session", n: Math.max(3, Math.round(390 * 60 / info.loop_interval_sec)) },
+  ];
+
+  return (
+    <div className="regime-lookback" style={{
+      marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--color-border)",
+    }}>
+      <div className="muted small" style={{ marginBottom: 4 }}>
+        Lookback: <strong style={{ color: "var(--color-text)" }}>{info.minutes_of_context.toFixed(0)} min</strong>
+        ({info.samples_currently}/{info.window_size} samples, {info.loop_interval_sec}s loop)
+      </div>
+      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+        {presets.map((p) => (
+          <button key={p.label} onClick={() => void setWindow(p.n)}
+                  disabled={busy}
+                  className={`chart-toolbar-btn ${info.window_size === p.n ? "active" : ""}`}
+                  style={{ fontSize: 10, padding: "2px 6px" }}>
+            {p.label}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
