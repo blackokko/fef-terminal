@@ -282,40 +282,6 @@ class LiveIBKRProvider:
                 return float(b.close)
         return float(bars[-1].close) if float(bars[-1].close) > 0 else None
 
-    async def fetch_historical_bars(
-        self,
-        contract: Contract,
-        *,
-        bar_size: str,
-        duration: str,
-    ) -> list[Bar]:
-        """One-shot historical-bar fetch. Used by the spread recommender to
-        build a 30-min bar series for TA entry detection."""
-        await self._ensure_connected()
-        assert self._ib is not None
-
-        ib_contract = _to_ib_contract(contract)
-        await self._ib.qualifyContractsAsync(ib_contract)
-
-        try:
-            bars = await asyncio.wait_for(
-                self._ib.reqHistoricalDataAsync(
-                    ib_contract,
-                    endDateTime="",
-                    durationStr=duration,
-                    barSizeSetting=bar_size,
-                    whatToShow="TRADES",
-                    useRTH=False,
-                    formatDate=2,
-                    keepUpToDate=False,
-                ),
-                timeout=20.0,
-            )
-        except (TimeoutError, asyncio.TimeoutError):
-            return []
-
-        return [_bar_from_ib(b) for b in bars]
-
     async def get_last_quote(self, contract: Contract) -> Quote:
         await self._ensure_connected()
         assert self._ib is not None

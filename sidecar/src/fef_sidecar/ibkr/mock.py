@@ -210,6 +210,9 @@ class MockIBKRProvider:
         *,
         bar_size: str,
         duration: str,
+        use_rth: bool = False,
+        what_to_show: str = "TRADES",
+        timeout_seconds: float = 20.0,
     ) -> list[Bar]:
         """Synthetic 30-min (or other) bar series for spread-recommender
         testing. Generates ~80 bars walking from a base price with a mild
