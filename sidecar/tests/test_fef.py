@@ -152,6 +152,72 @@ def test_wall_collapse_special_trigger() -> None:
     assert last.confidence == FEFConfidence.HIGH
 
 
+def test_wall_collapse_skips_when_drift_contradicts() -> None:
+    """Regression: 2026-05-18 7410C blowup.
+
+    A put wall BELOW spot collapsed (net_m < 0, strike < spx) while drift
+    was strongly bearish. Old logic mapped this to LONG_CALLS based on
+    strike position alone, firing a directional bull trade into a
+    confirmed downtrend. New logic requires (wall TYPE × position)
+    confluence + drift agreement; this scenario must NOT fire.
+    """
+    engine = FEFEngine(history_window=3, wall_collapse_pct=0.20)
+
+    put_wall_big = [(7360.0, -50000.0)]
+    put_wall_collapsed = [(7360.0, -20000.0)]
+
+    engine.push(_iter(ts=1, spx=7395.0, drift_m=0.0,
+                      gex_walls=put_wall_big, bias="BEARISH"))
+    engine.push(_iter(ts=2, spx=7390.0, drift_m=-3.0,
+                      gex_walls=put_wall_big, bias="BEARISH"))
+    engine.push(_iter(ts=3, spx=7385.0, drift_m=-6.0,
+                      gex_walls=put_wall_big, bias="BEARISH"))
+    last = engine.push(_iter(ts=4, spx=7372.0, drift_m=-10.0,
+                             gex_walls=put_wall_collapsed, bias="BEARISH"))
+
+    # Put wall below spot collapsing during bearish drift = floor breaking.
+    # Either fires LONG_PUTS via wall_collapse (correct direction), or
+    # falls through to aligned/chop. MUST NOT fire LONG_CALLS.
+    assert last.direction != FEFDirection.LONG_CALLS
+
+
+def test_wall_collapse_put_below_fires_long_puts_when_drift_agrees() -> None:
+    """Put wall below collapses + bearish drift → LONG_PUTS (floor gone)."""
+    engine = FEFEngine(history_window=3, wall_collapse_pct=0.20)
+
+    put_wall_big = [(7380.0, -50000.0)]
+    put_wall_collapsed = [(7380.0, -10000.0)]
+
+    engine.push(_iter(ts=1, spx=7420.0, drift_m=0.0,
+                      gex_walls=put_wall_big, bias="BEARISH"))
+    engine.push(_iter(ts=2, spx=7415.0, drift_m=-3.0,
+                      gex_walls=put_wall_big, bias="BEARISH"))
+    engine.push(_iter(ts=3, spx=7410.0, drift_m=-6.0,
+                      gex_walls=put_wall_big, bias="BEARISH"))
+    last = engine.push(_iter(ts=4, spx=7405.0, drift_m=-10.0,
+                             gex_walls=put_wall_collapsed, bias="BEARISH"))
+
+    assert last.wall_collapse_trigger is True
+    assert last.direction == FEFDirection.LONG_PUTS
+
+
+def test_wall_collapse_itm_wall_does_not_fire() -> None:
+    """ITM wall (call below spot, OR put above) collapse is not directional."""
+    engine = FEFEngine(history_window=3, wall_collapse_pct=0.20)
+
+    # Call wall BELOW spot (deep ITM calls being closed for profit)
+    itm_call_big = [(7300.0, 50000.0)]
+    itm_call_collapsed = [(7300.0, 10000.0)]
+
+    engine.push(_iter(ts=1, spx=7400.0, drift_m=0.0, gex_walls=itm_call_big))
+    engine.push(_iter(ts=2, spx=7402.0, drift_m=1.0, gex_walls=itm_call_big))
+    engine.push(_iter(ts=3, spx=7404.0, drift_m=2.0, gex_walls=itm_call_big))
+    last = engine.push(_iter(ts=4, spx=7406.0, drift_m=3.0,
+                             gex_walls=itm_call_collapsed))
+
+    assert last.wall_collapse_trigger is False
+
+
 def test_secondary_scores_populated_on_wait() -> None:
     engine = FEFEngine(history_window=3)
 

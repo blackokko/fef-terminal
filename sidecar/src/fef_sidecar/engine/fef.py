@@ -275,8 +275,18 @@ class FEFEngine:
     def _detect_wall_collapse(self) -> tuple[bool, FEFDirection | None]:
         """Detect whether the dominant wall lost >threshold exposure since last iter.
 
-        Returns (collapsed, direction_to_fire). Direction is away from the
-        collapsed wall: if a call wall above us collapsed, expect upward break.
+        Returns (collapsed, direction_to_fire). Direction reflects wall TYPE
+        (call vs put via sign of net_m) AND position vs spot — only an
+        out-of-the-money wall acting as resistance/support is actionable
+        when it collapses. Confluence with drift bias is required so the
+        trigger can't fire AGAINST trend (the 2026-05-18 7410C blowup).
+
+        Mapping:
+          Call wall above spot collapses → resistance gone → LONG_CALLS
+            (only if drift_cum_net_m is non-negative)
+          Put wall below spot collapses → support gone → LONG_PUTS
+            (only if drift_cum_net_m is non-positive)
+          ITM wall collapses (call below / put above spot) → not directional
         """
         if len(self._history) < 2:
             return False, None
@@ -287,35 +297,45 @@ class FEFEngine:
         if not prev.top_gex_walls or not cur.top_gex_walls:
             return False, None
 
-        # Track the prior iter's #1 wall and see if its exposure dropped
         prior_top = max(prev.top_gex_walls, key=lambda w: abs(w.net_m))
         current_same = next(
             (w for w in cur.top_gex_walls if abs(w.strike - prior_top.strike) < 1.0),
             None,
         )
-        if current_same is None:
-            # Wall fell out of top 5 entirely
-            direction = (
-                FEFDirection.LONG_CALLS if prior_top.strike > cur.spx_price else FEFDirection.LONG_PUTS
-            )
-            return True, direction
 
-        prior_abs = abs(prior_top.net_m)
-        cur_abs = abs(current_same.net_m)
-        if prior_abs <= 0:
-            return False, None
-        # IMPROVEMENTS #7: require absolute floor — a $50M -> $40M drop is noise,
-        # a $50M -> $5M drop is meaningful. Filter walls with insufficient mass.
-        if prior_abs < self._wall_collapse_floor_m:
-            return False, None
-        loss_pct = (prior_abs - cur_abs) / prior_abs
-        if loss_pct < self._wall_collapse_pct:
+        # Magnitude check — only trigger when meaningful exposure has been lost
+        if current_same is not None:
+            prior_abs = abs(prior_top.net_m)
+            cur_abs = abs(current_same.net_m)
+            if prior_abs < self._wall_collapse_floor_m:
+                return False, None
+            loss_pct = (prior_abs - cur_abs) / prior_abs if prior_abs > 0 else 0.0
+            if loss_pct < self._wall_collapse_pct:
+                return False, None
+        # If wall fell out of top 5 entirely, treat as full collapse — fall through
+
+        # Direction by wall TYPE + position
+        is_call_wall = prior_top.net_m > 0
+        is_above_spot = prior_top.strike > cur.spx_price
+
+        if is_call_wall and is_above_spot:
+            direction = FEFDirection.LONG_CALLS
+        elif (not is_call_wall) and (not is_above_spot):
+            direction = FEFDirection.LONG_PUTS
+        else:
+            # ITM wall collapse — call below or put above spot. Not directional.
             return False, None
 
-        # Wall collapsed — fire in direction away from it
-        direction = (
-            FEFDirection.LONG_CALLS if prior_top.strike > cur.spx_price else FEFDirection.LONG_PUTS
-        )
+        # Confluence with drift bias. If drift is significantly against the
+        # wall-collapse direction, skip the trigger entirely — let other
+        # branches (aligned / absorption / chop) handle the iter.
+        drift = cur.drift_cum_net_m
+        drift_threshold = self._wall_collapse_floor_m * 0.5
+        if direction == FEFDirection.LONG_CALLS and drift < -drift_threshold:
+            return False, None
+        if direction == FEFDirection.LONG_PUTS and drift > drift_threshold:
+            return False, None
+
         return True, direction
 
     def _classify_confidence(
