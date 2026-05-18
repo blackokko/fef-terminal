@@ -154,6 +154,11 @@ class AppState:
         ).split(",") if s.strip()
     ])
 
+    # Prior-day close per symbol — populated once at startup and on each
+    # symbol switch. Read by tick/bar loops to attach prior_close to
+    # TickEvent so the Live Quote panel can show day-change %.
+    prior_close_by_symbol: dict[str, float] = field(default_factory=dict)
+
     @classmethod
     def build(cls) -> AppState:
         return cls(

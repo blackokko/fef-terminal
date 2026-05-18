@@ -204,6 +204,22 @@ class MockIBKRProvider:
 
         self._scripted_bars_done = True
 
+    async def get_prior_close(self, contract: Contract) -> float | None:
+        """Mock prior close: 0.4% below the coherent track's session-open price.
+
+        Picks a small offset so the Live Quote panel demonstrates a realistic
+        day-change % rather than always showing 0.00%. Deterministic per-run.
+        """
+        if self._use_coherent_track:
+            from fef_sidecar.mock import get_track
+            try:
+                return round(float(get_track().session_open_price()) * 0.996, 2)
+            except Exception:
+                pass
+        if self._bars:
+            return round(float(self._bars[0].open) * 0.996, 2)
+        return None
+
     async def get_last_quote(self, contract: Contract) -> Quote:
         if not self._connected:
             await self.connect()

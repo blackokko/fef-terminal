@@ -117,6 +117,10 @@ async def set_symbol(request: Request, body: dict[str, str] = Body(...)) -> dict
     s.last_snapshot = None  # force a fresh QuantData fetch on the new symbol
     await cancel_data_loops(s)
     spawn_data_loops(s)
+    # Refresh prior close for the new symbol so day-change % is correct.
+    from fef_sidecar.main import refresh_prior_close
+    import asyncio as _aio
+    _aio.create_task(refresh_prior_close(s), name="refresh-prior-close")
     return {"ok": True, "active_symbol": s.active_symbol, "changed": True}
 
 

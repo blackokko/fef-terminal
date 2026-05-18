@@ -66,3 +66,11 @@ class IBKRProvider(Protocol):
 
     async def get_account_summary(self) -> AccountSummary | None:
         """Live account-level P/L + buying power. Polled every ~30s."""
+
+    async def get_prior_close(self, contract: Contract) -> float | None:
+        """Prior trading day's closing price for the underlying.
+
+        Used by the Live Quote panel to display day-change %. Cached on
+        AppState per symbol; fetched once at startup and on symbol switch.
+        Return None if the data isn't available.
+        """

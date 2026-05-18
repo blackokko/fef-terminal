@@ -32,6 +32,10 @@ class TickEvent(BaseModel):
     bid_size: float | None = None
     ask_size: float | None = None
     symbol: str | None = None
+    # Prior trading day's close. Lets the Live Quote panel compute day-change
+    # % client-side without an extra HTTP fetch. Same value on every tick
+    # until the next session — cheap to repeat.
+    prior_close: float | None = None
 
 
 class IterEvent(BaseModel):

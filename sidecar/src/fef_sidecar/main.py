@@ -86,6 +86,22 @@ async def _seed_defaults_on_first_run() -> None:
             logger.info("Seeded %d default presets", len(DEFAULT_PRESETS))
 
 
+async def refresh_prior_close(state: AppState) -> None:
+    """Fetch prior-day close for the active symbol and cache it on state.
+    Best-effort: silently leaves None on failure (panel falls back to no %).
+    """
+    from fef_sidecar.ibkr import Contract
+    symbol = state.active_symbol
+    try:
+        await state.ibkr.connect()
+        pc = await state.ibkr.get_prior_close(Contract.for_symbol(symbol))
+        if pc is not None and pc > 0:
+            state.prior_close_by_symbol[symbol] = pc
+            logger.info("Prior close for %s: %.2f", symbol, pc)
+    except Exception:
+        logger.exception("refresh_prior_close failed for %s", symbol)
+
+
 def spawn_data_loops(state: AppState) -> None:
     """(Re-)spawn the per-symbol data loops. Called on startup and whenever
     the active symbol is changed via /config/symbol so the loops pick up
@@ -179,6 +195,7 @@ async def lifespan(app: FastAPI):
     )
     if auto_loops:
         spawn_data_loops(state)
+        asyncio.create_task(refresh_prior_close(state), name="refresh-prior-close")
 
     logger.info(
         "fef-sidecar ready (QD=%s, IBKR=%s, auto_loops=%s)",

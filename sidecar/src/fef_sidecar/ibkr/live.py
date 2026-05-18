@@ -238,6 +238,50 @@ class LiveIBKRProvider:
             bars.updateEvent -= _on_update
             self._ib.cancelHistoricalData(bars)
 
+    async def get_prior_close(self, contract: Contract) -> float | None:
+        """Fetch yesterday's daily close via reqHistoricalData('2 D', '1 day').
+
+        Returns the close of the most-recent COMPLETED daily bar — i.e. the
+        bar whose date is strictly before today. Today's partial bar (if any)
+        is filtered out so the % change reflects 'change since prior close',
+        not 'change since today's open'.
+        """
+        from datetime import date as _date
+        await self._ensure_connected()
+        assert self._ib is not None
+
+        ib_contract = _to_ib_contract(contract)
+        await self._ib.qualifyContractsAsync(ib_contract)
+
+        try:
+            bars = await asyncio.wait_for(
+                self._ib.reqHistoricalDataAsync(
+                    ib_contract,
+                    endDateTime="",
+                    durationStr="3 D",
+                    barSizeSetting="1 day",
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=2,
+                    keepUpToDate=False,
+                ),
+                timeout=10.0,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return None
+
+        if not bars:
+            return None
+
+        today = _date.today()
+        for b in reversed(bars):
+            bar_date = b.date if isinstance(b.date, _date) else None
+            if bar_date is not None and bar_date < today and float(b.close) > 0:
+                return float(b.close)
+            if bar_date is None and float(b.close) > 0:
+                return float(b.close)
+        return float(bars[-1].close) if float(bars[-1].close) > 0 else None
+
     async def get_last_quote(self, contract: Contract) -> Quote:
         await self._ensure_connected()
         assert self._ib is not None

@@ -664,6 +664,7 @@ async def bar_stream_loop(state: AppState) -> None:
                         "close": bar.close,
                         "volume": bar.volume,
                     },
+                    prior_close=state.prior_close_by_symbol.get(symbol),
                 )
                 await state.broadcaster.publish(event)
             logger.info("Bar stream completed — sleeping 60s before reconnect")
@@ -1123,6 +1124,7 @@ async def tick_stream_loop(state: AppState) -> None:
                     bid=quote.bid, ask=quote.ask,
                     bid_size=quote.bid_size, ask_size=quote.ask_size,
                     symbol=symbol,
+                    prior_close=state.prior_close_by_symbol.get(symbol),
                 )
                 await state.broadcaster.publish(event)
         except asyncio.CancelledError:

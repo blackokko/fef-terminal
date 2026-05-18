@@ -64,6 +64,22 @@ export function LiveQuotePanel() {
         <div className={`live-quote-last ${flash ? `flash-${flash}` : ""}`}>
           {last != null ? last.toFixed(2) : "—"}
         </div>
+        {(() => {
+          const pc = lastTick.prior_close;
+          if (pc == null || pc <= 0 || last == null) return null;
+          const change = last - pc;
+          const pct = (change / pc) * 100;
+          const color = change >= 0 ? "var(--color-green)" : "var(--color-red)";
+          const sign = change >= 0 ? "+" : "";
+          return (
+            <div style={{
+              fontFamily: "var(--font-mono)", fontWeight: 600, fontSize: 13,
+              color, marginTop: 2,
+            }}>
+              {sign}{change.toFixed(2)} ({sign}{pct.toFixed(2)}%)
+            </div>
+          );
+        })()}
         <div className="muted small">updated {new Date(lastTick.timestamp_ms).toLocaleTimeString("en-US", { timeZone: "America/Chicago", hour12: false })} CT</div>
       </div>
 

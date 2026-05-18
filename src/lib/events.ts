@@ -73,6 +73,7 @@ export interface TickEvent {
   bid_size?: number | null;
   ask_size?: number | null;
   symbol?: string | null;
+  prior_close?: number | null;
 }
 
 export interface IterEvent {
