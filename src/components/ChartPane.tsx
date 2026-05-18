@@ -282,9 +282,27 @@ export function ChartPane() {
         console.error("bars fetch failed:", e);
       }
     };
-    // Reset render state on symbol/timeframe/date change so we re-setData
+    // Reset render state on symbol/timeframe/date change. CRITICAL: also
+    // clear the chart's data + all overlay lines + the bars state so we
+    // don't show stale candles/H-L/walls from the previous symbol while
+    // the new fetch is in flight.
     renderedBarCountRef.current = 0;
     setHasFittedOnce(false);
+    setBars([]);
+    try {
+      seriesRef.current?.setData([]);
+      ema8SeriesRef.current?.setData([]);
+      ema21SeriesRef.current?.setData([]);
+      const sd = sdRefs.current;
+      sd.mid?.setData([]); sd.up1?.setData([]); sd.up2?.setData([]); sd.up3?.setData([]);
+      sd.dn1?.setData([]); sd.dn2?.setData([]); sd.dn3?.setData([]);
+      if (seriesRef.current) {
+        for (const line of priceLinesRef.current) seriesRef.current.removePriceLine(line);
+        priceLinesRef.current = [];
+        for (const line of ambientLinesRef.current) seriesRef.current.removePriceLine(line);
+        ambientLinesRef.current = [];
+      }
+    } catch {}
     void fetchBars();
     // Historical mode: no polling (the day is closed). Live mode: poll every 3s.
     if (historicalDate) return () => { cancelled = true; };
@@ -466,12 +484,16 @@ export function ChartPane() {
     try { seriesRef.current.update(candle); } catch {}
   }, [lastTick, symbol, bars]);
 
-  // Wall overlays
+  // Wall overlays. ALWAYS clear stale lines on any change so switching from
+  // SPX to ES/SPY/etc. doesn't leave SPX wall labels stuck on the chart.
+  // Then only re-add the wall lines when symbol is SPX (the only one with
+  // QuantData flow walls).
   useEffect(() => {
-    if (!seriesRef.current || symbol !== "SPX") return;
+    if (!seriesRef.current) return;
     const series = seriesRef.current;
     for (const line of priceLinesRef.current) series.removePriceLine(line);
     priceLinesRef.current = [];
+    if (symbol !== "SPX") return;  // walls are SPX-only
     const { walls, ntmMaxPain } = aggregateWalls(lastIter);
     for (const w of walls) {
       priceLinesRef.current.push(series.createPriceLine({

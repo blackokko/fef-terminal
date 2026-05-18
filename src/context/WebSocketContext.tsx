@@ -62,7 +62,14 @@ const initialState: SidecarState = {
   recentPatternMatches: [],
 };
 
+interface SidecarSetters {
+  setActiveSymbol: (s: string) => void;
+}
+
 const SidecarContext = createContext<SidecarState>(initialState);
+const SidecarSettersContext = createContext<SidecarSetters>({
+  setActiveSymbol: () => {},
+});
 
 const RECENT_LIMIT = 200;
 
@@ -282,7 +289,21 @@ export function SidecarProvider({
     };
   }, [url, handleEvent]);
 
-  return <SidecarContext.Provider value={state}>{children}</SidecarContext.Provider>;
+  const setters: SidecarSetters = {
+    setActiveSymbol: (s: string) => setState((prev) => ({ ...prev, activeSymbol: s })),
+  };
+
+  return (
+    <SidecarContext.Provider value={state}>
+      <SidecarSettersContext.Provider value={setters}>
+        {children}
+      </SidecarSettersContext.Provider>
+    </SidecarContext.Provider>
+  );
+}
+
+export function useSidecarSetters(): SidecarSetters {
+  return useContext(SidecarSettersContext);
 }
 
 export function useSidecar(): SidecarState {

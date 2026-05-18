@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
+import { useSidecarSetters } from "../context/WebSocketContext";
 
 // Switches the active symbol on the sidecar — triggers a respawn of all
-// per-symbol data loops on the backend. Brief gap (~1s) while loops cycle.
+// per-symbol data loops on the backend. ~1s gap while loops cycle.
+// Updates SidecarContext directly so the chart + every panel reading
+// activeSymbol re-renders immediately (no full window reload — which
+// was unreliable in the Tauri webview and left activeSymbol stuck).
 
 const API_BASE = "http://127.0.0.1:8765";
 
@@ -13,12 +17,17 @@ interface Cfg {
 export function SymbolSelector() {
   const [cfg, setCfg] = useState<Cfg | null>(null);
   const [busy, setBusy] = useState(false);
+  const { setActiveSymbol } = useSidecarSetters();
 
   useEffect(() => {
     void (async () => {
       try {
         const r = await fetch(`${API_BASE}/config/symbol`);
-        if (r.ok) setCfg(await r.json());
+        if (r.ok) {
+          const data = await r.json();
+          setCfg(data);
+          setActiveSymbol(data.active_symbol);
+        }
       } catch {
         // sidecar not up yet
       }
@@ -39,9 +48,9 @@ export function SymbolSelector() {
       if (r.ok) {
         const data = await r.json();
         setCfg((prev) => (prev ? { ...prev, active_symbol: data.active_symbol } : prev));
-        // Hard-reload so every component (chart, sidecar context, panels) re-reads
-        // state from the freshly-restarted backend loops. ~100ms gap.
-        setTimeout(() => window.location.reload(), 300);
+        // Propagate to SidecarContext immediately so chart + LiveQuote +
+        // panels re-render with new symbol without needing a page reload.
+        setActiveSymbol(data.active_symbol);
       }
     } finally {
       setBusy(false);
