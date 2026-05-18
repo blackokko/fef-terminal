@@ -366,29 +366,29 @@ export function ChartPane() {
       //
       // Per ThinkOrSwim Learning Center: 'composed of two parallel lines to
       // the Linear Regression trendline and distanced from it by [N] standard
-      // deviations'.
+      // deviations'. TOS fits the regression across the FULL visible chart
+      // window (e.g. all bars in '10D 30min'), not a fixed N-bar lookback —
+      // that's what makes the channel meaningful as a 'this period's
+      // regression' rather than an EMA-like rolling envelope.
       //
-      // Definition:
-      //   1. Fit OLS linear regression (y = m·x + b) over the last `length` bars.
+      // Algorithm:
+      //   1. Fit OLS linear regression y = m·x + b over EVERY bar on chart.
       //   2. Center line = that regression line.
-      //   3. σ = stddev of the RESIDUALS (close - predicted) across the window.
+      //   3. σ = stddev of the residuals (close - predicted) across all bars.
       //   4. Bands at ±1σ / ±2σ / ±3σ run parallel to the regression line.
-      //   5. Channel is drawn only across the regression window — earlier
-      //      bars have no channel (the window slides forward each new bar).
-      const length = 20;  // TOS default
+      //   5. Channel spans the entire visible chart, recomputed when bars
+      //      change (new timeframe, longer lookback, new data poll).
       const channelData: {
         mid: LineData[]; up1: LineData[]; up2: LineData[]; up3: LineData[];
         dn1: LineData[]; dn2: LineData[]; dn3: LineData[];
       } = { mid: [], up1: [], up2: [], up3: [], dn1: [], dn2: [], dn3: [] };
 
-      if (closes.length >= length) {
-        const start = closes.length - length;
-        const ys = closes.slice(start);
-        const n = ys.length;
-        // x = 0..n-1 relative position within window
+      if (closes.length >= 2) {
+        const n = closes.length;
+        // x = 0..n-1 relative position across the whole chart
         let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
         for (let i = 0; i < n; i++) {
-          sumX += i; sumY += ys[i]; sumXY += i * ys[i]; sumX2 += i * i;
+          sumX += i; sumY += closes[i]; sumXY += i * closes[i]; sumX2 += i * i;
         }
         const denom = n * sumX2 - sumX * sumX;
         const m = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
@@ -397,12 +397,12 @@ export function ChartPane() {
         let ssq = 0;
         for (let i = 0; i < n; i++) {
           const pred = m * i + b;
-          ssq += (ys[i] - pred) ** 2;
+          ssq += (closes[i] - pred) ** 2;
         }
         const sd_ = Math.sqrt(ssq / n);
-        // Build the 7 parallel lines across the window
+        // Build the 7 parallel lines across every bar
         for (let i = 0; i < n; i++) {
-          const t = times[start + i];
+          const t = times[i];
           const y = m * i + b;
           channelData.mid.push({ time: t, value: y });
           channelData.up1.push({ time: t, value: y + sd_ });
@@ -540,7 +540,7 @@ export function ChartPane() {
             EMA
           </button>
           <button className={`chart-toolbar-btn ${showSD ? "active" : ""}`}
-                  onClick={() => setShowSD(s => !s)} title="StandardDevChannel — TOS-style linear regression channel, 20-bar, ±1σ / 2σ / 3σ">
+                  onClick={() => setShowSD(s => !s)} title="StandardDevChannel — TOS-style linear regression across the full chart, ±1σ / 2σ / 3σ. Recomputes on timeframe / lookback change.">
             STD
           </button>
         </div>
