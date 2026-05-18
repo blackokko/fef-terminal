@@ -113,6 +113,10 @@ def spawn_data_loops(state: AppState) -> None:
     state.auto_wf_task = asyncio.create_task(
         nightly_scheduler(state), name="auto-walk-forward-scheduler"
     )
+    from fef_sidecar.engine.runner_protector import runner_protector_loop
+    state.runner_protect_task = asyncio.create_task(
+        runner_protector_loop(state), name="runner-protector-loop"
+    )
 
 
 async def cancel_data_loops(state: AppState) -> None:

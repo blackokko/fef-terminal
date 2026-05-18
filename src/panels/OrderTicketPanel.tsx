@@ -120,15 +120,20 @@ export function OrderTicketPanel() {
     const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
     const direction = v.direction;
     const right = direction === "LONG_CALLS" ? "C" : "P";
+    // 85/10/5 split (matches user trading style)
+    const t1q = Math.max(1, Math.round(qty * 0.85));
+    const t2q = Math.max(1, Math.round(qty * 0.10));
+    const t3q = Math.max(1, qty - t1q - t2q);
     // Two-stage confirm
     const ok = window.confirm(
       `Place BRACKET ORDER via IBKR?\n\n` +
       `  BUY ${qty} SPX ${today} ${v.strike_rec}${right} @ $${opt.entry_limit.toFixed(2)}\n` +
-      `  T1 (1/3 qty): $${opt.t1.toFixed(2)}\n` +
-      `  T2 (1/3 qty): $${opt.t2.toFixed(2)}\n` +
-      `  T3 (1/3 qty): $${opt.t3.toFixed(2)}\n` +
+      `  T1 (${t1q}× ~85%): $${opt.t1.toFixed(2)}\n` +
+      `  T2 (${t2q}× runner): $${opt.t2.toFixed(2)}\n` +
+      `  T3 (${t3q}× runner): $${opt.t3.toFixed(2)}\n` +
       `  STOP (all):   $${opt.stop.toFixed(2)}\n\n` +
-      `Requires FEF_LIVE_TRADING=true env. Otherwise this is DRY_RUN (no real order).`
+      `Runner protector will exit T2/T3 at market if premium retraces to T1 fill.\n\n` +
+      `Requires FEF_LIVE_TRADING=true env. Otherwise DRY_RUN (no real order).`
     );
     if (!ok) return;
     setSending(true);

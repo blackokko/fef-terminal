@@ -110,6 +110,14 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
     from fef_sidecar.engine.live_trading import BracketSpec, place_bracket
 
     today = time.strftime("%Y%m%d")
+    # 85/10/5 split per user trading style — lock in 85% at T1, 15% runners.
+    # Round to keep qty whole; min 1 per child if qty >= 3.
+    t1_qty = max(1, round(qty * 0.85))
+    t2_qty = max(1, round(qty * 0.10))
+    t3_qty = max(1, qty - t1_qty - t2_qty)
+    # If rounding pushed t1 beyond qty, rebalance
+    if t1_qty + t2_qty + t3_qty != qty:
+        t1_qty = qty - t2_qty - t3_qty
     spec = BracketSpec(
         symbol=state.active_symbol, strike=float(strike),
         right="C" if direction == "LONG_CALLS" else "P",
@@ -117,7 +125,7 @@ async def maybe_auto_trade(state, verdict_dict: dict) -> AutoTradeDecision:
         entry_limit=float(opt["entry_limit"]),
         t1_limit=float(opt["t1"]), t2_limit=float(opt["t2"]),
         t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
-        t1_qty=qty // 3, t2_qty=qty // 3, t3_qty=qty - 2 * (qty // 3),
+        t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
     )
 
     try:

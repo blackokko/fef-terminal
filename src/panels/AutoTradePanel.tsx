@@ -14,6 +14,7 @@ interface AutoTradeStatus {
   last_at_ms: number;
   last_block_reason: string;
   session_cap_reached: boolean;
+  runner_protect_enabled: boolean;
 }
 
 export function AutoTradePanel() {
@@ -200,6 +201,31 @@ export function AutoTradePanel() {
             Reset
           </button>
         )}
+      </div>
+
+      <div className="muted small" style={{ marginTop: 8, borderTop: "1px solid var(--color-border)", paddingTop: 6 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={status.runner_protect_enabled}
+            onChange={async (e) => {
+              setBusy(true);
+              try {
+                await fetch(`${API_BASE}/auto_trade/runner_protect`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ enabled: e.target.checked }),
+                });
+                await refresh();
+              } catch {} finally { setBusy(false); }
+            }}
+            disabled={busy}
+          />
+          <span>
+            <strong>Runner protect</strong> — after T1 fills, exit remaining
+            runners at market if premium retraces to T1 fill (85/10/5 split)
+          </span>
+        </label>
       </div>
 
       {status.last_block_reason && (

@@ -105,6 +105,12 @@ class AppState:
     auto_trade_count_session: int = 0           # bumped after each successful fire
     auto_trade_last_at_ms: int = 0              # epoch ms of last fire
     auto_trade_last_block_reason: str = ""      # why most-recent eligible signal was skipped
+
+    # Runner protector — after T1 fills, market-exit remaining T2/T3 qty if
+    # the option premium retraces back below the T1 fill price. Locks in the
+    # 85% T1 win without giving back gains on the 15% runners.
+    runner_protect_enabled: bool = True
+    runner_protect_task: object | None = None
     position_task: object | None = None
     auto_wf_task: object | None = None
     # Active symbol — drives which contract is fed to bar/tick/iter loops and

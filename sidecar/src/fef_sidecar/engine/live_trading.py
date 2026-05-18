@@ -121,7 +121,19 @@ async def place_bracket(
             "reason": "DRY_RUN (FEF_LIVE_TRADING not enabled or confirm=false)",
         }
 
-    # LIVE path — wire to actual IBKR placeOrder
+    # LIVE path — wire to actual IBKR placeOrder.
+    #
+    # Order structure (no OCA on T1):
+    #   parent  LMT BUY qty
+    #   T1      LMT SELL t1_qty  — NOT in an OCA group, so T1 fill doesn't
+    #                              cancel T2/T3/STOP. Runners stay alive.
+    #   T2      LMT SELL t2_qty  — in OCA{stop+T2+T3} so any of them cancels
+    #                              the others (T2 fill cancels T3 + STOP, etc.)
+    #   T3      LMT SELL t3_qty  — same OCA as T2
+    #   STOP    STP SELL qty     — same OCA as T2/T3 (one stop covers all
+    #                              remaining qty; the runner_protector loop
+    #                              will market-exit T2/T3 separately if a
+    #                              retrace below T1 fill is detected)
     try:
         from ib_async import LimitOrder, StopOrder
 
@@ -139,18 +151,28 @@ async def place_bracket(
             ib_perm_id=parent_trade.order.permId,
         )
 
-        oca_group = f"FEF_OCA_{parent_trade.order.orderId}"
-        for child_record, tier_qty, tier_price, role in zip(children_saved, (
+        # OCA only for runners + stop (T1 stays free-standing)
+        runner_oca = f"FEF_RUNNERS_{parent_trade.order.orderId}"
+        children_pairs = list(zip(children_saved, (
             (spec.t1_qty, spec.t1_limit, "t1"),
             (spec.t2_qty, spec.t2_limit, "t2"),
             (spec.t3_qty, spec.t3_limit, "t3"),
             (spec.qty,    spec.stop_limit, "stop"),
-        )):
-            tier_qty, tier_price, role = tier_qty
+        )))
+        for child_record, (tier_qty, tier_price, role) in children_pairs:
             if role == "stop":
-                co = StopOrder("SELL", spec.qty, spec.stop_limit, parentId=parent_trade.order.orderId, ocaGroup=oca_group, ocaType=1, transmit=True)
-            else:
-                co = LimitOrder("SELL", tier_qty, tier_price, parentId=parent_trade.order.orderId, ocaGroup=oca_group, ocaType=1, transmit=(role == "t3"))
+                co = StopOrder("SELL", spec.qty, spec.stop_limit,
+                               parentId=parent_trade.order.orderId,
+                               ocaGroup=runner_oca, ocaType=1, transmit=True)
+            elif role == "t1":
+                # T1 standalone — no OCA, so T1 fill doesn't kill runners
+                co = LimitOrder("SELL", tier_qty, tier_price,
+                                parentId=parent_trade.order.orderId,
+                                transmit=False)
+            else:  # t2 or t3
+                co = LimitOrder("SELL", tier_qty, tier_price,
+                                parentId=parent_trade.order.orderId,
+                                ocaGroup=runner_oca, ocaType=1, transmit=False)
             child_trade = ib.placeOrder(ib_contract, co)
             await SignalIterRepository.update_live_order(
                 child_record.id, ib_order_id=child_trade.order.orderId,
@@ -158,7 +180,8 @@ async def place_bracket(
             )
 
         return {"ok": True, "dry_run": False, "parent_order_id": parent_saved.id,
-                "children": [c.id for c in children_saved], "oca_group": oca_group}
+                "children": [c.id for c in children_saved],
+                "runner_oca_group": runner_oca}
     except Exception as e:
         logger.exception("Live order submission failed")
         await SignalIterRepository.update_live_order(parent_saved.id, status="REJECTED", notes=str(e))

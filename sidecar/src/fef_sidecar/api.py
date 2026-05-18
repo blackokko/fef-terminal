@@ -428,7 +428,23 @@ async def auto_trade_status(request: Request) -> dict[str, Any]:
         "last_at_ms": s.auto_trade_last_at_ms,
         "last_block_reason": s.auto_trade_last_block_reason,
         "session_cap_reached": s.auto_trade_count_session >= s.auto_trade_max_per_session,
+        "runner_protect_enabled": s.runner_protect_enabled,
     }
+
+
+@router.post("/auto_trade/runner_protect")
+async def auto_trade_runner_protect(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Toggle the runner_protector loop. When ON (default), after T1 fills
+    on a bracket, the remaining T2/T3 runners are market-exited if the
+    option premium retraces back below T1 fill price."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    s = _state(request)
+    s.runner_protect_enabled = bool(body.get("enabled", True))
+    await SignalIterRepository.write_audit_log(
+        category="runner_protect_toggle", actor="user",
+        summary=f"Runner protector {'enabled' if s.runner_protect_enabled else 'disabled'}",
+    )
+    return {"ok": True, "runner_protect_enabled": s.runner_protect_enabled}
 
 
 @router.post("/auto_trade/toggle")
@@ -506,16 +522,22 @@ async def live_place_bracket(request: Request, body: dict[str, Any] = Body(...))
     Without both → DRY_RUN (writes records but doesn't hit IBKR)."""
     from fef_sidecar.engine.live_trading import BracketSpec, place_bracket
     s = _state(request)
+    # 85/10/5 default split per user trading style
+    qty = int(body["qty"])
+    t1_default = max(1, round(qty * 0.85))
+    t2_default = max(1, round(qty * 0.10))
+    t3_default = max(1, qty - t1_default - t2_default)
+    if t1_default + t2_default + t3_default != qty:
+        t1_default = qty - t2_default - t3_default
     spec = BracketSpec(
         symbol=body["symbol"], strike=float(body["strike"]),
-        right=body["right"], expiry=body["expiry"],
-        qty=int(body["qty"]),
+        right=body["right"], expiry=body["expiry"], qty=qty,
         entry_limit=float(body["entry_limit"]),
         t1_limit=float(body["t1_limit"]), t2_limit=float(body["t2_limit"]),
         t3_limit=float(body["t3_limit"]), stop_limit=float(body["stop_limit"]),
-        t1_qty=int(body.get("t1_qty", body["qty"] // 3)),
-        t2_qty=int(body.get("t2_qty", body["qty"] // 3)),
-        t3_qty=int(body.get("t3_qty", body["qty"] - 2 * (body["qty"] // 3))),
+        t1_qty=int(body.get("t1_qty", t1_default)),
+        t2_qty=int(body.get("t2_qty", t2_default)),
+        t3_qty=int(body.get("t3_qty", t3_default)),
     )
     return await place_bracket(
         s.ibkr, spec, confirm=body.get("confirm", False),
