@@ -28,6 +28,48 @@ def is_live_trading_enabled() -> bool:
     return os.environ.get("FEF_LIVE_TRADING", "false").lower() in ("true", "1", "yes", "on")
 
 
+def require_paper_account() -> bool:
+    """When true, refuse to submit any order to an account whose ID doesn't
+    start with 'DU' (IBKR paper account prefix). Default ON — protects
+    against the surprisingly common case where TWS is logged into the live
+    account but exposing the API on port 7497 (paper's default port).
+    """
+    return os.environ.get("FEF_REQUIRE_PAPER_ACCOUNT", "true").lower() in (
+        "true", "1", "yes", "on"
+    )
+
+
+def is_paper_account(account_id: str) -> bool:
+    """IBKR paper accounts are prefixed 'DU' (Demo User). Live accounts
+    start with 'U' (no D)."""
+    return account_id.startswith("DU")
+
+
+async def assert_paper_if_required(ibkr) -> None:
+    """Hard-stop guard before live submission when FEF_REQUIRE_PAPER_ACCOUNT
+    is on (default). Raises if the connected account looks live."""
+    if not require_paper_account():
+        return
+    try:
+        summary = await ibkr.get_account_summary()
+    except Exception:
+        summary = None
+    if summary is None:
+        raise RuntimeError(
+            "Could not read IBKR account summary — refusing to submit order "
+            "while FEF_REQUIRE_PAPER_ACCOUNT=true (safety default). Set "
+            "FEF_REQUIRE_PAPER_ACCOUNT=false to override (live-money mode)."
+        )
+    account_id = summary.account or ""
+    if not is_paper_account(account_id):
+        raise RuntimeError(
+            f"REFUSING TO SUBMIT — connected account '{account_id}' does not "
+            f"look like a paper account (paper IDs start with 'DU'). Either "
+            f"(a) connect TWS to the paper account on port 7497, or "
+            f"(b) set FEF_REQUIRE_PAPER_ACCOUNT=false to allow live trading."
+        )
+
+
 @dataclass(frozen=True)
 class BracketSpec:
     symbol: str
@@ -94,6 +136,21 @@ async def place_bracket(
 
     live = is_live_trading_enabled() and confirm and isinstance(ibkr, LiveIBKRProvider)
     dry_run = not live
+
+    # SAFETY GATE: when FEF_REQUIRE_PAPER_ACCOUNT=true (default), refuse to
+    # submit live orders to a non-paper account. Catches the case where TWS
+    # is logged into the live account but exposing port 7497.
+    if live:
+        try:
+            await assert_paper_if_required(ibkr)
+        except RuntimeError as e:
+            await SignalIterRepository.write_audit_log(
+                category="order_refused", actor="system",
+                summary=f"REFUSED: {e}",
+                details={"reason": str(e), "spec_qty": spec.qty,
+                         "spec_strike": spec.strike, "spec_right": spec.right},
+            )
+            return {"ok": False, "error": str(e), "refused_safety_gate": True}
 
     contract = Contract(
         symbol=spec.symbol, kind=ContractKind.OPTION,
@@ -274,6 +331,19 @@ async def place_credit_spread(
     """
     live = is_live_trading_enabled() and confirm and isinstance(ibkr, LiveIBKRProvider)  # noqa: F821
     dry_run = not live
+
+    # SAFETY GATE: same paper-account check as place_bracket.
+    if live:
+        try:
+            await assert_paper_if_required(ibkr)
+        except RuntimeError as e:
+            await SignalIterRepository.write_audit_log(
+                category="order_refused", actor="system",
+                summary=f"REFUSED SPREAD: {e}",
+                details={"reason": str(e), "kind": spec.kind, "qty": spec.qty,
+                         "short": spec.short_strike, "long": spec.long_strike},
+            )
+            return {"ok": False, "error": str(e), "refused_safety_gate": True}
 
     # Persist the parent (spread bracket) record
     spread_order = LiveOrder(
