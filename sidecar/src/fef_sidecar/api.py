@@ -764,16 +764,42 @@ async def live_orders(status: str | None = None, limit: int = 200) -> list[dict[
 
 
 @router.get("/live/positions")
-async def live_positions(limit: int = 100) -> list[dict[str, Any]]:
-    rows = await SignalIterRepository.query_live_positions(limit=limit)
-    return [
-        {"id": r.id, "snapshot_ts": r.snapshot_ts.isoformat(),
-         "symbol": r.symbol, "strike": r.strike, "right": r.right, "expiry": r.expiry,
-         "qty": r.qty, "avg_cost": r.avg_cost, "market_price": r.market_price,
-         "unrealized_pnl": r.unrealized_pnl, "delta": r.delta, "gamma": r.gamma,
-         "theta": r.theta, "vega": r.vega, "iv": r.iv}
-        for r in rows
-    ]
+async def live_positions(request: Request, limit: int = 100) -> list[dict[str, Any]]:
+    """Return currently-open positions from IBKR (not historical snapshots).
+
+    Live mode: queries ib.positions() directly so closed positions disappear
+    immediately. Mock mode: returns empty (mock has no real positions).
+    Falls back to DB snapshots only if IBKR is disconnected.
+    """
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    import time as _t
+
+    s = _state(request)
+    if isinstance(s.ibkr, LiveIBKRProvider) and getattr(s.ibkr, "_ib", None) is not None:
+        ib = s.ibkr._ib  # type: ignore[attr-defined]
+        if ib.isConnected():
+            out: list[dict[str, Any]] = []
+            for p in ib.positions():
+                if abs(p.position) < 0.5:
+                    continue  # zero qty = closed
+                c = p.contract
+                if getattr(c, "secType", "") != "OPT":
+                    continue
+                out.append({
+                    "id": None,
+                    "snapshot_ts": _t.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "symbol": getattr(c, "symbol", ""),
+                    "strike": float(getattr(c, "strike", 0)),
+                    "right": getattr(c, "right", ""),
+                    "expiry": getattr(c, "lastTradeDateOrContractMonth", ""),
+                    "qty": int(p.position),
+                    "avg_cost": float(p.avgCost) / 100.0 if p.avgCost else None,
+                    "market_price": None, "unrealized_pnl": None,
+                    "delta": None, "gamma": None, "theta": None, "vega": None, "iv": None,
+                })
+            return out
+    # Fallback for mock or disconnected: empty list (not stale DB rows)
+    return []
 
 
 @router.get("/live/status")

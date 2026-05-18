@@ -40,8 +40,10 @@ async def position_monitor_loop(state: AppState) -> None:
                     continue
                 if getattr(p.contract, "secType", "") != "OPT":
                     continue
-                # Fetch live greeks via reqMktData snapshot
-                ticker = ib.reqMktData(p.contract, "13", False, False)
+                # Fetch live greeks via reqMktData. No generic tick list for
+                # OPT — IBKR rejects "13" with error 321. modelGreeks stream
+                # automatically via tickOptionComputation events.
+                ticker = ib.reqMktData(p.contract, "", False, False)
                 await asyncio.sleep(0.5)  # let greeks populate
                 last = float(ticker.last) if ticker.last and ticker.last > 0 else (
                     float(ticker.close or 0))
