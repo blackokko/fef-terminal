@@ -678,17 +678,39 @@ async def _maybe_fetch_option_targets(
 
     try:
         quote = await state.ibkr.get_option_quote(contract)
-        return build_option_targets(
-            quote=quote,
-            current_spx=inputs.spx_price,
-            spx_t1=verdict.t1,
-            spx_t2=verdict.t2,
-            spx_t3=verdict.t3,
-            spx_stop=verdict.stop,
-        )
     except Exception as e:
         logger.warning("Could not fetch option quote for %s: %s", contract, e)
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="option_quote_fail", actor="system",
+                summary=f"get_option_quote raised: SPX {expiry} {verdict.strike_rec}{right}: {type(e).__name__}: {e}",
+                details={"strike": verdict.strike_rec, "right": right, "expiry": expiry,
+                         "error_type": type(e).__name__, "error": str(e)},
+            )
+        except Exception:
+            pass
         return None
+
+    targets = build_option_targets(
+        quote=quote, current_spx=inputs.spx_price,
+        spx_t1=verdict.t1, spx_t2=verdict.t2, spx_t3=verdict.t3, spx_stop=verdict.stop,
+    )
+    if targets is None:
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="option_quote_fail", actor="system",
+                summary=(
+                    f"option quote unusable for SPX {expiry} {verdict.strike_rec}{right}: "
+                    f"last={quote.last} bid={quote.bid} ask={quote.ask} delta={quote.delta} "
+                    f"(NaN/0 — IBKR didn't return valid pricing for this contract)"
+                ),
+                details={"strike": verdict.strike_rec, "right": right, "expiry": expiry,
+                         "last": quote.last, "bid": quote.bid, "ask": quote.ask,
+                         "delta": quote.delta},
+            )
+        except Exception:
+            pass
+    return targets
 
 
 def _option_pricing_dict(targets: OptionTargets | None) -> dict[str, Any] | None:

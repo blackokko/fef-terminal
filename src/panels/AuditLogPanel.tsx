@@ -62,7 +62,13 @@ export function AuditLogPanel() {
               </div>
               <div className="audit-log-summary">{e.summary}</div>
               <div className="muted small">
-                {new Date(e.timestamp).toLocaleString()} · {e.actor}
+                {new Date(e.timestamp + (e.timestamp.endsWith("Z") ? "" : "Z"))
+                  .toLocaleString("en-US", {
+                    timeZone: "America/Chicago",
+                    hour12: false,
+                    month: "2-digit", day: "2-digit",
+                    hour: "2-digit", minute: "2-digit", second: "2-digit",
+                  })} CT · {e.actor}
               </div>
             </li>
           ))}
