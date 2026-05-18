@@ -74,3 +74,18 @@ class IBKRProvider(Protocol):
         AppState per symbol; fetched once at startup and on symbol switch.
         Return None if the data isn't available.
         """
+
+    async def fetch_historical_bars(
+        self,
+        contract: Contract,
+        *,
+        bar_size: str,
+        duration: str,
+    ) -> list[Bar]:
+        """One-shot fetch of bar history — no streaming, no keepUpToDate.
+
+        Used by the spread recommender to build a 30-min bar series for TA
+        entry detection (EMA cross + StdDev channel + engulfing). Returns
+        empty list if the fetch fails or the underlying has no data.
+        """
+        return []

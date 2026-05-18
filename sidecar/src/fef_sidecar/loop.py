@@ -140,6 +140,41 @@ async def quantdata_poll_loop(state: AppState) -> None:
         await asyncio.sleep(interval)
 
 
+async def _get_spread_bars_30m(state: AppState) -> list[Any]:
+    """Return cached 30-min bars for the active symbol. Re-fetches if the
+    cache is older than 25 min OR is missing entirely. Best-effort: returns
+    [] if the fetch fails (recommender will then short-circuit to NONE).
+
+    30-min bars are resampled from finer-grained 30-min bar requests when
+    the broker supports it directly. For LiveIBKRProvider, we ask for
+    '30 mins' directly. For mock, the same — its fetch_historical_bars
+    synthesizes whatever bar size we request.
+    """
+    import time as _t
+    from fef_sidecar.ibkr.models import Contract
+
+    symbol = state.active_symbol
+    now_ms = int(_t.time() * 1000)
+    cached = state.spread_bars_by_symbol.get(symbol)
+    fetched_at = state.spread_bars_fetched_ms.get(symbol, 0)
+    if cached and (now_ms - fetched_at) < 25 * 60 * 1000:
+        return cached  # type: ignore[return-value]
+
+    try:
+        bars = await state.ibkr.fetch_historical_bars(  # type: ignore[attr-defined]
+            Contract.for_symbol(symbol),
+            bar_size="30 mins",
+            duration="5 D",
+        )
+    except Exception:
+        logger.exception("fetch_historical_bars (30m) failed for %s", symbol)
+        bars = []
+
+    state.spread_bars_by_symbol[symbol] = bars  # type: ignore[assignment]
+    state.spread_bars_fetched_ms[symbol] = now_ms
+    return bars  # type: ignore[return-value]
+
+
 def _ntm_max_pain(snap: Any) -> float:
     """NTM max pain from the snapshot's OI rows, or fall back to raw chain MP."""
     if snap.oi is None:
@@ -354,39 +389,55 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     except Exception:
         logger.exception("Calendar pause check failed")
 
-    # Spread recommendation — added to verdict as a separate field
+    # Spread recommendation — TA-driven entries (EMA 8/21 cross + pullback
+    # engulfing on StdDev channel) with delta-targeted strikes (<=0.15 delta,
+    # >=$0.70 premium). Reads cached 30-min bars; refreshes them at most
+    # every 25 minutes per symbol. Independent of FEF direction.
     try:
-        from fef_sidecar.engine.spread_recommender import recommend as recommend_spread
+        from fef_sidecar.engine.spread_recommender import recommend_from_bars
+        from fef_sidecar.engine.spread_entry import SpreadEntryTrigger  # noqa: F401
 
-        top_dex_call = next(
-            (w.strike for w in inputs.top_dex_walls if w.net_m > 0), None
-        )
-        top_dex_put = next(
-            (w.strike for w in inputs.top_dex_walls if w.net_m < 0), None
-        )
-        sim_minutes = getattr(snap, "simulated_minutes_since_open", None)
-        spread_rec = recommend_spread(
-            direction=verdict.direction.value,
-            confidence=verdict.confidence.value,
-            spx_price=inputs.spx_price,
-            ntm_max_pain=inputs.ntm_max_pain,
-            top_dex_call_strike=top_dex_call,
-            top_dex_put_strike=top_dex_put,
-            iv_rank_call_pct=inputs.iv_rank_call_pct,
-            iv_rank_put_pct=inputs.iv_rank_put_pct,
-            minutes_since_open=sim_minutes if sim_minutes is not None else now_minutes_since_open_et(),
-        )
-        event.verdict["spread_recommendation"] = {
-            "kind": spread_rec.kind,
-            "reasoning": spread_rec.reasoning,
-            "short_strike": spread_rec.short_strike,
-            "long_strike": spread_rec.long_strike,
-            "spread_width": spread_rec.spread_width,
-            "estimated_credit_per_contract": spread_rec.estimated_credit_per_contract,
-            "max_profit_per_contract": spread_rec.max_profit_per_contract,
-            "max_loss_per_contract": spread_rec.max_loss_per_contract,
-            "breakeven": spread_rec.breakeven,
-        }
+        bars_30m = await _get_spread_bars_30m(state)
+        if not bars_30m:
+            event.verdict["spread_recommendation"] = {
+                "kind": "NONE", "reasoning": "30-min bar history not yet available",
+                "short_strike": None, "long_strike": None, "spread_width": None,
+                "estimated_credit_per_contract": None,
+                "max_profit_per_contract": None,
+                "max_loss_per_contract": None,
+                "breakeven": None,
+            }
+        else:
+            today_ymd = _today_et().replace("-", "")
+            spread_rec = await recommend_from_bars(
+                bars_30m,
+                ibkr=state.ibkr,
+                symbol=state.active_symbol,
+                expiry=today_ymd,
+                spot=inputs.spx_price,
+            )
+            event.verdict["spread_recommendation"] = {
+                "kind": spread_rec.kind,
+                "reasoning": spread_rec.reasoning,
+                "short_strike": spread_rec.short_strike,
+                "long_strike": spread_rec.long_strike,
+                "spread_width": spread_rec.spread_width,
+                "estimated_credit_per_contract": spread_rec.estimated_credit_per_contract,
+                "max_profit_per_contract": spread_rec.max_profit_per_contract,
+                "max_loss_per_contract": spread_rec.max_loss_per_contract,
+                "breakeven": spread_rec.breakeven,
+                "trigger_bar_close_ms": spread_rec.trigger_bar_close_ms,
+                "trigger_signature": spread_rec.trigger_signature,
+                "short_delta": spread_rec.short_delta,
+                "fail_reasons": spread_rec.fail_reasons,
+                "fresh_trigger": bool(
+                    spread_rec.trigger_signature
+                    and spread_rec.trigger_signature != state.last_spread_trigger_signature
+                ),
+            }
+            if spread_rec.trigger_signature:
+                state.last_spread_trigger_signature = spread_rec.trigger_signature
+            state.last_spread_recommendation = event.verdict["spread_recommendation"]
     except Exception:
         logger.exception("Spread recommendation failed")
 

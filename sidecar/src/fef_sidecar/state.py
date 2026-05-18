@@ -159,6 +159,19 @@ class AppState:
     # TickEvent so the Live Quote panel can show day-change %.
     prior_close_by_symbol: dict[str, float] = field(default_factory=dict)
 
+    # 30-min bar cache per symbol — feeds the credit-spread recommender's
+    # TA entry detector (EMA 8/21, StdDev channel, engulfing). Re-fetched
+    # at most every 25 minutes per symbol so freshly closed 30-min bars
+    # get picked up without hammering IBKR.
+    spread_bars_by_symbol: dict[str, list[object]] = field(default_factory=dict)
+    spread_bars_fetched_ms: dict[str, int] = field(default_factory=dict)
+    # Last triggered signature — used so the recommender alert fires
+    # exactly once per fresh trigger bar (per user preference).
+    last_spread_trigger_signature: str = ""
+    # Cached recommendation object so callers don't have to re-fetch when
+    # the trigger hasn't moved.
+    last_spread_recommendation: dict[str, object] | None = None
+
     @classmethod
     def build(cls) -> AppState:
         return cls(

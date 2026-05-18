@@ -204,6 +204,57 @@ class MockIBKRProvider:
 
         self._scripted_bars_done = True
 
+    async def fetch_historical_bars(
+        self,
+        contract: Contract,
+        *,
+        bar_size: str,
+        duration: str,
+    ) -> list[Bar]:
+        """Synthetic 30-min (or other) bar series for spread-recommender
+        testing. Generates ~80 bars walking from a base price with a mild
+        trend and modest noise so the EMA cross + StdDev channel logic has
+        realistic data to evaluate.
+        """
+        import random as _random
+        if not self._connected:
+            await self.connect()
+
+        try:
+            target_minutes = int(bar_size.split()[0]) if "min" in bar_size else 30
+        except Exception:
+            target_minutes = 30
+
+        if self._use_coherent_track:
+            from fef_sidecar.mock import get_track
+            base = float(get_track().price_now())
+        elif self._bars:
+            base = float(self._bars[-1].close)
+        else:
+            base = 7400.0
+
+        rng = _random.Random(int(base * 100))
+        n_bars = 80
+        now = datetime.now()
+        bars: list[Bar] = []
+        price = base * 0.985
+        for i in range(n_bars):
+            ts = now - timedelta(minutes=(n_bars - i) * target_minutes)
+            drift = (base - price) * 0.05
+            wiggle = rng.uniform(-3.0, 3.0)
+            open_ = price
+            close = price + drift + wiggle
+            high = max(open_, close) + rng.uniform(0.5, 3.0)
+            low = min(open_, close) - rng.uniform(0.5, 3.0)
+            bars.append(Bar(
+                timestamp=ts,
+                open=round(open_, 2), high=round(high, 2),
+                low=round(low, 2), close=round(close, 2),
+                volume=rng.randint(800, 2500),
+            ))
+            price = close
+        return bars
+
     async def get_prior_close(self, contract: Contract) -> float | None:
         """Mock prior close: 0.4% below the coherent track's session-open price.
 

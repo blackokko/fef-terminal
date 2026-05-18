@@ -1,19 +1,16 @@
-"""Spread recommender — naked vs credit-spread suggestion for the FEF verdict.
+"""Credit-spread recommender — TA-driven entries with delta-targeted strikes.
 
-Decides whether the user should take a naked long call/put (high-conviction
-directional play) or a credit spread (defined-risk premium-collecting play
-that profits from time decay + the directional bias being correct enough).
+Independent of the FEF directional model: spreads have their own entry
+playbook (see engine/spread_entry.py for the rule set). When entry
+conditions trigger on the 30-min timeframe, this module scans the option
+chain for the first short strike with |delta| <= 0.15 AND mid premium >=
+$0.70, and assembles a 5-point wide spread recommendation.
 
-Heuristics drawn from common 0DTE practitioner playbook:
-- High IV rank (>60) → premium-rich environment → spreads more attractive
-- Late in session (after 13:30 ET) → theta accelerating → spreads benefit
-- Distance to NTM max pain >25pts → expect mean reversion → spread that
-  profits from price NOT reaching → CCS above for bullish, PCS below for bearish
-- LOW IVR (<30) + aligned HIGH verdict → naked is cheap relative to spreads
-- WAIT verdict → no recommendation
-
-Output describes a 1-leg-wide spread (e.g., 7400/7395 PCS) anchored on the
-nearest dominant wall in the relevant direction.
+Returns ``NONE`` whenever:
+  * Not enough bar history to evaluate
+  * Technical entry conditions not met
+  * No strike in the chain satisfies BOTH delta and premium targets
+    (per the 'show no spread' fallback choice)
 """
 
 from __future__ import annotations
@@ -21,142 +18,157 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from fef_sidecar.engine.spread_entry import (
+    SpreadEntryTrigger,
+    check_ccs_entry,
+    check_pcs_entry,
+)
+from fef_sidecar.engine.strike_picker import (
+    StrikePick,
+    find_ccs_strike,
+    find_pcs_strike,
+)
+from fef_sidecar.ibkr.models import Bar
+from fef_sidecar.ibkr.provider import IBKRProvider
+
 
 SpreadKind = Literal["LONG_CALL", "LONG_PUT", "PCS", "CCS", "NONE"]
 
 
 @dataclass(frozen=True)
 class SpreadRecommendation:
+    """Stable schema consumed by the verdict + OrderTicket panel.
+
+    Fields preserved from the prior heuristic-based recommender so the
+    frontend continues to render without modification.
+    """
+
     kind: SpreadKind
     reasoning: str
     short_strike: float | None = None
     long_strike: float | None = None
-    spread_width: float | None = None  # in points
-    estimated_credit_per_contract: float | None = None  # for spreads, in dollars
+    spread_width: float | None = None
+    estimated_credit_per_contract: float | None = None  # in cents (* 100)
     max_profit_per_contract: float | None = None
     max_loss_per_contract: float | None = None
     breakeven: float | None = None
+    # New diagnostic fields the panel can surface in tooltip/expanded view
+    trigger_bar_close_ms: int | None = None
+    trigger_signature: str = ""
+    short_delta: float | None = None
+    fail_reasons: list[str] | None = None
 
 
-def recommend(
-    direction: str,           # "LONG_CALLS" / "LONG_PUTS" / "WAIT"
-    confidence: str,          # "HIGH" / "MEDIUM" / "LOW" / "NONE"
-    spx_price: float,
-    ntm_max_pain: float,
-    top_dex_call_strike: float | None,
-    top_dex_put_strike: float | None,
-    iv_rank_call_pct: float | None,
-    iv_rank_put_pct: float | None,
-    minutes_since_open: int,
+def _build_from_trigger_and_pick(
+    trigger: SpreadEntryTrigger, pick: StrikePick, kind: SpreadKind
 ) -> SpreadRecommendation:
-    """Pick the trade structure for the current verdict + market context."""
+    """Assemble the SpreadRecommendation given a fired trigger + valid pick."""
+    credit_per_contract_cents = pick.estimated_credit * 100
+    width = pick.width
+    max_loss = (width - pick.estimated_credit) * 100
+    breakeven = (
+        pick.short_strike - pick.estimated_credit
+        if kind == "PCS"
+        else pick.short_strike + pick.estimated_credit
+    )
 
-    if direction == "WAIT":
-        return SpreadRecommendation(kind="NONE", reasoning="No actionable signal — stand down")
+    reasoning = " · ".join([
+        f"{kind} trigger:",
+        *trigger.reasons,
+        f"short {pick.short_strike:.0f} delta {pick.short_delta:+.2f}",
+        f"mid ${pick.estimated_credit:.2f}",
+    ])
 
-    iv_rank = iv_rank_call_pct if direction == "LONG_CALLS" else iv_rank_put_pct
-    is_late_session = minutes_since_open >= 240  # after ~13:30 ET
-    mp_distance = abs(spx_price - ntm_max_pain)
+    return SpreadRecommendation(
+        kind=kind,
+        reasoning=reasoning,
+        short_strike=pick.short_strike,
+        long_strike=pick.long_strike,
+        spread_width=width,
+        estimated_credit_per_contract=credit_per_contract_cents,
+        max_profit_per_contract=credit_per_contract_cents,
+        max_loss_per_contract=max_loss,
+        breakeven=breakeven,
+        trigger_bar_close_ms=trigger.trigger_bar_close_ms,
+        trigger_signature=trigger.signature,
+        short_delta=pick.short_delta,
+    )
 
-    # ---- LONG_CALLS branch ----
-    if direction == "LONG_CALLS":
-        # Naked when IV is cheap + high conviction
-        if (iv_rank is not None and iv_rank < 30) and confidence == "HIGH":
-            return SpreadRecommendation(
-                kind="LONG_CALL",
-                reasoning=f"HIGH conviction + IVR {iv_rank:.0f}% (cheap calls) — naked long",
-            )
 
-        # Late session + spot near a defended put wall → PCS (sell put spread, bullish)
-        if is_late_session and top_dex_put_strike is not None and spx_price > top_dex_put_strike:
-            short = round(top_dex_put_strike / 5) * 5
-            long_strike = short - 5
-            credit = 0.70  # typical 5-wide PCS credit at 0DTE
-            width = short - long_strike
-            return SpreadRecommendation(
-                kind="PCS",
-                reasoning=f"Late-session bullish + spot above DEX put wall {short:.0f} — collect premium with PCS",
-                short_strike=short,
-                long_strike=long_strike,
-                spread_width=width,
-                estimated_credit_per_contract=credit * 100,
-                max_profit_per_contract=credit * 100,
-                max_loss_per_contract=(width - credit) * 100,
-                breakeven=short - credit,
-            )
+async def recommend_from_bars(
+    bars_30m: list[Bar],
+    *,
+    ibkr: IBKRProvider,
+    symbol: str,
+    expiry: str,
+    spot: float,
+    delta_max: float = 0.15,
+    premium_min: float = 0.70,
+    width: float = 5.0,
+) -> SpreadRecommendation:
+    """Top-level entry point — checks both PCS and CCS triggers against the
+    30-min bar series, and returns the recommendation for whichever fires
+    (or NONE if neither does or no qualifying strike exists).
 
-        # High IVR (premium-rich) → favor PCS over naked
-        if iv_rank is not None and iv_rank > 60:
-            # Anchor short strike at NTM MP (or nearest 5-pt below spot)
-            anchor = ntm_max_pain if ntm_max_pain < spx_price else (spx_price - 10)
-            short = round(anchor / 5) * 5
-            long_strike = short - 5
-            credit = 0.85
-            width = 5.0
-            return SpreadRecommendation(
-                kind="PCS",
-                reasoning=f"IVR {iv_rank:.0f}% (rich premium) — sell PCS instead of buying naked",
-                short_strike=short,
-                long_strike=long_strike,
-                spread_width=width,
-                estimated_credit_per_contract=credit * 100,
-                max_profit_per_contract=credit * 100,
-                max_loss_per_contract=(width - credit) * 100,
-                breakeven=short - credit,
-            )
-
-        # Default: naked long call
+    Both triggers can't fire simultaneously (PCS needs uptrend + bullish
+    engulfing, CCS needs downtrend + bearish engulfing) so the order of
+    checks doesn't matter — but PCS is checked first for symmetry.
+    """
+    pcs_trigger = check_pcs_entry(bars_30m)
+    if pcs_trigger.triggered:
+        pick = await find_pcs_strike(
+            ibkr,
+            symbol=symbol,
+            expiry=expiry,
+            spot=spot,
+            width=width,
+            delta_max=delta_max,
+            premium_min=premium_min,
+        )
+        if pick is not None:
+            return _build_from_trigger_and_pick(pcs_trigger, pick, "PCS")
         return SpreadRecommendation(
-            kind="LONG_CALL",
-            reasoning="Directional bull move — naked long call for max delta",
+            kind="NONE",
+            reasoning=(
+                "PCS entry triggered but no strike in scan window had "
+                f"|delta| <= {delta_max} AND mid >= ${premium_min:.2f}"
+            ),
+            fail_reasons=pcs_trigger.reasons,
         )
 
-    # ---- LONG_PUTS branch ----
-    if direction == "LONG_PUTS":
-        if (iv_rank is not None and iv_rank < 30) and confidence == "HIGH":
-            return SpreadRecommendation(
-                kind="LONG_PUT",
-                reasoning=f"HIGH conviction + IVR {iv_rank:.0f}% (cheap puts) — naked long",
-            )
-
-        if is_late_session and top_dex_call_strike is not None and spx_price < top_dex_call_strike:
-            short = round(top_dex_call_strike / 5) * 5
-            long_strike = short + 5
-            credit = 0.70
-            width = long_strike - short
-            return SpreadRecommendation(
-                kind="CCS",
-                reasoning=f"Late-session bearish + spot below DEX call wall {short:.0f} — collect premium with CCS",
-                short_strike=short,
-                long_strike=long_strike,
-                spread_width=width,
-                estimated_credit_per_contract=credit * 100,
-                max_profit_per_contract=credit * 100,
-                max_loss_per_contract=(width - credit) * 100,
-                breakeven=short + credit,
-            )
-
-        if iv_rank is not None and iv_rank > 60:
-            anchor = ntm_max_pain if ntm_max_pain > spx_price else (spx_price + 10)
-            short = round(anchor / 5) * 5
-            long_strike = short + 5
-            credit = 0.85
-            width = 5.0
-            return SpreadRecommendation(
-                kind="CCS",
-                reasoning=f"IVR {iv_rank:.0f}% (rich premium) — sell CCS instead of buying naked",
-                short_strike=short,
-                long_strike=long_strike,
-                spread_width=width,
-                estimated_credit_per_contract=credit * 100,
-                max_profit_per_contract=credit * 100,
-                max_loss_per_contract=(width - credit) * 100,
-                breakeven=short + credit,
-            )
-
+    ccs_trigger = check_ccs_entry(bars_30m)
+    if ccs_trigger.triggered:
+        pick = await find_ccs_strike(
+            ibkr,
+            symbol=symbol,
+            expiry=expiry,
+            spot=spot,
+            width=width,
+            delta_max=delta_max,
+            premium_min=premium_min,
+        )
+        if pick is not None:
+            return _build_from_trigger_and_pick(ccs_trigger, pick, "CCS")
         return SpreadRecommendation(
-            kind="LONG_PUT",
-            reasoning="Directional bear move — naked long put for max negative delta",
+            kind="NONE",
+            reasoning=(
+                "CCS entry triggered but no strike in scan window had "
+                f"|delta| <= {delta_max} AND mid >= ${premium_min:.2f}"
+            ),
+            fail_reasons=ccs_trigger.reasons,
         )
 
-    return SpreadRecommendation(kind="NONE", reasoning="Unrecognized direction")
+    # Neither fired — surface the closer-to-firing rule's reasons so the
+    # panel can show what's pending. Prefer whichever rule has more
+    # criteria already satisfied (= fewer reasons).
+    if len(pcs_trigger.reasons) <= len(ccs_trigger.reasons):
+        pending = pcs_trigger
+        side = "PCS"
+    else:
+        pending = ccs_trigger
+        side = "CCS"
+    return SpreadRecommendation(
+        kind="NONE",
+        reasoning=f"No spread trigger — closest side ({side}): {pending.reasons[0] if pending.reasons else 'unknown'}",
+        fail_reasons=pending.reasons,
+    )

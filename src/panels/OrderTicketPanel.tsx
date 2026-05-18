@@ -247,12 +247,19 @@ export function OrderTicketPanel() {
 
       <div className="ticket-block">
         {spread && (spread.kind === "PCS" || spread.kind === "CCS") && spread.short_strike != null && spread.long_strike != null && (
-          <div className="ticket-spread-banner">
+          <div className="ticket-spread-banner" style={{
+            borderLeft: spread.fresh_trigger
+              ? "3px solid var(--color-green)" : undefined,
+          }}>
             <div className="ticket-spread-kind">
+              {spread.fresh_trigger && (
+                <span style={{ color: "var(--color-green)", marginRight: 6 }}>● NEW</span>
+              )}
               {spread.kind}: SELL {fmt(spread.short_strike, 0)} / BUY {fmt(spread.long_strike, 0)}
             </div>
             <div className="muted small">
               credit ~${fmt((spread.estimated_credit_per_contract ?? 0) / 100, 2)} ·
+              short Δ {spread.short_delta != null ? fmt(spread.short_delta, 2) : "?"} ·
               max profit ${fmt(spread.max_profit_per_contract, 0)} ·
               max loss ${fmt(spread.max_loss_per_contract, 0)} ·
               BE ${fmt(spread.breakeven, 0)}
