@@ -322,8 +322,12 @@ export function ChartPane() {
     }
   }, [showSD]);
 
-  // Apply bars to the chart — full setData on count change, update() on the
-  // last bar when count is same (in case its OHLC adjusted)
+  // Apply bars to the chart + ALWAYS recompute indicators when bars change.
+  //
+  // Previously the indicator recomputation was inside the 'count changed'
+  // branch — which silently skipped recompute when a fresh /bars fetch
+  // returned the same number of bars (very common when switching lookback).
+  // That left stale EMA + StdDev channels on a fresh dataset.
   useEffect(() => {
     if (!seriesRef.current || bars.length === 0) return;
     const candleData: CandlestickData[] = bars.map((b) => ({
@@ -337,100 +341,111 @@ export function ChartPane() {
 
     if (deduped.length !== renderedBarCountRef.current) {
       seriesRef.current.setData(deduped);
-      // EMA 8/21 — recursive: EMA_t = α·close + (1-α)·EMA_{t-1}, α = 2/(N+1)
-      const closes = bars.map(b => b.close);
-      const times = bars.map(b => Math.floor(b.timestamp_ms / 1000) as UTCTimestamp);
-      const ema = (period: number): LineData[] => {
-        const α = 2 / (period + 1);
-        const out: LineData[] = [];
-        let prev: number | null = null;
-        for (let i = 0; i < closes.length; i++) {
-          if (prev == null) {
-            // seed with SMA of first `period` closes
-            if (i >= period - 1) {
-              const seed = closes.slice(0, period).reduce((s, x) => s + x, 0) / period;
-              prev = seed;
-              out.push({ time: times[i], value: seed });
-            }
-          } else {
-            prev = α * closes[i] + (1 - α) * prev;
-            out.push({ time: times[i], value: prev });
-          }
-        }
-        return out;
-      };
-      if (ema8SeriesRef.current) ema8SeriesRef.current.setData(ema(8));
-      if (ema21SeriesRef.current) ema21SeriesRef.current.setData(ema(21));
-
-      // Standard Deviation Channel — TOS-style.
-      //
-      // Per ThinkOrSwim Learning Center: 'composed of two parallel lines to
-      // the Linear Regression trendline and distanced from it by [N] standard
-      // deviations'. TOS fits the regression across the FULL visible chart
-      // window (e.g. all bars in '10D 30min'), not a fixed N-bar lookback —
-      // that's what makes the channel meaningful as a 'this period's
-      // regression' rather than an EMA-like rolling envelope.
-      //
-      // Algorithm:
-      //   1. Fit OLS linear regression y = m·x + b over EVERY bar on chart.
-      //   2. Center line = that regression line.
-      //   3. σ = stddev of the residuals (close - predicted) across all bars.
-      //   4. Bands at ±1σ / ±2σ / ±3σ run parallel to the regression line.
-      //   5. Channel spans the entire visible chart, recomputed when bars
-      //      change (new timeframe, longer lookback, new data poll).
-      const channelData: {
-        mid: LineData[]; up1: LineData[]; up2: LineData[]; up3: LineData[];
-        dn1: LineData[]; dn2: LineData[]; dn3: LineData[];
-      } = { mid: [], up1: [], up2: [], up3: [], dn1: [], dn2: [], dn3: [] };
-
-      if (closes.length >= 2) {
-        const n = closes.length;
-        // x = 0..n-1 relative position across the whole chart
-        let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-        for (let i = 0; i < n; i++) {
-          sumX += i; sumY += closes[i]; sumXY += i * closes[i]; sumX2 += i * i;
-        }
-        const denom = n * sumX2 - sumX * sumX;
-        const m = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
-        const b = (sumY - m * sumX) / n;
-        // Residuals + population σ (TOS uses N, not N-1, for the stddev)
-        let ssq = 0;
-        for (let i = 0; i < n; i++) {
-          const pred = m * i + b;
-          ssq += (closes[i] - pred) ** 2;
-        }
-        const sd_ = Math.sqrt(ssq / n);
-        // Build the 7 parallel lines across every bar
-        for (let i = 0; i < n; i++) {
-          const t = times[i];
-          const y = m * i + b;
-          channelData.mid.push({ time: t, value: y });
-          channelData.up1.push({ time: t, value: y + sd_ });
-          channelData.up2.push({ time: t, value: y + 2 * sd_ });
-          channelData.up3.push({ time: t, value: y + 3 * sd_ });
-          channelData.dn1.push({ time: t, value: y - sd_ });
-          channelData.dn2.push({ time: t, value: y - 2 * sd_ });
-          channelData.dn3.push({ time: t, value: y - 3 * sd_ });
-        }
-      }
-      const sd = sdRefs.current;
-      sd.mid?.setData(channelData.mid);
-      sd.up1?.setData(channelData.up1);
-      sd.up2?.setData(channelData.up2);
-      sd.up3?.setData(channelData.up3);
-      sd.dn1?.setData(channelData.dn1);
-      sd.dn2?.setData(channelData.dn2);
-      sd.dn3?.setData(channelData.dn3);
       renderedBarCountRef.current = deduped.length;
-      // Fit only ONCE per symbol/timeframe load
-      if (!hasFittedOnce && chartRef.current) {
-        chartRef.current.timeScale().fitContent();
-        setHasFittedOnce(true);
-      }
     } else {
-      // Same count — just update the last bar in case its OHLC moved
+      // Same count — update the last bar in case its OHLC moved
       const last = deduped[deduped.length - 1];
       try { seriesRef.current.update(last); } catch {}
+    }
+
+    // --- Indicator recompute — ALWAYS, every time bars[] changes ---
+    const closes = bars.map(b => b.close);
+    const times = bars.map(b => Math.floor(b.timestamp_ms / 1000) as UTCTimestamp);
+
+    // EMA 8/21 — recursive: EMA_t = α·close + (1-α)·EMA_{t-1}, α = 2/(N+1)
+    const ema = (period: number): LineData[] => {
+      const α = 2 / (period + 1);
+      const out: LineData[] = [];
+      let prev: number | null = null;
+      for (let i = 0; i < closes.length; i++) {
+        if (prev == null) {
+          if (i >= period - 1) {
+            const seed = closes.slice(0, period).reduce((s, x) => s + x, 0) / period;
+            prev = seed;
+            out.push({ time: times[i], value: seed });
+          }
+        } else {
+          prev = α * closes[i] + (1 - α) * prev;
+          out.push({ time: times[i], value: prev });
+        }
+      }
+      return out;
+    };
+    if (ema8SeriesRef.current) ema8SeriesRef.current.setData(ema(8));
+    if (ema21SeriesRef.current) ema21SeriesRef.current.setData(ema(21));
+
+    // Standard Deviation Channel — TOS StandardDevChannel.
+    //
+    // y_i = close at bar i, x_i = i (relative index, 0..n-1)
+    //
+    // Centered OLS for numerical stability:
+    //   xbar = mean(x), ybar = mean(y)
+    //   sxx = Σ (x_i - xbar)²
+    //   sxy = Σ (x_i - xbar) (y_i - ybar)
+    //   slope m = sxy / sxx
+    //   intercept b = ybar - m * xbar
+    //
+    // The textbook non-centered form (n·Σxy − Σx·Σy)/(n·Σx² − Σx²)
+    // subtracts two large nearly-equal numbers for big n and loses ~6-10
+    // significant digits — that's why we were seeing the regression slope
+    // flip sign on near-flat charts. Centered form has full precision.
+    //
+    // σ = stddev of residuals (close - predicted) across ALL n bars.
+    // Bands at ±1σ/±2σ/±3σ are parallel to the regression line.
+    const channelData: {
+      mid: LineData[]; up1: LineData[]; up2: LineData[]; up3: LineData[];
+      dn1: LineData[]; dn2: LineData[]; dn3: LineData[];
+    } = { mid: [], up1: [], up2: [], up3: [], dn1: [], dn2: [], dn3: [] };
+
+    if (closes.length >= 2) {
+      const n = closes.length;
+      const xbar = (n - 1) / 2;  // mean of 0..n-1
+      let ybar = 0;
+      for (let i = 0; i < n; i++) ybar += closes[i];
+      ybar /= n;
+      let sxx = 0, sxy = 0;
+      for (let i = 0; i < n; i++) {
+        const dx = i - xbar;
+        const dy = closes[i] - ybar;
+        sxx += dx * dx;
+        sxy += dx * dy;
+      }
+      const m = sxx !== 0 ? sxy / sxx : 0;
+      const intercept = ybar - m * xbar;
+      // Residual stddev — population N (matches TOS convention)
+      let ssq = 0;
+      for (let i = 0; i < n; i++) {
+        const pred = m * i + intercept;
+        const e = closes[i] - pred;
+        ssq += e * e;
+      }
+      const sd_ = Math.sqrt(ssq / n);
+      // Build the 7 parallel lines across every bar
+      for (let i = 0; i < n; i++) {
+        const t = times[i];
+        const y = m * i + intercept;
+        channelData.mid.push({ time: t, value: y });
+        channelData.up1.push({ time: t, value: y + sd_ });
+        channelData.up2.push({ time: t, value: y + 2 * sd_ });
+        channelData.up3.push({ time: t, value: y + 3 * sd_ });
+        channelData.dn1.push({ time: t, value: y - sd_ });
+        channelData.dn2.push({ time: t, value: y - 2 * sd_ });
+        channelData.dn3.push({ time: t, value: y - 3 * sd_ });
+      }
+    }
+    const sd = sdRefs.current;
+    sd.mid?.setData(channelData.mid);
+    sd.up1?.setData(channelData.up1);
+    sd.up2?.setData(channelData.up2);
+    sd.up3?.setData(channelData.up3);
+    sd.dn1?.setData(channelData.dn1);
+    sd.dn2?.setData(channelData.dn2);
+    sd.dn3?.setData(channelData.dn3);
+
+    // Fit only ONCE per symbol/timeframe load
+    if (!hasFittedOnce && chartRef.current) {
+      chartRef.current.timeScale().fitContent();
+      setHasFittedOnce(true);
     }
   }, [bars, hasFittedOnce]);
 
