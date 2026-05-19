@@ -14,6 +14,28 @@ Add new items at the top. Move shipped items to the "Shipped" section.
 
 ## OPEN ITEMS
 
+### 2026-05-19 — 2-iter wall_collapse persistence may be too strict
+- **Symptom**: TODAY zero confluence signals fired (0/22 actionable were
+  confluence; all 22 were aligned_only). User noticed only aligned-only
+  was firing despite having both trigger types checked.
+- **Root cause**: The 2-iter persistence we shipped yesterday (reviewer's
+  Priority 4) requires the wall to lose >20% across BOTH iter[-2]→[-1]
+  AND iter[-3]→[-2]. Effectively ~36%+ cumulative drop over 4+ minutes
+  on a 120s cadence. Very rare.
+- **Yesterday's data (under old 1-iter rule)**: 17/115 actionable were
+  confluence (~15%), of which 7 won (41% win rate, +0.37R).
+- **Today's data (under new 2-iter rule)**: 0/22 confluence.
+- **Three interpretations**:
+  - 2-iter persistence is correct and wall collapses are rare → keep
+  - 2-iter is too strict → relax to 1-iter, or try alternative gates
+    (e.g. iter[-1] vs iter[-3] >25%)
+  - Today's market just didn't have collapses → wait for more sessions
+- **Decision criterion**: After 5 more sessions, if confluence rate
+  stays at 0-2%, the persistence is overkill — revert to 1-iter OR
+  switch to a 2-of-3-window vote variant. If confluence rate climbs
+  back to ~5-15%, the 2-iter filter is working as intended.
+- **Resets freeze?**: YES.
+
 ### 2026-05-19 — BE ladder UI label is misleading
 - **Symptom**: Live Execution panel shows `"locked +0.5R"` when the BE
   ladder fires at the 0.5R MFE trigger. Actual locked profit is **0R**
