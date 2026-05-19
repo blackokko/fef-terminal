@@ -89,27 +89,27 @@ def build_plan(
 
     is_long_calls = direction == FEFDirection.LONG_CALLS
 
-    # Stop sets the R unit. Today's data showed 10pt risk + 10pt T1 = 1:1
-    # which can't be profitable at 22% win rate. New design: T1 = 1R, T2 = 2R
-    # so wins can clear the loser-magnitude in fewer hits. With 50/30/20 split
-    # the weighted reward is (0.5 * 1R) + (0.3 * 2R) + (0.2 * T3R).
+    # T1 at 1.5R, T2 at 2.5R per Chat Claude's review. At 1:1 (T1=1R) the
+    # math required 55%+ win rate to clear breakeven — current confluence
+    # win rate is 41%. Moving T1 to 1.5R + 30% size lets each win contribute
+    # more, T2 stays well-positioned for the MFE distribution (80% of winners
+    # reach >=2R in today's data).
     stop_distance = 10.0
     stop = spot - stop_distance if is_long_calls else spot + stop_distance
 
-    # T1: 1R from spot. If a wall is closer (and ahead), prefer it but never
-    # use a wall that yields <0.5R since that's a setup we can't win at.
-    one_r_offset = stop_distance  # 10pts
-    t1_fixed = spot + one_r_offset if is_long_calls else spot - one_r_offset
-    if walls_dir and abs(walls_dir[0] - spot) >= 0.5 * stop_distance and abs(walls_dir[0] - spot) <= 25:
+    # T1: 1.5R from spot. Wall override only if 0.5R-2R band.
+    t1_offset = 1.5 * stop_distance  # 15pts
+    t1_fixed = spot + t1_offset if is_long_calls else spot - t1_offset
+    if walls_dir and 0.5 * stop_distance <= abs(walls_dir[0] - spot) <= 2 * stop_distance:
         t1 = walls_dir[0]
     else:
         t1 = t1_fixed
 
-    # T2: 2R from spot. Wall override only if 2R <= wall <= 2.5R.
-    two_r_offset = 2 * stop_distance  # 20pts
-    t2_fixed = spot + two_r_offset if is_long_calls else spot - two_r_offset
+    # T2: 2.5R from spot. Wall override only if 2R-3R band.
+    t2_offset = 2.5 * stop_distance  # 25pts
+    t2_fixed = spot + t2_offset if is_long_calls else spot - t2_offset
     t2_candidates = [w for w in walls_dir if abs(w - t1) > 3]
-    if t2_candidates and 0.8 * two_r_offset <= abs(t2_candidates[0] - spot) <= 1.3 * two_r_offset:
+    if t2_candidates and 2 * stop_distance <= abs(t2_candidates[0] - spot) <= 3 * stop_distance:
         t2 = t2_candidates[0]
     else:
         t2 = t2_fixed

@@ -466,6 +466,7 @@ async def auto_trade_status(request: Request) -> dict[str, Any]:
         "last_block_reason": s.auto_trade_last_block_reason,
         "session_cap_reached": s.auto_trade_count_session >= s.auto_trade_max_per_session,
         "qty_override": s.auto_trade_qty_override,
+        "trigger_types": s.auto_trade_trigger_types,
         "runner_protect_enabled": s.runner_protect_enabled,
     }
 
@@ -552,6 +553,12 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
         s.auto_trade_max_per_session = max(1, min(50, int(body["max_per_session"])))
     if "qty_override" in body:
         s.auto_trade_qty_override = max(0, min(100, int(body["qty_override"])))
+    if "trigger_types" in body:
+        valid = {"confluence", "aligned_only", "wall_only"}
+        types = [t for t in body["trigger_types"] if t in valid]
+        if not types:
+            types = ["confluence"]  # never allow empty — would block all fires silently
+        s.auto_trade_trigger_types = types
 
     await SignalIterRepository.write_audit_log(
         category="auto_trade_toggle", actor="user",
@@ -706,6 +713,33 @@ async def tuning_decide(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         session.add(r)
         await session.commit()
     return {"ok": True, "id": rec_id, "status": decision}
+
+
+@router.get("/engine/freeze_state")
+async def engine_freeze_state() -> dict[str, Any]:
+    """Sessions since most recent EngineChange — drives the FREEZE N/10
+    pill on the TopBar. Compares EngineChange.applied_at against
+    DailyReview.session_date count after that date.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import DailyReview, EngineChange
+    from sqlmodel import select as _s
+    async with _gs() as session:
+        latest = (await session.exec(
+            _s(EngineChange).order_by(EngineChange.applied_at.desc()).limit(1)  # type: ignore[attr-defined]
+        )).first()
+        reviews = list((await session.exec(_s(DailyReview))).all())
+    if latest is None:
+        return {"sessions_since_change": len(reviews), "target": 10,
+                "last_change": None, "last_change_at": None}
+    last_change_date = latest.applied_at.strftime("%Y-%m-%d")
+    sessions_after = sum(1 for r in reviews if r.session_date > last_change_date)
+    return {
+        "sessions_since_change": sessions_after,
+        "target": 10,
+        "last_change": latest.name,
+        "last_change_at": latest.applied_at.isoformat(),
+    }
 
 
 @router.get("/engine/changes")

@@ -16,7 +16,15 @@ interface AutoTradeStatus {
   session_cap_reached: boolean;
   runner_protect_enabled: boolean;
   qty_override: number;
+  trigger_types: string[];
 }
+
+const TRIGGER_TYPES = [
+  { value: "confluence", label: "Confluence (wall_collapse + aligned)",
+    hint: "Today: 41% win, +0.37R — the only profitable subset so far" },
+  { value: "aligned_only", label: "Aligned-only",
+    hint: "Today: 22% win, −0.26R — keep ON to grow sample for validation" },
+];
 
 export function AutoTradePanel() {
   const [status, setStatus] = useState<AutoTradeStatus | null>(null);
@@ -168,13 +176,14 @@ export function AutoTradePanel() {
       <table className="auto-trade-settings">
         <tbody>
           <tr>
-            <td>Confidence floor</td>
+            <td>Confidence floor <span className="muted small">(label only)</span></td>
             <td>
               <select
                 value={status.confidence_floor}
                 onChange={(e) => void updateSetting("confidence_floor", e.target.value)}
                 disabled={busy}
                 className="settings-input"
+                title="Demoted to informational. The Trigger Types selection above is the actual auto-trade volume knob. Set FEF_USE_CONFIDENCE_FLOOR=true env to re-enable as a gate."
               >
                 <option>HIGH</option>
                 <option>MEDIUM</option>
@@ -198,6 +207,30 @@ export function AutoTradePanel() {
                      value={status.max_per_session}
                      onChange={(e) => void updateSetting("max_per_session", Number(e.target.value))}
                      disabled={busy} className="settings-input" style={{ width: 80 }} />
+            </td>
+          </tr>
+          <tr>
+            <td>Trigger types</td>
+            <td>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                {TRIGGER_TYPES.map(t => (
+                  <label key={t.value} style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 11 }}>
+                    <input
+                      type="checkbox"
+                      checked={(status.trigger_types ?? []).includes(t.value)}
+                      onChange={(e) => {
+                        const cur = status.trigger_types ?? [];
+                        const next = e.target.checked
+                          ? [...cur, t.value]
+                          : cur.filter(x => x !== t.value);
+                        void updateSetting("trigger_types", next.length ? next : ["confluence"]);
+                      }}
+                      disabled={busy}
+                    />
+                    <span title={t.hint}>{t.label}</span>
+                  </label>
+                ))}
+              </div>
             </td>
           </tr>
           <tr>

@@ -41,6 +41,17 @@ export function VerdictTimelinePanel() {
   const [filterDir, setFilterDir] = useState<string>("ALL");
   const [filterConf, setFilterConf] = useState<string>("ALL");
   const [hideWait, setHideWait] = useState(true);
+  const [filterTrigger, setFilterTrigger] = useState<string>("CONFLUENCE_OR_ALIGNED");
+
+  const triggerOf = (r: Row): string => {
+    const ex = r.extras || {};
+    const aligned = !!ex.aligned;
+    const wall = !!ex.wall_collapse_trigger;
+    if (wall && aligned) return "confluence";
+    if (aligned) return "aligned_only";
+    if (wall) return "wall_only";
+    return "other";
+  };
 
   const refresh = async () => {
     try {
@@ -60,6 +71,14 @@ export function VerdictTimelinePanel() {
   if (filterDir !== "ALL") filtered = filtered.filter(r => r.direction === filterDir);
   if (filterConf !== "ALL") filtered = filtered.filter(r => r.confidence === filterConf);
   if (hideWait) filtered = filtered.filter(r => r.direction !== "WAIT");
+  if (filterTrigger === "CONFLUENCE_ONLY") {
+    filtered = filtered.filter(r => triggerOf(r) === "confluence");
+  } else if (filterTrigger === "CONFLUENCE_OR_ALIGNED") {
+    filtered = filtered.filter(r => {
+      const t = triggerOf(r);
+      return t === "confluence" || t === "aligned_only" || r.direction === "WAIT";
+    });
+  }
   filtered = filtered.slice(0, 80);
 
   return (
@@ -83,6 +102,12 @@ export function VerdictTimelinePanel() {
           <input type="checkbox" checked={hideWait} onChange={e => setHideWait(e.target.checked)} />
           Hide WAIT
         </label>
+        <select value={filterTrigger} onChange={e => setFilterTrigger(e.target.value)} className="settings-input"
+                title="Filter by trigger type. Default hides wall-only and other non-trigger verdicts to reduce noise.">
+          <option value="CONFLUENCE_OR_ALIGNED">Confluence + Aligned (default)</option>
+          <option value="CONFLUENCE_ONLY">Confluence only</option>
+          <option value="ALL">All trigger types</option>
+        </select>
       </div>
 
       {filtered.length === 0 ? (
@@ -91,7 +116,7 @@ export function VerdictTimelinePanel() {
         <table style={{ width: "100%", fontSize: 11, fontFamily: "var(--font-mono)" }}>
           <thead>
             <tr style={{ color: "var(--color-text-muted)", textAlign: "left" }}>
-              <th>Time</th><th>#</th><th>SPX</th><th>Direction</th><th>Conf</th><th>Strike</th>
+              <th>Time</th><th>#</th><th>SPX</th><th>Direction</th><th>Conf</th><th>Trigger</th><th>Strike</th>
             </tr>
           </thead>
           <tbody>
@@ -106,6 +131,9 @@ export function VerdictTimelinePanel() {
                     {r.direction}
                   </td>
                   <td style={{ color: CONF_COLOR[r.confidence] }}>{r.confidence}</td>
+                  <td className="muted small" style={{
+                    color: triggerOf(r) === "confluence" ? "var(--color-green)" : undefined,
+                  }}>{triggerOf(r)}</td>
                   <td className="muted">{ex.strike_rec ?? "—"}</td>
                 </tr>
               );

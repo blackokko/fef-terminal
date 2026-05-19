@@ -316,31 +316,43 @@ class FEFEngine:
             (only if drift_cum_net_m is non-positive)
           ITM wall collapses (call below / put above spot) → not directional
         """
-        if len(self._history) < 2:
+        # 2-iter persistence: require collapse signal to hold across two
+        # comparisons (iter[-2]→iter[-1] AND iter[-3]→iter[-2]). On a 120s
+        # cadence a 1-iter 20% wall drop is borderline indistinguishable
+        # from QuantData snapshot noise. Standard flow-system noise filter.
+        if len(self._history) < 3:
             return False, None
 
         prev = self._history[-2]
+        prev2 = self._history[-3]
         cur = self._history[-1]
 
-        if not prev.top_gex_walls or not cur.top_gex_walls:
+        if not prev.top_gex_walls or not cur.top_gex_walls or not prev2.top_gex_walls:
             return False, None
 
-        prior_top = max(prev.top_gex_walls, key=lambda w: abs(w.net_m))
-        current_same = next(
-            (w for w in cur.top_gex_walls if abs(w.strike - prior_top.strike) < 1.0),
-            None,
-        )
+        def _check_collapse(older, newer) -> bool:
+            """True if newer iter shows >threshold loss vs older iter at the
+            dominant wall of `older`."""
+            older_top = max(older.top_gex_walls, key=lambda w: abs(w.net_m))
+            newer_same = next(
+                (w for w in newer.top_gex_walls if abs(w.strike - older_top.strike) < 1.0),
+                None,
+            )
+            if newer_same is None:
+                return True  # wall fell out of top 5 entirely
+            older_abs = abs(older_top.net_m)
+            newer_abs = abs(newer_same.net_m)
+            if older_abs < self._wall_collapse_floor_m:
+                return False
+            loss_pct = (older_abs - newer_abs) / older_abs if older_abs > 0 else 0.0
+            return loss_pct >= self._wall_collapse_pct
 
-        # Magnitude check — only trigger when meaningful exposure has been lost
-        if current_same is not None:
-            prior_abs = abs(prior_top.net_m)
-            cur_abs = abs(current_same.net_m)
-            if prior_abs < self._wall_collapse_floor_m:
-                return False, None
-            loss_pct = (prior_abs - cur_abs) / prior_abs if prior_abs > 0 else 0.0
-            if loss_pct < self._wall_collapse_pct:
-                return False, None
-        # If wall fell out of top 5 entirely, treat as full collapse — fall through
+        # Both window comparisons must show the collapse
+        if not (_check_collapse(prev, cur) and _check_collapse(prev2, prev)):
+            return False, None
+
+        # Use the prior iter's top wall as the reference for direction.
+        prior_top = max(prev.top_gex_walls, key=lambda w: abs(w.net_m))
 
         # Direction by wall TYPE + position
         is_call_wall = prior_top.net_m > 0

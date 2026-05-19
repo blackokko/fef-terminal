@@ -137,18 +137,21 @@ def test_aligned_long_puts_fires() -> None:
 
 
 def test_wall_collapse_special_trigger() -> None:
+    """Wall collapse with 2-iter persistence: requires the >20% loss to hold
+    across two consecutive iter comparisons (noise filter)."""
     engine = FEFEngine(history_window=3, wall_collapse_pct=0.20)
 
-    big = [(7440.0, 50000.0)]  # massive call wall
-    collapsed = [(7440.0, 20000.0)]  # lost 60% — collapse
+    big = [(7440.0, 50000.0)]      # massive call wall
+    mid = [(7440.0, 30000.0)]      # 40% loss vs big (collapse step 1)
+    collapsed = [(7440.0, 15000.0)]  # 50% loss vs mid (collapse step 2)
 
     engine.push(_iter(ts=1, spx=7420.0, drift_m=0.0, gex_walls=big))
     engine.push(_iter(ts=2, spx=7422.0, drift_m=2.0, gex_walls=big))
-    engine.push(_iter(ts=3, spx=7424.0, drift_m=4.0, gex_walls=big))
+    engine.push(_iter(ts=3, spx=7424.0, drift_m=4.0, gex_walls=mid))
     last = engine.push(_iter(ts=4, spx=7426.0, drift_m=6.0, gex_walls=collapsed))
 
     assert last.wall_collapse_trigger is True
-    assert last.direction == FEFDirection.LONG_CALLS  # break in direction of collapsed wall
+    assert last.direction == FEFDirection.LONG_CALLS
     assert last.confidence == FEFConfidence.HIGH
 
 
@@ -182,18 +185,21 @@ def test_wall_collapse_skips_when_drift_contradicts() -> None:
 
 
 def test_wall_collapse_put_below_fires_long_puts_when_drift_agrees() -> None:
-    """Put wall below collapses + bearish drift → LONG_PUTS (floor gone)."""
+    """Put wall below collapses + bearish drift → LONG_PUTS (floor gone).
+    Updated for 2-iter persistence: collapse must hold across two iter
+    comparisons, so the wall drops in two steps."""
     engine = FEFEngine(history_window=3, wall_collapse_pct=0.20)
 
     put_wall_big = [(7380.0, -50000.0)]
-    put_wall_collapsed = [(7380.0, -10000.0)]
+    put_wall_mid = [(7380.0, -30000.0)]       # 40% loss vs big
+    put_wall_collapsed = [(7380.0, -10000.0)]  # 67% loss vs mid
 
     engine.push(_iter(ts=1, spx=7420.0, drift_m=0.0,
                       gex_walls=put_wall_big, bias="BEARISH"))
     engine.push(_iter(ts=2, spx=7415.0, drift_m=-3.0,
                       gex_walls=put_wall_big, bias="BEARISH"))
     engine.push(_iter(ts=3, spx=7410.0, drift_m=-6.0,
-                      gex_walls=put_wall_big, bias="BEARISH"))
+                      gex_walls=put_wall_mid, bias="BEARISH"))
     last = engine.push(_iter(ts=4, spx=7405.0, drift_m=-10.0,
                              gex_walls=put_wall_collapsed, bias="BEARISH"))
 

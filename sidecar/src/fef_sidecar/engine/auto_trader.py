@@ -41,6 +41,7 @@ class BlockReason:
     DISABLED = "DISABLED"
     ENV_NOT_SET = "ENV_NOT_SET"
     VERDICT_WAIT = "VERDICT_WAIT"
+    TRIGGER_NOT_ENABLED = "TRIGGER_NOT_ENABLED"
     BELOW_FLOOR = "BELOW_FLOOR"
     CALENDAR_PAUSE = "CALENDAR_PAUSE"
     COOL_DOWN = "COOL_DOWN"
@@ -51,6 +52,17 @@ class BlockReason:
     NO_STRIKE = "NO_STRIKE"
     PLACE_ERROR = "PLACE_ERROR"
     FIRED = "FIRED"
+
+
+def _verdict_trigger_type(v: dict) -> str:
+    """Map a verdict's boolean flags to a named trigger category.
+    Same logic used by daily_review's by_trigger aggregation."""
+    aligned = bool(v.get("aligned"))
+    wall = bool(v.get("wall_collapse_trigger"))
+    if wall and aligned: return "confluence"
+    if aligned: return "aligned_only"
+    if wall: return "wall_only"
+    return "other"
 
 
 @dataclass(frozen=True)
@@ -86,12 +98,31 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     if direction not in ("LONG_CALLS", "LONG_PUTS"):
         return AutoTradeDecision(False, f"verdict is {direction}", BlockReason.VERDICT_WAIT)
 
-    # Gate 4: confidence floor
+    # Gate 3.5: trigger type must be enabled in state.auto_trade_trigger_types.
+    # Replaces the confidence_floor as the primary volume knob — today's data
+    # showed confidence-floor was inverted (HIGH 14% win vs LOW 41%).
+    # Trigger-type gating uses the actual engine flag (aligned, wall_collapse)
+    # which we know separates winners from losers more cleanly.
+    trigger_type = _verdict_trigger_type(verdict_dict)
+    enabled_triggers = getattr(state, "auto_trade_trigger_types", ["confluence", "aligned_only"])
+    if trigger_type not in enabled_triggers:
+        return AutoTradeDecision(
+            False,
+            f"trigger '{trigger_type}' not in enabled {enabled_triggers}",
+            BlockReason.TRIGGER_NOT_ENABLED,
+        )
+
+    # Gate 4: confidence floor — DEMOTED to informational. Confidence is still
+    # computed and stored on the verdict, but it no longer gates auto-trade.
+    # The above trigger-type gate is the actual volume knob. To re-enable
+    # confidence-floor gating, set FEF_USE_CONFIDENCE_FLOOR=true.
+    import os as _os
     conf = verdict_dict.get("confidence", "NONE")
-    if _CONFIDENCE_RANK.get(conf, 0) < _CONFIDENCE_RANK.get(state.auto_trade_confidence_floor, 3):
-        return AutoTradeDecision(False,
-            f"{conf} below floor {state.auto_trade_confidence_floor}",
-            BlockReason.BELOW_FLOOR)
+    if _os.environ.get("FEF_USE_CONFIDENCE_FLOOR", "false").lower() in ("true", "1", "yes"):
+        if _CONFIDENCE_RANK.get(conf, 0) < _CONFIDENCE_RANK.get(state.auto_trade_confidence_floor, 3):
+            return AutoTradeDecision(False,
+                f"{conf} below floor {state.auto_trade_confidence_floor}",
+                BlockReason.BELOW_FLOOR)
 
     # Gate 5: calendar pause window
     try:
@@ -161,11 +192,12 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     from fef_sidecar.engine.live_trading import BracketSpec, place_bracket
 
     today = time.strftime("%Y%m%d")
-    # 50/30/20 split — let runners run. Today's MFE analysis: 80% of winners
-    # reach >=2R MFE, 40% reach >=3R. Old 85/10/5 was exiting most of the
-    # position at T1 (1R) leaving the bulk of the move on the table.
-    t1_qty = max(1, round(qty * 0.50))
-    t2_qty = max(1, round(qty * 0.30))
+    # 30/40/30 split — shift weight toward T2 (now 2.5R). At 41% win rate
+    # (confluence), the math favors carrying more capital into the larger
+    # R-multiples. T1 reduced from 50% to 30%; T2 raised from 30% to 40%;
+    # T3 stays roughly even.
+    t1_qty = max(1, round(qty * 0.30))
+    t2_qty = max(1, round(qty * 0.40))
     t3_qty = max(1, qty - t1_qty - t2_qty)
     if t1_qty + t2_qty + t3_qty != qty:
         t1_qty = qty - t2_qty - t3_qty

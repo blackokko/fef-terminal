@@ -191,6 +191,17 @@ class AppState:
     # (global max_per_session AND per-symbol max_per_symbol).
     auto_trade_count_by_symbol: dict[str, int] = field(default_factory=dict)
     auto_trade_max_per_symbol: int = 2
+    # Trigger types the auto-trader is willing to fire on. Maps engine
+    # verdict flags (aligned, wall_collapse_trigger) to named categories.
+    # Default permissive: keep data flowing on both subsets so we can
+    # observe whether confluence sustains its edge across sessions.
+    #   'confluence'    = wall_collapse + aligned (today: +0.37R, 41% win)
+    #   'aligned_only'  = aligned without wall_collapse (today: -0.26R, 22% win)
+    #   'wall_only'     = wall_collapse without aligned (currently impossible
+    #                     post wall_collapse_requires_aligned gate)
+    auto_trade_trigger_types: list[str] = field(default_factory=lambda: [
+        "confluence", "aligned_only"
+    ])
 
     # Shadow engine — parallel evaluator for A/B-testing engine changes.
     # When set, every iter is pushed to BOTH the production engine and the
