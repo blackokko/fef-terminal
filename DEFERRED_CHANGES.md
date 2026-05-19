@@ -14,6 +14,40 @@ Add new items at the top. Move shipped items to the "Shipped" section.
 
 ## OPEN ITEMS
 
+### 2026-05-19 — Auto-trade stacks contracts on existing positions
+- **Symptom**: User saw 7400C grow to 20 contracts as subsequent signals
+  fired while the position was already open. With 5-contract auto-trade
+  size, 4 successive same-strike fires = 20 contracts on one contract.
+- **Why this happens**: The 9-gate auto-trader doesn't check existing
+  IBKR positions before submitting a new BUY. It checks confidence,
+  cool-down, session cap, etc., but treats each fire as independent.
+  When the cool-down is lowered for data-gathering velocity, the same
+  contract can fire multiple times before earlier positions resolve.
+- **What it puts at risk**:
+  - The dollar_loss_cap is per-parent ($3k each), so 4 parents = $12k
+    of potential drawdown on one contract instead of $3k
+  - The BE ladder is per-parent. 4 parents on same contract = 4
+    different `dynamic_stop_level` values, all trying to manage the
+    same underlying long
+  - The position-check we added prevents accidental shorting on EXIT,
+    but doesn't prevent stacking on ENTRY
+  - SYMBOL_CAP gate (max 2 per session per symbol) was supposed to
+    cap this, but user has it at higher / disabled for data collection
+- **Two fix variants**:
+  - **A (per-contract cap)**: Gate auto-trade — if IBKR positions
+    already include this exact (symbol, strike, right, expiry) at >=N
+    contracts, block with `BlockReason.POSITION_ALREADY_OPEN`. N is a
+    user setting (default 1: never stack).
+  - **B (per-contract cool-down)**: Track last-fire time per
+    (strike, right, expiry) tuple instead of per-symbol. So even with
+    a short symbol-cool-down, the exact same contract requires a
+    longer fresh-trade cool-down (say 5 min).
+- **Current workaround**: Keep SYMBOL_CAP low (2/session per symbol) +
+  use longer cool-down. User said they want short cool-down for max
+  data volume, so this is a real tension.
+- **Resets freeze?**: YES (new auto-trader gate). But it's a safety
+  feature, not engine tuning — defensible whenever the user wants it.
+
 ### 2026-05-19 — 2-iter wall_collapse persistence may be too strict
 - **Symptom**: TODAY zero confluence signals fired (0/22 actionable were
   confluence; all 22 were aligned_only). User noticed only aligned-only
