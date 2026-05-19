@@ -797,6 +797,204 @@ async def engine_change_log(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     return {"ok": True, "id": row.id}
 
 
+@router.get("/diag/ibkr_executions")
+async def diag_ibkr_executions(request: Request, days: int = 1) -> dict[str, Any]:
+    """Pull every fill from IBKR for the last N days. Authoritative source
+    for what actually executed — useful to cross-reference against our
+    LiveOrder records. Returns raw executions + grouped by contract.
+    """
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    s = _state(request)
+    if not isinstance(s.ibkr, LiveIBKRProvider):
+        return {"mode": "mock", "executions": [], "by_contract": {}}
+    ib = getattr(s.ibkr, "_ib", None)
+    if ib is None or not ib.isConnected():
+        return {"mode": "disconnected"}
+
+    try:
+        # ib_async: reqExecutionsAsync with no filter returns all recent fills
+        # (IBKR caps at ~7 days). For wider history we'd need /reqAllOpenOrders.
+        fills = await ib.reqExecutionsAsync()
+    except Exception as e:
+        return {"mode": "live", "error": f"reqExecutionsAsync failed: {e}"}
+
+    cutoff = _dt.now(_tz.utc) - _td(days=days)
+    out_exec: list[dict[str, Any]] = []
+    by_contract: dict[str, list[dict]] = {}
+    for f in fills:
+        ex = f.execution
+        c = f.contract
+        if getattr(c, "secType", "") != "OPT":
+            continue
+        # ex.time is a datetime, tz-aware
+        ts = ex.time if hasattr(ex, "time") and ex.time else None
+        if ts is None: continue
+        if ts.tzinfo is None: ts = ts.replace(tzinfo=_tz.utc)
+        if ts < cutoff: continue
+
+        contract_key = f"{c.symbol} {c.strike}{c.right} {c.lastTradeDateOrContractMonth}"
+        rec = {
+            "exec_id": ex.execId,
+            "timestamp": ts.isoformat(),
+            "contract": contract_key,
+            "side": ex.side,  # 'BOT' or 'SLD'
+            "shares": float(ex.shares),
+            "price": float(ex.price),
+            "ib_order_id": ex.orderId,
+            "perm_id": ex.permId,
+            "cum_qty": float(ex.cumQty),
+            "avg_price": float(ex.avgPrice),
+        }
+        out_exec.append(rec)
+        by_contract.setdefault(contract_key, []).append(rec)
+
+    # Compute realized P/L per contract from the fills directly
+    pnl_by_contract: dict[str, dict[str, Any]] = {}
+    for k, fills_list in by_contract.items():
+        bought = sum(f["shares"] * f["price"] for f in fills_list if f["side"] == "BOT")
+        sold = sum(f["shares"] * f["price"] for f in fills_list if f["side"] == "SLD")
+        bot_qty = sum(f["shares"] for f in fills_list if f["side"] == "BOT")
+        sld_qty = sum(f["shares"] for f in fills_list if f["side"] == "SLD")
+        # Realized P/L (only for fully closed positions; partial closes ratable)
+        realized = (sold - bought) * 100 if bot_qty == sld_qty else None
+        pnl_by_contract[k] = {
+            "bot_qty": bot_qty,
+            "sld_qty": sld_qty,
+            "avg_bot_price": round(bought / bot_qty, 4) if bot_qty else None,
+            "avg_sld_price": round(sold / sld_qty, 4) if sld_qty else None,
+            "realized_pnl_dollars": round(realized, 2) if realized is not None else None,
+            "fully_closed": bot_qty == sld_qty,
+            "fills_count": len(fills_list),
+        }
+
+    # Session totals (today UTC for clean math; could refine to ET)
+    total_realized = sum(p["realized_pnl_dollars"] or 0 for p in pnl_by_contract.values())
+
+    return {
+        "mode": "live",
+        "days": days,
+        "total_executions": len(out_exec),
+        "contracts_touched": len(by_contract),
+        "total_realized_pnl_dollars": round(total_realized, 2),
+        "pnl_by_contract": pnl_by_contract,
+        "executions": out_exec,
+    }
+
+
+@router.get("/diag/trade_reconcile")
+async def diag_trade_reconcile(request: Request) -> dict[str, Any]:
+    """Cross-reference our LiveOrder records with IBKR's authoritative
+    execution log. Surfaces:
+      - DB parents that have IBKR fills (matched)
+      - DB parents that have NO IBKR fills (silent rejection / phantom)
+      - IBKR fills that have NO matching DB parent (manual orders / DB wipe)
+      - Real per-trade P/L from actual fill prices (vs our +1.1R/-1R approx)
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import LiveOrder
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from sqlmodel import select as _s
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    s = _state(request)
+    if not isinstance(s.ibkr, LiveIBKRProvider):
+        return {"mode": "mock"}
+    ib = getattr(s.ibkr, "_ib", None)
+    if ib is None or not ib.isConnected():
+        return {"mode": "disconnected"}
+
+    today_et = _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+
+    async with _gs() as session:
+        db_parents = list((await session.exec(
+            _s(LiveOrder).where(LiveOrder.bracket_role == "parent")
+            .where(LiveOrder.dry_run == False)  # noqa: E712
+        )).all())
+    db_parents_today = [p for p in db_parents
+                        if p.submitted_at.strftime("%Y-%m-%d") == today_et]
+
+    try:
+        fills = await ib.reqExecutionsAsync()
+    except Exception as e:
+        return {"mode": "live", "error": f"reqExecutionsAsync failed: {e}"}
+
+    # Index IBKR fills by (orderId, permId) and by contract
+    ibkr_by_order_id: dict[int, list] = {}
+    ibkr_by_perm_id: dict[int, list] = {}
+    for f in fills:
+        ex = f.execution
+        oid = getattr(ex, "orderId", None)
+        pid = getattr(ex, "permId", None)
+        if oid is not None:
+            ibkr_by_order_id.setdefault(oid, []).append(f)
+        if pid is not None:
+            ibkr_by_perm_id.setdefault(pid, []).append(f)
+
+    matched: list[dict] = []
+    db_without_ibkr: list[dict] = []
+    for p in db_parents_today:
+        ibkr_fills = []
+        if p.ib_order_id and p.ib_order_id in ibkr_by_order_id:
+            ibkr_fills = ibkr_by_order_id[p.ib_order_id]
+        elif p.ib_perm_id and p.ib_perm_id in ibkr_by_perm_id:
+            ibkr_fills = ibkr_by_perm_id[p.ib_perm_id]
+        if not ibkr_fills:
+            db_without_ibkr.append({
+                "parent_id": p.id, "contract": f"{p.symbol} {p.strike}{p.right}",
+                "qty": p.qty, "status": p.status,
+                "ib_order_id": p.ib_order_id,
+                "submitted_at": p.submitted_at.isoformat(),
+            })
+            continue
+        fill_prices = [float(f.execution.price) for f in ibkr_fills]
+        matched.append({
+            "parent_id": p.id, "contract": f"{p.symbol} {p.strike}{p.right}",
+            "db_qty": p.qty, "db_status": p.status,
+            "db_limit_price": p.limit_price,
+            "ibkr_fills_count": len(ibkr_fills),
+            "ibkr_avg_fill_price": round(sum(fill_prices) / len(fill_prices), 4),
+            "ibkr_first_fill_price": fill_prices[0],
+        })
+
+    # Find IBKR fills with no matching DB parent (only BOT side — SLD would be
+    # exits managed by our watcher, which is expected and not orphan)
+    db_known_order_ids = {p.ib_order_id for p in db_parents if p.ib_order_id}
+    db_known_perm_ids = {p.ib_perm_id for p in db_parents if p.ib_perm_id}
+    ibkr_without_db: list[dict] = []
+    for f in fills:
+        ex = f.execution
+        c = f.contract
+        if getattr(c, "secType", "") != "OPT": continue
+        if ex.side != "BOT": continue  # only flag entries
+        if ex.orderId in db_known_order_ids: continue
+        if ex.permId in db_known_perm_ids: continue
+        ts = ex.time if ex.time and ex.time.tzinfo else (
+            ex.time.replace(tzinfo=_tz.utc) if ex.time else None)
+        ibkr_without_db.append({
+            "exec_id": ex.execId,
+            "timestamp": ts.isoformat() if ts else None,
+            "contract": f"{c.symbol} {c.strike}{c.right}",
+            "side": ex.side,
+            "qty": float(ex.shares),
+            "price": float(ex.price),
+            "ib_order_id": ex.orderId,
+        })
+
+    return {
+        "mode": "live",
+        "session_date_et": today_et,
+        "db_parents_today": len(db_parents_today),
+        "matched": len(matched),
+        "db_without_ibkr_fill": len(db_without_ibkr),
+        "ibkr_fill_without_db_parent": len(ibkr_without_db),
+        "matched_detail": matched,
+        "db_without_ibkr_detail": db_without_ibkr,
+        "ibkr_without_db_detail": ibkr_without_db,
+    }
+
+
 @router.get("/diag/pnl")
 async def diag_pnl(request: Request) -> dict[str, Any]:
     """Diagnostic: show raw IBKR PnL subscription state + AccountSummary
