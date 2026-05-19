@@ -28,25 +28,44 @@ Add new items at the top. Move shipped items to the "Shipped" section.
 - **Category**: UI labeling bug. Pure render-time math.
 - **Resets freeze?**: No.
 
-### 2026-05-19 — BE ladder uses SPX, not option price
+### 2026-05-19 — BE ladder uses SPX, not option price [HIGH PRIORITY]
 - **Symptom**: BE ladder correctly moves stop to entry SPX, but the
   option premium at "entry SPX" is LOWER than entry option price after a
   round trip. Theta decay (5-15% on 0DTE per ~10 min) + bid-ask slippage
   (~$0.20/contract round trip) means "SPX BE" ≠ "option BE". Trades can
   exit at "0R locked" SPX but actually negative on P/L.
+- **EVIDENCE FROM 2026-05-19 (live paper data)**:
+  - 9 parent trades, 2 winners, 7 losers
+  - **5 of 7 losers** triggered BE ladder at +0.5R MFE, then retraced to
+    entry SPX. Exited at "locked +0R" per the system but option-negative.
+  - User observation confirmed: "trades that go green then red are the
+    majority of losses". Empirically true for today's sample (5/7 = 71%).
+  - Secondary observation: late-day stops were WORSE than early stops
+    even at the same "+0R locked" classification. Theta acceleration on
+    0DTE through the afternoon. Structural feature of 0DTE, not engine
+    bug — but the BE design needs to ACCOUNT for it.
 - **Two fix variants**:
   - **2a (calibration buffer, easy)**: Change `BE_LADDER` to
     `[(0.5, 0.2), (1.0, 0.6), (1.5, 1.1)]` — at MFE +0.5R, stop moves to
-    entry + 0.2R giving theta cushion. Magnitudes are guesses without
-    multi-session data.
+    entry + 0.2R giving theta cushion. Buffer magnitude is still a guess
+    without multi-session data.
   - **2b (option-price ladder, correct)**: Capture actual fill price at
     order placement. Watcher polls option mid every N seconds, ratchets
     stop in OPTION-PRICE space. Mathematically guarantees "locked +X%"
-    means real P/L. Requires extra IBKR quote calls per parent.
+    means real P/L. Independent of theta. Requires extra IBKR quote calls
+    per parent — adds API load.
+  - **2c (time-of-day-aware buffer)**: 2a's buffer scales with minutes-
+    to-close. Earlier in day = smaller buffer. Late afternoon = larger
+    buffer. Empirical calibration after multi-session data.
 - **Category**: Engine / exit-strategy change.
 - **Resets freeze?**: YES. The reviewer specifically warned about this
-  kind of mid-flight tuning — recommend waiting for ≥10 sessions of data
-  to inform whether 2a's magnitude or 2b's frequency is the right call.
+  kind of mid-flight tuning. With today's evidence (5/7 losers fit the
+  pattern), this is the highest-priority deferred change, but waiting
+  for the freeze to elapse + multi-session data is still the right call.
+- **Decision criterion for shipping**: After ≥10 sessions, if the
+  "5/7 losers fit BE retrace pattern" ratio holds AT or above 50%, ship
+  variant 2b (option-price). If the pattern fades with more data, the
+  current SPX-BE may be fine.
 
 ### 2026-05-19 — IBKR reqPnL returning 0 for DUM098107
 - **Symptom**: Today's P/L pill shows 0 from IBKR despite 16 closed
