@@ -873,6 +873,45 @@ async def diag_session_pnl_estimate(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/history/hft")
+async def history_hft(symbol: str = "SPX", from_ts_ms: int | None = None,
+                       to_ts_ms: int | None = None, limit: int = 500) -> list[dict[str, Any]]:
+    """Return HFTSample rows. Filter by symbol + timestamp range.
+    Used by ml_patterns + analytical queries to correlate HFT state
+    with trade outcomes.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import HFTSample
+    from sqlmodel import select as _s
+    async with _gs() as session:
+        stmt = _s(HFTSample).where(HFTSample.symbol == symbol)
+        if from_ts_ms is not None:
+            stmt = stmt.where(HFTSample.timestamp_ms >= from_ts_ms)
+        if to_ts_ms is not None:
+            stmt = stmt.where(HFTSample.timestamp_ms <= to_ts_ms)
+        stmt = stmt.order_by(HFTSample.timestamp_ms.desc()).limit(limit)  # type: ignore[attr-defined]
+        rows = list((await session.exec(stmt)).all())
+    return [
+        {"id": r.id, "symbol": r.symbol, "timestamp_ms": r.timestamp_ms,
+         "short_vol_pts": r.short_vol_pts, "long_vol_pts": r.long_vol_pts,
+         "vol_ratio": r.vol_ratio, "vol_regime": r.vol_regime,
+         "cancel_to_trade_ratio": r.cancel_to_trade_ratio,
+         "quote_intensity_per_sec": r.quote_intensity_per_sec,
+         "stuffing_severity": r.stuffing_severity,
+         "book_imbalance": r.book_imbalance,
+         "book_imbalance_5lvl": r.book_imbalance_5lvl,
+         "book_direction": r.book_direction,
+         "book_confidence": r.book_confidence,
+         "weighted_mid_price": r.weighted_mid_price,
+         "book_spread": r.book_spread,
+         "composite_direction": r.composite_direction,
+         "vol_source": r.vol_source,
+         "stuffing_source": r.stuffing_source,
+         "depth_source": r.depth_source}
+        for r in rows
+    ]
+
+
 @router.get("/diag/streams")
 async def diag_streams(request: Request) -> dict[str, Any]:
     """Per-stream health snapshot. Returns last-activity timestamp + task

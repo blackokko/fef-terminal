@@ -214,6 +214,13 @@ class AppState:
     # global auto_trade_last_at_ms stays as a backstop; each symbol's
     # cool-down clock is independent so SPX firing doesn't block QQQ.
     auto_trade_last_at_ms_by_symbol: dict[str, int] = field(default_factory=dict)
+    # Latest HFT + microstructure snapshots — populated by hft_loop +
+    # microstructure_loop on every iter so _run_one_iter can stamp them
+    # into SignalIter.extras for offline analysis (which HFT/microstructure
+    # state coincided with each signal).
+    last_hft_state: dict = field(default_factory=dict)
+    last_microstructure_state: dict = field(default_factory=dict)
+
     # Last verdict cache per scanner symbol — feeds the FE ScannerPanel
     # tiles so each symbol shows its most recent direction/confidence
     # without subscribing to every IterEvent in render.

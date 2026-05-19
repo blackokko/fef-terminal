@@ -303,6 +303,43 @@ class MicrostructureSample(SQLModel, table=True):
     confidence: str = "LOW"
 
 
+class HFTSample(SQLModel, table=True):
+    """One HFT signal sample — realized vol + quote stuffing + L2 book.
+
+    Written by hft_loop at FEF_HFT_PERSIST_SEC cadence (default 1s,
+    sampled from the 250ms broadcast). Used by ml_patterns + analytical
+    queries to correlate HFT state with trade outcomes.
+    """
+
+    __tablename__ = "hft_sample"
+
+    id: int | None = Field(default=None, primary_key=True)
+    symbol: str = Field(index=True)
+    timestamp_ms: int = Field(index=True)
+
+    short_vol_pts: float = 0.0
+    long_vol_pts: float = 0.0
+    vol_ratio: float = 1.0
+    vol_regime: str = "NORMAL"
+
+    cancel_to_trade_ratio: float = 0.0
+    quote_intensity_per_sec: float = 0.0
+    stuffing_severity: str = "NORMAL"
+
+    book_imbalance: float = 0.0
+    book_imbalance_5lvl: float = 0.0
+    book_direction: str = "BALANCED"
+    book_confidence: str = "LOW"
+    weighted_mid_price: float | None = None
+    book_spread: float | None = None
+
+    composite_direction: str = "NEUTRAL"
+
+    vol_source: str = "synth"
+    stuffing_source: str = "synth"
+    depth_source: str = "synth"
+
+
 class VixSample(SQLModel, table=True):
     """One VIX index reading. Written by vix_poll_loop (default 30s)."""
 

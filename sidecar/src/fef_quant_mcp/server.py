@@ -820,6 +820,50 @@ def get_shadow_comparisons(session_date: str | None = None,
     ]
 
 
+@mcp.tool()
+def get_hft_samples(symbol: str = "SPX", from_ts_ms: int | None = None,
+                     to_ts_ms: int | None = None,
+                     limit: int = 500) -> list[dict[str, Any]]:
+    """Return HFT signal samples — realized vol + quote stuffing + L2 depth.
+
+    HFTSample rows are written by the sidecar's hft_loop every ~1s. Each
+    row has: short_vol_pts, long_vol_pts, vol_ratio, vol_regime,
+    cancel_to_trade_ratio, quote_intensity_per_sec, stuffing_severity,
+    book_imbalance, book_imbalance_5lvl, book_direction, book_confidence,
+    weighted_mid_price, book_spread, composite_direction, vol_source,
+    stuffing_source, depth_source.
+
+    For correlating HFT state with signal outcomes: query SignalIter
+    rows + HFTSample rows by timestamp_ms range, or read the
+    signal_iter.extras.hft_at_fire field which has the HFT snapshot
+    captured at fire time.
+    """
+    from fef_sidecar.db.models import HFTSample
+    with _get_session() as session:
+        stmt = select(HFTSample).where(HFTSample.symbol == symbol)
+        if from_ts_ms is not None:
+            stmt = stmt.where(HFTSample.timestamp_ms >= from_ts_ms)
+        if to_ts_ms is not None:
+            stmt = stmt.where(HFTSample.timestamp_ms <= to_ts_ms)
+        stmt = stmt.order_by(HFTSample.timestamp_ms.desc()).limit(limit)  # type: ignore[attr-defined]
+        rows = session.exec(stmt).all()
+    return [
+        {"id": r.id, "symbol": r.symbol, "timestamp_ms": r.timestamp_ms,
+         "short_vol_pts": r.short_vol_pts, "long_vol_pts": r.long_vol_pts,
+         "vol_ratio": r.vol_ratio, "vol_regime": r.vol_regime,
+         "cancel_to_trade_ratio": r.cancel_to_trade_ratio,
+         "quote_intensity_per_sec": r.quote_intensity_per_sec,
+         "stuffing_severity": r.stuffing_severity,
+         "book_imbalance": r.book_imbalance,
+         "book_imbalance_5lvl": r.book_imbalance_5lvl,
+         "book_direction": r.book_direction,
+         "weighted_mid_price": r.weighted_mid_price,
+         "book_spread": r.book_spread,
+         "composite_direction": r.composite_direction}
+        for r in rows
+    ]
+
+
 def main() -> None:
     """Entry point for the `fef-mcp` console script."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")

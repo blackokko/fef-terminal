@@ -367,6 +367,12 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             **verdict.to_log_extras(),
             "option_pricing": _option_pricing_dict(option_targets),
             "regime_at_fire": state.last_regime.regime if state.last_regime else None,
+            # Snapshot the latest HFT + microstructure state at fire time so
+            # offline analysis (ML pattern discovery, TuningRecommendation)
+            # can correlate signal outcomes with HFT/microstructure context
+            # without doing a time-window join.
+            "hft_at_fire": dict(state.last_hft_state) if state.last_hft_state else None,
+            "microstructure_at_fire": dict(state.last_microstructure_state) if state.last_microstructure_state else None,
         },
         session_date=_today_et(),
         provider_mode=_current_provider_mode(state),
@@ -952,6 +958,8 @@ async def hft_loop(state: AppState) -> None:
     from fef_sidecar.ibkr.live import LiveIBKRProvider
 
     interval = float(os.environ.get("HFT_LOOP_INTERVAL_SEC", "0.25"))
+    persist_interval = float(os.environ.get("FEF_HFT_PERSIST_SEC", "1.0"))
+    last_persist_ms = [0]  # mutable closure ref so inner block can update
     rng = _random.Random()
 
     state.vol_state = RealizedVolState()
@@ -1101,6 +1109,55 @@ async def hft_loop(state: AppState) -> None:
                     vol_source=vol_source, stuffing_source=stuffing_source,
                     depth_source=depth_source,
                 ))
+
+                # Cache latest state on AppState so SignalIter can snapshot
+                # at fire time (correlates HFT to each signal).
+                state.last_hft_state = {
+                    "timestamp_ms": now_ms,
+                    "short_vol_pts": vol.short_vol_pts, "long_vol_pts": vol.long_vol_pts,
+                    "vol_ratio": vol.ratio, "vol_regime": vol.regime,
+                    "cancel_to_trade_ratio": stuff.cancel_to_trade_ratio,
+                    "quote_intensity_per_sec": stuff.quote_intensity_per_sec,
+                    "stuffing_severity": stuff.severity,
+                    "book_imbalance": depth.imbalance,
+                    "book_imbalance_5lvl": depth.imbalance_5lvl,
+                    "book_direction": depth.direction,
+                    "book_confidence": depth.confidence,
+                    "weighted_mid_price": depth.weighted_mid_price,
+                    "book_spread": depth.spread,
+                    "composite_direction": composite,
+                }
+
+                # Persist HFTSample at FEF_HFT_PERSIST_SEC cadence (default 1s)
+                if (now_ms - last_persist_ms[0]) >= persist_interval * 1000:
+                    last_persist_ms[0] = now_ms
+                    try:
+                        from fef_sidecar.db.models import HFTSample
+                        from fef_sidecar.db.engine import get_session as _gs
+                        sample = HFTSample(
+                            symbol=state.active_symbol,
+                            timestamp_ms=now_ms,
+                            short_vol_pts=vol.short_vol_pts, long_vol_pts=vol.long_vol_pts,
+                            vol_ratio=vol.ratio, vol_regime=vol.regime,
+                            cancel_to_trade_ratio=stuff.cancel_to_trade_ratio,
+                            quote_intensity_per_sec=stuff.quote_intensity_per_sec,
+                            stuffing_severity=stuff.severity,
+                            book_imbalance=depth.imbalance,
+                            book_imbalance_5lvl=depth.imbalance_5lvl,
+                            book_direction=depth.direction,
+                            book_confidence=depth.confidence,
+                            weighted_mid_price=depth.weighted_mid_price,
+                            book_spread=depth.spread,
+                            composite_direction=composite,
+                            vol_source=vol_source,
+                            stuffing_source=stuffing_source,
+                            depth_source=depth_source,
+                        )
+                        async with _gs() as _s:
+                            _s.add(sample)
+                            await _s.commit()
+                    except Exception:
+                        logger.exception("HFTSample persist failed")
             except _asyncio.CancelledError:
                 raise
             except Exception:
@@ -1221,6 +1278,16 @@ async def microstructure_loop(state: AppState) -> None:
 
                 now_ms = int(_time.time() * 1000)
                 sig = assess(state.microstructure_state, now_ms)
+                # Cache for SignalIter snapshot at fire time
+                state.last_microstructure_state = {
+                    "timestamp_ms": sig.timestamp_ms,
+                    "ofi_window": sig.ofi_window,
+                    "avi_pct": sig.avi_pct,
+                    "microprice": sig.microprice,
+                    "microprice_deviation_bp": sig.microprice_deviation_bp,
+                    "direction": sig.direction,
+                    "confidence": sig.confidence,
+                }
                 await state.broadcaster.publish(MicrostructureEvent(
                     timestamp_ms=sig.timestamp_ms,
                     ofi_window=sig.ofi_window,
