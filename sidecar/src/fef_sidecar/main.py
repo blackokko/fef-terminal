@@ -254,6 +254,19 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(refresh_prior_close(state), name="refresh-prior-close")
         asyncio.create_task(backfill_regime_from_db(state), name="backfill-regime")
 
+        # Position reconciliation on startup — detects orphans (IBKR has,
+        # DB doesn't) and phantoms (DB has, IBKR doesn't). Critical for
+        # crash recovery; runs after IBKR is connected.
+        async def _reconcile_after_connect():
+            # Wait for IBKR + first iter to settle, then reconcile
+            await asyncio.sleep(8)
+            from fef_sidecar.engine.position_reconcile import reconcile_positions
+            try:
+                await reconcile_positions(state)
+            except Exception:
+                logger.exception("startup position reconciliation failed")
+        asyncio.create_task(_reconcile_after_connect(), name="position-reconcile-startup")
+
     logger.info(
         "fef-sidecar ready (QD=%s, IBKR=%s, auto_loops=%s)",
         type(state.quantdata).__name__,

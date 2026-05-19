@@ -1064,6 +1064,27 @@ async def shadow_comparisons(limit: int = 200, session_date: str | None = None) 
     ]
 
 
+@router.post("/admin/reconcile_positions")
+async def admin_reconcile_positions(request: Request) -> dict[str, Any]:
+    """Cross-reference IBKR positions vs our LiveOrder parents.
+    Detects orphans (IBKR has, DB doesn't — bot can't manage)
+    and phantoms (DB has, IBKR doesn't — auto-marked CLOSED).
+    Returns counts + detailed lists. Idempotent.
+    """
+    from fef_sidecar.engine.position_reconcile import reconcile_positions
+    return await reconcile_positions(_state(request))
+
+
+@router.post("/admin/sweep_orphans")
+async def admin_sweep_orphans(request: Request) -> dict[str, Any]:
+    """⚠ DESTRUCTIVE. Market-sell-to-close every IBKR option position that
+    has no matching managed parent in our DB. Use when reconcile shows
+    orphans and you want them flat NOW. Requires confirm=true.
+    """
+    from fef_sidecar.engine.position_reconcile import sweep_orphan_positions
+    return await sweep_orphan_positions(_state(request))
+
+
 @router.post("/admin/backfill_regime")
 async def admin_backfill_regime(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
     """Backfill extras.regime_at_fire on historical signal_iter rows."""
