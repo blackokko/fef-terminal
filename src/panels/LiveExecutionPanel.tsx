@@ -133,14 +133,30 @@ export function LiveExecutionPanel() {
                       })
                   } CT
                 </div>
-                {(o as any).dynamic_stop_level != null && (o as any).entry_spx_price != null && (
-                  <div className="muted small" style={{ marginTop: 2,
-                    color: ((o as any).be_ladder_max_step_R ?? 0) > 0 ? "var(--color-green)" : "var(--color-text-muted)" }}>
-                    BE ladder: {((o as any).be_ladder_max_step_R ?? 0) === 0
-                      ? `armed (stop ${(o as any).spx_target_stop?.toFixed(2)})`
-                      : `locked +${((o as any).be_ladder_max_step_R ?? 0).toFixed(1)}R → stop ${(o as any).dynamic_stop_level?.toFixed(2)}`}
-                  </div>
-                )}
+                {(o as any).dynamic_stop_level != null && (o as any).entry_spx_price != null && (() => {
+                  const entry = (o as any).entry_spx_price as number;
+                  const origStop = (o as any).spx_target_stop as number;
+                  const dynStop = (o as any).dynamic_stop_level as number;
+                  const risk = Math.abs(entry - origStop) || 1;
+                  // True locked-R: how much profit (in R units) is now guaranteed
+                  // vs entry SPX. Positive = locked profit, 0 = BE, negative = original stop.
+                  const lockedR = o.right === "C"
+                    ? (dynStop - entry) / risk
+                    : (entry - dynStop) / risk;
+                  const stepFired = (o as any).be_ladder_max_step_R ?? 0;
+                  return (
+                    <div className="muted small" style={{ marginTop: 2,
+                      color: lockedR > 0 ? "var(--color-green)" :
+                             lockedR === 0 && stepFired > 0 ? "var(--color-amber)" :
+                             "var(--color-text-muted)" }}>
+                      BE ladder: {stepFired === 0
+                        ? `armed (orig stop ${origStop.toFixed(2)})`
+                        : lockedR > 0
+                          ? `locked +${lockedR.toFixed(2)}R → stop ${dynStop.toFixed(2)} (trigger ${stepFired.toFixed(1)}R)`
+                          : `at BE (stop ${dynStop.toFixed(2)}, trigger ${stepFired.toFixed(1)}R)`}
+                    </div>
+                  );
+                })()}
               </li>
             ))}
           </ul>

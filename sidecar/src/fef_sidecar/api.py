@@ -646,7 +646,22 @@ async def history_reviews(limit: int = 30) -> list[dict[str, Any]]:
          "win_rate_pct": r.win_rate_pct, "expectancy_r": r.expectancy_r,
          "t1_hits": r.t1_hits, "t2_hits": r.t2_hits, "t3_hits": r.t3_hits,
          "by_trigger": r.by_trigger, "by_confidence": r.by_confidence,
-         "by_hour_ct": r.by_hour_ct}
+         "by_hour_ct": r.by_hour_ct,
+         "by_direction": getattr(r, "by_direction", {}),
+         "by_regime": getattr(r, "by_regime", {}),
+         "by_wall_distance": getattr(r, "by_wall_distance", {}),
+         "by_fe_ratio": getattr(r, "by_fe_ratio", {}),
+         "by_block_reason": getattr(r, "by_block_reason", {}),
+         "actual_trades_taken": getattr(r, "actual_trades_taken", 0),
+         "actual_wins": getattr(r, "actual_wins", 0),
+         "actual_losses": getattr(r, "actual_losses", 0),
+         "actual_total_R": getattr(r, "actual_total_R", 0.0),
+         "dedup_actionable": getattr(r, "dedup_actionable", 0),
+         "dedup_wins": getattr(r, "dedup_wins", 0),
+         "dedup_stops": getattr(r, "dedup_stops", 0),
+         "dedup_timeouts": getattr(r, "dedup_timeouts", 0),
+         "dedup_win_rate_pct": getattr(r, "dedup_win_rate_pct", 0.0),
+         "dedup_expectancy_r": getattr(r, "dedup_expectancy_r", 0.0)}
         for r in rows
     ]
 

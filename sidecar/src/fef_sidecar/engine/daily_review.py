@@ -95,6 +95,14 @@ async def compute_daily_review(session_date: str) -> DailyReview:
     tier_counts = Counter()
     realized_total = 0.0
 
+    # Per-signal records for deduplication. Each entry: (epoch_ms,
+    # contract_key, outcome, realized_R). After the main loop we group
+    # by contract_key + time window and keep only the FIRST signal per
+    # group — that gives per-INDEPENDENT-SETUP stats vs the inflated
+    # per-signal stats when stacking happens.
+    per_signal_records: list[tuple[int, str, str, float]] = []
+    DEDUP_WINDOW_MIN = 5
+
     for r in today_actionable:
         ex = r.extras or {}
         t1 = ex.get("t1"); t2 = ex.get("t2"); t3 = ex.get("t3"); stop = ex.get("stop")
@@ -128,6 +136,13 @@ async def compute_daily_review(session_date: str) -> DailyReview:
             realized_R = 0.0; tier_counts["TIMEOUT"] += 1; outcome = "TIMEOUT"
 
         realized_total += realized_R
+
+        # Record for deduplication. Contract key matches what the engine
+        # produces — strike_rec from extras (the actual contract that
+        # would be bought) + direction + today's expiry.
+        strike = ex.get("strike_rec")
+        contract_key = f"{r.direction.value}|{strike}"
+        per_signal_records.append((start_ms, contract_key, outcome, realized_R))
 
         wall = bool(ex.get("wall_collapse_trigger"))
         aligned = bool(ex.get("aligned"))
@@ -174,6 +189,27 @@ async def compute_daily_review(session_date: str) -> DailyReview:
     wins = tier_counts.get("T1", 0) + tier_counts.get("T2", 0) + tier_counts.get("T3", 0)
     stops = tier_counts.get("STOP", 0)
     timeouts = tier_counts.get("TIMEOUT", 0)
+
+    # Dedup pass: walk per_signal_records chronologically, keeping the
+    # first fire per (contract_key) within DEDUP_WINDOW_MIN minutes.
+    # Subsequent fires within that window on the same contract are dupes
+    # and get dropped from the dedup stats.
+    per_signal_records.sort(key=lambda x: x[0])
+    last_fire_ms: dict[str, int] = {}
+    dedup_records: list[tuple[str, float]] = []
+    for ts_ms, contract_key, outcome, r_realized in per_signal_records:
+        prev = last_fire_ms.get(contract_key)
+        if prev is not None and (ts_ms - prev) < DEDUP_WINDOW_MIN * 60_000:
+            continue  # dupe — same contract within window
+        last_fire_ms[contract_key] = ts_ms
+        dedup_records.append((outcome, r_realized))
+    dedup_outcomes = Counter(o for o, _ in dedup_records)
+    dedup_n = len(dedup_records)
+    dedup_wins_n = (dedup_outcomes.get("T1", 0) + dedup_outcomes.get("T2", 0)
+                    + dedup_outcomes.get("T3", 0))
+    dedup_stops_n = dedup_outcomes.get("STOP", 0)
+    dedup_timeouts_n = dedup_outcomes.get("TIMEOUT", 0)
+    dedup_realized_total = sum(r for _, r in dedup_records)
 
     def _summary(rs: list) -> dict:
         n = len(rs)
@@ -245,6 +281,12 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         actual_wins=actual_wins,
         actual_losses=actual_losses,
         actual_total_R=round(actual_total_R, 2),
+        dedup_actionable=dedup_n,
+        dedup_wins=dedup_wins_n,
+        dedup_stops=dedup_stops_n,
+        dedup_timeouts=dedup_timeouts_n,
+        dedup_win_rate_pct=round(dedup_wins_n / dedup_n * 100, 1) if dedup_n else 0.0,
+        dedup_expectancy_r=round(dedup_realized_total / dedup_n, 3) if dedup_n else 0.0,
     )
 
     # Upsert: delete any existing row for this date first

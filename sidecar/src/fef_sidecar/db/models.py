@@ -514,6 +514,18 @@ class DailyReview(SQLModel, table=True):
     actual_losses: int = 0
     actual_total_R: float = 0.0
 
+    # Deduplicated per-setup stats — groups consecutive same-contract fires
+    # within DEDUP_WINDOW_MIN minutes into one "setup", scores only the
+    # FIRST signal of each group. Closer to real-money P/L expectancy
+    # since stacking on the same contract produces correlated outcomes
+    # but only one underlying market move to capture.
+    dedup_actionable: int = 0
+    dedup_wins: int = 0
+    dedup_stops: int = 0
+    dedup_timeouts: int = 0
+    dedup_win_rate_pct: float = 0.0
+    dedup_expectancy_r: float = 0.0
+
 
 class EngineChange(SQLModel, table=True):
     """One row per engine semantic change. Lets the TuningRecommender

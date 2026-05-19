@@ -70,19 +70,13 @@ Add new items at the top. Move shipped items to the "Shipped" section.
   back to ~5-15%, the 2-iter filter is working as intended.
 - **Resets freeze?**: YES.
 
-### 2026-05-19 — BE ladder UI label is misleading
-- **Symptom**: Live Execution panel shows `"locked +0.5R"` when the BE
-  ladder fires at the 0.5R MFE trigger. Actual locked profit is **0R**
-  (stop moved to entry SPX, the BE step). User watched a trade go
-  negative despite the panel saying 0.5R was locked.
-- **Root cause**: I'm displaying `be_ladder_max_step_R` (the trigger that
-  fired) as if it were the locked-profit-R. The audit log gets it right
-  ("locks 0.0R") but the UI doesn't.
-- **Fix (UI honesty, NO engine change)**: Compute locked-R from
-  `(dynamic_stop_level - entry_spx_price) / risk` and display that
-  instead. Could ship without freeze impact.
-- **Category**: UI labeling bug. Pure render-time math.
-- **Resets freeze?**: No.
+### 2026-05-19 — BE ladder UI label is misleading [SHIPPED 2026-05-19]
+- Fixed in commit. LiveExecution panel now computes true locked-R from
+  `(dynamic_stop_level - entry_spx_price) / risk` instead of displaying
+  the trigger-R as if it were locked profit. New states:
+    - `armed (orig stop X)` — no ratchet yet
+    - `at BE (stop X, trigger 0.5R)` — stop moved to entry, 0 actually locked
+    - `locked +0.5R → stop X (trigger 1.0R)` — actual locked profit shown
 
 ### 2026-05-19 — BE ladder uses SPX, not option price [HIGH PRIORITY]
 - **Symptom**: BE ladder correctly moves stop to entry SPX, but the

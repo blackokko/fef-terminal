@@ -93,6 +93,12 @@ async def init_db() -> None:
             ("daily_review", "actual_losses", "INTEGER DEFAULT 0"),
             ("daily_review", "actual_total_R", "REAL DEFAULT 0.0"),
             ("audit_log", "block_reason_code", "TEXT"),
+            ("daily_review", "dedup_actionable", "INTEGER DEFAULT 0"),
+            ("daily_review", "dedup_wins", "INTEGER DEFAULT 0"),
+            ("daily_review", "dedup_stops", "INTEGER DEFAULT 0"),
+            ("daily_review", "dedup_timeouts", "INTEGER DEFAULT 0"),
+            ("daily_review", "dedup_win_rate_pct", "REAL DEFAULT 0.0"),
+            ("daily_review", "dedup_expectancy_r", "REAL DEFAULT 0.0"),
         ]
         for table, column, type_sql in migrations:
             try:
