@@ -23,7 +23,6 @@ import { WalkForwardPanel } from "../panels/WalkForwardPanel";
 import { ChartAnnotationsPanel } from "../panels/ChartAnnotationsPanel";
 import { MicrostructurePanel } from "../panels/MicrostructurePanel";
 import { OptimizePanel } from "../panels/OptimizePanel";
-import { RiskOverlayPanel } from "../panels/RiskOverlayPanel";
 import { TournamentPanel } from "../panels/TournamentPanel";
 import { FEFVerdictPanel } from "../panels/FEFVerdictPanel";
 import { GlossaryPanel } from "../panels/GlossaryPanel";
@@ -74,7 +73,6 @@ export function Sidebar() {
           <>
             <Safe name="AccountScorecard"><AccountScorecardPanel /></Safe>
             <Safe name="Calendar"><CalendarPanel /></Safe>
-            <Safe name="RiskOverlay"><RiskOverlayPanel /></Safe>
             <Safe name="Regime"><RegimePanel /></Safe>
             <Safe name="LiveQuote"><LiveQuotePanel /></Safe>
             <Safe name="FEFVerdict"><FEFVerdictPanel /></Safe>

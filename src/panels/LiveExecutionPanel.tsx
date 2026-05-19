@@ -133,6 +133,14 @@ export function LiveExecutionPanel() {
                       })
                   } CT
                 </div>
+                {(o as any).dynamic_stop_level != null && (o as any).entry_spx_price != null && (
+                  <div className="muted small" style={{ marginTop: 2,
+                    color: ((o as any).be_ladder_max_step_R ?? 0) > 0 ? "var(--color-green)" : "var(--color-text-muted)" }}>
+                    BE ladder: {((o as any).be_ladder_max_step_R ?? 0) === 0
+                      ? `armed (stop ${(o as any).spx_target_stop?.toFixed(2)})`
+                      : `locked +${((o as any).be_ladder_max_step_R ?? 0).toFixed(1)}R → stop ${(o as any).dynamic_stop_level?.toFixed(2)}`}
+                  </div>
+                )}
               </li>
             ))}
           </ul>

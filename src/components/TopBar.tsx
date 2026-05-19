@@ -53,6 +53,47 @@ function ModelStatePill() {
   );
 }
 
+function TodayPnLPill({ ibkrDailyPnl }: { ibkrDailyPnl: number | null | undefined }) {
+  const [estimate, setEstimate] = useState<number | null>(null);
+
+  useEffect(() => {
+    const refresh = async () => {
+      try {
+        const r = await fetch("http://127.0.0.1:8765/diag/session_pnl_estimate");
+        if (r.ok) {
+          const d = await r.json();
+          setEstimate(d.estimated_session_pnl_usd);
+        }
+      } catch {}
+    };
+    void refresh();
+    const id = window.setInterval(refresh, 15000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Prefer IBKR's daily_pnl when non-zero. Fall back to our estimate.
+  const usingFallback = (ibkrDailyPnl == null || ibkrDailyPnl === 0) && estimate != null && estimate !== 0;
+  const value = usingFallback ? estimate : ibkrDailyPnl;
+  const color = value == null ? undefined
+    : value >= 0 ? "var(--color-green)" : "var(--color-red)";
+
+  return (
+    <div className="topbar-section"
+         title={usingFallback
+           ? "IBKR reqPnL returning 0 — falling back to LiveOrder-based estimate"
+           : "Today P/L from IBKR reqPnL"}>
+      <span className="topbar-label">
+        Today P/L{usingFallback ? " ~" : ""}
+      </span>
+      <span className="topbar-value" style={{ color, fontWeight: 600 }}>
+        {value != null
+          ? `${value >= 0 ? "+" : "-"}$${Math.abs(value).toFixed(0)}`
+          : "—"}
+      </span>
+    </div>
+  );
+}
+
 function FreezePill() {
   const [sessions, setSessions] = useState<number | null>(null);
   const [target, setTarget] = useState<number>(10);
@@ -149,18 +190,7 @@ export function TopBar() {
         </span>
       </div>
 
-      <div className="topbar-section">
-        <span className="topbar-label">Today P/L</span>
-        <span className="topbar-value" style={{
-          color: lastAccount?.daily_pnl == null ? undefined
-            : lastAccount.daily_pnl >= 0 ? "var(--color-green)" : "var(--color-red)",
-          fontWeight: 600,
-        }}>
-          {lastAccount?.daily_pnl != null
-            ? `${lastAccount.daily_pnl >= 0 ? "+" : "-"}$${Math.abs(lastAccount.daily_pnl).toFixed(0)}`
-            : "—"}
-        </span>
-      </div>
+      <TodayPnLPill ibkrDailyPnl={lastAccount?.daily_pnl} />
 
       <div className="topbar-section">
         <span className="topbar-label">Last iter</span>

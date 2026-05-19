@@ -1269,41 +1269,92 @@ async def live_orders(status: str | None = None, limit: int = 200) -> list[dict[
 
 @router.get("/live/positions")
 async def live_positions(request: Request, limit: int = 100) -> list[dict[str, Any]]:
-    """Return currently-open positions from IBKR (not historical snapshots).
+    """Return currently-open positions from IBKR, enriched with the most
+    recent LivePosition DB snapshot per contract (which has fresh greeks +
+    market_price + unrealized_pnl populated by position_monitor_loop
+    every ~5s).
 
-    Live mode: queries ib.positions() directly so closed positions disappear
-    immediately. Mock mode: returns empty (mock has no real positions).
-    Falls back to DB snapshots only if IBKR is disconnected.
+    IBKR is authoritative for "is this open" (so closed positions disappear
+    immediately); DB snapshot is authoritative for greeks + P/L numbers.
     """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import LivePosition
     from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from sqlmodel import select as _s
     import time as _t
 
     s = _state(request)
-    if isinstance(s.ibkr, LiveIBKRProvider) and getattr(s.ibkr, "_ib", None) is not None:
-        ib = s.ibkr._ib  # type: ignore[attr-defined]
-        if ib.isConnected():
-            out: list[dict[str, Any]] = []
-            for p in ib.positions():
-                if abs(p.position) < 0.5:
-                    continue  # zero qty = closed
-                c = p.contract
-                if getattr(c, "secType", "") != "OPT":
-                    continue
-                out.append({
-                    "id": None,
-                    "snapshot_ts": _t.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "symbol": getattr(c, "symbol", ""),
-                    "strike": float(getattr(c, "strike", 0)),
-                    "right": getattr(c, "right", ""),
-                    "expiry": getattr(c, "lastTradeDateOrContractMonth", ""),
-                    "qty": int(p.position),
-                    "avg_cost": float(p.avgCost) / 100.0 if p.avgCost else None,
-                    "market_price": None, "unrealized_pnl": None,
-                    "delta": None, "gamma": None, "theta": None, "vega": None, "iv": None,
-                })
-            return out
-    # Fallback for mock or disconnected: empty list (not stale DB rows)
-    return []
+    if not (isinstance(s.ibkr, LiveIBKRProvider) and getattr(s.ibkr, "_ib", None) is not None):
+        return []
+    ib = s.ibkr._ib  # type: ignore[attr-defined]
+    if not ib.isConnected():
+        return []
+
+    # Get currently-open positions from IBKR
+    open_positions = []
+    for p in ib.positions():
+        if abs(p.position) < 0.5:
+            continue
+        c = p.contract
+        if getattr(c, "secType", "") != "OPT":
+            continue
+        open_positions.append({
+            "symbol": getattr(c, "symbol", ""),
+            "strike": float(getattr(c, "strike", 0)),
+            "right": getattr(c, "right", ""),
+            "expiry": getattr(c, "lastTradeDateOrContractMonth", ""),
+            "qty": int(p.position),
+            "avg_cost": float(p.avgCost) / 100.0 if p.avgCost else None,
+        })
+
+    if not open_positions:
+        return []
+
+    # Pull the most recent LivePosition snapshot per contract for greeks/PnL.
+    # position_monitor_loop writes a fresh row every ~5s. We get the latest
+    # per (symbol, strike, right, expiry) via a wide query + dict reduction.
+    async with _gs() as session:
+        recent_snaps = list((await session.exec(
+            _s(LivePosition).order_by(LivePosition.snapshot_ts.desc()).limit(500)  # type: ignore[attr-defined]
+        )).all())
+    latest_snap: dict[str, LivePosition] = {}
+    for snap in recent_snaps:
+        key = f"{snap.symbol}|{snap.strike}|{snap.right}|{snap.expiry}"
+        if key not in latest_snap:
+            latest_snap[key] = snap
+
+    # Merge: IBKR for liveness + qty, DB snapshot for greeks/PnL
+    out: list[dict[str, Any]] = []
+    for op in open_positions:
+        key = f"{op['symbol']}|{op['strike']}|{op['right']}|{op['expiry']}"
+        snap = latest_snap.get(key)
+        # If the snapshot's qty matches IBKR's qty (sanity), trust the snapshot
+        # for greeks/PnL. If qty mismatched (e.g. partial fill mid-snapshot),
+        # still show the latest greeks since the contract is the same.
+        out.append({
+            "id": snap.id if snap else None,
+            "snapshot_ts": (snap.snapshot_ts.isoformat() if snap
+                            else _t.strftime("%Y-%m-%dT%H:%M:%S")),
+            "symbol": op["symbol"], "strike": op["strike"],
+            "right": op["right"], "expiry": op["expiry"],
+            "qty": op["qty"],
+            "avg_cost": op["avg_cost"] if op["avg_cost"] is not None
+                        else (snap.avg_cost if snap else None),
+            "market_price": snap.market_price if snap else None,
+            "unrealized_pnl": (
+                # Recompute with current qty if we have a market_price
+                round((snap.market_price - (op["avg_cost"] or snap.avg_cost or 0))
+                      * op["qty"] * 100, 2)
+                if snap and snap.market_price is not None and (op["avg_cost"] is not None or snap.avg_cost)
+                else None
+            ),
+            "delta": snap.delta if snap else None,
+            "gamma": snap.gamma if snap else None,
+            "theta": snap.theta if snap else None,
+            "vega": snap.vega if snap else None,
+            "iv": snap.iv if snap else None,
+        })
+    return out
 
 
 @router.get("/live/status")
