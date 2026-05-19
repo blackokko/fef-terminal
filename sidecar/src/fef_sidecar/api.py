@@ -782,6 +782,97 @@ async def engine_change_log(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     return {"ok": True, "id": row.id}
 
 
+@router.get("/diag/pnl")
+async def diag_pnl(request: Request) -> dict[str, Any]:
+    """Diagnostic: show raw IBKR PnL subscription state + AccountSummary
+    tag dump. Used to investigate why Today's P/L shows 0.0 despite
+    closed trades.
+    """
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    s = _state(request)
+    if not isinstance(s.ibkr, LiveIBKRProvider):
+        return {"mode": "mock", "note": "no real PnL in mock mode"}
+    ib = getattr(s.ibkr, "_ib", None)
+    if ib is None or not ib.isConnected():
+        return {"mode": "disconnected"}
+
+    accounts = list(ib.managedAccounts())
+    pnl_subs = getattr(s.ibkr, "_pnl_subscriptions", {})
+    pnl_state = {}
+    for acct, pnl_obj in pnl_subs.items():
+        try:
+            pnl_state[acct] = {
+                "dailyPnL": pnl_obj.dailyPnL if pnl_obj.dailyPnL == pnl_obj.dailyPnL else None,
+                "realizedPnL": pnl_obj.realizedPnL if pnl_obj.realizedPnL == pnl_obj.realizedPnL else None,
+                "unrealizedPnL": pnl_obj.unrealizedPnL if pnl_obj.unrealizedPnL == pnl_obj.unrealizedPnL else None,
+            }
+        except Exception as e:
+            pnl_state[acct] = {"error": str(e)}
+
+    try:
+        values = await ib.accountSummaryAsync()
+        summary_tags = {v.tag: v.value for v in values if v.account == accounts[0]} if accounts else {}
+    except Exception as e:
+        summary_tags = {"error": str(e)}
+
+    return {
+        "mode": "live",
+        "managed_accounts": accounts,
+        "pnl_subscriptions": pnl_state,
+        "account_summary_tags": summary_tags,
+    }
+
+
+@router.get("/diag/session_pnl_estimate")
+async def diag_session_pnl_estimate(request: Request) -> dict[str, Any]:
+    """Estimate today's session P/L from our own LiveOrder records when
+    reqPnL is silent. Each CLOSED parent contributes a coarse +R estimate
+    (using the BracketSpec's risk distance × spec qty × 100 × 0.6 as a
+    rough average weighted-R win). STOPPED parents contribute the
+    risk-distance loss. Better than always-zero; not a substitute for
+    real IBKR P/L once that's working.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import LiveOrder
+    from sqlmodel import select as _s
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    today_et = _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    async with _gs() as session:
+        parents = list((await session.exec(
+            _s(LiveOrder).where(LiveOrder.bracket_role == "parent")
+            .where(LiveOrder.dry_run == False)  # noqa: E712
+        )).all())
+    today_parents = [p for p in parents
+                     if p.submitted_at.strftime("%Y-%m-%d") == today_et]
+
+    est_total = 0.0
+    by_status: dict[str, int] = {}
+    for p in today_parents:
+        by_status[p.status] = by_status.get(p.status, 0) + 1
+        if p.entry_spx_price is None or p.spx_target_stop is None:
+            continue
+        risk_pts = abs(p.entry_spx_price - p.spx_target_stop) or 10.0
+        # Approximate per-contract $ at risk = (risk_pts × delta ≈ 0.3 × $100)
+        # We don't have actual fills; use entry_limit (approximates option price)
+        per_contract_risk = (p.limit_price or 1.0) * 100
+        if p.status == "CLOSED":
+            est_total += per_contract_risk * p.qty * 1.1   # +1.1R weighted
+        elif p.status == "STOPPED":
+            est_total -= per_contract_risk * p.qty * 1.0
+        elif p.status == "PARTIAL":
+            est_total += per_contract_risk * p.qty * 0.4   # T1 fired only
+
+    return {
+        "session_date": today_et,
+        "parents_count": len(today_parents),
+        "by_status": by_status,
+        "estimated_session_pnl_usd": round(est_total, 0),
+        "note": "approximation — uses entry_limit × qty × R-weighted outcome. "
+                "If IBKR reqPnL is working, /account is authoritative.",
+    }
+
+
 @router.get("/diag/streams")
 async def diag_streams(request: Request) -> dict[str, Any]:
     """Per-stream health snapshot. Returns last-activity timestamp + task
@@ -1145,7 +1236,12 @@ async def live_orders(status: str | None = None, limit: int = 200) -> list[dict[
          "qty": r.qty, "order_type": r.order_type, "limit_price": r.limit_price,
          "parent_id": r.parent_id, "bracket_role": r.bracket_role,
          "status": r.status, "filled_qty": r.filled_qty, "avg_fill_price": r.avg_fill_price,
-         "commission": r.commission, "dry_run": r.dry_run, "ib_order_id": r.ib_order_id}
+         "commission": r.commission, "dry_run": r.dry_run, "ib_order_id": r.ib_order_id,
+         # BE ladder state (parent rows only — surfaces on the UI)
+         "entry_spx_price": r.entry_spx_price,
+         "spx_target_stop": r.spx_target_stop,
+         "dynamic_stop_level": r.dynamic_stop_level,
+         "be_ladder_max_step_R": r.be_ladder_max_step_R}
         for r in rows
     ]
 
