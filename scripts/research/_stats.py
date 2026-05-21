@@ -1,14 +1,14 @@
-"""Statistical methodology helpers — DSR, PBO, K-fold + CPCV.
+"""Statistical methodology helpers — DSR, PBO, K-fold + CPCV + Sequential Bootstrap.
 
 Built 2026-05-21 per Claude Chat's institutional-methodology gap analysis:
 the methodology layer is where retail solo platforms differ most from
-professional shops. These three tools address the multiple-testing /
+professional shops. These tools address the multiple-testing /
 overfitting / in-sample-fitting blind spots that classical Sharpe and
 single-window backtests can't catch.
 
 References:
 - López de Prado, "The Deflated Sharpe Ratio" (2014)
-- López de Prado, Advances in Financial Machine Learning (2018), ch. 7, 12, 14
+- López de Prado, Advances in Financial Machine Learning (2018), ch. 4, 7, 12, 14
 - Bailey & López de Prado, "The Probability of Backtest Overfitting" (2014)
 
 No external deps beyond scipy (already in sidecar venv).
@@ -16,6 +16,7 @@ No external deps beyond scipy (already in sidecar venv).
 from __future__ import annotations
 
 import math
+import random
 from itertools import combinations
 from typing import Callable, Sequence
 
@@ -450,5 +451,221 @@ def probability_of_backtest_overfitting(
             "moderate overfit risk" if pbo is not None and pbo < 0.5 else
             "high overfit risk — apparent winners don't survive cross-period" if pbo is not None else
             "insufficient data",
+        ),
+    }
+
+
+def sequential_bootstrap_indices(
+    signal_start_times_ms: Sequence[int],
+    label_horizon_minutes: int = 60,
+    sample_length: int | None = None,
+    seed: int | None = None,
+) -> list[int]:
+    """Draw a sequential bootstrap sample of signal indices (López de Prado
+    AFML 2018, Algorithm 4.1, "Sequential Bootstrap").
+
+    For overlapping-label time series (like our 60-min lookahead signals),
+    classical bootstrap underestimates SE because it treats overlapping
+    samples as independent. Sequential Bootstrap samples with probability
+    ∝ "uniqueness" to preserve the effective sample size correctly.
+
+    Algorithm:
+      1. Indicator matrix: each signal j touches a set of minute-bars
+         [t_j, t_j + label_horizon_minutes - 1] (binned by minute).
+      2. For each draw, the candidate-j uniqueness = mean over j's bars of
+         1 / (1 + count_of_already_drawn_signals_touching_that_bar).
+      3. Sample j with probability ∝ uniqueness. Repeat with replacement.
+
+    The first draw has uniform uniqueness (1.0 for all candidates); each
+    subsequent draw progressively downweights signals whose bars are
+    already represented in the drawn sample.
+
+    Args:
+        signal_start_times_ms: per-signal epoch ms of signal fire / label start.
+        label_horizon_minutes: forward window of each signal's label (default 60).
+        sample_length: number of indices to draw (default = len(signals)).
+        seed: random seed for reproducibility.
+
+    Returns: list of indices into the input signal list (with replacement).
+    """
+    n_signals = len(signal_start_times_ms)
+    if n_signals == 0:
+        return []
+    if sample_length is None:
+        sample_length = n_signals
+
+    rng = random.Random(seed)
+
+    # Bin each signal's outcome window into integer minute-bars.
+    # Bar key = floor(ts_ms / 60_000). Each signal touches `label_horizon_minutes`
+    # consecutive bars: [start_bin, start_bin + label_horizon_minutes).
+    signal_bars: list[list[int]] = []
+    for ts_ms in signal_start_times_ms:
+        start_bin = ts_ms // 60_000
+        signal_bars.append(list(range(start_bin, start_bin + label_horizon_minutes)))
+
+    # For each bar, count how many drawn signals currently touch it.
+    # Default int = 0.
+    bar_draw_count: dict[int, int] = {}
+
+    drawn_indices: list[int] = []
+    for _ in range(sample_length):
+        # Compute uniqueness for each candidate signal.
+        # uniqueness_j = mean over bars-in-j of 1 / (1 + bar_draw_count[bar])
+        weights: list[float] = []
+        for j in range(n_signals):
+            bars = signal_bars[j]
+            if not bars:
+                weights.append(0.0)
+                continue
+            total = 0.0
+            for b in bars:
+                # +1 in denom: if no draws yet, weight = 1 (uniform). Each
+                # additional draw on this bar halves, thirds, etc.
+                total += 1.0 / (1.0 + bar_draw_count.get(b, 0))
+            weights.append(total / len(bars))
+
+        # Sample one signal index proportional to weights.
+        total_w = sum(weights)
+        if total_w <= 0:
+            # All zero (shouldn't happen with non-empty signals); fall back uniform.
+            chosen = rng.randrange(n_signals)
+        else:
+            r = rng.random() * total_w
+            cum = 0.0
+            chosen = n_signals - 1  # default last in case of float rounding
+            for j, w in enumerate(weights):
+                cum += w
+                if r <= cum:
+                    chosen = j
+                    break
+
+        drawn_indices.append(chosen)
+        # Update bar-draw counts for the chosen signal's bars.
+        for b in signal_bars[chosen]:
+            bar_draw_count[b] = bar_draw_count.get(b, 0) + 1
+
+    return drawn_indices
+
+
+def _classical_bootstrap_sharpe_distribution(
+    returns: Sequence[float],
+    n_bootstraps: int,
+    seed: int | None,
+) -> dict:
+    """Classical (uniform-with-replacement) bootstrap SR distribution.
+    Used internally to surface the SE gap vs sequential bootstrap."""
+    n = len(returns)
+    if n < 5:
+        return {"sharpe_mean": None, "sharpe_std": None}
+    rng = random.Random(seed)
+    srs: list[float] = []
+    for _ in range(n_bootstraps):
+        sample = [returns[rng.randrange(n)] for _ in range(n)]
+        sr = sharpe_ratio(sample)
+        if sr is not None:
+            srs.append(sr)
+    if not srs:
+        return {"sharpe_mean": None, "sharpe_std": None}
+    m = sum(srs) / len(srs)
+    var = sum((s - m) ** 2 for s in srs) / max(len(srs) - 1, 1)
+    return {
+        "sharpe_mean": round(m, 4),
+        "sharpe_std": round(math.sqrt(var) if var > 0 else 0.0, 4),
+    }
+
+
+def sharpe_distribution_sequential(
+    returns: Sequence[float],
+    signal_start_times_ms: Sequence[int],
+    n_bootstraps: int = 1000,
+    label_horizon_minutes: int = 60,
+    seed: int | None = None,
+) -> dict:
+    """Sequential-bootstrap Sharpe distribution (López de Prado AFML ch. 4).
+
+    For each of n_bootstraps reps:
+      1. Draw a sequential-bootstrap sample of indices (length = len(returns)).
+      2. Compute Sharpe on the returns selected by those indices.
+    Then report distribution stats.
+
+    Also computes a classical bootstrap as a side-by-side comparison so
+    callers can surface the SE gap that overlapping labels create. The
+    common AFML claim is that classical bootstrap *understates* SE under
+    overlapping labels (ratio of seq/classical std > 1); but in practice
+    the direction depends on the data — uniqueness-weighted draws are more
+    diverse, so bootstrap-rep variance can actually decrease. The
+    sequential CI is the methodologically-correct one regardless of
+    direction; the comparison just diagnoses how mis-calibrated the
+    classical bootstrap was.
+
+    Args:
+        returns: per-signal realized return.
+        signal_start_times_ms: per-signal epoch ms of signal fire.
+        n_bootstraps: number of bootstrap reps (default 1000).
+        label_horizon_minutes: forward label window (default 60).
+        seed: random seed for reproducibility.
+
+    Returns: dict with sharpe_mean/std/CI/p_negative for the sequential
+    bootstrap, plus classical_bootstrap_comparison block for context.
+    """
+    n = len(returns)
+    if n < 5 or len(signal_start_times_ms) != n:
+        return {
+            "n_bootstraps": 0,
+            "label_horizon_minutes": label_horizon_minutes,
+            "note": f"need ≥5 returns and matching timestamps (got {n} returns, "
+                    f"{len(signal_start_times_ms)} timestamps)",
+        }
+
+    srs: list[float] = []
+    for rep in range(n_bootstraps):
+        rep_seed = None if seed is None else seed + rep
+        indices = sequential_bootstrap_indices(
+            signal_start_times_ms,
+            label_horizon_minutes=label_horizon_minutes,
+            sample_length=n,
+            seed=rep_seed,
+        )
+        sample_returns = [returns[i] for i in indices]
+        sr = sharpe_ratio(sample_returns)
+        if sr is not None:
+            srs.append(sr)
+
+    if not srs:
+        return {
+            "n_bootstraps": n_bootstraps,
+            "label_horizon_minutes": label_horizon_minutes,
+            "sharpe_mean": None,
+            "sharpe_std": None,
+            "note": "all bootstrap reps had degenerate Sharpe (zero variance)",
+        }
+
+    sr_mean = sum(srs) / len(srs)
+    sr_var = sum((s - sr_mean) ** 2 for s in srs) / max(len(srs) - 1, 1)
+    sr_std = math.sqrt(sr_var) if sr_var > 0 else 0.0
+    srs_sorted = sorted(srs)
+    lo_idx = int(0.025 * len(srs_sorted))
+    hi_idx = min(int(0.975 * len(srs_sorted)), len(srs_sorted) - 1)
+    p_neg = sum(1 for s in srs if s <= 0) / len(srs)
+
+    # Side-by-side classical bootstrap so we can surface the SE gap.
+    classical = _classical_bootstrap_sharpe_distribution(
+        returns, n_bootstraps=n_bootstraps, seed=seed,
+    )
+
+    return {
+        "n_bootstraps": n_bootstraps,
+        "n_reps_with_valid_sharpe": len(srs),
+        "label_horizon_minutes": label_horizon_minutes,
+        "sharpe_mean": round(sr_mean, 4),
+        "sharpe_std": round(sr_std, 4),
+        "sharpe_ci_95": (round(srs_sorted[lo_idx], 4), round(srs_sorted[hi_idx], 4)),
+        "sharpe_p_negative": round(p_neg, 4),
+        "classical_bootstrap_comparison": classical,
+        "se_inflation_factor": (
+            round(sr_std / classical["sharpe_std"], 3)
+            if classical.get("sharpe_std") and classical["sharpe_std"] > 0
+            else None
         ),
     }

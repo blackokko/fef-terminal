@@ -47,32 +47,79 @@ class SweepResult:
     test_total_pnl: float
 
 
-def _proxy_pnl(direction: str, spx_now: float, spx_future: float, qty: int = 15,
-               symbol: str = "SPX", apply_friction: bool = True) -> float:
-    """Per-share-equivalent: SPX move × delta × 100 × qty.
+def _proxy_pnl(direction: str, spx_now: float, spx_walk: list[float],
+               qty: int = 15, symbol: str = "SPX",
+               apply_friction: bool = True) -> float:
+    """Bar-walk proxy P/L with 50/30/20 partial scale-out + -1R stop.
 
-    Assumes 0.5 delta, $50/pt/contract. Caps at -$10/pt loss to simulate stop.
+    P2 (2026-05-21): replaces the prior linear endpoint estimate
+    (spx_future − spx_now, capped at -10pt) with order-preserving walk
+    through `spx_walk` (forward iter prices). Methodology now matches
+    scripts/research/ablation_backtest.py::_simulate_baseline,
+    per_regime_sweep v2, and realistic_fill_estimator v2.
 
-    apply_friction (default True): subtracts slippage + commission via the
-    standard cost model. Without this, walk-forward results overstate edge
-    by 20-50% for 0DTE since 0DTE bid-ask is wide enough to eat real fills.
+    Why this matters: endpoint scoring misses intermediate stop hits AND
+    misses T1/T2 partial scale-out wins. On fast-reversal sequences it
+    over/undercounted P/L by a wide margin and produced the optimal-
+    grid-floor artifact in per_regime_sweep v1.
+
+    Args:
+        direction: "LONG_CALLS" or "LONG_PUTS".
+        spx_now: SPX at entry.
+        spx_walk: forward SPX prices in chronological order. The walk
+            uses each price as a single-point bar (high=low=close=price)
+            — this is coarser than 1-min bars but matches the iter
+            granularity available at this layer. Use spx_walk = [endpoint]
+            for legacy single-endpoint behavior.
+        qty: contract count for $ conversion ($50/pt/contract × 0.5 delta).
+        apply_friction: subtract slippage + commission.
+
+    Returns $ P/L. With apply_friction=True, walk-forward edges are no
+    longer overstated by 20-50% from 0DTE bid-ask slippage.
     """
     from fef_sidecar.engine.slippage import DEFAULTS as SLIP_DEFAULTS
 
-    move = spx_future - spx_now
-    if direction == "LONG_PUTS":
-        move = -move
-    pnl = move * 50 * qty
-    stop = -10 * 50 * qty
-    gross_pnl = max(stop, pnl)
+    direction_sign = +1 if direction == "LONG_CALLS" else -1
+    # Bar-walk over spx_walk with 50/30/20 partial scale-out
+    realized_r = 0.0
+    remaining_share = 1.0
+    tiers_fired: set[str] = set()
+    T1_SHARE, T2_SHARE, T3_SHARE = 0.5, 0.3, 0.2
+    final_close = spx_walk[-1] if spx_walk else spx_now
+    for price in spx_walk:
+        adverse_r = direction_sign * (price - spx_now) / 10.0
+        favor_r = adverse_r  # single-point bar; favor/adverse are the same value
+        if adverse_r <= -1.0 and remaining_share > 0:
+            realized_r += remaining_share * -1.0
+            remaining_share = 0.0
+            break
+        if favor_r >= 1.0 and "T1" not in tiers_fired:
+            realized_r += T1_SHARE * 1.0
+            remaining_share -= T1_SHARE
+            tiers_fired.add("T1")
+        if favor_r >= 2.0 and "T2" not in tiers_fired:
+            realized_r += T2_SHARE * 2.0
+            remaining_share -= T2_SHARE
+            tiers_fired.add("T2")
+        if favor_r >= 3.0 and "T3" not in tiers_fired:
+            realized_r += T3_SHARE * 3.0
+            remaining_share -= T3_SHARE
+            tiers_fired.add("T3")
+        if remaining_share <= 0.001:
+            remaining_share = 0.0
+            break
+    if remaining_share > 0:
+        final_r = direction_sign * (final_close - spx_now) / 10.0
+        realized_r += remaining_share * final_r
+
+    # Convert R to $: 1R = 10pt × 0.5 delta × $100/pt × qty / 100  ≡  10pt × $50/pt × qty
+    # Matches the legacy convention: 10pt SPX move × 50 × qty.
+    gross_pnl = realized_r * 10 * 50 * qty
 
     if not apply_friction:
-        return gross_pnl
+        return round(gross_pnl, 2)
 
-    # Friction model: 1pt entry premium × half-spread × 2 (round trip)
-    # + commission round-trip
     cfg = SLIP_DEFAULTS.get(symbol.upper(), SLIP_DEFAULTS["SPX"])
-    # Approximate entry premium ~ $5 for an ATM 0DTE (rough)
     entry_premium_estimate = 5.0
     spread_cost = entry_premium_estimate * cfg["bid_ask_pct_of_mid"] * qty * 100
     commission = cfg["commission_per_contract"] * qty * 2  # round-trip
@@ -144,12 +191,18 @@ def run_sweep(
             verdict = engine.push(inputs)
             if verdict.direction.value == "WAIT":
                 continue
-            # Look ahead lookahead_iters for proxy P/L
+            # Look ahead lookahead_iters for proxy P/L. P2 (2026-05-21):
+            # pass the full forward walk so _proxy_pnl can apply bar-walk
+            # methodology with 50/30/20 partial scale-out + -1R stop,
+            # matching ablation_backtest._simulate_baseline / per_regime_sweep v2.
             future_idx = i + cfg.lookahead_iters
             if future_idx >= len(slice_iters):
                 continue
-            future_spx = slice_iters[future_idx]["spx_price"]
-            pnl = _proxy_pnl(verdict.direction.value, it["spx_price"], future_spx)
+            spx_walk = [
+                slice_iters[j]["spx_price"]
+                for j in range(i + 1, future_idx + 1)
+            ]
+            pnl = _proxy_pnl(verdict.direction.value, it["spx_price"], spx_walk)
             returns.append(pnl)
             trades += 1
             if pnl > 0:
