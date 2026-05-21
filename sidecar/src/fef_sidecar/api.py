@@ -115,6 +115,16 @@ async def set_symbol(request: Request, body: dict[str, str] = Body(...)) -> dict
 
     s.active_symbol = symbol
     s.last_snapshot = None  # force a fresh QuantData fetch on the new symbol
+    # Reset the regime detector window — samples carry the previous
+    # symbol's `spx_price`, and mixing TLT (~$82) with SPX (~$7400) breaks
+    # range-based regime calculations (e.g. OPEN_DRIVE rationale shows
+    # 7292pt range). Regime thresholds are SPX-tuned anyway; pre-switch
+    # samples are not meaningful cross-symbol.
+    try:
+        s.regime_detector.reset()
+        s.last_regime = None
+    except Exception:
+        pass
     await cancel_data_loops(s)
     spawn_data_loops(s)
     # Refresh prior close for the new symbol so day-change % is correct.
@@ -369,9 +379,58 @@ async def walk_forward_runs(limit: int = 30) -> list[dict[str, Any]]:
 
 
 @router.post("/ml/train")
-async def ml_train() -> dict[str, Any]:
+async def ml_train(request: Request) -> dict[str, Any]:
     from fef_sidecar.engine.ml_patterns import train_and_persist
-    return await train_and_persist()
+    return await train_and_persist(state=_state(request))
+
+
+@router.get("/ml/proposals")
+async def ml_proposals(top_k: int = 10) -> dict[str, Any]:
+    """Surface candidate Pattern rules mined from training data.
+
+    These are NOT engine rules — they're proposals the user reviews and
+    explicitly accepts into the Pattern table via /ml/proposals/accept.
+    """
+    from fef_sidecar.engine.pattern_proposals import propose_patterns
+    items = await propose_patterns(top_k=top_k)
+    return {"ok": True, "proposals": items}
+
+
+@router.post("/ml/proposals/accept")
+async def ml_proposals_accept(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Persist an accepted proposal as a row in the `pattern` table.
+
+    Body: {feature, operator, threshold, name?, notes?}.
+    Writes a single-condition Pattern that the live pattern-matcher will
+    then evaluate alongside user-defined patterns.
+    """
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import Pattern
+
+    feature = body["feature"]
+    operator = body["operator"]
+    threshold = float(body["threshold"])
+    default_name = f"ml: {feature} {operator} {threshold:g}"
+    name = body.get("name") or default_name
+    notes = body.get("notes") or "ML proposal"
+
+    async with get_session() as session:
+        existing = (await session.exec(
+            select(Pattern).where(Pattern.name == name)  # type: ignore[attr-defined]
+        )).first()
+        if existing is not None:
+            return {"ok": False, "error": f"Pattern '{name}' already exists", "pattern_id": existing.id}
+        pat = Pattern(
+            name=name,
+            conditions=[{"field": feature, "operator": operator, "value": threshold}],
+            description=notes,
+            enabled=True,
+        )
+        session.add(pat)
+        await session.flush()
+        return {"ok": True, "pattern_id": pat.id, "name": pat.name}
 
 
 @router.get("/ml/runs")
@@ -380,6 +439,11 @@ async def ml_runs(limit: int = 20) -> list[dict[str, Any]]:
     return [
         {"id": r.id, "trained_at": r.trained_at.isoformat(), "algorithm": r.algorithm,
          "n_training_rows": r.n_training_rows, "n_features": r.n_features,
+         "label_kind": getattr(r, "label_kind", "binary_win"),
+         "cv_mae": getattr(r, "cv_mae", None),
+         "cv_r2": getattr(r, "cv_r2", None),
+         "cv_n_folds": getattr(r, "cv_n_folds", None),
+         "model_path": getattr(r, "model_path", None),
          "train_accuracy": r.train_accuracy, "test_accuracy": r.test_accuracy,
          "test_auc": r.test_auc, "feature_importances": r.feature_importances}
         for r in rows
@@ -460,11 +524,9 @@ async def auto_trade_status(request: Request) -> dict[str, Any]:
         "confidence_floor": s.auto_trade_confidence_floor,
         "cool_down_sec": s.auto_trade_cool_down_sec,
         "cool_down_remaining_sec": int(cool_remaining),
-        "max_per_session": s.auto_trade_max_per_session,
         "count_session": s.auto_trade_count_session,
         "last_at_ms": s.auto_trade_last_at_ms,
         "last_block_reason": s.auto_trade_last_block_reason,
-        "session_cap_reached": s.auto_trade_count_session >= s.auto_trade_max_per_session,
         "qty_override": s.auto_trade_qty_override,
         "trigger_types": s.auto_trade_trigger_types,
         "runner_protect_enabled": s.runner_protect_enabled,
@@ -525,7 +587,7 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
     """Turn auto-trade on/off + optionally update settings.
 
     Body: {enabled: bool, confirm: bool, [confidence_floor], [cool_down_sec],
-           [max_per_session]}
+           [qty_override], [trigger_types]}
 
     confirm=true required when enabling (defensive — prevent accidental
     enabling via a stale fetch or replay)."""
@@ -549,8 +611,6 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
         s.auto_trade_confidence_floor = str(body["confidence_floor"]).upper()
     if "cool_down_sec" in body:
         s.auto_trade_cool_down_sec = max(60, int(body["cool_down_sec"]))
-    if "max_per_session" in body:
-        s.auto_trade_max_per_session = max(1, min(50, int(body["max_per_session"])))
     if "qty_override" in body:
         s.auto_trade_qty_override = max(0, min(100, int(body["qty_override"])))
     if "trigger_types" in body:
@@ -564,18 +624,18 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
         category="auto_trade_toggle", actor="user",
         summary=f"Auto-trade {'ENABLED' if new_enabled else 'DISABLED'} "
                 f"(was {'on' if old_enabled else 'off'}) — floor={s.auto_trade_confidence_floor}, "
-                f"cool_down={s.auto_trade_cool_down_sec}s, max={s.auto_trade_max_per_session}",
+                f"cool_down={s.auto_trade_cool_down_sec}s, per_symbol_cap={s.auto_trade_max_per_symbol}",
         details={
             "enabled": new_enabled, "confidence_floor": s.auto_trade_confidence_floor,
             "cool_down_sec": s.auto_trade_cool_down_sec,
-            "max_per_session": s.auto_trade_max_per_session,
+            "max_per_symbol": s.auto_trade_max_per_symbol,
         },
     )
     return {
         "ok": True, "enabled": s.auto_trade_enabled,
         "confidence_floor": s.auto_trade_confidence_floor,
         "cool_down_sec": s.auto_trade_cool_down_sec,
-        "max_per_session": s.auto_trade_max_per_session,
+        "max_per_symbol": s.auto_trade_max_per_symbol,
     }
 
 
@@ -592,10 +652,15 @@ async def scanner_symbols_get(request: Request) -> dict[str, Any]:
         remaining = s.auto_trade_cool_down_sec - int((now_ms - last) / 1000)
         if remaining > 0:
             cool_remaining_by_symbol[sym] = remaining
+    enabled_count = sum(1 for on in s.scan_enabled_symbols.values() if on)
+    implied_global = s.auto_trade_max_per_symbol * max(1, enabled_count)
     return {
         "enabled": dict(s.scan_enabled_symbols),
         "max_per_symbol": s.auto_trade_max_per_symbol,
-        "max_per_session_global": s.auto_trade_max_per_session,
+        # Implied global = per-symbol cap × enabled symbols. No separate
+        # global gate now; this field is for UI display only.
+        "max_per_session_global": implied_global,
+        "implied_global_cap": implied_global,
         "count_global": s.auto_trade_count_session,
         "count_by_symbol": dict(s.auto_trade_count_by_symbol),
         "cool_down_sec": s.auto_trade_cool_down_sec,
@@ -625,6 +690,71 @@ async def scanner_symbols_set(request: Request, body: dict[str, Any] = Body(...)
         "enabled": dict(s.scan_enabled_symbols),
         "max_per_symbol": s.auto_trade_max_per_symbol,
     }
+
+
+@router.get("/history/reviews_split")
+async def history_reviews_split(limit: int = 30) -> list[dict[str, Any]]:
+    """Per-session metrics with realized P/L split into paper vs live.
+
+    Combines DailyReview rows (for dedup_expectancy_r / dedup_win_rate_pct
+    — signal-quality metrics independent of execution channel) with
+    per-session IBKRExecution sums split by account ID prefix:
+      - account.startswith("DU") → paper
+      - else → live
+
+    Used by the ModelEvolution panel to render two graphs (paper + live).
+    """
+    from collections import defaultdict
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import DailyReview, IBKRExecution
+    from sqlmodel import select as _s
+
+    async with _gs() as session:
+        reviews = list((await session.exec(
+            _s(DailyReview).order_by(DailyReview.session_date.desc()).limit(limit)  # type: ignore[attr-defined]
+        )).all())
+        execs = list((await session.exec(_s(IBKRExecution))).all())
+
+    def is_paper(acct: str | None) -> bool:
+        return bool(acct and acct.startswith("DU"))
+
+    # Group fills by (session_date, paper_or_live, contract_key) and
+    # compute per-contract realized P/L (avg_sld - avg_bot) × paired × 100
+    by_session: dict[tuple, dict] = defaultdict(
+        lambda: {"bot_v": 0.0, "sld_v": 0.0, "bot_q": 0.0, "sld_q": 0.0}
+    )
+    for f in execs:
+        channel = "paper" if is_paper(f.account) else "live"
+        ckey = (f.symbol, f.strike, f.right, f.expiry)
+        slot = by_session[(f.session_date, channel, ckey)]
+        if f.side == "BOT":
+            slot["bot_v"] += f.shares * f.price
+            slot["bot_q"] += f.shares
+        else:
+            slot["sld_v"] += f.shares * f.price
+            slot["sld_q"] += f.shares
+
+    realized_by_session: dict[tuple, float] = defaultdict(float)
+    for (sd, channel, _ck), slot in by_session.items():
+        paired = min(slot["bot_q"], slot["sld_q"])
+        if paired <= 0:
+            continue
+        avg_bot = slot["bot_v"] / slot["bot_q"] if slot["bot_q"] else 0
+        avg_sld = slot["sld_v"] / slot["sld_q"] if slot["sld_q"] else 0
+        realized_by_session[(sd, channel)] += (avg_sld - avg_bot) * paired * 100.0
+
+    out = []
+    for r in reviews:
+        out.append({
+            "session_date": r.session_date,
+            "dedup_actionable": getattr(r, "dedup_actionable", 0),
+            "dedup_wins": getattr(r, "dedup_wins", 0),
+            "dedup_win_rate_pct": getattr(r, "dedup_win_rate_pct", 0.0),
+            "dedup_expectancy_r": getattr(r, "dedup_expectancy_r", 0.0),
+            "paper_realized_dollars": round(realized_by_session.get((r.session_date, "paper"), 0.0), 2),
+            "live_realized_dollars": round(realized_by_session.get((r.session_date, "live"), 0.0), 2),
+        })
+    return out
 
 
 @router.get("/history/reviews")
@@ -661,7 +791,12 @@ async def history_reviews(limit: int = 30) -> list[dict[str, Any]]:
          "dedup_stops": getattr(r, "dedup_stops", 0),
          "dedup_timeouts": getattr(r, "dedup_timeouts", 0),
          "dedup_win_rate_pct": getattr(r, "dedup_win_rate_pct", 0.0),
-         "dedup_expectancy_r": getattr(r, "dedup_expectancy_r", 0.0)}
+         "dedup_expectancy_r": getattr(r, "dedup_expectancy_r", 0.0),
+         "sharpe_ratio": getattr(r, "sharpe_ratio", None),
+         "sortino_ratio": getattr(r, "sortino_ratio", None),
+         "max_drawdown_R": getattr(r, "max_drawdown_R", None),
+         "profit_factor": getattr(r, "profit_factor", None),
+         "ulcer_index": getattr(r, "ulcer_index", None)}
         for r in rows
     ]
 
@@ -748,7 +883,11 @@ async def engine_freeze_state() -> dict[str, Any]:
         return {"sessions_since_change": len(reviews), "target": 10,
                 "last_change": None, "last_change_at": None}
     last_change_date = latest.applied_at.strftime("%Y-%m-%d")
-    sessions_after = sum(1 for r in reviews if r.session_date > last_change_date)
+    # Use `>=` so the change-day itself counts as a clean session. The
+    # engine change applies mid-day, but the user's convention is that
+    # the day's overall data still represents a usable session. Was `>`
+    # which made the change-day uncounted (off-by-one vs user tracking).
+    sessions_after = sum(1 for r in reviews if r.session_date >= last_change_date)
     return {
         "sessions_since_change": sessions_after,
         "target": 10,
@@ -820,6 +959,15 @@ async def diag_ibkr_executions(request: Request, days: int = 1) -> dict[str, Any
     except Exception as e:
         return {"mode": "live", "error": f"reqExecutionsAsync failed: {e}"}
 
+    # Write-through persist to DB (idempotent by exec_id). Any caller hitting
+    # this endpoint causes the persistence layer to update — no separate cron
+    # needed for normal operation. Survives IBKR's 7-day cache eviction.
+    persisted_new = 0
+    try:
+        persisted_new = await _persist_ibkr_executions(fills)
+    except Exception:
+        logger.exception("write-through persist of IBKR executions failed")
+
     cutoff = _dt.now(_tz.utc) - _td(days=days)
     out_exec: list[dict[str, Any]] = []
     by_contract: dict[str, list[dict]] = {}
@@ -880,6 +1028,148 @@ async def diag_ibkr_executions(request: Request, days: int = 1) -> dict[str, Any
         "total_realized_pnl_dollars": round(total_realized, 2),
         "pnl_by_contract": pnl_by_contract,
         "executions": out_exec,
+        "persisted_new_rows": persisted_new,
+    }
+
+
+async def _persist_ibkr_executions(fills) -> int:
+    """Upsert IBKR fills into ibkr_execution table. Returns count of NEW
+    rows added (existing exec_ids are skipped). Called write-through from
+    /diag/ibkr_executions and the historical-query endpoint.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import IBKRExecution
+    from sqlmodel import select as _s
+    from datetime import timezone as _tz, timedelta as _td
+
+    et_tz = _tz(_td(hours=-4))
+    new_count = 0
+    async with _gs() as session:
+        existing = set((await session.exec(_s(IBKRExecution.exec_id))).all())
+        for f in fills:
+            ex = f.execution
+            c = f.contract
+            if getattr(c, "secType", "") != "OPT":
+                continue
+            if not ex.execId or ex.execId in existing:
+                continue
+            ts = getattr(ex, "time", None)
+            if ts is None:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_tz.utc)
+            sess_date = ts.astimezone(et_tz).strftime("%Y-%m-%d")
+            row = IBKRExecution(
+                exec_id=ex.execId,
+                timestamp=ts,
+                session_date=sess_date,
+                symbol=getattr(c, "symbol", ""),
+                strike=float(getattr(c, "strike", 0) or 0),
+                right=getattr(c, "right", ""),
+                expiry=getattr(c, "lastTradeDateOrContractMonth", ""),
+                side=ex.side,
+                shares=float(ex.shares),
+                price=float(ex.price),
+                cum_qty=float(getattr(ex, "cumQty", 0) or 0),
+                avg_price=float(getattr(ex, "avgPrice", 0) or 0),
+                ib_order_id=getattr(ex, "orderId", None),
+                perm_id=getattr(ex, "permId", None),
+                account=getattr(ex, "acctNumber", None),
+            )
+            session.add(row)
+            new_count += 1
+        if new_count:
+            await session.commit()
+    return new_count
+
+
+@router.get("/diag/ibkr_executions_persisted")
+async def diag_ibkr_executions_persisted(
+    request: Request,
+    session_date: str | None = None,
+    days_back: int = 30,
+) -> dict[str, Any]:
+    """Query persisted IBKR executions from our DB. Survives IBKR's 7-day
+    cache eviction. Use session_date=YYYY-MM-DD for a single day, or
+    days_back=N for a rolling window (default 30).
+
+    The DB is populated write-through whenever /diag/ibkr_executions is
+    called (which the audit endpoint does each session), so the persisted
+    record grows over time without an explicit cron.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import IBKRExecution
+    from sqlmodel import select as _s
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    async with _gs() as session:
+        stmt = _s(IBKRExecution)
+        if session_date:
+            stmt = stmt.where(IBKRExecution.session_date == session_date)
+        else:
+            cutoff = (_dt.now(_tz.utc) - _td(days=days_back)).strftime("%Y-%m-%d")
+            stmt = stmt.where(IBKRExecution.session_date >= cutoff)
+        stmt = stmt.order_by(IBKRExecution.timestamp)  # type: ignore[attr-defined]
+        rows = list((await session.exec(stmt)).all())
+
+    by_date: dict[str, list[dict]] = {}
+    by_contract: dict[str, list[dict]] = {}
+    for r in rows:
+        contract_key = f"{r.symbol} {r.strike}{r.right} {r.expiry}"
+        rec = {
+            "exec_id": r.exec_id,
+            "timestamp": r.timestamp.isoformat(),
+            "session_date": r.session_date,
+            "contract": contract_key,
+            "side": r.side,
+            "shares": r.shares,
+            "price": r.price,
+            "ib_order_id": r.ib_order_id,
+            "perm_id": r.perm_id,
+            "account": r.account,
+        }
+        by_date.setdefault(r.session_date, []).append(rec)
+        by_contract.setdefault(contract_key, []).append(rec)
+
+    # Aggregate P/L per session-date and per-contract
+    pnl_by_date = {}
+    for date, fills in by_date.items():
+        bot = sum(f["shares"] * f["price"] for f in fills if f["side"] == "BOT")
+        sld = sum(f["shares"] * f["price"] for f in fills if f["side"] == "SLD")
+        bot_q = sum(f["shares"] for f in fills if f["side"] == "BOT")
+        sld_q = sum(f["shares"] for f in fills if f["side"] == "SLD")
+        pnl_by_date[date] = {
+            "fills": len(fills),
+            "bot_qty": bot_q,
+            "sld_qty": sld_q,
+            "avg_bot_price": round(bot / bot_q, 4) if bot_q else None,
+            "avg_sld_price": round(sld / sld_q, 4) if sld_q else None,
+            "realized_pnl_dollars": round((sld - bot) * 100, 2) if bot_q == sld_q and bot_q > 0 else None,
+            "fully_closed": bot_q == sld_q and bot_q > 0,
+        }
+
+    pnl_by_contract = {}
+    for ck, fills in by_contract.items():
+        bot = sum(f["shares"] * f["price"] for f in fills if f["side"] == "BOT")
+        sld = sum(f["shares"] * f["price"] for f in fills if f["side"] == "SLD")
+        bot_q = sum(f["shares"] for f in fills if f["side"] == "BOT")
+        sld_q = sum(f["shares"] for f in fills if f["side"] == "SLD")
+        pnl_by_contract[ck] = {
+            "bot_qty": bot_q, "sld_qty": sld_q,
+            "avg_bot_price": round(bot / bot_q, 4) if bot_q else None,
+            "avg_sld_price": round(sld / sld_q, 4) if sld_q else None,
+            "realized_pnl_dollars": round((sld - bot) * 100, 2) if bot_q == sld_q and bot_q > 0 else None,
+            "fully_closed": bot_q == sld_q and bot_q > 0,
+        }
+
+    return {
+        "session_date": session_date,
+        "days_back": days_back if not session_date else None,
+        "total_executions": len(rows),
+        "dates_covered": sorted(by_date.keys()),
+        "contracts_touched": len(by_contract),
+        "pnl_by_date": pnl_by_date,
+        "pnl_by_contract": pnl_by_contract,
     }
 
 
@@ -995,6 +1285,1424 @@ async def diag_trade_reconcile(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/diag/signal_execution_audit")
+async def diag_signal_execution_audit(
+    request: Request, session_date: str | None = None
+) -> dict[str, Any]:
+    """Per-signal execution audit. For each LiveOrder parent placed today:
+      - The signal/verdict it was placed on (entry_limit, target SPX levels)
+      - The actual IBKR BUY fill — entry slippage vs limit
+      - The actual IBKR SELL fills on the same contract — exits + prices
+      - Realized P/L per contract (aggregates handles stacking)
+      - SPX overshoot at T1 (target vs actual SPX where T1 fired)
+
+    Entry matching is exact (LiveOrder.ib_order_id ↔ IBKR fill.orderId).
+    Exit fills are watcher-issued market orders that don't get LiveOrder
+    rows (only audit log) — so they're matched per-contract, not per-parent.
+    For stacked positions on the same strike, the per-parent entry slippage
+    is still attributable, but realized P/L is per-contract aggregate only.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import LiveOrder
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from sqlmodel import select as _s
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    s = _state(request)
+    if not isinstance(s.ibkr, LiveIBKRProvider):
+        return {"mode": "mock"}
+    ib = getattr(s.ibkr, "_ib", None)
+    if ib is None or not ib.isConnected():
+        return {"mode": "disconnected"}
+
+    target_date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+
+    async with _gs() as session:
+        db_parents = list((await session.exec(
+            _s(LiveOrder).where(LiveOrder.bracket_role == "parent")
+            .where(LiveOrder.dry_run == False)  # noqa: E712
+        )).all())
+    parents = [p for p in db_parents
+               if p.submitted_at.strftime("%Y-%m-%d") == target_date]
+
+    try:
+        fills = await ib.reqExecutionsAsync()
+    except Exception as e:
+        return {"mode": "live", "error": f"reqExecutionsAsync failed: {e}"}
+
+    # Index fills both ways
+    by_order_id: dict[int, list[dict]] = {}
+    by_contract: dict[str, list[dict]] = {}
+    for f in fills:
+        ex = f.execution
+        c = f.contract
+        if getattr(c, "secType", "") != "OPT":
+            continue
+        ts = getattr(ex, "time", None)
+        if ts is None:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_tz.utc)
+        rec = {
+            "exec_id": ex.execId,
+            "timestamp": ts.isoformat(),
+            "_ts": ts,
+            "contract_key": f"{c.symbol} {c.strike}{c.right} {c.lastTradeDateOrContractMonth}",
+            "side": ex.side,
+            "shares": float(ex.shares),
+            "price": float(ex.price),
+            "ib_order_id": ex.orderId,
+        }
+        by_order_id.setdefault(ex.orderId, []).append(rec)
+        by_contract.setdefault(rec["contract_key"], []).append(rec)
+    for fl in by_contract.values():
+        fl.sort(key=lambda r: r["_ts"])
+
+    # Per-parent audit (entry-level)
+    audit_rows: list[dict] = []
+    for p in parents:
+        contract_key = f"{p.symbol} {p.strike}{p.right} {p.expiry}"
+
+        entry_fills = by_order_id.get(p.ib_order_id or -1, [])
+        bot_fills = [f for f in entry_fills if f["side"] == "BOT"]
+        bot_qty = sum(f["shares"] for f in bot_fills)
+        avg_entry = (sum(f["shares"] * f["price"] for f in bot_fills) / bot_qty
+                     if bot_qty else None)
+
+        entry_slip_d = None
+        entry_slip_pct = None
+        if avg_entry is not None and p.limit_price:
+            entry_slip_d = round(avg_entry - p.limit_price, 4)
+            entry_slip_pct = round(entry_slip_d / p.limit_price * 100, 2)
+
+        t1_overshoot = None
+        if p.spx_target_t1 is not None and p.spx_target_t1_at_spx is not None:
+            if p.right == "C":
+                t1_overshoot = round(p.spx_target_t1_at_spx - p.spx_target_t1, 2)
+            else:
+                t1_overshoot = round(p.spx_target_t1 - p.spx_target_t1_at_spx, 2)
+
+        audit_rows.append({
+            "parent_id": p.id,
+            "submitted_at": p.submitted_at.isoformat(),
+            "contract": contract_key,
+            "right": p.right,
+            "qty_ordered": p.qty,
+            "qty_filled": int(bot_qty),
+            "status": p.status,
+            "ib_order_id": p.ib_order_id,
+            "signal": {
+                "entry_limit": p.limit_price,
+                "entry_spx": p.entry_spx_price,
+                "t1_spx": p.spx_target_t1,
+                "t2_spx": p.spx_target_t2,
+                "t3_spx": p.spx_target_t3,
+                "stop_spx": p.spx_target_stop,
+                "dynamic_stop_spx": p.dynamic_stop_level,
+                "be_step_reached_R": p.be_ladder_max_step_R,
+            },
+            "actual": {
+                "avg_buy_price": round(avg_entry, 4) if avg_entry else None,
+                "entry_slip_dollars": entry_slip_d,
+                "entry_slip_pct": entry_slip_pct,
+                "buy_fills_count": len(bot_fills),
+            },
+            "tiers": {
+                "t1_fired": p.spx_target_t1_fired,
+                "t2_fired": p.spx_target_t2_fired,
+                "t3_fired": p.spx_target_t3_fired,
+                "t1_actual_spx": p.spx_target_t1_at_spx,
+                "t2_actual_spx": p.spx_target_t2_at_spx,
+                "t3_actual_spx": p.spx_target_t3_at_spx,
+                "t1_actually_hit": (
+                    (p.spx_target_t1_at_spx or 0) > 0
+                    or (p.status == "CLOSED" and p.spx_target_t1_fired)
+                ),
+                "t2_actually_hit": (
+                    (p.spx_target_t2_at_spx or 0) > 0
+                    or (p.status == "CLOSED" and p.spx_target_t2_fired)
+                ),
+                "t3_actually_hit": (
+                    (p.spx_target_t3_at_spx or 0) > 0
+                    or (p.status == "CLOSED" and p.spx_target_t3_fired)
+                ),
+                "t1_overshoot_spx": t1_overshoot,
+            },
+        })
+
+    # Per-contract aggregation (handles stacking)
+    contract_summary: dict[str, dict] = {}
+    for ck, fl in by_contract.items():
+        bots = [f for f in fl if f["side"] == "BOT"]
+        slds = [f for f in fl if f["side"] == "SLD"]
+        bot_q = sum(f["shares"] for f in bots)
+        sld_q = sum(f["shares"] for f in slds)
+        bot_t = sum(f["shares"] * f["price"] for f in bots)
+        sld_t = sum(f["shares"] * f["price"] for f in slds)
+        realized = (sld_t - bot_t) * 100 if bot_q == sld_q and bot_q > 0 else None
+        contract_summary[ck] = {
+            "buy_count": len(bots),
+            "sell_count": len(slds),
+            "bot_qty": bot_q,
+            "sld_qty": sld_q,
+            "avg_buy_price": round(bot_t / bot_q, 4) if bot_q else None,
+            "avg_sell_price": round(sld_t / sld_q, 4) if sld_q else None,
+            "best_sell_price": round(max(f["price"] for f in slds), 4) if slds else None,
+            "worst_sell_price": round(min(f["price"] for f in slds), 4) if slds else None,
+            "fully_closed": bot_q == sld_q and bot_q > 0,
+            "realized_pnl_dollars": round(realized, 2) if realized is not None else None,
+        }
+
+    # Aggregate stats
+    slips_d = [r["actual"]["entry_slip_dollars"] for r in audit_rows
+               if r["actual"]["entry_slip_dollars"] is not None]
+    slips_pct = [r["actual"]["entry_slip_pct"] for r in audit_rows
+                 if r["actual"]["entry_slip_pct"] is not None]
+    overshoots = [r["tiers"]["t1_overshoot_spx"] for r in audit_rows
+                  if r["tiers"]["t1_overshoot_spx"] is not None]
+    # Truth signal: spx_target_tN_at_spx > 0 means the tier ACTUALLY fired
+    # (watcher writes the SPX value at fire time). The boolean t1/2/3_fired
+    # flags get set to True by the STOP path too, so they're not reliable.
+    #
+    # Fallback for rows written before t2/t3_at_spx column existed:
+    # status='CLOSED' means all 3 tiers truly fired (the watcher's only path
+    # to CLOSED requires all 3 booleans True AND status was not already STOPPED,
+    # so STOPPED rows stay STOPPED). status='STOPPED' is the ambiguous case —
+    # we use t1_at_spx for T1 truth, and treat T2/T3 as "unknown" without
+    # the dedicated fire-time SPX column.
+    def _hit(r, tier: int) -> bool:
+        actual = r["tiers"].get(f"t{tier}_actual_spx")
+        if actual and actual > 0:
+            return True
+        # Pre-migration fallback: CLOSED status implies all tiers fired
+        return r["status"] == "CLOSED" and r["tiers"].get(f"t{tier}_fired", False)
+    t1_fires = sum(1 for r in audit_rows if _hit(r, 1))
+    t2_fires = sum(1 for r in audit_rows if _hit(r, 2))
+    t3_fires = sum(1 for r in audit_rows if _hit(r, 3))
+    stops = sum(1 for r in audit_rows if r["status"] == "STOPPED")
+
+    aggregate = {
+        "parent_count": len(audit_rows),
+        "entry_slip_avg_dollars": round(sum(slips_d) / len(slips_d), 4) if slips_d else None,
+        "entry_slip_avg_pct": round(sum(slips_pct) / len(slips_pct), 2) if slips_pct else None,
+        "entry_slip_max_dollars": max(slips_d, default=None),
+        "entry_slip_min_dollars": min(slips_d, default=None),
+        "t1_overshoot_avg_spx": round(sum(overshoots) / len(overshoots), 2) if overshoots else None,
+        "t1_overshoot_max_spx": max(overshoots, default=None),
+        "t1_overshoot_min_spx": min(overshoots, default=None),
+        "t1_actually_hit_count": t1_fires,
+        "t2_actually_hit_count": t2_fires,
+        "t3_actually_hit_count": t3_fires,
+        "stopped_count": stops,
+        "total_realized_dollars": round(sum(
+            c["realized_pnl_dollars"] or 0 for c in contract_summary.values()
+        ), 2),
+    }
+
+    return {
+        "mode": "live",
+        "session_date": target_date,
+        "aggregate": aggregate,
+        "parents": audit_rows,
+        "contract_summary": contract_summary,
+    }
+
+
+@router.get("/diag/portfolio_greeks")
+async def diag_portfolio_greeks(request: Request) -> dict[str, Any]:
+    """Sum greeks across ALL open IBKR option positions. Surfaces net
+    portfolio exposure so you can see what you owe the market right now.
+
+    Returns:
+      - net_delta_dollars: position-weighted delta × 100 × spot (dollar exposure)
+      - net_gamma: position-weighted gamma × 100
+      - net_vega_dollars: position-weighted vega × 100 (dollar P/L per 1pt IV)
+      - net_theta_dollars: position-weighted theta × 100 (dollar P/L per day)
+      - per_position: per-contract breakdown
+
+    Greeks come from IBKR's modelGreeks (computed from their vol surface).
+    If a position has no model greeks (rare on liquid options), it's flagged
+    in `missing_greeks` and excluded from the totals.
+    """
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+
+    s = _state(request)
+    if not isinstance(s.ibkr, LiveIBKRProvider):
+        return {"mode": "mock", "positions": [], "net": {}}
+    ib = getattr(s.ibkr, "_ib", None)
+    if ib is None or not ib.isConnected():
+        return {"mode": "disconnected"}
+
+    positions = ib.positions()
+    per_position: list[dict[str, Any]] = []
+    missing_greeks: list[str] = []
+    net_delta = 0.0
+    net_gamma = 0.0
+    net_vega = 0.0
+    net_theta = 0.0
+
+    for pos in positions:
+        c = pos.contract
+        if getattr(c, "secType", "") != "OPT":
+            continue
+        qty = float(pos.position)
+        if abs(qty) < 0.001:
+            continue
+        # Get current quote with greeks. Request and await tick.
+        from ib_async import Ticker
+        try:
+            await ib.qualifyContractsAsync(c)
+            ticker: Ticker = ib.reqMktData(c, "", False, False)
+            # Brief wait for greeks to arrive (model greeks have ~250ms latency)
+            import asyncio as _aio
+            await _aio.sleep(0.6)
+            mg = ticker.modelGreeks
+        except Exception as e:
+            logger.warning("greeks fetch failed for %s: %s", c.localSymbol, e)
+            mg = None
+        finally:
+            try:
+                ib.cancelMktData(c)
+            except Exception:
+                pass
+
+        contract_label = f"{c.symbol} {c.strike}{c.right} {c.lastTradeDateOrContractMonth}"
+        if mg is None or mg.delta is None:
+            missing_greeks.append(contract_label)
+            per_position.append({
+                "contract": contract_label, "qty": qty,
+                "delta": None, "gamma": None, "vega": None, "theta": None,
+                "model_greeks_available": False,
+            })
+            continue
+
+        # Multiply by 100 (options multiplier) and by qty
+        pos_delta = (mg.delta or 0) * qty * 100
+        pos_gamma = (mg.gamma or 0) * qty * 100
+        pos_vega = (mg.vega or 0) * qty * 100
+        pos_theta = (mg.theta or 0) * qty * 100
+        net_delta += pos_delta
+        net_gamma += pos_gamma
+        net_vega += pos_vega
+        net_theta += pos_theta
+
+        per_position.append({
+            "contract": contract_label, "qty": qty,
+            "delta": round(mg.delta or 0, 4),
+            "gamma": round(mg.gamma or 0, 4),
+            "vega": round(mg.vega or 0, 4),
+            "theta": round(mg.theta or 0, 4),
+            "iv": round(mg.impliedVol or 0, 4) if mg.impliedVol else None,
+            "underlying_price": round(mg.undPrice or 0, 2) if mg.undPrice else None,
+            "position_delta": round(pos_delta, 2),
+            "position_gamma": round(pos_gamma, 2),
+            "position_vega": round(pos_vega, 2),
+            "position_theta": round(pos_theta, 2),
+        })
+
+    # Estimate dollar exposures using an SPX-like spot. Use the first
+    # position's underlying as a rough proxy (or 0 if none).
+    spot_proxy = next((p.get("underlying_price") for p in per_position
+                       if p.get("underlying_price")), 0)
+    net_delta_dollars = round(net_delta * spot_proxy, 2) if spot_proxy else None
+
+    # Thresholds for warnings — purely informational
+    warnings: list[str] = []
+    if net_delta_dollars and abs(net_delta_dollars) > 100000:
+        warnings.append(f"|net_delta_dollars| = ${abs(net_delta_dollars):,.0f} > $100k threshold")
+    if net_theta and net_theta < -5000:
+        warnings.append(f"net_theta = ${net_theta:,.0f}/day — large theta bleed")
+
+    return {
+        "mode": "live",
+        "position_count": len(per_position),
+        "missing_greeks_for": missing_greeks,
+        "net": {
+            "delta": round(net_delta, 2),
+            "delta_dollars": net_delta_dollars,
+            "gamma": round(net_gamma, 2),
+            "vega": round(net_vega, 2),
+            "theta": round(net_theta, 2),
+            "spot_proxy_used": spot_proxy,
+        },
+        "warnings": warnings,
+        "per_position": per_position,
+    }
+
+
+@router.get("/diag/symbol_correlations")
+async def diag_symbol_correlations(
+    request: Request, lookback_hours: int = 24,
+) -> dict[str, Any]:
+    """Pairwise Pearson correlation between symbols on price-action sequences.
+
+    For each enabled scanner symbol, pulls recent SignalIter rows and
+    computes correlation on the spx_price series (which is the symbol's
+    own price when SignalIter was written under that symbol's scan).
+    Use BEFORE enabling multiple uncorrelated symbols — if they're
+    actually 0.9 correlated intraday, you're not getting diversification.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import SignalIter
+    from sqlmodel import select as _s
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    import statistics as _stat
+
+    s = _state(request)
+    enabled_syms = [sym for sym, on in s.scan_enabled_symbols.items() if on]
+    enabled_syms.append(s.active_symbol)
+    syms = sorted(set(enabled_syms))
+
+    cutoff = _dt.now(_tz.utc) - _td(hours=lookback_hours)
+
+    series: dict[str, list[tuple[_dt, float]]] = {}
+    async with _gs() as session:
+        for sym in syms:
+            rows = list((await session.exec(
+                _s(SignalIter).where(SignalIter.timestamp >= cutoff)  # type: ignore[arg-type]
+                .order_by(SignalIter.timestamp)  # type: ignore[attr-defined]
+            )).all())
+            # Filter to rows where extras.scanner_symbol matches OR active_symbol
+            filtered: list[tuple[_dt, float]] = []
+            for r in rows:
+                ex = r.extras or {}
+                row_sym = ex.get("scanner_symbol") or s.active_symbol
+                if row_sym == sym:
+                    filtered.append((r.timestamp, r.spx_price))
+            series[sym] = filtered
+
+    # Build a unified time-aligned matrix. Resample each series to the
+    # MIN timestamp set so correlations are computed on synchronous samples.
+    # Crude approach: just use the timestamps of the smallest series and
+    # nearest-neighbor lookup in the others. Good enough for intraday.
+    series_lens = {sym: len(s_) for sym, s_ in series.items()}
+    base_sym = min(syms, key=lambda x: series_lens[x]) if syms else None
+    sample_count = 0
+    matrix: dict[str, dict[str, float | None]] = {a: {b: None for b in syms} for a in syms}
+
+    if base_sym and series.get(base_sym):
+        base_times = [t for t, _ in series[base_sym]]
+        sample_count = len(base_times)
+        # Align other series by nearest timestamp
+        aligned: dict[str, list[float]] = {}
+        for sym in syms:
+            if not series[sym]:
+                continue
+            sym_pairs = series[sym]
+            j = 0
+            out: list[float] = []
+            for bt in base_times:
+                while j + 1 < len(sym_pairs) and sym_pairs[j + 1][0] <= bt:
+                    j += 1
+                out.append(sym_pairs[j][1])
+            aligned[sym] = out
+
+        for a in syms:
+            for b in syms:
+                if a == b:
+                    matrix[a][b] = 1.0
+                    continue
+                xs = aligned.get(a); ys = aligned.get(b)
+                if not xs or not ys or len(xs) < 3 or len(ys) < 3:
+                    continue
+                # Pearson on returns (delta of price) rather than levels
+                rx = [xs[i] - xs[i-1] for i in range(1, len(xs))]
+                ry = [ys[i] - ys[i-1] for i in range(1, len(ys))]
+                if len(rx) < 2:
+                    continue
+                try:
+                    mx = _stat.mean(rx); my = _stat.mean(ry)
+                    sx = _stat.stdev(rx); sy = _stat.stdev(ry)
+                    if sx == 0 or sy == 0:
+                        continue
+                    cov = sum((rx[i]-mx)*(ry[i]-my) for i in range(len(rx))) / (len(rx)-1)
+                    matrix[a][b] = round(cov / (sx * sy), 3)
+                except Exception:
+                    matrix[a][b] = None
+
+    return {
+        "lookback_hours": lookback_hours,
+        "symbols": syms,
+        "sample_count": sample_count,
+        "series_lengths": series_lens,
+        "correlation_matrix": matrix,
+    }
+
+
+@router.post("/backtest/save_tournament")
+async def backtest_save_tournament(
+    request: Request, body: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Persist a Preset Tournament run + its per-preset results.
+
+    Called by the panel after a successful tournament run so the leaderboard
+    survives refresh. Lets you track preset performance day-over-day instead
+    of every Run being ephemeral.
+
+    Body:
+      session_date_from: str
+      session_date_to: str
+      apply_be_ladder: bool
+      commission_per_contract: float (optional)
+      notes: str (optional)
+      results: list of per-preset rows with all the metrics
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import TournamentRun, TournamentRunResult
+
+    # Compute regime distribution for the window — count regime_at_fire
+    # across SignalIter rows in the range, normalize to fractions.
+    from fef_sidecar.db.models import SignalIter as _SI
+    from sqlmodel import select as _s
+    from collections import Counter as _Counter
+    regime_dist: dict[str, float] = {}
+    dominant_regime = "UNKNOWN"
+    async with _gs() as session:
+        date_from = body.get("session_date_from", "")
+        date_to = body.get("session_date_to", date_from)
+        iter_rows = list((await session.exec(
+            _s(_SI)
+            .where(_SI.session_date >= date_from)
+            .where(_SI.session_date <= date_to)
+        )).all())
+        regime_counts: _Counter = _Counter()
+        for it in iter_rows:
+            ex = it.extras or {}
+            regime = ex.get("regime_at_fire") or "NORMAL"
+            regime_counts[regime] += 1
+        total = sum(regime_counts.values())
+        if total > 0:
+            regime_dist = {k: round(v / total, 3) for k, v in regime_counts.items()}
+            dominant_regime = max(regime_counts.items(), key=lambda kv: kv[1])[0]
+
+    run = TournamentRun(
+        session_date_from=body.get("session_date_from", ""),
+        session_date_to=body.get("session_date_to", ""),
+        apply_be_ladder=bool(body.get("apply_be_ladder", True)),
+        commission_per_contract=float(body.get("commission_per_contract", 0.65)),
+        preset_count=len(body.get("results") or []),
+        notes=str(body.get("notes", "")),
+        regime_distribution=regime_dist,
+        dominant_regime=dominant_regime,
+    )
+    async with _gs() as session:
+        session.add(run)
+        await session.commit()
+        await session.refresh(run)
+        for i, r in enumerate(body.get("results") or [], start=1):
+            session.add(TournamentRunResult(
+                tournament_run_id=run.id,
+                preset_id=int(r.get("preset_id", 0)),
+                preset_name=str(r.get("preset_name", "")),
+                rank=i if (r.get("trade_count") or 0) > 0 and not r.get("error") else 0,
+                trade_count=int(r.get("trade_count") or 0),
+                iters_scanned=int(r.get("iters_scanned") or 0),
+                wins=int(r.get("wins") or 0),
+                losses=int(r.get("losses") or 0),
+                win_rate_pct=float(r.get("win_rate_pct") or 0),
+                expectancy_r=float(r.get("expectancy_R") or 0),
+                sharpe_ratio=r.get("sharpe_ratio"),
+                max_drawdown_r=float(r.get("max_drawdown_R") or 0),
+                profit_factor=r.get("profit_factor"),
+                cumulative_r=float(r.get("cumulative_R") or 0),
+                skipped=r.get("skipped") or {},
+                error=r.get("error"),
+            ))
+        await session.commit()
+    return {"ok": True, "tournament_run_id": run.id, "saved_results": run.preset_count}
+
+
+@router.get("/backtest/tournament_runs")
+async def backtest_tournament_runs(
+    request: Request, limit: int = 30,
+) -> list[dict[str, Any]]:
+    """List recent tournament runs (newest first). Each entry includes
+    the run metadata + a summary of the winning preset for that run.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import TournamentRun, TournamentRunResult
+    from sqlmodel import select as _s
+
+    async with _gs() as session:
+        runs = list((await session.exec(
+            _s(TournamentRun)
+            .order_by(TournamentRun.run_at.desc())  # type: ignore[attr-defined]
+            .limit(limit)
+        )).all())
+        out = []
+        for run in runs:
+            winner_rows = list((await session.exec(
+                _s(TournamentRunResult)
+                .where(TournamentRunResult.tournament_run_id == run.id)
+                .where(TournamentRunResult.rank == 1)
+            )).all())
+            winner = winner_rows[0] if winner_rows else None
+            out.append({
+                "id": run.id,
+                "run_at": run.run_at.isoformat(),
+                "session_date_from": run.session_date_from,
+                "session_date_to": run.session_date_to,
+                "apply_be_ladder": run.apply_be_ladder,
+                "preset_count": run.preset_count,
+                "notes": run.notes,
+                "winner_preset_name": winner.preset_name if winner else None,
+                "winner_cumulative_r": winner.cumulative_r if winner else None,
+                "winner_expectancy_r": winner.expectancy_r if winner else None,
+                "winner_sharpe": winner.sharpe_ratio if winner else None,
+                "regime_distribution": getattr(run, "regime_distribution", {}) or {},
+                "dominant_regime": getattr(run, "dominant_regime", "UNKNOWN"),
+            })
+        return out
+
+
+@router.get("/backtest/tournament_runs/{run_id}")
+async def backtest_tournament_run_detail(
+    request: Request, run_id: int,
+) -> dict[str, Any]:
+    """Full leaderboard for one historical tournament run."""
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import TournamentRun, TournamentRunResult
+    from sqlmodel import select as _s
+
+    async with _gs() as session:
+        run = (await session.exec(
+            _s(TournamentRun).where(TournamentRun.id == run_id)
+        )).first()
+        if run is None:
+            return {"error": f"tournament_run {run_id} not found"}
+        rows = list((await session.exec(
+            _s(TournamentRunResult)
+            .where(TournamentRunResult.tournament_run_id == run_id)
+            .order_by(TournamentRunResult.rank)  # type: ignore[attr-defined]
+        )).all())
+        return {
+            "id": run.id,
+            "run_at": run.run_at.isoformat(),
+            "session_date_from": run.session_date_from,
+            "session_date_to": run.session_date_to,
+            "apply_be_ladder": run.apply_be_ladder,
+            "commission_per_contract": run.commission_per_contract,
+            "preset_count": run.preset_count,
+            "notes": run.notes,
+            "results": [
+                {
+                    "preset_id": r.preset_id,
+                    "preset_name": r.preset_name,
+                    "rank": r.rank,
+                    "trade_count": r.trade_count,
+                    "iters_scanned": r.iters_scanned,
+                    "wins": r.wins,
+                    "losses": r.losses,
+                    "win_rate_pct": r.win_rate_pct,
+                    "expectancy_R": r.expectancy_r,
+                    "sharpe_ratio": r.sharpe_ratio,
+                    "max_drawdown_R": r.max_drawdown_r,
+                    "profit_factor": r.profit_factor,
+                    "cumulative_R": r.cumulative_r,
+                    "skipped": r.skipped,
+                    "error": r.error,
+                } for r in rows
+            ],
+        }
+
+
+@router.post("/diag/refresh_prior_close")
+async def diag_refresh_prior_close(request: Request) -> dict[str, Any]:
+    """Re-fetch prior-day close for the active symbol from IBKR. Used when
+    the initial fetch failed (e.g. TWS was down at startup) so the Live
+    Quote panel can show the day-change % once TWS is back up.
+    """
+    from fef_sidecar.main import refresh_prior_close
+    s = _state(request)
+    await refresh_prior_close(s)
+    pc = s.prior_close_by_symbol.get(s.active_symbol)
+    return {
+        "ok": pc is not None,
+        "active_symbol": s.active_symbol,
+        "prior_close": pc,
+    }
+
+
+@router.post("/diag/backfill_spx_bars")
+async def diag_backfill_spx_bars(
+    request: Request,
+    symbol: str = "SPX",
+    bar_size: str = "1 min",
+    duration: str = "5 D",
+) -> dict[str, Any]:
+    """Pull historical bars from IBKR and upsert into HistoricalBar.
+
+    Default: last 5 trading days of 1-minute SPX bars. Used to give the
+    backtester a higher-resolution SPX path than the 2-minute iter cadence
+    so target/stop checks fire at realistic times.
+
+    Idempotent: skips bars already in the DB (unique on symbol+bar_size+
+    timestamp_ms).
+    """
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from fef_sidecar.ibkr.models import Contract
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import HistoricalBar
+    from sqlmodel import select as _s
+
+    s = _state(request)
+    if not isinstance(s.ibkr, LiveIBKRProvider):
+        return {"mode": "mock", "added": 0}
+    ib = getattr(s.ibkr, "_ib", None)
+    if ib is None or not ib.isConnected():
+        return {"mode": "disconnected"}
+
+    try:
+        contract = Contract.for_symbol(symbol)
+        from fef_sidecar.ibkr.live import _to_ib_contract
+        ib_contract = _to_ib_contract(contract)
+        await ib.qualifyContractsAsync(ib_contract)
+        # SPX uses TRADES bar type since it has no bid/ask (index).
+        bars = await ib.reqHistoricalDataAsync(
+            ib_contract,
+            endDateTime="",  # empty = up to now
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES" if symbol == "SPX" else "MIDPOINT",
+            useRTH=True,
+            formatDate=2,  # epoch seconds
+            keepUpToDate=False,
+        )
+    except Exception as e:
+        return {"error": f"IBKR fetch failed: {type(e).__name__}: {e}"}
+
+    added = 0; existing = 0
+    async with _gs() as session:
+        # Pull existing timestamps to avoid duplicates
+        existing_rows = list((await session.exec(
+            _s(HistoricalBar)
+            .where(HistoricalBar.symbol == symbol)
+            .where(HistoricalBar.bar_size == bar_size)
+        )).all())
+        existing_ts = {r.timestamp_ms for r in existing_rows}
+        for b in bars:
+            try:
+                ts_ms = int(b.date.timestamp() * 1000) if hasattr(b.date, "timestamp") else int(b.date * 1000)
+            except Exception:
+                continue
+            if ts_ms in existing_ts:
+                existing += 1
+                continue
+            session.add(HistoricalBar(
+                symbol=symbol, bar_size=bar_size, timestamp_ms=ts_ms,
+                open=float(b.open), high=float(b.high), low=float(b.low),
+                close=float(b.close), volume=float(b.volume or 0),
+            ))
+            added += 1
+        if added:
+            await session.commit()
+    return {
+        "symbol": symbol, "bar_size": bar_size, "duration": duration,
+        "fetched_from_ibkr": len(bars),
+        "added_to_db": added,
+        "already_existed": existing,
+    }
+
+
+@router.get("/backtest/full_pipeline")
+async def backtest_full_pipeline(
+    request: Request,
+    session_date_from: str,
+    session_date_to: str | None = None,
+    apply_be_ladder: bool = True,
+    commission_per_contract: float = 0.65,
+    avg_entry_slip_pct: float | None = None,
+    avg_exit_slip_pct: float | None = None,
+    preset_id: int | None = None,
+) -> dict[str, Any]:
+    """Full-pipeline backtest. For every SignalIter row in [from, to] that
+    would have fired the auto-trader, simulate:
+      1. Entry at limit (with optional slippage)
+      2. Walk forward through subsequent iters' SPX path
+      3. Check T1/T2/T3/STOP crossings against the verdict's targets
+      4. Optionally simulate BE ladder ratcheting (apply_be_ladder=true)
+      5. Apply commission per round trip
+
+    Returns per-trade outcomes + equity curve + Sharpe/MDD aggregated.
+
+    Slippage: if avg_entry_slip_pct / avg_exit_slip_pct are None, computed
+    from actual IBKRExecution data for that contract. Otherwise applies the
+    user-supplied flat pct.
+
+    NOTE: this is a strategy backtester (replays auto-trader gates +
+    watcher exits), distinct from optimization.py (parameter sweep at
+    threshold level) and backtest.py (pattern matching). Use this for
+    "if I changed the BE ladder, what would Tuesday have looked like?"
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import (
+        SignalIter, FEFDirection, IBKRExecution, StrategyPreset, HistoricalBar,
+    )
+    from sqlmodel import select as _s
+    import statistics as _stat
+    import math as _math
+    import traceback as _tb
+
+    to_date = session_date_to or session_date_from
+
+    # === Outer try/except wraps EVERYTHING so we always return JSON, never 500.
+    # Inner code paths can still skip individual rows on per-row errors.
+    try:
+        async with _gs() as session:
+            sigs = list((await session.exec(
+                _s(SignalIter)
+                .where(SignalIter.session_date >= session_date_from)
+                .where(SignalIter.session_date <= to_date)
+                .order_by(SignalIter.timestamp)  # type: ignore[attr-defined]
+            )).all())
+            # Historical fills for slippage estimation
+            fills = list((await session.exec(
+                _s(IBKRExecution)
+                .where(IBKRExecution.session_date >= session_date_from)
+                .where(IBKRExecution.session_date <= to_date)
+            )).all())
+            # Load preset thresholds if requested. When preset_id is set,
+            # we instantiate a fresh FEFEngine with those thresholds and
+            # re-evaluate every iter's inputs through it. Different presets
+            # → different verdicts → different trades.
+            preset_row = None
+            if preset_id is not None:
+                preset_row = (await session.exec(
+                    _s(StrategyPreset).where(StrategyPreset.id == preset_id)
+                )).first()
+            # Pull 1-min SPX bars for finer-grained path resolution. The
+            # backtester walks forward on these instead of iter snapshots —
+            # catches stop/target crosses inside a 2-min iter window that
+            # would otherwise be missed by snapshot-cadence checks.
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            try:
+                _ts_lo = int(_dt.fromisoformat(session_date_from).replace(tzinfo=_tz.utc).timestamp() * 1000)
+                _ts_hi = int((_dt.fromisoformat(to_date).replace(tzinfo=_tz.utc) + _td(days=1)).timestamp() * 1000)
+            except Exception:
+                _ts_lo = 0; _ts_hi = 10**13
+            spx_bars = list((await session.exec(
+                _s(HistoricalBar)
+                .where(HistoricalBar.symbol == "SPX")
+                .where(HistoricalBar.bar_size == "1 min")
+                .where(HistoricalBar.timestamp_ms >= _ts_lo)
+                .where(HistoricalBar.timestamp_ms < _ts_hi)
+                .order_by(HistoricalBar.timestamp_ms)  # type: ignore[attr-defined]
+            )).all())
+    except Exception as e:
+        return {
+            "error": f"DB query failed: {type(e).__name__}: {e}",
+            "trace": _tb.format_exc().splitlines()[-5:],
+        }
+
+    # Wrap remaining computation in a top-level try/except so a single
+    # malformed historical row never produces a 500.
+    try:
+        return _backtest_compute(
+            sigs=sigs, fills=fills, spx_bars=spx_bars,
+            session_date_from=session_date_from, to_date=to_date,
+            apply_be_ladder=apply_be_ladder,
+            commission_per_contract=commission_per_contract,
+            avg_entry_slip_pct=avg_entry_slip_pct,
+            avg_exit_slip_pct=avg_exit_slip_pct,
+            preset_row=preset_row,
+        )
+    except Exception as e:
+        return {
+            "error": f"backtest computation failed: {type(e).__name__}: {e}",
+            "trace": _tb.format_exc().splitlines()[-10:],
+            "from": session_date_from, "to": to_date,
+            "iters_scanned": len(sigs),
+        }
+
+
+def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
+                      apply_be_ladder, commission_per_contract,
+                      avg_entry_slip_pct, avg_exit_slip_pct,
+                      preset_row=None):
+    """Synchronous backtest computation. Called from the route handler with
+    pre-queried sigs + fills. Pure computation — wrapped in caller's
+    try/except so any exception becomes a JSON error response.
+
+    When preset_row is provided, every iter is re-evaluated through a fresh
+    FEFEngine instantiated with that preset's thresholds. The stored
+    SignalIter.direction is IGNORED — the preset's engine produces the
+    verdict that drives the trade. This is how different presets produce
+    different backtest results from the same historical data.
+    """
+    import statistics as _stat
+
+    # If we have a preset, build a fresh engine with its thresholds and
+    # re-evaluate every historical iter. Otherwise we trust the stored
+    # SignalIter rows (which were produced under the live engine's config
+    # at the time they were recorded).
+    fresh_verdicts: dict[int, dict] | None = None
+    if preset_row is not None:
+        try:
+            from fef_sidecar.engine import FEFEngine
+            from fef_sidecar.engine.types import FEFInputs
+            from fef_sidecar.quantdata.models import ExposureRow
+            engine = FEFEngine(
+                wall_proximity_pts=float(preset_row.wall_proximity_pts),
+                wall_collapse_pct=float(preset_row.wall_collapse_pct),
+                wall_collapse_floor_m=float(preset_row.wall_collapse_floor_m),
+                absorption_fe_ratio_min=float(preset_row.absorption_fe_ratio_min),
+            )
+            fresh_verdicts = {}
+            for s in sigs:
+                try:
+                    gex_rows = [
+                        ExposureRow(strike=w.get("strike", 0),
+                                    call_m=max(0, w.get("net_m", 0)),
+                                    put_m=min(0, w.get("net_m", 0)),
+                                    net_m=w.get("net_m", 0))
+                        for w in (s.top_gex_walls or [])
+                    ]
+                    dex_rows = [
+                        ExposureRow(strike=w.get("strike", 0),
+                                    call_m=max(0, w.get("net_m", 0)),
+                                    put_m=min(0, w.get("net_m", 0)),
+                                    net_m=w.get("net_m", 0))
+                        for w in (s.top_dex_walls or [])
+                    ]
+                    inputs = FEFInputs(
+                        timestamp_ms=int(s.timestamp.timestamp() * 1000) if s.timestamp else 0,
+                        spx_price=float(s.spx_price),
+                        drift_cum_net_m=float(s.drift_cum_net_m or 0),
+                        drift_bias=s.drift_bias or "NEUTRAL",
+                        top_gex_walls=gex_rows,
+                        top_dex_walls=dex_rows,
+                        ntm_max_pain=float(s.ntm_max_pain or s.spx_price),
+                        raw_max_pain=float(s.raw_max_pain or s.spx_price),
+                        aggression_call_pct=s.aggression_call_pct,
+                        aggression_put_pct=s.aggression_put_pct,
+                    )
+                    v = engine.push(inputs)
+                    fresh_verdicts[s.id] = {
+                        "direction": v.direction.value,
+                        "t1": v.t1, "t2": v.t2, "t3": v.t3, "stop": v.stop,
+                        "strike_rec": v.strike_rec,
+                    }
+                except Exception:
+                    # If we can't re-evaluate this iter, fall back to skip
+                    fresh_verdicts[s.id] = {"direction": "WAIT"}
+        except Exception:
+            logger.exception("preset re-evaluation failed; falling back to stored verdicts")
+            fresh_verdicts = None
+
+    # Compute historical avg slippage per side from IBKRExecution + SignalIter
+    # extras (entry_limit on iter vs actual fill price). Only used when caller
+    # didn't supply explicit slippage pct.
+    if avg_entry_slip_pct is None:
+        slip_samples = []
+        try:
+            for s_ in sigs:
+                try:
+                    ex = s_.extras or {}
+                    opt = ex.get("option_pricing") or {}
+                    limit = opt.get("entry_limit")
+                    if not limit: continue
+                    try: limit = float(limit)
+                    except (TypeError, ValueError): continue
+                    if limit <= 0: continue
+                    strike_rec = ex.get("strike_rec")
+                    if strike_rec is None: continue
+                    try: strike_rec = float(strike_rec)
+                    except (TypeError, ValueError): continue
+                    for f in fills:
+                        try:
+                            if abs(float(f.strike) - strike_rec) > 0.5: continue
+                            if f.side != "BOT": continue
+                            f_ts = f.timestamp.replace(tzinfo=None) if (f.timestamp and f.timestamp.tzinfo) else f.timestamp
+                            s_ts = s_.timestamp.replace(tzinfo=None) if (s_.timestamp and s_.timestamp.tzinfo) else s_.timestamp
+                            if f_ts is None or s_ts is None: continue
+                            dt = abs((f_ts - s_ts).total_seconds())
+                            if dt > 300: continue
+                            slip_samples.append((float(f.price) - limit) / limit * 100)
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        except Exception:
+            logger.exception("slip sample computation failed; defaulting to 0")
+        # Manual mean — Python 3.14's statistics module has a bug where
+        # _exact_ratio on certain float-like inputs raises AttributeError
+        # on the .numerator attribute. Plain sum/len avoids the issue.
+        avg_entry_slip_pct = round(sum(float(x) for x in slip_samples) / len(slip_samples), 2) if slip_samples else 0.0
+
+    if avg_exit_slip_pct is None:
+        avg_exit_slip_pct = avg_entry_slip_pct  # approx
+
+    # Build SPX timeline. Prefer 1-min bars (high/low intra-bar — catches
+    # stop/target crosses inside a bar that iter-snapshot misses). Fall back
+    # to iter-cadence (timestamp, close) tuples when bars are missing.
+    spx_path = [(s_.timestamp, s_.spx_price) for s_ in sigs]
+    bars_sorted = sorted(spx_bars or [], key=lambda b: b.timestamp_ms)
+    bar_starts = [b.timestamp_ms for b in bars_sorted]
+    use_bars = len(bars_sorted) > 0
+    import bisect as _bisect
+
+    trades: list[dict[str, Any]] = []
+    skipped = {"no_dir": 0, "no_opt": 0, "no_targets": 0, "exception": 0}
+    for idx, s_ in enumerate(sigs):
+      try:
+        ex = s_.extras or {}
+        # If we have a preset's fresh verdicts, use those. Otherwise fall
+        # back to the stored SignalIter.direction + extras.t1/t2/t3.
+        fresh = fresh_verdicts.get(s_.id) if fresh_verdicts else None
+        if fresh:
+            dir_val = fresh["direction"]
+            t1 = fresh.get("t1"); t2 = fresh.get("t2")
+            t3 = fresh.get("t3"); stop = fresh.get("stop")
+        else:
+            dir_val = s_.direction.value if hasattr(s_.direction, "value") else str(s_.direction)
+            t1 = ex.get("t1"); t2 = ex.get("t2"); t3 = ex.get("t3"); stop = ex.get("stop")
+        if dir_val not in ("LONG_CALLS", "LONG_PUTS"):
+            skipped["no_dir"] += 1; continue
+        # Entry limit still comes from stored option_pricing (we don't
+        # rebuild option quotes for the preset re-eval). If a preset would
+        # have fired but the stored row lacked pricing, we skip.
+        opt = ex.get("option_pricing") or {}
+        entry_limit = opt.get("entry_limit")
+        if not entry_limit or entry_limit <= 0:
+            skipped["no_opt"] += 1; continue
+        if t1 is None or t2 is None or t3 is None or stop is None:
+            skipped["no_targets"] += 1; continue
+        # Defensive: ensure numeric (older rows might have string/Decimal)
+        try:
+            t1 = float(t1); t2 = float(t2); t3 = float(t3); stop = float(stop)
+            entry_limit = float(entry_limit)
+        except (TypeError, ValueError):
+            skipped["no_targets"] += 1; continue
+        entry_spx = s_.spx_price
+        if entry_spx is None: continue
+        entry_spx = float(entry_spx)
+        is_long = dir_val == "LONG_CALLS"
+
+        # Build forward path. Prefer 1-min bars from HistoricalBar (high+low
+        # intra-bar catches stop/target crosses that 2-min iter snapshots miss).
+        entry_ts_ms = (
+            int(s_.timestamp.timestamp() * 1000)
+            if s_.timestamp else 0
+        )
+        bar_path = []
+        if use_bars and entry_ts_ms > 0:
+            start_i = _bisect.bisect_left(bar_starts, entry_ts_ms)
+            # ~3 hours of 1-min bars = 180
+            bar_path = bars_sorted[start_i:start_i + 180]
+
+        if bar_path:
+            # 1-min path: each tick gives high/low for cross detection
+            path_items = [(b.timestamp_ms, float(b.open), float(b.high),
+                           float(b.low), float(b.close)) for b in bar_path]
+            path_mode = "1min_bar"
+        else:
+            # Fallback: iter-cadence — use spx_price as both high/low/close
+            iter_slice = spx_path[idx + 1:idx + 90]
+            if not iter_slice:
+                continue
+            path_items = [(int(t.timestamp() * 1000) if t else 0, p, p, p, p)
+                          for t, p in iter_slice]
+            path_mode = "iter_snapshot"
+
+        # BE ladder simulation — same logic as spx_target_watcher
+        BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+        risk_spx = abs(entry_spx - stop)
+        dyn_stop = stop
+        be_step = 0.0
+        outcome = "TIMEOUT"
+        exit_spx = path_items[-1][4]  # last close
+        partial_R = 0.0
+
+        for ts_ms, p_open, p_high, p_low, p_close in path_items:
+            # Update BE ladder using favorable extreme reached within bar
+            favor_extreme = p_high if is_long else p_low
+            adverse_extreme = p_low if is_long else p_high
+            if apply_be_ladder and risk_spx > 0:
+                mfe_R = (
+                    (favor_extreme - entry_spx) / risk_spx if is_long
+                    else (entry_spx - favor_extreme) / risk_spx
+                )
+                for trig_R, new_stop_R in BE_LADDER:
+                    if mfe_R >= trig_R and be_step < trig_R:
+                        be_step = trig_R
+                        if is_long:
+                            new_stop = entry_spx + new_stop_R * risk_spx
+                            if new_stop > dyn_stop: dyn_stop = new_stop
+                        else:
+                            new_stop = entry_spx - new_stop_R * risk_spx
+                            if new_stop < dyn_stop: dyn_stop = new_stop
+
+            # Conservative intra-bar ordering: check stop BEFORE targets.
+            # Use adverse extreme so a wick through the stop counts as a hit
+            # even if the bar's close recovered.
+            stop_hit = (
+                (is_long and adverse_extreme <= dyn_stop)
+                or (not is_long and adverse_extreme >= dyn_stop)
+            )
+            if stop_hit:
+                outcome = "STOP" if dyn_stop == stop else f"BE_STOP_{be_step:.1f}R"
+                exit_spx = dyn_stop
+                break
+            # Check tiers using favorable extreme — wick to target counts
+            t1_hit = (is_long and favor_extreme >= t1) or (not is_long and favor_extreme <= t1)
+            t2_hit = (is_long and favor_extreme >= t2) or (not is_long and favor_extreme <= t2)
+            t3_hit = (is_long and favor_extreme >= t3) or (not is_long and favor_extreme <= t3)
+            if t3_hit:
+                outcome = "T3"
+                exit_spx = t3
+                break
+            elif t2_hit and "T2" not in str(partial_R):
+                partial_R += 0.4 * 2.5
+                outcome = "T2_in_progress"
+            elif t1_hit and partial_R < 0.1:
+                partial_R += 0.3 * 1.5
+
+        # Compute R based on outcome (using SPX-points R)
+        if outcome == "T3":
+            realized_R = 0.3 * 1.5 + 0.4 * 2.5 + 0.3 * 5.0  # 30/40/30 split full run
+        elif outcome.startswith("BE_STOP"):
+            realized_R = float(outcome.split("_")[-1].replace("R", ""))
+        elif outcome == "STOP":
+            realized_R = -1.0
+        elif outcome == "T2_in_progress":
+            # T1+T2 hit, runner stopped at BE or further
+            realized_R = 0.3 * 1.5 + 0.4 * 2.5 + 0.3 * max(0, be_step)
+        else:  # TIMEOUT or T1-only
+            if is_long:
+                mfe_R = (max(p[2] for p in path_items) - entry_spx) / risk_spx if risk_spx > 0 else 0
+            else:
+                mfe_R = (entry_spx - min(p[3] for p in path_items)) / risk_spx if risk_spx > 0 else 0
+            if mfe_R >= 1.5:
+                realized_R = 0.3 * 1.5 + 0.7 * be_step
+            else:
+                realized_R = be_step  # whatever's locked
+
+        # Apply slippage + commission
+        qty = 5  # default
+        slip_R_entry = -avg_entry_slip_pct / 100 * 0.5  # rough cost in R
+        slip_R_exit = -avg_exit_slip_pct / 100 * 0.5
+        commission_R = -(commission_per_contract * 2) / (entry_limit * 100) * qty  # roundtrip / per dollar
+        realized_R_net = realized_R + slip_R_entry + slip_R_exit + commission_R
+
+        trades.append({
+            "timestamp": s_.timestamp.isoformat(),
+            "session_date": s_.session_date,
+            "direction": dir_val,
+            "entry_spx": entry_spx,
+            "exit_spx": exit_spx,
+            "outcome": outcome,
+            "be_step_R": be_step,
+            "realized_R_gross": round(realized_R, 3),
+            "realized_R_net": round(realized_R_net, 3),
+            "path_mode": path_mode,
+        })
+      except Exception as _e:
+        skipped["exception"] += 1
+        logger.exception("backtest iter %s failed", s_.id)
+        continue
+
+    # Aggregate metrics
+    if not trades:
+        return {
+            "from": session_date_from, "to": to_date,
+            "trade_count": 0,
+            "iters_scanned": len(sigs),
+            "skipped": skipped,
+            "note": "no trades fired in this window — see 'skipped' for reasons",
+        }
+
+    # Manual aggregation — avoid statistics module (Py 3.14 .numerator bug).
+    # Sanitize: drop NaN / Inf values that would poison sum-based metrics.
+    import math as _math
+    R_series_raw = [float(t["realized_R_net"]) for t in trades]
+    R_series = [r for r in R_series_raw if _math.isfinite(r)]
+    if not R_series:
+        return {
+            "from": session_date_from, "to": to_date,
+            "trade_count": len(trades),
+            "iters_scanned": len(sigs),
+            "skipped": skipped,
+            "note": f"all {len(trades)} trades had non-finite R — likely data issue",
+        }
+    wins = sum(1 for r in R_series if r > 0)
+    win_rate = wins / len(R_series) * 100
+    expectancy = sum(R_series) / len(R_series)
+    if len(R_series) >= 2:
+        variance = sum((r - expectancy) ** 2 for r in R_series) / (len(R_series) - 1)
+        std_R = variance ** 0.5
+        sharpe = (expectancy / std_R) if std_R > 0 else None
+    else:
+        sharpe = None
+    cum = 0.0; peak = 0.0; max_dd = 0.0
+    for r in R_series:
+        cum += r
+        if cum > peak: peak = cum
+        if peak - cum > max_dd: max_dd = peak - cum
+    gross_win = sum(r for r in R_series if r > 0)
+    gross_loss = abs(sum(r for r in R_series if r < 0))
+    pf = gross_win / gross_loss if gross_loss > 0 else None
+
+    return {
+        "from": session_date_from, "to": to_date,
+        "trade_count": len(trades),
+        "iters_scanned": len(sigs),
+        "skipped": skipped,
+        "wins": wins,
+        "losses": len(trades) - wins,
+        "win_rate_pct": round(win_rate, 2),
+        "expectancy_R": round(expectancy, 3),
+        "sharpe_ratio": round(sharpe, 3) if sharpe else None,
+        "max_drawdown_R": round(max_dd, 3),
+        "profit_factor": round(pf, 3) if pf else None,
+        "cumulative_R": round(sum(R_series), 3),
+        "be_ladder_applied": apply_be_ladder,
+        "avg_entry_slip_pct_used": avg_entry_slip_pct,
+        "avg_exit_slip_pct_used": avg_exit_slip_pct,
+        "commission_per_contract": commission_per_contract,
+        "trades": trades,
+    }
+
+
+@router.get("/diag/signal_audit_buckets")
+async def diag_signal_audit_buckets(
+    request: Request, session_date: str | None = None
+) -> dict[str, Any]:
+    """For each parent on `session_date`, join with its firing SignalIter
+    (closest timestamp before submit), then bucket by (right, status):
+    C_WIN / C_LOSS / P_WIN / P_LOSS. Compute medians + means for numeric
+    fields and counters for categorical, so daily pattern audits don't
+    require ad-hoc Python.
+
+    Numeric fields surfaced: delta_price, delta_drift, fe_ratio,
+    drift_cum_net_m, pa_score, mp_gravity, gex_walls, dex_floor,
+    nearest_wall_distance, plus HFT/microstructure when present.
+    Categorical: confidence, drift_bias, aligned, vol_regime,
+    book_direction, micro_direction.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import LiveOrder, SignalIter
+    from sqlmodel import select as _s
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    import statistics as _stat
+    from collections import Counter as _Counter
+
+    target_date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+
+    async with _gs() as session:
+        parents = list((await session.exec(
+            _s(LiveOrder).where(LiveOrder.bracket_role == "parent")
+            .where(LiveOrder.dry_run == False)  # noqa: E712
+        )).all())
+        parents = [p for p in parents
+                   if p.submitted_at.strftime("%Y-%m-%d") == target_date]
+
+        iters = list((await session.exec(
+            _s(SignalIter).where(SignalIter.session_date == target_date)
+            .order_by(SignalIter.timestamp)  # type: ignore[attr-defined]
+        )).all())
+
+    def _find_iter(submit_dt):
+        best = None; best_diff = None
+        for it in iters:
+            it_ts = it.timestamp
+            if it_ts.tzinfo is None:
+                it_ts = it_ts.replace(tzinfo=_tz.utc)
+            sub_ts = submit_dt
+            if sub_ts.tzinfo is None:
+                sub_ts = sub_ts.replace(tzinfo=_tz.utc)
+            diff = (sub_ts - it_ts).total_seconds()
+            if diff < 0 or diff > 60:
+                continue
+            if best_diff is None or diff < best_diff:
+                best = it; best_diff = diff
+        return best
+
+    records: list[dict] = []
+    for p in parents:
+        it = _find_iter(p.submitted_at)
+        if it is None:
+            continue
+        ext = dict(it.extras or {})
+        sec = ext.get("secondary_scores") or {}
+        hft = ext.get("hft_at_fire") or {}
+        micro = ext.get("microstructure_at_fire") or {}
+        records.append({
+            "pid": p.id, "right": p.right, "status": p.status,
+            "side_status": f"{p.right}_{'WIN' if p.status == 'CLOSED' else ('LOSS' if p.status == 'STOPPED' else 'OTHER')}",
+            "direction": it.direction.value if it.direction else None,
+            "confidence": it.confidence.value if it.confidence else None,
+            "delta_price": ext.get("delta_price"),
+            "delta_drift": ext.get("delta_drift_m"),
+            "fe_ratio": ext.get("fe_ratio"),
+            "aligned": ext.get("aligned"),
+            "absorption": ext.get("absorption"),
+            "wall_collapse": ext.get("wall_collapse_trigger"),
+            "nearest_wall_distance": ext.get("nearest_wall_distance"),
+            "drift_cum_net_m": it.drift_cum_net_m,
+            "drift_bias": it.drift_bias,
+            "pa_score": sec.get("price_action"),
+            "mp_gravity": sec.get("mp_gravity"),
+            "drift_score": sec.get("drift"),
+            "gex_walls": sec.get("gex_walls"),
+            "dex_floor": sec.get("dex_floor"),
+            "agg_score": sec.get("aggression"),
+            "hft_present": bool(hft),
+            "vol_regime": hft.get("vol_regime"),
+            "short_vol_pts": hft.get("short_vol_pts"),
+            "vol_ratio": hft.get("vol_ratio"),
+            "cancel_trade_ratio": hft.get("cancel_to_trade_ratio"),
+            "book_imb_1": hft.get("book_imbalance"),
+            "book_imb_5": hft.get("book_imbalance_5lvl"),
+            "book_direction": hft.get("book_direction"),
+            "book_conf": hft.get("book_confidence"),
+            "composite_dir": hft.get("composite_direction"),
+            "micro_present": bool(micro),
+            "ofi_window": micro.get("ofi_window"),
+            "avi_pct": micro.get("avi_pct"),
+            "microprice_dev_bp": micro.get("microprice_deviation_bp"),
+            "micro_direction": micro.get("direction"),
+            "micro_conf": micro.get("confidence"),
+        })
+
+    groups: dict[str, list[dict]] = {}
+    for r in records:
+        groups.setdefault(r["side_status"], []).append(r)
+
+    def _stats(vals):
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return None
+        return {
+            "n": len(vals),
+            "mean": round(_stat.mean(vals), 4),
+            "median": round(_stat.median(vals), 4),
+            "min": round(min(vals), 4),
+            "max": round(max(vals), 4),
+        }
+
+    numeric_fields = [
+        "delta_price", "delta_drift", "fe_ratio",
+        "drift_cum_net_m", "pa_score", "mp_gravity",
+        "drift_score", "gex_walls", "dex_floor", "agg_score",
+        "nearest_wall_distance",
+        "short_vol_pts", "vol_ratio", "cancel_trade_ratio",
+        "book_imb_1", "book_imb_5",
+        "ofi_window", "avi_pct", "microprice_dev_bp",
+    ]
+    cat_fields = [
+        "confidence", "drift_bias", "aligned", "absorption", "wall_collapse",
+        "vol_regime", "book_direction", "book_conf", "composite_dir",
+        "micro_direction", "micro_conf",
+    ]
+
+    numeric_by_bucket: dict[str, dict[str, dict]] = {}
+    for bucket, rows in groups.items():
+        numeric_by_bucket[bucket] = {
+            f: _stats([r[f] for r in rows]) for f in numeric_fields
+        }
+    categorical_by_bucket: dict[str, dict[str, dict]] = {}
+    for bucket, rows in groups.items():
+        categorical_by_bucket[bucket] = {
+            f: dict(_Counter(r[f] for r in rows if r[f] is not None))
+            for f in cat_fields
+        }
+
+    summary = {b: {"n": len(rs)} for b, rs in groups.items()}
+    return {
+        "session_date": target_date,
+        "total_trades_audited": len(records),
+        "hft_snapshot_coverage": sum(1 for r in records if r["hft_present"]),
+        "micro_snapshot_coverage": sum(1 for r in records if r["micro_present"]),
+        "summary_by_bucket": summary,
+        "numeric_by_bucket": numeric_by_bucket,
+        "categorical_by_bucket": categorical_by_bucket,
+        "trades": records,  # full per-trade rows for downstream filtering
+    }
+
+
+@router.get("/diag/hour_of_day_stats")
+async def diag_hour_of_day_stats(
+    request: Request, days_back: int = 30
+) -> dict[str, Any]:
+    """Aggregate `by_hour_ct` JSON across recent DailyReview rows so the
+    "11am-noon CT prints money" hypothesis can be checked across multiple
+    sessions, not just the most recent one.
+
+    Returns per-hour totals (signals, wins, expectancy) across the lookback
+    window, plus the same data broken out per-session for trend analysis.
+    """
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import DailyReview
+    from sqlmodel import select as _s
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    cutoff = (_dt.now(_tz.utc) - _td(days=days_back)).strftime("%Y-%m-%d")
+
+    async with _gs() as session:
+        reviews = list((await session.exec(
+            _s(DailyReview).where(DailyReview.session_date >= cutoff)
+            .order_by(DailyReview.session_date)  # type: ignore[attr-defined]
+        )).all())
+
+    per_session: list[dict] = []
+    rolled: dict[str, dict] = {}  # hour_ct (str) -> aggregated stats
+
+    for r in reviews:
+        hours = dict(r.by_hour_ct or {})
+        per_session.append({
+            "session_date": r.session_date,
+            "by_hour_ct": hours,
+        })
+        for hr_key, stats in hours.items():
+            if not isinstance(stats, dict):
+                continue
+            slot = rolled.setdefault(str(hr_key), {
+                "n": 0, "wins": 0, "stops": 0, "timeouts": 0,
+                "expectancy_sum_R": 0.0, "sessions": 0,
+            })
+            slot["sessions"] += 1
+            n = int(stats.get("n", 0) or 0)
+            wins = int(stats.get("wins", 0) or 0)
+            stops = int(stats.get("stops", 0) or 0)
+            timeouts = int(stats.get("timeouts", 0) or 0)
+            exp_r = float(stats.get("expectancy_r", 0.0) or 0.0)
+            slot["n"] += n
+            slot["wins"] += wins
+            slot["stops"] += stops
+            slot["timeouts"] += timeouts
+            slot["expectancy_sum_R"] += exp_r * n  # weight by sample size
+
+    rolled_out = {}
+    for hr, v in rolled.items():
+        n = v["n"]
+        rolled_out[hr] = {
+            "total_signals": n,
+            "total_wins": v["wins"],
+            "total_stops": v["stops"],
+            "total_timeouts": v["timeouts"],
+            "sessions_with_data": v["sessions"],
+            "win_rate_pct": round(v["wins"] * 100 / n, 2) if n else 0.0,
+            "weighted_expectancy_r": round(v["expectancy_sum_R"] / n, 4) if n else 0.0,
+        }
+
+    # Hour sort
+    def _hr_sort(k: str) -> int:
+        try:
+            return int(k.split(":")[0]) if ":" in k else int(k)
+        except Exception:
+            return 99
+
+    sorted_hours = sorted(rolled_out.items(), key=lambda kv: _hr_sort(kv[0]))
+
+    return {
+        "days_back": days_back,
+        "session_count": len(reviews),
+        "hours_aggregated": dict(sorted_hours),
+        "per_session": per_session,
+    }
+
+
 @router.get("/diag/pnl")
 async def diag_pnl(request: Request) -> dict[str, Any]:
     """Diagnostic: show raw IBKR PnL subscription state + AccountSummary
@@ -1036,21 +2744,387 @@ async def diag_pnl(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/diag/non_fire_analysis")
+async def diag_non_fire_analysis(
+    session_date: str | None = None,
+    lookahead_minutes: int = 30,
+) -> dict[str, Any]:
+    """Bucket SignalIter rows by direction × confidence and report the
+    forward SPX excursion observed in the next `lookahead_minutes` (5/15/30/60).
+
+    Surfaces "WAIT verdicts that would have hit T1" — the missed-trade
+    blind spot. Read-only; freeze-safe.
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import SignalIter, SignalLookaheadOutcome
+    from sqlmodel import select as _s
+
+    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    if lookahead_minutes not in (5, 15, 30, 60):
+        raise HTTPException(400, "lookahead_minutes must be one of 5/15/30/60")
+
+    async with _gs() as session:
+        outcomes = list((await session.exec(
+            _s(SignalLookaheadOutcome)
+            .where(SignalLookaheadOutcome.session_date == date)
+            .where(SignalLookaheadOutcome.lookahead_minutes == lookahead_minutes)
+        )).all())
+        signal_ids = {o.signal_iter_id for o in outcomes}
+        sigs = list((await session.exec(
+            _s(SignalIter)
+            .where(SignalIter.session_date == date)
+        )).all())
+    sigs_by_id = {s.id: s for s in sigs if s.id is not None}
+
+    by_bucket: dict[str, dict[str, Any]] = {}
+    for o in outcomes:
+        sig = sigs_by_id.get(o.signal_iter_id)
+        if sig is None:
+            continue
+        bucket_key = f"{o.direction_at_signal}_{o.confidence_at_signal}"
+        slot = by_bucket.setdefault(bucket_key, {
+            "n": 0, "would_have_hit_t1": 0, "would_have_hit_stop": 0,
+            "spx_mfe_pts_sum": 0.0, "spx_mae_pts_sum": 0.0,
+        })
+        slot["n"] += 1
+        if o.would_have_hit_t1:
+            slot["would_have_hit_t1"] += 1
+        if o.would_have_hit_stop:
+            slot["would_have_hit_stop"] += 1
+        slot["spx_mfe_pts_sum"] += o.spx_mfe_pts
+        slot["spx_mae_pts_sum"] += o.spx_mae_pts
+    for slot in by_bucket.values():
+        n = max(slot["n"], 1)
+        slot["mfe_avg"] = round(slot["spx_mfe_pts_sum"] / n, 2)
+        slot["mae_avg"] = round(slot["spx_mae_pts_sum"] / n, 2)
+        slot["would_hit_t1_pct"] = round(slot["would_have_hit_t1"] / n * 100, 1)
+        slot["would_hit_stop_pct"] = round(slot["would_have_hit_stop"] / n * 100, 1)
+        del slot["spx_mfe_pts_sum"], slot["spx_mae_pts_sum"]
+
+    return {
+        "session_date": date,
+        "lookahead_minutes": lookahead_minutes,
+        "total_outcomes": len(outcomes),
+        "buckets": by_bucket,
+        "note": "WAIT rows with high mfe_avg = missed opportunities. "
+                "LOSS rows with low mfe_avg = correctly skipped chop.",
+    }
+
+
+@router.post("/diag/non_fire_backfill")
+async def diag_non_fire_backfill(session_date: str | None = None) -> dict[str, Any]:
+    """Trigger an on-demand backfill of SignalLookaheadOutcome rows for
+    the given session_date (default today). Normally handled by the
+    background worker every 5min; this endpoint forces immediate run."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fef_sidecar.engine.signal_lookahead import backfill_session
+    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    return await backfill_session(date)
+
+
+@router.get("/diag/counterfactual_signal_strength")
+async def diag_counterfactual_signal_strength(session_date: str | None = None) -> dict[str, Any]:
+    """Replay each closed trade through hypothetical B+C+D exits using
+    BE-step-reached as proxy for option MFE. Returns per-parent actual
+    vs counterfactual P/L and the aggregate incremental upside.
+
+    Pure analytics — does not modify any state. Quantifies "what would
+    today's P/L be with option-price + trail + time-decay exits?"
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fef_sidecar.engine.counterfactual import run_for_session
+    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    return await run_for_session(date)
+
+
+@router.get("/diag/counterfactual_polling_interval")
+async def diag_counterfactual_polling_interval(
+    session_date: str | None = None,
+    intervals: str = "30,60,90",
+) -> dict[str, Any]:
+    """Replay FEF engine at faster polling cadences over today's FlowSnapshot
+    data + simulate trade outcomes via 1-min SPX bars. Surfaces how many
+    additional actionable signals would have fired and their estimated
+    win rate / expectancy.
+
+    Quantifies "what if we polled at 30s / 60s instead of 120s?"
+
+    Args:
+        session_date: YYYY-MM-DD (default today ET)
+        intervals: comma-separated target intervals in seconds (default "30,60,90")
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fef_sidecar.engine.counterfactual import run_polling_simulation
+    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    iv_list = [int(x.strip()) for x in intervals.split(",") if x.strip().isdigit()]
+    return await run_polling_simulation(date, iv_list or [30, 60, 90])
+
+
+@router.get("/diag/fire_order_analysis")
+async def diag_fire_order_analysis(session_date: str | None = None) -> dict[str, Any]:
+    """Bucket signal outcomes by `fire_order` (1 = first fire of cluster,
+    2+ = stacks). Answers "are stacks adding value or hurting?"
+
+    Joins SignalIter (filtered by session_date if given) with LiveOrder
+    fills to compute realized R per fire_order bucket.
+    """
+    from collections import defaultdict
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import IBKRExecution, LiveOrder, SignalIter
+    from sqlmodel import select as _s
+
+    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+
+    async with _gs() as session:
+        sigs = list((await session.exec(
+            _s(SignalIter)
+            .where(SignalIter.session_date == date)  # type: ignore[attr-defined]
+            .where(SignalIter.direction != "WAIT")  # type: ignore[attr-defined]
+        )).all())
+        parents = list((await session.exec(
+            _s(LiveOrder)
+            .where(LiveOrder.bracket_role == "parent")
+            .where(LiveOrder.dry_run == False)  # noqa: E712
+        )).all())
+        execs = list((await session.exec(_s(IBKRExecution).where(IBKRExecution.session_date == date))).all())
+
+    parents = [p for p in parents if p.submitted_at.strftime("%Y-%m-%d") == date]
+
+    # Per-contract realized P/L
+    by_contract: dict[tuple, dict] = defaultdict(lambda: {"bot_v": 0.0, "sld_v": 0.0, "bot_q": 0.0, "sld_q": 0.0})
+    for f in execs:
+        key = (f.symbol, f.strike, f.right, f.expiry)
+        slot = by_contract[key]
+        if f.side == "BOT":
+            slot["bot_v"] += f.shares * f.price
+            slot["bot_q"] += f.shares
+        else:
+            slot["sld_v"] += f.shares * f.price
+            slot["sld_q"] += f.shares
+    contract_pnl: dict[tuple, float] = {}
+    for key, slot in by_contract.items():
+        paired = min(slot["bot_q"], slot["sld_q"])
+        if paired <= 0: continue
+        avg_bot = slot["bot_v"] / slot["bot_q"] if slot["bot_q"] else 0
+        avg_sld = slot["sld_v"] / slot["sld_q"] if slot["sld_q"] else 0
+        contract_pnl[key] = (avg_sld - avg_bot) * paired * 100.0
+
+    # Pair signals with parents (closest submit within 60s, same direction × strike)
+    def find_parent(sg):
+        from datetime import timezone
+        ts = sg.timestamp
+        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+        right = "C" if (sg.direction.value if hasattr(sg.direction, "value") else str(sg.direction)) == "LONG_CALLS" else "P"
+        best = None; best_diff = None
+        for p in parents:
+            if p.right != right: continue
+            pts = p.submitted_at
+            if pts.tzinfo is None: pts = pts.replace(tzinfo=timezone.utc)
+            diff = (pts - ts).total_seconds()
+            if 0 <= diff <= 60:
+                if best_diff is None or diff < best_diff:
+                    best = p; best_diff = diff
+        return best
+
+    # Bucket by fire_order
+    by_order: dict[int, dict] = defaultdict(lambda: {"n": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+    for sg in sigs:
+        fo = (sg.extras or {}).get("fire_order")
+        if fo is None or fo == 0:
+            continue
+        p = find_parent(sg)
+        if p is None:
+            continue
+        key = (p.symbol, p.strike, p.right, p.expiry)
+        ppnl = contract_pnl.get(key)
+        if ppnl is None: continue
+        # Share P/L equally among all parents that fired on this contract
+        n_parents = sum(1 for x in parents if (x.symbol, x.strike, x.right, x.expiry) == key)
+        share = ppnl / max(n_parents, 1)
+        # Cap bucket at 4+ to avoid n=1 buckets
+        bucket = fo if fo < 4 else 4
+        slot = by_order[bucket]
+        slot["n"] += 1
+        if share > 0: slot["wins"] += 1
+        elif share < 0: slot["losses"] += 1
+        slot["pnl"] += share
+
+    out_buckets = []
+    for k in sorted(by_order.keys()):
+        v = by_order[k]
+        label = f"{k}" if k < 4 else "4+"
+        out_buckets.append({
+            "fire_order": label,
+            "n": v["n"],
+            "wins": v["wins"],
+            "losses": v["losses"],
+            "win_rate_pct": round(v["wins"] / max(v["n"], 1) * 100, 1),
+            "total_pnl": round(v["pnl"], 2),
+            "avg_pnl": round(v["pnl"] / max(v["n"], 1), 2),
+        })
+
+    return {
+        "session_date": date,
+        "buckets": out_buckets,
+        "note": "fire_order = position in cluster of (direction × strike) within a 5-min window. "
+                "1 = first fire, 2+ = stacks. Compare WR / avg_pnl across buckets to see if "
+                "stacks add value over first-fires.",
+    }
+
+
+@router.post("/diag/fire_order_backfill")
+async def diag_fire_order_backfill(session_date: str | None = None) -> dict[str, Any]:
+    """One-time / retroactive: stamp fire_order into existing SignalIter.extras."""
+    from fef_sidecar.engine.fire_order import backfill_fire_order
+    return await backfill_fire_order(session_date=session_date)
+
+
+@router.get("/diag/realistic_fill_replay")
+async def diag_realistic_fill_replay(session_date: str | None = None) -> dict[str, Any]:
+    """Replay paper trades under haircutted fill assumptions (spread cross +
+    latency drag + commissions). Tells you "if my edge is execution +
+    stacking, what's left when paper-flattering effects are removed?"
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fef_sidecar.engine.realistic_fill import replay_session
+    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    return await replay_session(date)
+
+
+@router.get("/diag/edge_decomposition")
+async def diag_edge_decomposition(
+    session_dates: str | None = None,
+    realistic_fill_haircut_pct: float = 0.20,
+) -> dict[str, Any]:
+    """Shapley-style decomposition of paper edge into signal + execution +
+    stacking + interaction components. Each component has a different
+    live-survival rate, so the decomposition predicts what fraction of
+    paper edge will survive the paper-to-live transition.
+
+    Run ideally on the full 10-session freeze dataset post-freeze. Earlier
+    runs are directionally useful but estimates are noisy.
+
+    Args:
+        session_dates: comma-separated YYYY-MM-DD list (default: today only)
+        realistic_fill_haircut_pct: 0.20 = 20% haircut (moderate scenario)
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fef_sidecar.engine.shapley_decomposition import run_decomposition
+    if session_dates:
+        dates = [d.strip() for d in session_dates.split(",") if d.strip()]
+    else:
+        dates = [_dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")]
+    return await run_decomposition(dates, realistic_fill_haircut_pct=realistic_fill_haircut_pct)
+
+
+@router.get("/diag/realistic_fill_history")
+async def diag_realistic_fill_history(days: int = 7) -> dict[str, Any]:
+    """Per-session realistic-fill replay history. Tracks haircut % over time."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fef_sidecar.engine.realistic_fill import replay_all_sessions
+    et = _tz(_td(hours=-4))
+    today = _dt.now(et)
+    dates = [(today - _td(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    return await replay_all_sessions(dates)
+
+
+@router.get("/diag/counterfactual_cooldown")
+async def diag_counterfactual_cooldown(
+    session_date: str | None = None,
+    cooldowns: str = "60,180,300,600",
+) -> dict[str, Any]:
+    """Replay today's actual signals through different per-symbol cooldown
+    rules. Lets you test "what if I used 300s instead of 60s?" without
+    actually changing the auto-trader.
+
+    For each cooldown value, the simulator filters which actual signals
+    would have made it through that cooldown gate, then simulates trade
+    outcomes via 1-min SPX bars.
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fef_sidecar.engine.counterfactual import run_cooldown_simulation
+    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    cd_list = [int(x.strip()) for x in cooldowns.split(",") if x.strip().isdigit()]
+    return await run_cooldown_simulation(date, cd_list or [60, 180, 300, 600])
+
+
 @router.get("/diag/session_pnl_estimate")
 async def diag_session_pnl_estimate(request: Request) -> dict[str, Any]:
-    """Estimate today's session P/L from our own LiveOrder records when
-    reqPnL is silent. Each CLOSED parent contributes a coarse +R estimate
-    (using the BracketSpec's risk distance × spec qty × 100 × 0.6 as a
-    rough average weighted-R win). STOPPED parents contribute the
-    risk-distance loss. Better than always-zero; not a substitute for
-    real IBKR P/L once that's working.
+    """Compute today's session P/L from persisted IBKR executions.
+
+    Preferred source (when present): sum of (SLD value - BOT value) × $100
+    across all IBKRExecution rows for today, scoped by contract so partial
+    fills net correctly even when buys and sells span multiple bars. This
+    matches the per-date number shown in /diag/ibkr_executions_persisted
+    (the +$6,780 today). Returns it as `estimated_session_pnl_usd` so the
+    TopBar pill picks it up unchanged.
+
+    Fallback (no executions persisted yet): coarse LiveOrder R-weighted
+    estimate — kept so the pill still shows *something* on a freshly
+    restarted sidecar before the execution write-through fires. The
+    response includes a `source` field so callers can tell which path
+    produced the number.
     """
     from fef_sidecar.db.engine import get_session as _gs
-    from fef_sidecar.db.models import LiveOrder
+    from fef_sidecar.db.models import IBKRExecution, LiveOrder
     from sqlmodel import select as _s
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 
     today_et = _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+
+    async with _gs() as session:
+        # Primary: persisted IBKR executions for today
+        exec_rows = list((await session.exec(
+            _s(IBKRExecution).where(IBKRExecution.session_date == today_et)
+        )).all())
+
+    if exec_rows:
+        # Net BOT vs SLD value per contract; sum × 100 = realized $ PnL.
+        # Contracts where BOT qty ≠ SLD qty still have open exposure; we
+        # only count the closed leg (min(bot_q, sld_q)) at avg prices so a
+        # half-closed contract contributes its realized portion.
+        by_contract: dict[str, dict[str, float]] = {}
+        for r in exec_rows:
+            key = f"{r.symbol} {r.strike}{r.right} {r.expiry}"
+            slot = by_contract.setdefault(key, {"bot_v": 0.0, "sld_v": 0.0, "bot_q": 0.0, "sld_q": 0.0})
+            if r.side == "BOT":
+                slot["bot_v"] += r.shares * r.price
+                slot["bot_q"] += r.shares
+            elif r.side == "SLD":
+                slot["sld_v"] += r.shares * r.price
+                slot["sld_q"] += r.shares
+
+        total_pnl = 0.0
+        open_exposure_contracts = 0
+        for key, slot in by_contract.items():
+            bot_q = slot["bot_q"]
+            sld_q = slot["sld_q"]
+            if bot_q == 0 and sld_q == 0:
+                continue
+            if bot_q != sld_q:
+                open_exposure_contracts += 1
+            # Realized PnL on the closed leg: pair off min(bot_q, sld_q)
+            # using avg prices on each side.
+            paired = min(bot_q, sld_q)
+            if paired <= 0:
+                continue
+            avg_bot = slot["bot_v"] / bot_q if bot_q > 0 else 0.0
+            avg_sld = slot["sld_v"] / sld_q if sld_q > 0 else 0.0
+            total_pnl += (avg_sld - avg_bot) * paired * 100.0
+
+        return {
+            "session_date": today_et,
+            "source": "ibkr_executions",
+            "fills": len(exec_rows),
+            "contracts_touched": len(by_contract),
+            "open_exposure_contracts": open_exposure_contracts,
+            "estimated_session_pnl_usd": round(total_pnl, 0),
+            "note": "realized P/L from persisted IBKR executions, paired by contract",
+        }
+
+    # Fallback path — no executions persisted yet
     async with _gs() as session:
         parents = list((await session.exec(
             _s(LiveOrder).where(LiveOrder.bracket_role == "parent")
@@ -1058,31 +3132,30 @@ async def diag_session_pnl_estimate(request: Request) -> dict[str, Any]:
         )).all())
     today_parents = [p for p in parents
                      if p.submitted_at.strftime("%Y-%m-%d") == today_et]
-
     est_total = 0.0
     by_status: dict[str, int] = {}
     for p in today_parents:
         by_status[p.status] = by_status.get(p.status, 0) + 1
         if p.entry_spx_price is None or p.spx_target_stop is None:
             continue
-        risk_pts = abs(p.entry_spx_price - p.spx_target_stop) or 10.0
-        # Approximate per-contract $ at risk = (risk_pts × delta ≈ 0.3 × $100)
-        # We don't have actual fills; use entry_limit (approximates option price)
-        per_contract_risk = (p.limit_price or 1.0) * 100
+        # Risk per contract = (entry option price - stop option price) × $100.
+        # We don't track stop option prices directly; approximate as 50% of
+        # entry premium (mirrors the typical 50% trail-stop the engine sets).
+        per_contract_risk = max((p.limit_price or 1.0) * 0.5, 0.5) * 100
         if p.status == "CLOSED":
-            est_total += per_contract_risk * p.qty * 1.1   # +1.1R weighted
+            est_total += per_contract_risk * p.qty * 1.1
         elif p.status == "STOPPED":
             est_total -= per_contract_risk * p.qty * 1.0
         elif p.status == "PARTIAL":
-            est_total += per_contract_risk * p.qty * 0.4   # T1 fired only
+            est_total += per_contract_risk * p.qty * 0.4
 
     return {
         "session_date": today_et,
+        "source": "liveorder_fallback",
         "parents_count": len(today_parents),
         "by_status": by_status,
         "estimated_session_pnl_usd": round(est_total, 0),
-        "note": "approximation — uses entry_limit × qty × R-weighted outcome. "
-                "If IBKR reqPnL is working, /account is authoritative.",
+        "note": "fallback estimate — no persisted IBKR executions yet for today",
     }
 
 
@@ -1195,28 +3268,43 @@ async def panic_flat(request: Request) -> dict[str, Any]:
     s.auto_trade_enabled = False
     result["steps"]["auto_trade_disabled"] = True
 
-    # 3. Market-sell all open option positions
+    # 3. Market-sell all open option positions. Same routing-bug fix as
+    # kill_all_orders — must rebuild + qualify the contract before
+    # placing, otherwise IBKR silently rejects.
     sells = []
     if isinstance(s.ibkr, LiveIBKRProvider) and s.ibkr._ib is not None:  # type: ignore[attr-defined]
         ib = s.ibkr._ib  # type: ignore[attr-defined]
         if ib.isConnected():
             try:
                 from ib_async import MarketOrder
+                from fef_sidecar.ibkr.live import _to_ib_contract
+                from fef_sidecar.ibkr.models import Contract, ContractKind
                 for p in ib.positions():
                     if getattr(p.contract, "secType", "") != "OPT": continue
                     qty = int(p.position)
                     if abs(qty) < 1: continue
                     action = "SELL" if qty > 0 else "BUY"
+                    sym = getattr(p.contract, "symbol", "")
+                    strike = float(getattr(p.contract, "strike", 0))
+                    right = getattr(p.contract, "right", "")
+                    expiry = getattr(p.contract, "lastTradeDateOrContractMonth", "")
                     try:
+                        opt_contract = Contract(
+                            symbol=sym, kind=ContractKind.OPTION,
+                            exchange="CBOE" if sym == "SPX" else "SMART",
+                            expiry=expiry, strike=strike, right=right,
+                        )
+                        ic = _to_ib_contract(opt_contract)
+                        await ib.qualifyContractsAsync(ic)
                         order = MarketOrder(action, abs(qty), transmit=True)
-                        t = ib.placeOrder(p.contract, order)
+                        t = ib.placeOrder(ic, order)
                         sells.append({
-                            "contract": f"{p.contract.symbol} {p.contract.strike}{p.contract.right}",
+                            "contract": f"{sym} {strike}{right}",
                             "qty": abs(qty), "action": action,
                             "ib_order_id": t.order.orderId,
                         })
                     except Exception as e:
-                        sells.append({"error": str(e)})
+                        sells.append({"contract": f"{sym} {strike}{right}", "error": str(e)})
             except Exception as e:
                 result["steps"]["flat_positions_error"] = str(e)
     result["steps"]["positions_flat"] = sells
@@ -1368,6 +3456,93 @@ async def admin_daily_review(body: dict[str, Any] = Body(default={})) -> dict[st
             "actionable_signals": review.actionable_signals}
 
 
+@router.post("/admin/backfill_live_order_fills")
+async def admin_backfill_live_order_fills(
+    body: dict[str, Any] = Body(default={}),
+) -> dict[str, Any]:
+    """Backfill live_order.filled_qty + avg_fill_price + status from
+    ibkr_execution rows (matched by ib_order_id). Read-only fix for the
+    long-standing gap where parent order rows never had their fill data
+    populated, so UI / research scripts showed filled_qty=0 on rows
+    that actually filled.
+
+    Safe: only updates fill-tracking fields on existing rows; doesn't
+    touch the live order placement / callback path. Idempotent.
+
+    Body: {session_date?: 'YYYY-MM-DD'} — restrict to one date, or omit
+    for all-time."""
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import IBKRExecution, LiveOrder
+    from sqlmodel import select as _s
+
+    session_date = body.get("session_date")
+    async with _gs() as _ss:
+        # Gather all execs and group by ib_order_id
+        execs_q = _s(IBKRExecution)
+        if session_date:
+            execs_q = execs_q.where(IBKRExecution.session_date == session_date)
+        execs = list((await _ss.exec(execs_q)).all())
+        by_order: dict[int, list] = {}
+        for e in execs:
+            if e.ib_order_id is None:
+                continue
+            by_order.setdefault(int(e.ib_order_id), []).append(e)
+
+        # Gather candidate live_orders. Restrict by date if requested.
+        lo_q = _s(LiveOrder)
+        candidates = list((await _ss.exec(lo_q)).all())
+        if session_date:
+            candidates = [
+                p for p in candidates
+                if p.submitted_at and p.submitted_at.strftime("%Y-%m-%d") == session_date
+            ]
+
+        updated = 0
+        skipped_no_match = 0
+        skipped_already_filled = 0
+        for p in candidates:
+            if p.ib_order_id is None:
+                continue
+            fills = by_order.get(int(p.ib_order_id))
+            if not fills:
+                skipped_no_match += 1
+                continue
+            total_shares = sum(float(f.shares or 0) for f in fills)
+            if total_shares <= 0:
+                skipped_no_match += 1
+                continue
+            weighted_px = sum(float(f.shares or 0) * float(f.price or 0) for f in fills) / total_shares
+            # Idempotency: only write if anything actually changes
+            new_filled = int(round(total_shares))
+            new_px = round(weighted_px, 4)
+            if (p.filled_qty == new_filled
+                    and p.avg_fill_price is not None
+                    and abs((p.avg_fill_price or 0) - new_px) < 0.005):
+                skipped_already_filled += 1
+                continue
+            p.filled_qty = new_filled
+            p.avg_fill_price = new_px
+            # Update status to a sane value if it was still in pre-fill state
+            if p.status in ("SUBMITTED", "ACCEPTED", "WORKING", None):
+                qty_target = int(p.qty or 0)
+                if qty_target > 0 and new_filled >= qty_target:
+                    p.status = "FILLED"
+                elif new_filled > 0:
+                    p.status = "PARTIAL"
+            _ss.add(p)
+            updated += 1
+        await _ss.commit()
+
+    return {
+        "ok": True,
+        "session_date": session_date or "all",
+        "live_orders_updated": updated,
+        "skipped_no_matching_exec": skipped_no_match,
+        "skipped_already_filled": skipped_already_filled,
+        "exec_rows_scanned": len(execs),
+    }
+
+
 @router.post("/auto_trade/reset_session")
 async def auto_trade_reset_session(request: Request) -> dict[str, Any]:
     """Reset the per-session auto-trade counter (lets you fire more if you've
@@ -1381,7 +3556,7 @@ async def auto_trade_reset_session(request: Request) -> dict[str, Any]:
     s.auto_trade_last_at_ms_by_symbol.clear()
     await SignalIterRepository.write_audit_log(
         category="auto_trade_reset", actor="user",
-        summary=f"Reset auto-trade session counter (was {old}/{s.auto_trade_max_per_session})",
+        summary=f"Reset auto-trade session counters (was {old} fires, per-symbol cap {s.auto_trade_max_per_symbol})",
     )
     return {"ok": True, "old_count": old}
 
@@ -1665,9 +3840,15 @@ async def calendar_pause_check() -> dict[str, Any]:
 
 
 @router.get("/analytics/attribution")
-async def analytics_attribution() -> dict[str, Any]:
+async def analytics_attribution(session_date: str | None = None) -> dict[str, Any]:
+    """P/L attribution by direction/confidence/hour.
+
+    Args:
+        session_date: YYYY-MM-DD ET to filter to one session.
+                      Default None = all-time.
+    """
     from fef_sidecar.engine.perf_attribution import attribution
-    result = await attribution()
+    result = await attribution(session_date=session_date)
     return {
         k: [
             {"bucket": s.bucket, "trades": s.trades, "wins": s.wins, "losses": s.losses,
@@ -1961,7 +4142,19 @@ async def close_ticket(
             ticket.closed_at = datetime.now(UTC)
         session.add(ticket)
         await session.flush()
-        return {"ok": True, "ticket_id": ticket_id, "status": ticket.status.value}
+        status_value = ticket.status.value
+
+    # Auto-retrain debounce — when a ticket finalizes, schedule a retrain.
+    # The trigger function dedups concurrent calls so rapid-fire closes
+    # don't kick off multiple trains.
+    if status_value in ("CLOSED", "STOPPED", "PARTIAL"):
+        try:
+            from fef_sidecar.engine.ml_autoretrain import schedule_retrain
+            schedule_retrain(_state(request))
+        except Exception:
+            logger.exception("Auto-retrain scheduling failed (ticket %s)", ticket_id)
+
+    return {"ok": True, "ticket_id": ticket_id, "status": status_value}
 
 
 # IMPROVEMENTS #C: strategy presets — save/apply named threshold sets

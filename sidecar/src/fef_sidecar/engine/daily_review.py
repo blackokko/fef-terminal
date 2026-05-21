@@ -316,7 +316,11 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         else: by_fe_ratio[">=10"].append(realized_R)
 
     n_actionable = len(today_actionable)
-    wins = tier_counts.get("T1", 0) + tier_counts.get("T2", 0) + tier_counts.get("T3", 0)
+    # wins = signals with positive realized R (matches sub-aggregate
+    # _summary definition so top-level and per-direction/hour/regime
+    # buckets agree). Includes BE-ladder-locked stops where the
+    # residual exits above entry, which the strict tier-count misses.
+    wins = sum(1 for _ts, _ck, _out, r in per_signal_records if r > 0)
     stops = tier_counts.get("STOP", 0)
     timeouts = tier_counts.get("TIMEOUT", 0)
 
@@ -439,11 +443,11 @@ async def compute_daily_review(session_date: str) -> DailyReview:
     # attribution which needs parent_id linkage on the bracket children
     # (not currently persisted). Follow-up in DEFERRED_CHANGES.
     import os as _os
-    from fef_sidecar.db.models import IbkrExecution
+    from fef_sidecar.db.models import IBKRExecution
     R_DOLLARS = float(_os.environ.get("FEF_R_DOLLARS", "400"))
     async with get_session() as _session2:
         execs = list((await _session2.exec(
-            select(IbkrExecution).where(IbkrExecution.session_date == session_date)
+            select(IBKRExecution).where(IBKRExecution.session_date == session_date)
         )).all())
     realized_dollars = sum(
         float(e.shares or 0) * float(e.price or 0) * 100
@@ -508,6 +512,55 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         session.add(review)
         await session.commit()
         await session.refresh(review)
+
+    # Cascade: keep DailySession in sync from the same source of truth.
+    # daily_session.gross_pnl/net_pnl used to be never written ($0 across
+    # all rows). Auto-compute from ibkr_execution + the per-contract
+    # realized P/L for best/worst trade fields. Net = gross for now
+    # (commission data isn't reliably captured on ibkr_execution).
+    from fef_sidecar.db.models import DailySession
+    # Per-contract P/L for best/worst surfacing
+    best_pnl = 0.0
+    worst_pnl = 0.0
+    if execs:
+        by_contract: dict[tuple, float] = {}
+        for e in execs:
+            key = (e.symbol, e.strike, e.right, e.expiry)
+            sign = 1 if (e.side or "").upper() == "SLD" else -1
+            by_contract[key] = by_contract.get(key, 0.0) + sign * float(e.shares or 0) * float(e.price or 0) * 100
+        if by_contract:
+            best_pnl = max(by_contract.values())
+            worst_pnl = min(by_contract.values())
+    async with get_session() as session:
+        existing_ds = (await session.exec(
+            select(DailySession).where(DailySession.session_date == session_date)
+        )).first()
+        if existing_ds is not None:
+            existing_ds.total_iters = len(sigs)
+            existing_ds.actionable_signals = n_actionable
+            existing_ds.trades_taken = actual_trades
+            existing_ds.gross_pnl = round(realized_dollars, 2)
+            existing_ds.net_pnl = round(realized_dollars, 2)
+            existing_ds.win_count = actual_wins
+            existing_ds.loss_count = actual_losses
+            existing_ds.best_trade_pnl = round(best_pnl, 2)
+            existing_ds.worst_trade_pnl = round(worst_pnl, 2)
+            existing_ds.updated_at = datetime.now(UTC)
+            session.add(existing_ds)
+        else:
+            session.add(DailySession(
+                session_date=session_date,
+                total_iters=len(sigs),
+                actionable_signals=n_actionable,
+                trades_taken=actual_trades,
+                gross_pnl=round(realized_dollars, 2),
+                net_pnl=round(realized_dollars, 2),
+                win_count=actual_wins,
+                loss_count=actual_losses,
+                best_trade_pnl=round(best_pnl, 2),
+                worst_trade_pnl=round(worst_pnl, 2),
+            ))
+        await session.commit()
 
     await SignalIterRepository.write_audit_log(
         category="daily_review", actor="system",

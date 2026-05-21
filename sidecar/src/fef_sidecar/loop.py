@@ -75,6 +75,42 @@ def _walls_json(walls: Any) -> list[dict[str, Any]]:
     ]
 
 
+# Per-symbol plausible price range — anything outside is rejected as
+# garbage (stale ticker route, wrong-symbol QuantData response, etc.).
+# Catches the 5/18-5/20 corruption where active_symbol=ES caused
+# QuantData to return spx_price≈67 which then cascaded into
+# delta_price=-7341 / nearest_wall_distance=7300+ across hundreds of
+# SignalIter rows. Guard prevents new bad rows; old rows are filtered
+# downstream via the same range.
+SYMBOL_PRICE_BOUNDS: dict[str, tuple[float, float]] = {
+    "SPX": (1000.0, 20000.0),
+    "SPY": (200.0, 1500.0),
+    "QQQ": (200.0, 1500.0),
+    "IWM": (100.0, 800.0),
+    "GLD": (100.0, 500.0),
+    "SMH": (100.0, 500.0),
+    "TLT": (50.0, 300.0),
+    "ES":  (1000.0, 20000.0),  # E-mini SPX futures — same band as SPX
+    "NQ":  (5000.0, 50000.0),
+    "RTY": (1000.0, 5000.0),
+}
+
+
+def _snapshot_plausible(snap: Any, symbol: str) -> tuple[bool, str]:
+    """Validate a QuantData snapshot against per-symbol price bounds.
+    Returns (ok, reason). When False, the snapshot is garbage and must
+    NOT be cached, persisted, or fed into the FEF engine."""
+    if snap is None:
+        return False, "snap is None"
+    spx = getattr(snap, "spx_price", None)
+    if spx is None or spx <= 0:
+        return False, f"spx_price={spx!r} non-positive"
+    lo, hi = SYMBOL_PRICE_BOUNDS.get(symbol, (50.0, 50000.0))
+    if not (lo <= spx <= hi):
+        return False, f"spx_price={spx:.2f} outside {symbol} bounds [{lo:.0f}, {hi:.0f}]"
+    return True, "ok"
+
+
 # ---------------------------------------------------------------------------
 # QuantData poll loop — refreshes the cached snapshot at high cadence
 # ---------------------------------------------------------------------------
@@ -89,6 +125,14 @@ async def quantdata_poll_loop(state: AppState) -> None:
             # Ensure QuantData page filter matches active symbol (idempotent)
             await state.quantdata.set_page_filter(ticker=state.active_symbol)  # type: ignore[attr-defined]
             snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
+            ok, reason = _snapshot_plausible(snap, state.active_symbol)
+            if not ok:
+                logger.warning(
+                    "Discarded implausible snapshot for %s: %s — not caching or persisting",
+                    state.active_symbol, reason,
+                )
+                await asyncio.sleep(interval)
+                continue
             state.last_snapshot = snap
             state.last_spx_price = snap.spx_price  # type: ignore[union-attr]
 
@@ -269,11 +313,20 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     perf: dict[str, float] = {}
     t_start = _time.perf_counter()
 
-    # SPX sanity guard — when active_symbol is a futures contract (ES/NQ/RTY)
-    # QuantData sometimes returns a snapshot with spx_price near zero or wildly
-    # stale. Comparing against the live IBKR tick catches it. If the snapshot
-    # price diverges >50% from the live tick, skip this iter — the engine
-    # would otherwise compute garbage deltas (e.g. dPrice=-7341pts).
+    # SPX sanity guard — defense in depth.
+    # Layer 1 (absolute bounds): catches snapshots whose price is outside
+    # the active symbol's plausible range. Doesn't require a live tick, so
+    # it works pre-market and during IBKR reconnects. The 5/18-5/20 ES
+    # corruption (spx_price≈67) is caught here.
+    if state.last_snapshot is not None:
+        ok, reason = _snapshot_plausible(state.last_snapshot, state.active_symbol)
+        if not ok:
+            logger.warning("Skip iter: cached snapshot failed plausibility check — %s", reason)
+            state.last_snapshot = None
+            return
+    # Layer 2 (relative drift): catches snapshots that pass the absolute
+    # bounds but diverge sharply from the live IBKR tick (stale data
+    # mid-session). Requires a live tick reference.
     if state.last_snapshot is not None and state.last_live_tick_spx > 0:
         snap_spx = getattr(state.last_snapshot, "spx_price", 0)
         if snap_spx > 0 and abs(snap_spx - state.last_live_tick_spx) > state.last_live_tick_spx * 0.5:
@@ -348,6 +401,55 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     option_targets = await _maybe_fetch_option_targets(state, verdict, inputs)
     perf["option_quote_ms"] = (_time.perf_counter() - t0) * 1000
 
+    # ML inference overlay — Phase 2. Observational only: stamps
+    # ml_expected_r into SignalIter.extras + IterEvent without altering the
+    # verdict object that auto_trader consumes. Engine-freeze-safe.
+    ml_expected_r: float | None = None
+    try:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        ml_svc = getattr(state, "ml_inference", None)
+        if ml_svc is not None and ml_svc.is_ready() and verdict.direction.value != "WAIT":
+            et = _tz(_td(hours=-4))
+            hour_et = int(_dt.now(et).strftime("%H"))
+            ml_expected_r = ml_svc.score(
+                {
+                    "direction": verdict.direction.value,
+                    "confidence": verdict.confidence.value,
+                    "spx_price": inputs.spx_price,
+                    "ntm_max_pain": inputs.ntm_max_pain,
+                    "drift_cum_net_m": inputs.drift_cum_net_m,
+                    "aggression_call_pct": inputs.aggression_call_pct,
+                    "aggression_put_pct": inputs.aggression_put_pct,
+                    "iv_rank_call_pct": inputs.iv_rank_call_pct,
+                    "iv_rank_put_pct": inputs.iv_rank_put_pct,
+                    "top_gex_walls": _walls_json(inputs.top_gex_walls),
+                    "top_dex_walls": _walls_json(inputs.top_dex_walls),
+                    "extras": {
+                        "fe_ratio": verdict.fe_ratio,
+                        "delta_price": verdict.delta_price,
+                        "delta_drift_m": verdict.delta_drift_m,
+                    },
+                },
+                hour_et=hour_et,
+            )
+    except Exception:
+        logger.exception("ML inference scoring failed")
+        ml_expected_r = None
+
+    # Fire-order: count of preceding signals on this (direction, strike)
+    # within the dedup window. fire_order=1 = first fire of a cluster,
+    # 2+ = stacks. Lets analytics distinguish first-fire signal quality
+    # from stack-fire signal quality.
+    fire_order = 0
+    try:
+        from fef_sidecar.engine.fire_order import compute_fire_order_live
+        if verdict.direction.value != "WAIT":
+            fire_order = compute_fire_order_live(
+                state, verdict.direction.value, verdict.strike_rec,
+            )
+    except Exception:
+        logger.exception("fire_order computation failed")
+
     signal = await SignalIterRepository.write_iter(
         spx_price=inputs.spx_price,
         direction=verdict.direction,
@@ -367,12 +469,32 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             **verdict.to_log_extras(),
             "option_pricing": _option_pricing_dict(option_targets),
             "regime_at_fire": state.last_regime.regime if state.last_regime else None,
+            "ml_expected_r": ml_expected_r,
+            "fire_order": fire_order,
             # Snapshot the latest HFT + microstructure state at fire time so
             # offline analysis (ML pattern discovery, TuningRecommendation)
             # can correlate signal outcomes with HFT/microstructure context
             # without doing a time-window join.
             "hft_at_fire": dict(state.last_hft_state) if state.last_hft_state else None,
             "microstructure_at_fire": dict(state.last_microstructure_state) if state.last_microstructure_state else None,
+            # VIX at fire time — enables regime-conditional backtests + theta
+            # projection. Captured from the global VIX poller's last reading.
+            "vix_at_fire": state.last_vix,
+            # Auto-trader gate state at iter time — was a fire eligible? if not
+            # which gate would have blocked it? Used by backtester to replay
+            # full live behavior, not just FEF verdicts.
+            "gate_state_at_fire": {
+                "auto_trade_enabled": state.auto_trade_enabled,
+                "session_count": state.auto_trade_count_session,
+                "cool_down_remaining_sec_global": max(
+                    0, state.auto_trade_cool_down_sec - int(
+                        (int(_time.time() * 1000) - state.auto_trade_last_at_ms) / 1000
+                    )
+                ) if state.auto_trade_last_at_ms else 0,
+                "count_by_symbol": dict(state.auto_trade_count_by_symbol),
+                "max_per_symbol": state.auto_trade_max_per_symbol,
+                "trigger_types_enabled": list(state.auto_trade_trigger_types),
+            },
         },
         session_date=_today_et(),
         provider_mode=_current_provider_mode(state),
@@ -403,6 +525,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             "nearest_wall_distance": verdict.nearest_wall_distance,
             "secondary_scores": verdict.secondary_scores,
             "option_pricing": _option_pricing_dict(option_targets),
+            "ml_expected_r": ml_expected_r,
         },
         snapshot={
             "top_gex": _walls_json(inputs.top_gex_walls),
@@ -800,6 +923,15 @@ def _option_pricing_dict(targets: OptionTargets | None) -> dict[str, Any] | None
         "t2": targets.t2,
         "t3": targets.t3,
         "stop": targets.stop,
+        # Full greeks + bid/ask now captured at fire time so backtester can
+        # model theta drag + real slippage. Forward-only (expired contracts
+        # can't be backfilled).
+        "gamma": targets.gamma,
+        "vega": targets.vega,
+        "theta": targets.theta,
+        "iv": targets.iv,
+        "bid": targets.bid,
+        "ask": targets.ask,
     }
 
 

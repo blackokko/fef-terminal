@@ -87,54 +87,76 @@ another thing that can break in live).
 
 ## OPEN ITEMS
 
-### 2026-05-21 — Known data-integrity issues (ongoing audit, not all bugs yet) [LIVING LIST]
-Discovered during 5/20 daily_review debugging. Each one risks
-silent misinterpretation of strategy performance. Cross-check
-ibkr_execution dollar sums against everything else.
-- **live_order.filled_qty / avg_fill_price never populated** on
-  parents (all NULL on 5/20's 61 parents). The ENTRY fill info is
-  lost. Workaround: pull from ibkr_execution by ib_order_id.
-  Where: live_trading.py around place_bracket(). Needs ORDER_STATUS
-  callback to update parent row on fill.
-- **Bracket child orders not persisted as live_order rows**. Only
-  parents have rows; the T1/T2/T3/STOP child orders never get
-  written. Means per-parent exit attribution requires matching
-  ibkr_execution by (symbol, strike, right, date) with no clean
-  link back to a specific parent when stacking. Fix: persist
-  child orders with parent_id pointing back.
-- **SignalIter.spx_price corruption** — 15 rows on 5/18, 4 on 5/19,
-  5 on 5/20 had spx_price=67.2 (or similar non-SPX value). Probably
-  a SPY/futures→SPX conversion bug. Filter is `BETWEEN 1000 AND
-  10000`. Root cause: see loop.py snapshot read; suspect upstream
-  fallback when SPX quote unavailable.
-- **SignalIter.extras numeric garbage** — some delta_price values
-  reach +3508 (impossible for an SPX delta), pa_score/agg_score
-  occasionally clamp to ±1.0 placeholders, nearest_wall_distance
-  hits +7317pts. Suggests fallback values are leaking into the
-  signal record. Audit each upstream computation for defensive
-  defaults that should have been None.
-- **HFT/micro snapshot coverage gap** — 65/218 fired signals 5/18-
-  5/20 have hft_at_fire/microstructure_at_fire. Feature rolled out
-  mid-day 5/19. Don't draw HFT conclusions until coverage is 100%
-  (~5/25 onward).
-- **daily_session.gross_pnl/net_pnl never written** — all five rows
-  have $0. Either nothing populates this table or it's only filled
-  by operator manual entry. Decide whether to compute auto from
-  ibkr_execution or remove the field.
-- **Cross-check queries to run periodically**:
-  ```sql
-  -- daily_review.actual_total_R × R_DOLLARS should ≈ ibkr_execution sum
-  SELECT dr.session_date, dr.actual_total_R,
-         (SELECT SUM(CASE WHEN side='SLD' THEN shares*price*100
-                          ELSE -shares*price*100 END)
-          FROM ibkr_execution WHERE session_date=dr.session_date) AS realized_$
-  FROM daily_review dr;
+### 2026-05-21 — Data-integrity issues found + fixed [PARTIALLY SHIPPED]
 
-  -- live_order parents on date X should ≈ count of distinct ib_order_id
-  -- in ibkr_execution where side='BOT' on same date
-  ```
-- **Resets freeze?**: NO — all observation / read-side / fill-tracking.
-  None changes signal generation or exit logic.
+**SHIPPED 2026-05-21 (commit pending):**
+- ✅ **Snapshot plausibility guard** (loop.py) — per-symbol price
+  bounds reject ES/wrong-ticker garbage (was leaking spx_price=67
+  into signals on 5/18-5/20, cascading delta_price=-7341+ into
+  extras). New defensive layer doesn't require live IBKR tick so
+  it works pre-market and during reconnects.
+- ✅ **daily_session.gross_pnl/net_pnl/best/worst auto-computed**
+  from ibkr_execution during compute_daily_review. Was always $0.
+  Now 5/19=$6,780 / 5/20=$6,815 (matches IBKR exactly).
+- ✅ **live_order.filled_qty/avg_fill_price backfill** —
+  /admin/backfill_live_order_fills endpoint + standalone script
+  scripts/research/backfill_and_recompute.py. Idempotent, joins
+  by ib_order_id. Already run for 5/18-5/20: 93 parent rows now
+  have correct fill data.
+- ✅ **daily_review top-level wins definition aligned** with sub-
+  aggregates (both count net-positive-R). Was tier-based and
+  silently disagreed with by_direction.wins on BE-locked stops.
+
+**STILL OPEN (deferred):**
+- **Bracket child orders not persisted as live_order rows**. Only
+  parents have rows; T1/T2/T3/STOP child orders never get
+  written, so per-parent dollar-accurate R attribution still
+  needs heuristics. Fix: persist children with parent_id pointing
+  back. Bigger refactor; risks the live order placement path so
+  needs careful testing.
+- **live_order.filled_qty runtime callback** — backfill works for
+  historical data but NEW parent orders still won't have fills
+  populated in real-time. Needs ORDER_STATUS / execDetails
+  callback to update parent rows on fill. Same risk profile as
+  bracket children change.
+- **Per-parent dollar-accurate actual_wins/actual_losses** —
+  current _estimate_parent_r uses SPX-target flags + 1:1
+  option/SPX mapping. Overstates per-parent R for partial-then-
+  stop trades (e.g., 5/20 reports 61/0 W/L when reality is mixed).
+  Session-level dollar number IS correct ($6,815 confirmed).
+  Per-parent attribution needs the bracket-child fill linking
+  above to be done first.
+- **SignalIter.extras garbage on historical rows** — old rows
+  with delta_price=-7341, nearest_wall_distance=7317 etc. still
+  in DB. Downstream filters via `spx_price BETWEEN 1000-10000`
+  exclude these but the bad extras values are immortal.
+  Optional: backfill-clean script to overwrite extras on
+  spx-corrupted rows. Low priority — these rows are filtered out.
+- **HFT/micro snapshot coverage gap** — time-based, fills in
+  naturally. No action.
+
+**Cross-check queries** (run before drawing strategy conclusions):
+```sql
+-- Session R × R_DOLLARS should ≈ ibkr_execution sum
+SELECT dr.session_date, dr.actual_total_R,
+       (SELECT SUM(CASE WHEN side='SLD' THEN shares*price*100
+                        ELSE -shares*price*100 END)
+        FROM ibkr_execution WHERE session_date=dr.session_date) AS realized_$
+FROM daily_review dr;
+
+-- Top-level wins must match by_direction wins (post 2026-05-21 fix)
+SELECT session_date, wins,
+       json_extract(by_direction, '$.LONG_CALLS.wins') +
+       json_extract(by_direction, '$.LONG_PUTS.wins') AS by_dir_wins
+FROM daily_review;
+
+-- Snapshot bounds — should be 0 going forward
+SELECT session_date, COUNT(*)
+FROM signal_iter
+WHERE spx_price < 1000 OR spx_price > 10000
+GROUP BY session_date;
+```
+- **Resets freeze?**: NO — observation / read-side / fill-tracking only.
 
 ### 2026-05-20 — daily_review accounting bugs invalidate session-level metrics [SHIPPED 2026-05-21]
 - **Status**: Fixed in `engine/daily_review.py`. Two changes:
