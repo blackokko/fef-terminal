@@ -102,6 +102,16 @@ class ExitVariant:
     # can isolate the entry filter as the only knob changed vs baseline.
     # Supported kinds: 'direction_30m' (params: threshold_pts).
     entry_filter: dict | None = None
+    # Break-even ladder — ordered list of (peak_r_trigger, new_stop_r).
+    # Once peak_r crosses a trigger, the dynamic stop ratchets UP to
+    # new_stop_r (only upward, never down). Captures the live engine's
+    # runner-protection behavior. spx_target_watcher.py uses
+    # [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]: hit +0.5R → stop to BE;
+    # hit +1.0R → lock +0.5R; hit +1.5R → lock +1R. The variants
+    # without be_ladder set keep the original -1R fixed stop (a
+    # pessimistic-vs-live model — useful for measuring the BE ladder's
+    # incremental contribution).
+    be_ladder: list[tuple[float, float]] | None = None
 
     @property
     def is_meta(self) -> bool:
@@ -213,6 +223,51 @@ REGISTERED_VARIANTS: list[ExitVariant] = [
         targets=[(1.0, 0.5), (2.0, 0.3), (3.0, 0.2)],
         entry_filter={"kind": "direction_30m", "params": {"threshold_pts": 3.0}},
     ),
+    # ----- BE-ladder variants -----
+    # Critical discovery 2026-05-21: spx_target_watcher.py applies a BE
+    # ladder [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)] to all parents. The
+    # variants above (no be_ladder set) are pessimistic vs actual live
+    # behavior — they show stop-outs at -1R that the live engine would
+    # have ratcheted to BE before adverse moves hit. The two variants
+    # below model the ladder explicitly so we can measure (a) accurate
+    # current-live behavior, and (b) the 2b+B+C+D combination the user
+    # asked about (runner protection from BE ladder + B+C+D's trail).
+    ExitVariant(
+        # Accurate model of current live exit logic: partials + the
+        # live BE ladder. The right reference point for measuring the
+        # B+C+D shadow's incremental edge vs what's actually running.
+        label="baseline_partial_with_be_ladder",
+        stop_r=-1.0,
+        targets=[(1.0, 0.5), (2.0, 0.3), (3.0, 0.2)],
+        be_ladder=[(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)],
+    ),
+    ExitVariant(
+        # The "Option 2b + B+C+D" combination: BE ladder protection on
+        # runners (stop ratchets up as MFE increases) + B+C+D's
+        # peak-trail (exit on pullback from peak). Two protection
+        # mechanisms that compose rather than conflict — ladder
+        # prevents giving back ALL of MFE on a deep reversal, trail
+        # exits earlier when intra-trade pullback exceeds threshold.
+        label="bcd_trail_15pct_with_be_ladder",
+        stop_r=-1.0,
+        targets=[(1.0, 1.0)],
+        trail_peak_floor_r=0.3,
+        trail_pullback_r=0.15,
+        be_ladder=[(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)],
+    ),
+    ExitVariant(
+        # And: pure-trail + BE ladder. Tonight's surprise headline
+        # winner (pure_trail_15pct, +$32k vs baseline) PLUS the BE
+        # ladder runner protection. If trail-alone is doing the work
+        # and BE ladder protects further-out runners, this should
+        # combine the best of both.
+        label="pure_trail_15pct_with_be_ladder",
+        stop_r=-1.0,
+        targets=[],
+        trail_peak_floor_r=0.3,
+        trail_pullback_r=0.15,
+        be_ladder=[(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)],
+    ),
 ]
 
 
@@ -273,6 +328,14 @@ def simulate_variant(
     remaining_share = 1.0
     tiers_fired: set[int] = set()
     peak_r = 0.0
+    # Dynamic stop — starts at variant.stop_r, ratchets via be_ladder.
+    # Conservative ordering: a bar's adverse_r is checked against the
+    # PREVIOUS bar's dynamic_stop_r (i.e., ratchet only takes effect
+    # on the NEXT bar). Matches the live engine where the watcher
+    # updates state after observing the bar, so adverse-move-this-bar
+    # uses the stop in effect at bar start.
+    dynamic_stop_r = variant.stop_r
+    ladder = sorted(variant.be_ladder or [], key=lambda x: x[0])
     trail_enabled = (
         variant.trail_peak_floor_r is not None
         and variant.trail_pullback_r is not None
@@ -283,14 +346,28 @@ def simulate_variant(
         favor_pts = b["high"] if direction_sign > 0 else b["low"]
         adverse_r = direction_sign * (adverse_pts - entry_spx) / 10.0
         favor_r = direction_sign * (favor_pts - entry_spx) / 10.0
+
+        # 1. Stop (priority on ambiguous bars). Uses the dynamic stop
+        # as ratcheted by prior bars — this bar's peak update hasn't
+        # happened yet.
+        if adverse_r <= dynamic_stop_r and remaining_share > 0:
+            realized_r += remaining_share * dynamic_stop_r
+            return {"realized_r": realized_r,
+                    "exit_reason": "stop" if dynamic_stop_r <= variant.stop_r + 1e-9
+                                   else "be_stop",
+                    "peak_r": peak_r, "exit_ms": b["timestamp_ms"]}
+
+        # Update peak now that we know the bar's high didn't precede
+        # the stop. (For partials/trail we check vs this bar's
+        # favorable extreme below.)
         if favor_r > peak_r:
             peak_r = favor_r
 
-        # 1. Stop (priority on ambiguous bars)
-        if adverse_r <= variant.stop_r and remaining_share > 0:
-            realized_r += remaining_share * variant.stop_r
-            return {"realized_r": realized_r, "exit_reason": "stop",
-                    "peak_r": peak_r, "exit_ms": b["timestamp_ms"]}
+        # BE ladder ratchet — only after peak update + stop check, so
+        # the new (higher) stop applies starting next bar.
+        for trig, new_stop in ladder:
+            if peak_r >= trig and new_stop > dynamic_stop_r:
+                dynamic_stop_r = new_stop
 
         # 2. Targets in order — fire any not yet hit
         for idx, (r_level, share) in enumerate(variant.targets):
