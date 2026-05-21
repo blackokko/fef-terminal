@@ -162,43 +162,122 @@ def run_gap_analysis(
     for d in parents_by_dir:
         parents_by_dir[d].sort()
 
-    # Pair-off realized $ per parent (using ibkr_execution rows)
+    # Pair-off realized $ per parent — proper per-parent attribution
+    # (2026-05-21 fix per data integrity audit). Previous version did
+    # per-session-per-right rollup and pro-rated by parent BOT-qty share,
+    # which smeared all parents in the same right/day to the same realized_r
+    # (clustering bug). The new method: match ibkr_execution rows to
+    # parents by ib_order_id when available; fall back to pro-rata by
+    # parent's BOT-volume share within its contract group otherwise.
     parent_realized_dollars: dict[int, float | None] = {}
-    for d, plist in parents_by_dir.items():
-        for _ms, pid, p in plist:
-            # All ibkr_execution rows matching parent's contract on its
-            # session date. Simple pair-off across all (could over-attribute
-            # if multiple parents hit same contract — accept that noise).
-            cur.execute(
-                """
-                SELECT side, shares, price
-                FROM ibkr_execution
-                WHERE session_date = ?
-                  AND symbol = 'SPX'
-                  AND right = ?
-                """,
-                (p["submitted_at"][:10], p["right"]),
-            )
-            execs = cur.fetchall()
-            # This is per-session per-right rollup — we use it only as
-            # a sanity-check signal for "did anything live happen"
-            if not execs:
-                parent_realized_dollars[pid] = None
-                continue
-            bot_q = sum(float(e["shares"]) for e in execs if e["side"].upper() == "BOT")
-            sld_q = sum(float(e["shares"]) for e in execs if e["side"].upper() == "SLD")
-            bot_v = sum(float(e["shares"]) * float(e["price"]) for e in execs if e["side"].upper() == "BOT")
-            sld_v = sum(float(e["shares"]) * float(e["price"]) for e in execs if e["side"].upper() == "SLD")
-            paired = min(bot_q, sld_q)
-            if paired == 0:
-                parent_realized_dollars[pid] = None
-                continue
-            avg_bot = bot_v / bot_q if bot_q else 0
-            avg_sld = sld_v / sld_q if sld_q else 0
-            # Pro-rate by this parent's qty share of total bot_q on the
-            # contract group — coarse but documents the share-of-day attribution.
-            share = float(p["qty"] or 0) / bot_q if bot_q > 0 else 0
-            parent_realized_dollars[pid] = (avg_sld - avg_bot) * paired * 100 * share
+
+    # Build: (date, strike, right) → list of ibkr_execution rows
+    # And:   ib_order_id → list of ibkr_execution rows
+    exec_rows_by_contract: dict[tuple, list[dict]] = defaultdict(list)
+    exec_rows_by_order_id: dict[int, list[dict]] = defaultdict(list)
+    for er in cur.execute(
+        """
+        SELECT exec_id, ib_order_id, session_date, strike, right, side, shares, price
+        FROM ibkr_execution
+        WHERE session_date BETWEEN ? AND ?
+          AND symbol = 'SPX'
+        """,
+        (date_from, date_to),
+    ).fetchall():
+        e = dict(er)
+        exec_rows_by_contract[(e["session_date"], float(e["strike"] or 0), e["right"])].append(e)
+        if e["ib_order_id"] is not None:
+            exec_rows_by_order_id[int(e["ib_order_id"])].append(e)
+
+    # Pull each parent's ib_order_id + strike so we can attribute fills.
+    parents_full = cur.execute(
+        """
+        SELECT id, ib_order_id, strike, right, qty, submitted_at, status, entry_spx_price
+        FROM live_order
+        WHERE bracket_role = 'parent'
+          AND substr(submitted_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (date_from, date_to),
+    ).fetchall()
+
+    # Build parent_id → bracket child ib_order_ids (T1/T2/T3/stop) so SLD
+    # fills attributable to the bracket flow through to the parent's realized.
+    bracket_children = cur.execute(
+        """
+        SELECT id, ib_order_id, parent_id
+        FROM live_order
+        WHERE parent_id IS NOT NULL
+          AND substr(submitted_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (date_from, date_to),
+    ).fetchall()
+    parent_to_child_order_ids: dict[int, list[int]] = defaultdict(list)
+    for bc in bracket_children:
+        if bc["ib_order_id"] is not None and bc["parent_id"] is not None:
+            parent_to_child_order_ids[int(bc["parent_id"])].append(int(bc["ib_order_id"]))
+
+    for pf in parents_full:
+        pid = pf["id"]
+        # Collect fills attributable to THIS parent: its own ib_order_id +
+        # all its bracket children's ib_order_ids.
+        attributable_order_ids = []
+        if pf["ib_order_id"] is not None:
+            attributable_order_ids.append(int(pf["ib_order_id"]))
+        attributable_order_ids.extend(parent_to_child_order_ids.get(pid, []))
+
+        fills: list[dict] = []
+        for oid in attributable_order_ids:
+            fills.extend(exec_rows_by_order_id.get(oid, []))
+
+        # Three attribution tiers:
+        # (1) full order-id matching: parent BOT + all bracket children SLD
+        #     linkages present → per-parent realized (cleanest)
+        # (2) order-id BOT only + per-contract SLD pool: parent's BOT fills
+        #     identified, but bracket children not linked → use contract-
+        #     group SLD pair-off, anchor BOT-qty per-parent (still cleaner
+        #     than (3) for sessions with multiple parents per contract)
+        # (3) full pro-rata fallback: when ib_order_id missing entirely
+        #     → contract-group pair-off pro-rated by parent's qty share
+        # Until bracket-child persistence is wired (separate engine fix),
+        # tier (2) is the typical path.
+        own_bot_q = sum(float(e["shares"]) for e in fills if e["side"].upper() == "BOT")
+        own_sld_q = sum(float(e["shares"]) for e in fills if e["side"].upper() == "SLD")
+        own_bot_v = sum(float(e["shares"]) * float(e["price"]) for e in fills if e["side"].upper() == "BOT")
+
+        if own_bot_q > 0 and own_sld_q > 0:
+            # Tier 1
+            own_sld_v = sum(float(e["shares"]) * float(e["price"]) for e in fills if e["side"].upper() == "SLD")
+            paired = min(own_bot_q, own_sld_q)
+            avg_bot = own_bot_v / own_bot_q
+            avg_sld = own_sld_v / own_sld_q
+            parent_realized_dollars[pid] = (avg_sld - avg_bot) * paired * 100
+            continue
+
+        # Need contract-group SLD pool for tier 2 or 3
+        key = (pf["submitted_at"][:10], float(pf["strike"] or 0), pf["right"])
+        group_execs = exec_rows_by_contract.get(key, [])
+        if not group_execs:
+            parent_realized_dollars[pid] = None
+            continue
+        grp_bot_q = sum(float(e["shares"]) for e in group_execs if e["side"].upper() == "BOT")
+        grp_sld_q = sum(float(e["shares"]) for e in group_execs if e["side"].upper() == "SLD")
+        grp_bot_v = sum(float(e["shares"]) * float(e["price"]) for e in group_execs if e["side"].upper() == "BOT")
+        grp_sld_v = sum(float(e["shares"]) * float(e["price"]) for e in group_execs if e["side"].upper() == "SLD")
+        if grp_bot_q == 0 or grp_sld_q == 0:
+            parent_realized_dollars[pid] = None
+            continue
+        grp_paired = min(grp_bot_q, grp_sld_q)
+        grp_avg_bot = grp_bot_v / grp_bot_q
+        grp_avg_sld = grp_sld_v / grp_sld_q
+        grp_realized = (grp_avg_sld - grp_avg_bot) * grp_paired * 100
+
+        if own_bot_q > 0:
+            # Tier 2: anchor BOT-qty per-parent
+            share = own_bot_q / grp_bot_q
+        else:
+            # Tier 3: pro-rata by parent.qty
+            share = float(pf["qty"] or 0) / grp_bot_q
+        parent_realized_dollars[pid] = grp_realized * share
 
     # Pick the canonical "accurate live model" simulator variant
     baseline_be = _variant_by_label("baseline_partial_with_be_ladder")

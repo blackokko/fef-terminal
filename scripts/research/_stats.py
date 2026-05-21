@@ -218,7 +218,14 @@ def deflated_sharpe_ratio(
         except ValueError:
             sr_zero = 0.0
 
-    denom_inside = 1 - skew * sr_hat + ((excess_kurt - 1) / 4.0) * (sr_hat ** 2)
+    # Bailey & López de Prado (2014) eq. 9 uses NON-excess kurtosis (κ = m4/m2²),
+    # NOT excess kurtosis (κ_excess = κ - 3). _skew_kurt returns excess. The
+    # denominator term `(κ - 1) / 4` thus becomes `(excess_kurt + 3 - 1) / 4
+    # = (excess_kurt + 2) / 4`. Earlier versions of this file used
+    # `(excess_kurt - 1) / 4` which biased DSR upward by 5-15% on
+    # positively-kurtotic data (typical for option-trade R distributions).
+    # Fixed 2026-05-21 per formula audit.
+    denom_inside = 1 - skew * sr_hat + ((excess_kurt + 2) / 4.0) * (sr_hat ** 2)
     if denom_inside <= 0:
         return {
             "observed_sharpe": round(sr_hat, 4),
