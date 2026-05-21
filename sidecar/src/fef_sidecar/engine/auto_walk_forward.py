@@ -125,10 +125,172 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
     return run
 
 
+async def _persist_today_ibkr_fills(state) -> int:
+    """Persist today's IBKR executions to DB. Without this, ibkr_execution
+    rows only get written when /diag/ibkr_executions is queried — so if no
+    UI hits it, today's fills are missing at nightly compute time. Returns
+    the count of NEW rows persisted (idempotent on exec_id)."""
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from sqlmodel import select
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import IBKRExecution
+    if not isinstance(state.ibkr, LiveIBKRProvider):
+        return 0
+    try:
+        ib = state.ibkr._ib  # type: ignore[attr-defined]
+        # Pull recent fills from IBKR (server-side cache, ~7 days max)
+        from ib_async import ExecutionFilter
+        execs = await ib.reqExecutionsAsync(ExecutionFilter())
+        if not execs:
+            return 0
+        from datetime import timezone as _tz, timedelta as _td
+        et_tz = _tz(_td(hours=-4))
+        new_count = 0
+        async with get_session() as session:
+            for ex in execs:
+                # Skip if already persisted
+                existing = (await session.exec(
+                    select(IBKRExecution).where(IBKRExecution.exec_id == ex.execution.execId)
+                )).first()
+                if existing is not None:
+                    continue
+                ts = ex.time
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=_tz.utc)
+                sess_date = ts.astimezone(et_tz).strftime("%Y-%m-%d")
+                row = IBKRExecution(
+                    exec_id=ex.execution.execId,
+                    timestamp=ts,
+                    session_date=sess_date,
+                    symbol=getattr(ex.contract, "symbol", ""),
+                    strike=float(getattr(ex.contract, "strike", 0) or 0),
+                    right=getattr(ex.contract, "right", "") or "",
+                    expiry=getattr(ex.contract, "lastTradeDateOrContractMonth", "") or "",
+                    side=ex.execution.side,
+                    shares=float(ex.execution.shares),
+                    price=float(ex.execution.price),
+                    cum_qty=float(ex.execution.cumQty),
+                    avg_price=float(ex.execution.avgPrice),
+                    ib_order_id=int(getattr(ex.execution, "orderId", 0) or 0) or None,
+                    perm_id=int(getattr(ex.execution, "permId", 0) or 0) or None,
+                    account=getattr(ex.execution, "acctNumber", "") or "",
+                )
+                session.add(row)
+                new_count += 1
+            await session.commit()
+        return new_count
+    except Exception:
+        logger.exception("_persist_today_ibkr_fills failed")
+        return 0
+
+
+async def _backfill_live_order_fills_for(session_date: str) -> dict:
+    """Update live_order.filled_qty / avg_fill_price by ib_order_id match
+    against ibkr_execution rows for the given session_date. Same logic as
+    the /admin/backfill_live_order_fills endpoint but inlined for the
+    nightly chain."""
+    from sqlmodel import select
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import IBKRExecution, LiveOrder
+
+    async with get_session() as ss:
+        execs = list((await ss.exec(
+            select(IBKRExecution).where(IBKRExecution.session_date == session_date)
+        )).all())
+        by_order: dict[int, list] = {}
+        for e in execs:
+            if e.ib_order_id is None:
+                continue
+            by_order.setdefault(int(e.ib_order_id), []).append(e)
+        candidates = list((await ss.exec(select(LiveOrder))).all())
+        candidates = [p for p in candidates
+                      if p.submitted_at
+                      and p.submitted_at.strftime("%Y-%m-%d") == session_date]
+        updated = 0
+        for p in candidates:
+            if p.ib_order_id is None:
+                continue
+            fills = by_order.get(int(p.ib_order_id))
+            if not fills:
+                continue
+            total = sum(float(f.shares or 0) for f in fills)
+            if total <= 0:
+                continue
+            wpx = sum(float(f.shares or 0) * float(f.price or 0) for f in fills) / total
+            new_filled = int(round(total))
+            new_px = round(wpx, 4)
+            if (p.filled_qty == new_filled and p.avg_fill_price is not None
+                    and abs((p.avg_fill_price or 0) - new_px) < 0.005):
+                continue
+            p.filled_qty = new_filled
+            p.avg_fill_price = new_px
+            if p.status in ("SUBMITTED", "ACCEPTED", "WORKING", None):
+                qt = int(p.qty or 0)
+                if qt > 0 and new_filled >= qt:
+                    p.status = "FILLED"
+                elif new_filled > 0:
+                    p.status = "PARTIAL"
+            ss.add(p)
+            updated += 1
+        await ss.commit()
+    return {"execs": len(execs), "updated": updated}
+
+
+async def _audit_data_integrity(session_date: str) -> dict:
+    """Lightweight data-integrity audit for the given session. Logs any
+    anomalies to audit_log so the user sees them in the morning before
+    drawing conclusions from the data. Read-only."""
+    from sqlmodel import select
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import SignalIter, IBKRExecution
+    from fef_sidecar.db.repository import SignalIterRepository
+
+    findings: list[str] = []
+    async with get_session() as ss:
+        # 1. SignalIter spx_price out of plausible range?
+        bad_spx = list((await ss.exec(
+            select(SignalIter).where(SignalIter.session_date == session_date)
+            .where((SignalIter.spx_price < 1000) | (SignalIter.spx_price > 20000))  # type: ignore[operator]
+        )).all())
+        if bad_spx:
+            findings.append(f"{len(bad_spx)} signal_iter rows have implausible spx_price")
+        # 2. IBKR execs without ib_order_id (rare, means we can't backfill)
+        execs = list((await ss.exec(
+            select(IBKRExecution).where(IBKRExecution.session_date == session_date)
+        )).all())
+        execs_no_order = [e for e in execs if e.ib_order_id is None]
+        if execs_no_order:
+            findings.append(f"{len(execs_no_order)}/{len(execs)} IBKR fills missing ib_order_id")
+        # 3. IBKR fills present at all?
+        if not execs:
+            findings.append("NO IBKR fills persisted for this session — check connection / write-through")
+
+    summary = (
+        "data_integrity OK" if not findings
+        else "data_integrity: " + " | ".join(findings)
+    )
+    await SignalIterRepository.write_audit_log(
+        category="data_integrity", actor="system",
+        summary=summary, details={"findings": findings, "session_date": session_date},
+    )
+    return {"findings": findings, "ok": not findings}
+
+
 async def nightly_scheduler(state) -> None:
-    """Sleeps until the configured hour each day, then runs auto walk-forward."""
+    """Sleeps until the configured hour each day, then runs the nightly
+    data hygiene + analytics chain in this order:
+      1. Persist today's IBKR fills (no UI hit required)
+      2. Backfill live_order.filled_qty / avg_fill_price
+      3. Data integrity audit (logs anomalies)
+      4. Auto walk-forward sweep
+      5. compute_daily_review (now consumes fresh IBKR + live_order data)
+      6. Tuning recommender
+
+    The hygiene steps (1-3) ensure the analytics steps (4-6) always
+    operate on up-to-date data even if no UI session triggered the
+    write-throughs during the trading day."""
     target_hour = int(os.environ.get("FEF_AUTO_WALKFORWARD_HOUR", "22"))
-    logger.info("Auto walk-forward scheduler started (will run at %02d:00 UTC daily)", target_hour)
+    logger.info("Nightly scheduler started (will run at %02d:00 UTC daily)", target_hour)
     while True:
         now = datetime.now(UTC)
         target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
@@ -136,24 +298,49 @@ async def nightly_scheduler(state) -> None:
             from datetime import timedelta
             target = target + timedelta(days=1)
         sleep_seconds = (target - now).total_seconds()
-        logger.info("Auto walk-forward sleeping %.0f sec until next run", sleep_seconds)
+        logger.info("Nightly scheduler sleeping %.0f sec until next run", sleep_seconds)
         try:
             await asyncio.sleep(sleep_seconds)
-            await run_auto_walk_forward(state)
-            # Also compute today's daily review (feedback loop for FEF tuning)
+
+            from datetime import timezone as _tz, timedelta as _td
+            et = _tz(_td(hours=-4))
+            session_date = datetime.now(et).strftime("%Y-%m-%d")
+
+            # 1. Persist today's IBKR fills (no-op if already current)
+            try:
+                n = await _persist_today_ibkr_fills(state)
+                logger.info("Nightly: persisted %d new IBKR fills", n)
+            except Exception:
+                logger.exception("Nightly: persist IBKR fills failed")
+            # 2. Backfill live_order.filled_qty / avg_fill_price
+            try:
+                r = await _backfill_live_order_fills_for(session_date)
+                logger.info("Nightly: live_order fills backfill: %s", r)
+            except Exception:
+                logger.exception("Nightly: live_order fills backfill failed")
+            # 3. Data integrity audit
+            try:
+                r = await _audit_data_integrity(session_date)
+                logger.info("Nightly: data integrity: %s", r)
+            except Exception:
+                logger.exception("Nightly: data integrity audit failed")
+
+            # 4. Walk-forward sweep
+            try:
+                await run_auto_walk_forward(state)
+            except Exception:
+                logger.exception("Nightly: auto_walk_forward failed")
+
+            # 5. Daily review (now using fresh IBKR + live_order data) + 6. tuning
             try:
                 from fef_sidecar.engine.daily_review import compute_daily_review
                 from fef_sidecar.engine.tuning_runner import run_tuning_recommendations
-                from datetime import timezone as _tz
-                et = _tz(__import__("datetime").timedelta(hours=-4))
-                session_date = datetime.now(et).strftime("%Y-%m-%d")
                 await compute_daily_review(session_date)
-                # Auto-run the tuning recommender after each DailyReview computes.
                 await run_tuning_recommendations()
             except Exception:
-                logger.exception("daily_review / tuning compute failed")
+                logger.exception("Nightly: daily_review / tuning compute failed")
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Auto walk-forward iteration failed")
+            logger.exception("Nightly scheduler iteration failed")
             await asyncio.sleep(3600)  # retry in 1h on failure
