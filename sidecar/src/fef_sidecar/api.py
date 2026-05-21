@@ -3616,6 +3616,17 @@ async def admin_backfill_commissions(
     except Exception as e:
         return {"ok": False, "error": f"reqExecutionsAsync failed: {e}"}
 
+    # CRITICAL: ib_async's reqExecutionsAsync resolves the future with Fill
+    # objects whose commissionReport is empty — commissionReport events
+    # arrive on a SEPARATE TWS event channel after execDetails. The Fill
+    # objects in the returned list are the SAME objects as wrapper.fills
+    # (mutated in place by dataclassUpdate when commissionReport events
+    # land). So we wait a moment after reqExecutionsAsync returns to let
+    # those events flow, then re-read fill.commissionReport.commission.
+    # Reference: ib_async wrapper.py:824, 848-861.
+    import asyncio as _aio_comm, os as _os_comm
+    await _aio_comm.sleep(float(_os_comm.environ.get("FEF_COMMISSION_RACE_WAIT_SEC", "2.0")))
+
     # exec_id -> (commission, realized_pnl)
     pairs: dict[str, tuple[float | None, float | None]] = {}
     for f in fills:

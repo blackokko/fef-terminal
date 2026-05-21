@@ -129,7 +129,14 @@ async def _persist_today_ibkr_fills(state) -> int:
     """Persist today's IBKR executions to DB. Without this, ibkr_execution
     rows only get written when /diag/ibkr_executions is queried — so if no
     UI hits it, today's fills are missing at nightly compute time. Returns
-    the count of NEW rows persisted (idempotent on exec_id)."""
+    the count of NEW rows persisted (idempotent on exec_id).
+
+    Also captures CommissionReport.commission + realizedPNL — but ib_async
+    delivers those on a SEPARATE event channel that arrives AFTER
+    reqExecutionsAsync resolves. The Fill objects in the returned list are
+    mutated in place when commissionReport events land, so a brief sleep
+    between the request and the read picks up the commissions correctly.
+    Reference: ib_async wrapper.py execDetails + commissionReport handlers."""
     from fef_sidecar.ibkr.live import LiveIBKRProvider
     from sqlmodel import select
     from fef_sidecar.db.engine import get_session
@@ -143,16 +150,45 @@ async def _persist_today_ibkr_fills(state) -> int:
         execs = await ib.reqExecutionsAsync(ExecutionFilter())
         if not execs:
             return 0
+        # Wait for CommissionReport events to land (they arrive AFTER the
+        # execDetails future resolves — see ib_async wrapper.py:824, 856).
+        wait_sec = float(os.environ.get("FEF_COMMISSION_RACE_WAIT_SEC", "2.0"))
+        await asyncio.sleep(wait_sec)
         from datetime import timezone as _tz, timedelta as _td
         et_tz = _tz(_td(hours=-4))
         new_count = 0
         async with get_session() as session:
             for ex in execs:
-                # Skip if already persisted
+                # Read commission from the Fill's now-updated CommissionReport
+                cr = getattr(ex, "commissionReport", None)
+                comm_val: float | None = None
+                rpnl_val: float | None = None
+                if cr is not None:
+                    _c = getattr(cr, "commission", None)
+                    if _c is not None and not (isinstance(_c, float) and _c != _c):
+                        try: comm_val = float(_c)
+                        except (TypeError, ValueError): pass
+                    _r = getattr(cr, "realizedPNL", None)
+                    if _r is not None and not (isinstance(_r, float) and _r != _r):
+                        try: rpnl_val = float(_r)
+                        except (TypeError, ValueError): pass
+
+                # Skip if already persisted (but try to update commission
+                # if previously NULL — handles the case where this exec was
+                # captured before the commission-race fix).
                 existing = (await session.exec(
                     select(IBKRExecution).where(IBKRExecution.exec_id == ex.execution.execId)
                 )).first()
                 if existing is not None:
+                    changed = False
+                    if existing.commission is None and comm_val is not None:
+                        existing.commission = comm_val
+                        changed = True
+                    if existing.realized_pnl is None and rpnl_val is not None:
+                        existing.realized_pnl = rpnl_val
+                        changed = True
+                    if changed:
+                        session.add(existing)
                     continue
                 ts = ex.time
                 if ts.tzinfo is None:
@@ -174,6 +210,8 @@ async def _persist_today_ibkr_fills(state) -> int:
                     ib_order_id=int(getattr(ex.execution, "orderId", 0) or 0) or None,
                     perm_id=int(getattr(ex.execution, "permId", 0) or 0) or None,
                     account=getattr(ex.execution, "acctNumber", "") or "",
+                    commission=comm_val,
+                    realized_pnl=rpnl_val,
                 )
                 session.add(row)
                 new_count += 1
