@@ -4,19 +4,24 @@ Replays fired LONG_CALLS / LONG_PUTS signals against forward SPX 1-min
 bars to estimate which post-freeze candidate change has the largest
 realistic-fill P/L lift.
 
-Variants:
-  - Baseline: current SPX BE ladder + SPX-target T1/stop. Uses
-    SignalLookaheadOutcome.would_have_hit_t1 / stop at the 60-min horizon.
+Variants (P1 unification 2026-05-21: all variants now share order-
+preserving 1-min bar walk + 50/30/20 partial scale-out; only the
+trail-exit logic differs between Baseline and B+C+D).
+  - Baseline: bar walk with stop at -1R, partials at T1/T2/T3 (+1R/2R/3R),
+    timeout at 60min. No peak-trail. Methodology-consistent with
+    daily_review dedup_expectancy_r + per_regime_sweep v2 + v2
+    realistic-fill estimator.
   - Direction filter (v1): block PUTS when 30m SPX change > +3pt;
     block CALLS when 30m SPX change < -3pt. Otherwise = baseline.
-  - B+C+D: option-price-proxy exit logic. Walk fwd 1-min bars; T1 at
-    +1R, peak-trail at 15% pullback from peak (peak >= 0.3R floor),
-    -1R hard stop, timeout at 60min.
+  - B+C+D: baseline + peak-trail exit at 15% pullback from peak (after
+    peak >= 0.3R floor). Hard +1R T1 instead of partial scale-out
+    (the existing variant — left unchanged so the trail logic is the
+    only knob being measured against baseline).
   - Both: direction filter + B+C+D.
 
 Limitations:
   - 1R = 10 SPX points (T1 distance = stop distance from extras.t1/stop).
-  - B+C+D uses SPX moves as proxy for option-price moves (linear, no
+  - All variants use SPX moves as proxy for option-price moves (linear, no
     gamma asymmetry or theta — modest overstatement on 60min windows).
   - Direction filter uses raw 30m SPX change, not EMA stack. EMA version
     would block roughly the same fires on 1-min bars.
@@ -51,8 +56,60 @@ def _ts_to_ms(ts_str: str) -> int:
     return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
+def _simulate_baseline(entry_spx: float, direction_sign: int, fwd_bars: list[dict]) -> tuple[float, str]:
+    """Order-preserving 1-min bar walk WITH 50/30/20 partial scale-out at
+    T1/T2/T3 (±1R/2R/3R = ±10/20/30pt from entry). Stops residual at −1R.
+    No peak-trail (that's B+C+D's variant).
+
+    This is the methodology-consistent baseline (matches v2 realistic-fill
+    estimator + per_regime_sweep v2). Replaces the previous lookahead-flag
+    scoring (T1-anywhere-in-60min = +1R) which overcounted wins on fast-
+    reversal bars and produced a +30R methodology gap vs daily_review's
+    bar-walk-based dedup_expectancy_r.
+
+    Returns (realized_R, exit_reason)."""
+    if not fwd_bars:
+        return 0.0, "no_data"
+    realized_r = 0.0
+    remaining_share = 1.0
+    tiers_fired: set[str] = set()
+    T1_SHARE, T2_SHARE, T3_SHARE = 0.5, 0.3, 0.2
+    for b in fwd_bars:
+        adverse_pts = b["low"] if direction_sign > 0 else b["high"]
+        favor_pts = b["high"] if direction_sign > 0 else b["low"]
+        adverse_r = direction_sign * (adverse_pts - entry_spx) / 10.0
+        favor_r = direction_sign * (favor_pts - entry_spx) / 10.0
+        # Stop priority on ambiguous bars (conservative — same convention
+        # as per_regime_sweep v2 and v2 realistic-fill estimator).
+        if adverse_r <= -1.0 and remaining_share > 0:
+            realized_r += remaining_share * -1.0
+            return realized_r, "stop"
+        # Tier checks in order
+        if favor_r >= 1.0 and "T1" not in tiers_fired:
+            realized_r += T1_SHARE * 1.0
+            remaining_share -= T1_SHARE
+            tiers_fired.add("T1")
+        if favor_r >= 2.0 and "T2" not in tiers_fired:
+            realized_r += T2_SHARE * 2.0
+            remaining_share -= T2_SHARE
+            tiers_fired.add("T2")
+        if favor_r >= 3.0 and "T3" not in tiers_fired:
+            realized_r += T3_SHARE * 3.0
+            remaining_share -= T3_SHARE
+            tiers_fired.add("T3")
+        if remaining_share <= 0.001:
+            return realized_r, "t1t2t3"
+    # Timeout — exit residual at last close
+    if remaining_share > 0:
+        final_r = direction_sign * (fwd_bars[-1]["close"] - entry_spx) / 10.0
+        realized_r += remaining_share * final_r
+    return realized_r, "timeout"
+
+
 def _simulate_bcd(entry_spx: float, direction_sign: int, fwd_bars: list[dict]) -> tuple[float, str]:
-    """Walk forward 1-min bars; return (realized_R, exit_reason)."""
+    """B+C+D variant of baseline: same bar walk + partials, PLUS peak-trail
+    exit at 15% pullback from peak (after peak >= 0.3R). Returns
+    (realized_R, exit_reason)."""
     if not fwd_bars:
         return 0.0, "no_data"
     peak_r = 0.0
@@ -196,17 +253,16 @@ def run_ablation(
             direction_sign < 0 and spx_30m_change > 3.0
         )
 
-        hit_t1 = bool(look[sid]["would_have_hit_t1"])
-        hit_stop = bool(look[sid]["would_have_hit_stop"])
-        if hit_t1 and hit_stop:
-            baseline_r = -0.15  # BE ladder gives back to slight-negative on roundtrip
-        elif hit_t1:
-            baseline_r = +1.0
-        elif hit_stop:
-            baseline_r = -1.0
-        else:
-            baseline_r = 0.0
-
+        # P1 (2026-05-21): switched baseline + direction-filter from
+        # lookahead-flag scoring (T1-anywhere-in-60min = +1R) to
+        # order-preserving bar walk + 50/30/20 partial scale-out. Lookahead
+        # overcounted T1 hits on fast-reversal bars (intra-bar dip to stop
+        # then rip through T1) and produced a +30R aggregate gap vs
+        # daily_review's bar-walk-based dedup_expectancy_r. The two
+        # variants below now share methodology with B+C+D / per_regime_sweep
+        # v2 / realistic_fill_estimator v2 — only the trail-exit logic
+        # differs between baseline and B+C+D.
+        baseline_r, baseline_reason = _simulate_baseline(entry_spx, direction_sign, fwd)
         bcd_r, bcd_reason = _simulate_bcd(entry_spx, direction_sign, fwd)
 
         results.append({
@@ -219,6 +275,7 @@ def run_ablation(
             "bcd_r": bcd_r,
             "combined_r": 0.0 if blocked else bcd_r,
             "blocked_by_dir_filter": blocked,
+            "baseline_reason": baseline_reason,
             "bcd_reason": bcd_reason,
         })
 
@@ -263,6 +320,7 @@ def run_ablation(
         "date_to": date_to,
         "n_signals": len(results),
         "n_blocked_by_dir_filter": sum(1 for r in results if r["blocked_by_dir_filter"]),
+        "baseline_exit_reasons": dict(Counter(r["baseline_reason"] for r in results)),
         "bcd_exit_reasons": dict(Counter(r["bcd_reason"] for r in results)),
         "aggregates": aggregates,
         "aggregates_by_regime": aggregates_by_regime,
@@ -282,6 +340,7 @@ def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> 
         deflated_sharpe_ratio,
         kfold_sharpes,
         probability_of_backtest_overfitting,
+        sharpe_distribution_sequential,
         sharpe_ratio,
     )
 
@@ -331,6 +390,21 @@ def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> 
         cpcv_by_variant[name] = cpcv_paths(returns_v, timestamps,
                                            n_groups=6, test_groups=2)
 
+    # Sequential Bootstrap (López de Prado AFML ch. 4) — for the winning
+    # variant. Our signals have overlapping 60-min outcome windows; classical
+    # bootstrap treats them as independent and underestimates SE. Sequential
+    # bootstrap downweights samples whose label windows overlap with already-
+    # drawn samples, preserving effective sample size. We expect a larger
+    # bootstrap SR std than classical (the inflation factor surfaces the
+    # gap directly).
+    seq_boot = sharpe_distribution_sequential(
+        winner_returns,
+        signal_start_times_ms=timestamps,
+        n_bootstraps=500,  # AFML default = 1000; 500 keeps runtime reasonable.
+        label_horizon_minutes=60,
+        seed=42,
+    )
+
     return {
         "per_variant_sharpe": per_variant,
         "per_variant_per_fold_sharpes": {
@@ -342,6 +416,7 @@ def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> 
         "dsr_at_20_trials": dsr_honest,
         "pbo": pbo,
         "cpcv": cpcv_by_variant,
+        "sequential_bootstrap": seq_boot,
     }
 
 
@@ -352,6 +427,7 @@ def format_report(result: dict, dollars_per_r: float = DOLLARS_PER_R) -> str:
     lines.append("")
     lines.append(f"- Fired signals analyzed: **{result['n_signals']}**")
     lines.append(f"- Blocked by direction filter: {result['n_blocked_by_dir_filter']}")
+    lines.append(f"- Baseline exit reasons: {result.get('baseline_exit_reasons', {})}")
     lines.append(f"- B+C+D exit reasons: {result['bcd_exit_reasons']}")
     lines.append("")
     lines.append("### Aggregate R-unit P/L by variant")
@@ -519,6 +595,86 @@ def format_report(result: dict, dollars_per_r: float = DOLLARS_PER_R) -> str:
                     "group, per-path Sharpes are still noisy; CPCV becomes much more "
                     "informative as data accumulates post-freeze._"
                 )
+
+        # Sequential Bootstrap — LdP AFML ch. 4. Corrects for the SE
+        # underestimation that classical bootstrap suffers when label windows
+        # overlap (here: 60-min lookahead horizons that pile up on
+        # consecutive minutes of bars). Side-by-side with a classical
+        # bootstrap so the inflation factor is visible.
+        seq_boot = ms.get("sequential_bootstrap") or {}
+        if seq_boot and seq_boot.get("sharpe_mean") is not None:
+            lines.append("")
+            lines.append("#### Sequential Bootstrap Sharpe distribution (winning variant)")
+            lines.append("")
+            lines.append(
+                "López de Prado AFML ch. 4 (Algorithm 4.1). Standard bootstrap "
+                "draws samples uniformly with replacement, treating overlapping-"
+                "window labels as independent. When our signal labels share "
+                "outcome bars (60-min lookahead horizons piled up on consecutive "
+                "minute bars), classical bootstrap CIs are **mis-calibrated** "
+                "— the resampled distribution doesn't reflect the effective "
+                "sample size. Sequential Bootstrap samples each observation "
+                "with probability ∝ its **uniqueness** (the fraction of its "
+                "outcome bars not yet represented in the drawn sample), "
+                "yielding bootstrap distributions that better approximate "
+                "the true sampling distribution of the Sharpe estimator."
+            )
+            lines.append("")
+            ci = seq_boot.get("sharpe_ci_95") or (None, None)
+            classical = seq_boot.get("classical_bootstrap_comparison") or {}
+            lines.append(
+                f"- **Winning variant**: `{ms.get('winner', '?')}`  "
+                f"(label horizon = {seq_boot.get('label_horizon_minutes', '?')} min, "
+                f"{seq_boot.get('n_bootstraps', '?')} bootstrap reps)"
+            )
+            lines.append(
+                f"- **Sequential SR mean ± std**: "
+                f"`{seq_boot.get('sharpe_mean', 'n/a')} ± {seq_boot.get('sharpe_std', 'n/a')}`"
+            )
+            if ci[0] is not None and ci[1] is not None:
+                lines.append(
+                    f"- **95% CI**: `[{ci[0]:+.4f}, {ci[1]:+.4f}]`"
+                )
+            lines.append(
+                f"- **P(SR ≤ 0)**: `{seq_boot.get('sharpe_p_negative', 'n/a')}`  "
+                "(fraction of bootstrap reps whose Sharpe is non-positive)"
+            )
+            if classical.get("sharpe_std") is not None:
+                lines.append(
+                    f"- **Classical bootstrap SR std (for comparison)**: "
+                    f"`{classical.get('sharpe_std', 'n/a')}`  "
+                    f"(mean `{classical.get('sharpe_mean', 'n/a')}`)"
+                )
+            if seq_boot.get("se_inflation_factor") is not None:
+                factor = seq_boot["se_inflation_factor"]
+                if factor > 1.05:
+                    fdir = (
+                        "> 1 = sequential bootstrap inflates SE vs classical "
+                        "(classical was understating uncertainty)"
+                    )
+                elif factor < 0.95:
+                    fdir = (
+                        "< 1 = sequential bootstrap tightens SE vs classical "
+                        "(more diverse resampling reduces variance; "
+                        "uniqueness-weighting picks more-representative draws)"
+                    )
+                else:
+                    fdir = "≈ 1 = label overlap doesn't materially change SE here"
+                lines.append(
+                    f"- **SE ratio (seq / classical)**: `{factor}x`  ({fdir})"
+                )
+            lines.append("")
+            lines.append(
+                "_Interpretation: the sequential-bootstrap CI is the methodologically-"
+                "correct one — read 95% CI and P(SR ≤ 0) directly. If 95% CI "
+                "straddles zero or P(SR ≤ 0) > 0.1, the apparent edge is fragile. "
+                "The SE-ratio diagnostic tells you whether classical bootstrap "
+                "was lying about uncertainty: ratio > 1 means classical understated "
+                "SE (the common AFML claim); ratio < 1 means classical overstated "
+                "SE because uniqueness-weighted draws happen to be more "
+                "representative on this sample. Either way, the sequential numbers "
+                "are the ones to trust._"
+            )
     return "\n".join(lines)
 
 
