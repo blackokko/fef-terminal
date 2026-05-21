@@ -302,19 +302,36 @@ def _current_provider_mode(state: AppState) -> str:
     return "mixed"
 
 
-async def _alt_direction_30m_signal(state: AppState) -> dict | None:
-    """Compute an independent 30-min SPX EMA-8/EMA-21 stack direction
-    signal. Stamped into signal_iter.extras.alt_direction_30m at write
-    time so we can correlate engine direction (drift_bias) vs this alt
-    signal across sessions WITHOUT gating any live trade on it.
+def _ema(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+    alpha = 2 / (period + 1)
+    ema = sum(values[:period]) / period  # SMA seed
+    for v in values[period:]:
+        ema = alpha * v + (1 - alpha) * ema
+    return ema
 
-    Reads the most recent 25 SPX 1-min bars from HistoricalBar.
-    Returns None on insufficient data. Cheap: indexed read, ~5ms.
+
+async def _alt_direction_signal(
+    state: AppState,
+    *,
+    n_bars: int,
+    ema_short: int,
+    ema_long: int,
+    label: str,
+) -> dict | None:
+    """Compute an independent SPX EMA-stack direction signal at the
+    requested lookback. Stamped into signal_iter.extras at write time so
+    we can correlate engine direction (drift_bias) vs alt signals across
+    sessions WITHOUT gating any live trade on them.
+
+    Reads the most recent n_bars SPX 1-min bars from HistoricalBar.
+    Returns None on insufficient data. Cheap: indexed read, ~5ms per call.
 
     Built 2026-05-21 in response to the finding that drift_bias is
     88-100% BULLISH on 4 of 4 sessions regardless of actual SPX path.
-    Need an independent direction signal before deciding whether to
-    gate trades on it — collect data first, gate later (post-freeze)."""
+    P3 (2026-05-21): now parametric so we can shadow at multiple
+    timeframes (30m, 4h) and pick the most predictive one post-freeze."""
     try:
         from sqlmodel import select
         from fef_sidecar.db.engine import get_session
@@ -325,46 +342,59 @@ async def _alt_direction_30m_signal(state: AppState) -> dict | None:
                 .where(HistoricalBar.symbol == "SPX")
                 .where(HistoricalBar.bar_size == "1 min")
                 .order_by(HistoricalBar.timestamp_ms.desc())  # type: ignore[attr-defined]
-                .limit(25)
+                .limit(n_bars)
             )).all())
-        if len(bars) < 21:
-            return {"signal": "INSUFFICIENT_DATA", "n_bars": len(bars)}
+        if len(bars) < ema_long:
+            return {"signal": "INSUFFICIENT_DATA", "n_bars": len(bars), "label": label}
         bars.reverse()  # chronological
         closes = [b.close for b in bars]
 
-        def _ema(values, period):
-            if len(values) < period:
-                return None
-            alpha = 2 / (period + 1)
-            ema = sum(values[:period]) / period  # SMA seed
-            for v in values[period:]:
-                ema = alpha * v + (1 - alpha) * ema
-            return ema
-
-        ema_8 = _ema(closes, 8)
-        ema_21 = _ema(closes, 21)
-        if ema_8 is None or ema_21 is None:
+        ema_s = _ema(closes, ema_short)
+        ema_l = _ema(closes, ema_long)
+        if ema_s is None or ema_l is None:
             return None
-        ema_8_prev = _ema(closes[:-5], 8) if len(closes) >= 13 else None
-        ema_8_slope = ema_8 - ema_8_prev if ema_8_prev is not None else 0
+        # Slope window scaled with the timeframe — 5 bars for short EMA-8
+        # (5 min on 1-min bars), 30 bars for slow EMA-50 (30 min). Picks
+        # up trend acceleration / deceleration regardless of timeframe.
+        slope_window = max(5, ema_short // 2)
+        ema_s_prev = _ema(closes[:-slope_window], ema_short) if len(closes) >= ema_short + slope_window else None
+        ema_s_slope = ema_s - ema_s_prev if ema_s_prev is not None else 0
         current_spx = closes[-1]
-        if ema_8 > ema_21 * 1.0005 and current_spx > ema_8:
+        if ema_s > ema_l * 1.0005 and current_spx > ema_s:
             alignment = "BULLISH"
-        elif ema_8 < ema_21 * 0.9995 and current_spx < ema_8:
+        elif ema_s < ema_l * 0.9995 and current_spx < ema_s:
             alignment = "BEARISH"
         else:
             alignment = "NEUTRAL"
         return {
             "signal": alignment,
-            "ema_8": round(ema_8, 2),
-            "ema_21": round(ema_21, 2),
-            "ema_8_slope_5bar": round(ema_8_slope, 2),
-            "spx_vs_ema8_pts": round(current_spx - ema_8, 2),
+            "label": label,
+            f"ema_{ema_short}": round(ema_s, 2),
+            f"ema_{ema_long}": round(ema_l, 2),
+            f"ema_{ema_short}_slope_{slope_window}bar": round(ema_s_slope, 2),
+            f"spx_vs_ema{ema_short}_pts": round(current_spx - ema_s, 2),
             "n_bars": len(bars),
         }
     except Exception:
-        logger.exception("_alt_direction_30m_signal failed")
+        logger.exception("_alt_direction_signal(%s) failed", label)
         return None
+
+
+async def _alt_direction_30m_signal(state: AppState) -> dict | None:
+    """30-min shadow: 25 1-min bars, EMA-8/EMA-21."""
+    return await _alt_direction_signal(
+        state, n_bars=25, ema_short=8, ema_long=21, label="30m"
+    )
+
+
+async def _alt_direction_4h_signal(state: AppState) -> dict | None:
+    """4-hour shadow: 240 1-min bars, EMA-50/EMA-200. Catches the
+    slower trend regime that the 30m read can flip on the wrong side of.
+    Needs 200+ stored 1-min bars (~3.3 hours of session) before it
+    returns a non-INSUFFICIENT_DATA signal."""
+    return await _alt_direction_signal(
+        state, n_bars=240, ema_short=50, ema_long=200, label="4h"
+    )
 
 
 def _current_account_class(state: AppState) -> str:
@@ -535,6 +565,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     # actual SPX path; want data on whether an alt signal predicts
     # outcomes any better before deciding to gate on it (post-freeze).
     alt_direction = await _alt_direction_30m_signal(state)
+    alt_direction_4h = await _alt_direction_4h_signal(state)
 
     signal = await SignalIterRepository.write_iter(
         spx_price=inputs.spx_price,
@@ -563,11 +594,18 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             # provider_mode (which captures mock-vs-IBKR, not paper-vs-live).
             "account_class": _current_account_class(state),
             "account_id": getattr(state.ibkr, "account_id", "") or "",
-            # Shadow alt direction signal — 30m SPX EMA-8/EMA-21 stack.
-            # Observational only; NOT used to gate any trade. Compare
-            # against drift_bias outcomes across N sessions to decide
-            # whether to gate on it post-freeze.
+            # Shadow alt direction signals — SPX EMA stack at multiple
+            # timeframes. Observational only; NOT used to gate any trade.
+            # Compare against drift_bias outcomes across N sessions to
+            # decide whether to gate on either post-freeze.
+            #   30m = 25 1-min bars, EMA-8/EMA-21 (immediate context)
+            #   4h  = 240 1-min bars, EMA-50/EMA-200 (session-trend context)
+            # Two timeframes so we can spot regime conflict: 30m BEARISH
+            # vs 4h BULLISH suggests a pullback within an uptrend, not a
+            # full reversal — exit-only gating may be more appropriate
+            # than block-fire gating in that case.
             "alt_direction_30m": alt_direction,
+            "alt_direction_4h": alt_direction_4h,
             # Snapshot the latest HFT + microstructure state at fire time so
             # offline analysis (ML pattern discovery, TuningRecommendation)
             # can correlate signal outcomes with HFT/microstructure context
