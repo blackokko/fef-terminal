@@ -1,4 +1,4 @@
-"""Per-regime parameter sweep — Option 4 diagnostic.
+"""Per-regime parameter sweep — Option 4 diagnostic (v2 methodology).
 
 Runs the FEF threshold-knob sweep SEPARATELY per regime label
 (PIN_DAY / TREND_DAY / CHOP / WALL_TEST / OPEN_DRIVE / NORMAL) and
@@ -10,14 +10,20 @@ the regimes themselves are real (each has a different optimal config,
 mixed-regime sweep is confused) OR because parameter tuning is noise-
 fitting (per-regime sub-optima also drift)?
 
-Reading the output
-------------------
-- For each regime: top-5 configs from the FULL-window sweep + cross-
-  half drift check.
-- "Cross-half drift" = how different the first-half optimal is from
-  the second-half optimal. Stable per-regime sub-optima → regimes are
-  real → presets are the right architecture, just need a better
-  classifier. Drift inside each regime → 4-knob design is noise-fit.
+v2 methodology (2026-05-22, post Chat scrutiny)
+-----------------------------------------------
+v1 used optimization.py's `_proxy_pnl` = `(spx_future - spx_now) × $50 × qty`
+with a fixed 3-iter (~6 min) lookahead and a hard −$10/pt stop. That's
+crude. v1 reported TREND_DAY test_$ at −$25,856 — but the realistic-fill
+estimator v2 showed real broker fills produced +$9k on the same signals.
+The −$25k was a simulator artifact.
+
+v2 replaces `_proxy_pnl` with an order-preserving 1-min bar walk +
+50/30/20 partial scale-out, using T1/T2/T3 at ±1R/2R/3R and stop at
+−1R from entry (R=10pt SPX, matches FEF's standard 0DTE targeting).
+Same logic as ablation_backtest.py::_simulate_bcd minus peak-trail.
+
+Compare to v1 by checking git history (commit 7af326e).
 
 CLI
 ---
@@ -28,10 +34,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import json
 import sqlite3
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -64,6 +72,34 @@ def _passes_account_filter(extras_dict: dict, accept: set[str]) -> bool:
     if cls == "unknown" and "paper" in accept:
         return True
     return False
+
+
+def _ts_to_ms(ts_str: str) -> int:
+    """Parse a SignalIter.timestamp string to UTC ms epoch.
+    Mirrors ablation_backtest._ts_to_ms — DB stores naive UTC timestamps."""
+    dt = datetime.fromisoformat(ts_str.replace(" ", "T"))
+    return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def _load_spx_bars(date_from: str, date_to: str, db_path: str) -> tuple[dict, list[int]]:
+    """Load 1-min SPX bars covering the window + 60min buffer at each end.
+    Returns (bar_by_ms dict, sorted list of timestamp_ms keys)."""
+    db = sqlite3.connect(db_path)
+    db.row_factory = sqlite3.Row
+    cur = db.cursor()
+    bars = cur.execute(
+        """
+        SELECT timestamp_ms, open, high, low, close
+        FROM historical_bar
+        WHERE symbol='SPX' AND bar_size='1 min'
+          AND timestamp_ms >= strftime('%s', ? || ' 00:00:00') * 1000 - 3600000
+          AND timestamp_ms <  strftime('%s', ? || ' 23:59:59') * 1000 + 3600000
+        ORDER BY timestamp_ms
+        """,
+        (date_from, date_to),
+    ).fetchall()
+    bar_by_ms = {b["timestamp_ms"]: dict(b) for b in bars}
+    return bar_by_ms, sorted(bar_by_ms.keys())
 
 
 def _load_iters_by_regime(
@@ -113,6 +149,7 @@ def _load_iters_by_regime(
             (ex.get("regime_demoted") or {}).get("regime") or "NORMAL"
         )
         by_regime[regime].append({
+            "timestamp_ms": _ts_to_ms(r["timestamp"]),
             "spx_price": r["spx_price"],
             "drift_cum_net_m": r["drift_cum_net_m"],
             "drift_bias": r["drift_bias"] or "NEUTRAL",
@@ -126,30 +163,212 @@ def _load_iters_by_regime(
     return dict(by_regime)
 
 
-def _run_sweep(iters: list[dict]):
-    from fef_sidecar.engine.optimization import SweepConfig, run_sweep
-    cfg = SweepConfig(
-        proximity_values=PROXIMITY_VALUES,
-        collapse_pct_values=COLLAPSE_PCT_VALUES,
-        collapse_floor_values=COLLAPSE_FLOOR_VALUES,
-        absorption_fe_values=ABSORPTION_FE_VALUES,
-        lookahead_iters=LOOKAHEAD_ITERS,
+# v2 sweep parameters (mirror auto-trader's standard 0DTE targeting)
+RISK_PTS = 10.0          # T1=±10pt SPX from entry, stop=∓10pt
+T1_SHARE, T2_SHARE, T3_SHARE = 0.5, 0.3, 0.2  # 50/30/20 scale-out
+
+
+def _simulate_partial_walk_v2(
+    direction: str, entry_spx: float, fwd_bars: list[dict],
+    risk_pts: float = RISK_PTS,
+) -> float:
+    """Order-preserving 1-min bar walk with 50/30/20 partial scale-out.
+
+    Same shape as ablation_backtest.py::_simulate_bcd minus the peak-
+    trail. Returns realized R as a float (positive = win, negative =
+    loss). Conservative ordering: within a single 1-min bar, stop has
+    priority if both stop and a tier level are crossed.
+
+    T1 = entry ± 1R; T2 = ± 2R; T3 = ± 3R; stop = ∓ 1R.
+    R = `risk_pts` SPX (default 10).
+    Scale-out: 50% at T1, 30% at T2, 20% at T3. After partials, residual
+    sells at the (still original) stop if it hits. If 60 min elapses
+    without full exit, the residual exits at the last bar's close."""
+    if not fwd_bars:
+        return 0.0
+    is_lc = direction == "LONG_CALLS"
+    sign = 1 if is_lc else -1
+    realized_r = 0.0
+    remaining_share = 1.0
+    tiers_fired: set[str] = set()
+    for b in fwd_bars:
+        adverse_pts = b["low"] if is_lc else b["high"]
+        favor_pts = b["high"] if is_lc else b["low"]
+        adverse_r = sign * (adverse_pts - entry_spx) / risk_pts
+        favor_r = sign * (favor_pts - entry_spx) / risk_pts
+        # Stop priority on ambiguous bars (conservative)
+        if adverse_r <= -1.0 and remaining_share > 0:
+            realized_r += remaining_share * -1.0
+            return realized_r
+        # Tier checks in order (T1 → T2 → T3)
+        if favor_r >= 1.0 and "T1" not in tiers_fired:
+            realized_r += T1_SHARE * 1.0
+            remaining_share -= T1_SHARE
+            tiers_fired.add("T1")
+        if favor_r >= 2.0 and "T2" not in tiers_fired:
+            realized_r += T2_SHARE * 2.0
+            remaining_share -= T2_SHARE
+            tiers_fired.add("T2")
+        if favor_r >= 3.0 and "T3" not in tiers_fired:
+            realized_r += T3_SHARE * 3.0
+            remaining_share -= T3_SHARE
+            tiers_fired.add("T3")
+        if remaining_share <= 0.001:
+            return realized_r
+    # Timeout — exit residual at last close
+    if remaining_share > 0 and fwd_bars:
+        final_r = sign * (fwd_bars[-1]["close"] - entry_spx) / risk_pts
+        realized_r += remaining_share * final_r
+    return realized_r
+
+
+def _run_sweep_v2(iters: list[dict], bar_by_ms: dict, bar_ms_sorted: list[int]):
+    """v2 sweep: replays FEFEngine over candidate threshold configs to
+    generate verdicts, then walks 1-min SPX bars per non-WAIT verdict
+    with 50/30/20 partial scale-out. Replaces optimization.py's
+    `_proxy_pnl` linear approximation.
+
+    Returns a list of SweepResult-shaped dicts sorted by test_sharpe DESC."""
+    import math
+    from dataclasses import dataclass
+
+    from fef_sidecar.engine.fef import FEFEngine
+    from fef_sidecar.engine.types import FEFInputs
+    from fef_sidecar.quantdata.models import ExposureRow
+
+    if len(iters) < 10:
+        return []
+    split = int(len(iters) * 0.6)
+    train_iters = iters[:split]
+    test_iters = iters[split:]
+
+    def bars_in_window(start_ms: int, end_ms: int) -> list[dict]:
+        lo = bisect.bisect_left(bar_ms_sorted, start_ms)
+        hi = bisect.bisect_right(bar_ms_sorted, end_ms)
+        return [bar_by_ms[m] for m in bar_ms_sorted[lo:hi]]
+
+    def _eval(slice_iters: list[dict], engine: FEFEngine):
+        engine.reset()
+        returns_R: list[float] = []
+        wins = losses = 0
+        for it in slice_iters:
+            gex_rows = [
+                ExposureRow(strike=w["strike"], call_m=max(0, w["net_m"]),
+                            put_m=min(0, w["net_m"]), net_m=w["net_m"])
+                for w in (it.get("top_gex_walls") or [])
+            ]
+            dex_rows = [
+                ExposureRow(strike=w["strike"], call_m=max(0, w["net_m"]),
+                            put_m=min(0, w["net_m"]), net_m=w["net_m"])
+                for w in (it.get("top_dex_walls") or [])
+            ]
+            inputs = FEFInputs(
+                timestamp_ms=it.get("timestamp_ms", 0),
+                spx_price=it["spx_price"],
+                drift_cum_net_m=it["drift_cum_net_m"],
+                drift_bias=it.get("drift_bias", "NEUTRAL"),
+                top_gex_walls=gex_rows,
+                top_dex_walls=dex_rows,
+                ntm_max_pain=it.get("ntm_max_pain", it["spx_price"]),
+                raw_max_pain=it.get("raw_max_pain", it["spx_price"]),
+                aggression_call_pct=it.get("aggression_call_pct"),
+                aggression_put_pct=it.get("aggression_put_pct"),
+            )
+            verdict = engine.push(inputs)
+            direction = verdict.direction.value if hasattr(verdict.direction, "value") else str(verdict.direction)
+            if direction == "WAIT":
+                continue
+            sig_ms = it.get("timestamp_ms")
+            if not sig_ms:
+                continue
+            fwd = bars_in_window(sig_ms, sig_ms + 60 * 60 * 1000)
+            if not fwd:
+                continue
+            r = _simulate_partial_walk_v2(direction, it["spx_price"], fwd)
+            returns_R.append(r)
+            if r > 0.05:
+                wins += 1
+            elif r < -0.05:
+                losses += 1
+        return returns_R, wins, losses
+
+    def _sharpe(returns):
+        if len(returns) < 5:
+            return None
+        mean = sum(returns) / len(returns)
+        var = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+        if var <= 0:
+            return None
+        return round(mean / math.sqrt(var) * math.sqrt(252), 2)
+
+    # R-units convert to $ via the same constant as ablation_backtest.py
+    R_DOLLARS = 400.0
+
+    results = []
+    for prox in PROXIMITY_VALUES:
+        for cpct in COLLAPSE_PCT_VALUES:
+            for cfloor in COLLAPSE_FLOOR_VALUES:
+                for afe in ABSORPTION_FE_VALUES:
+                    engine = FEFEngine(
+                        wall_proximity_pts=prox,
+                        wall_collapse_pct=cpct,
+                        wall_collapse_floor_m=cfloor,
+                        absorption_fe_ratio_min=afe,
+                    )
+                    train_r, train_w, train_l = _eval(train_iters, engine)
+                    test_r, test_w, test_l = _eval(test_iters, engine)
+                    results.append({
+                        "wall_proximity_pts": prox,
+                        "wall_collapse_pct": cpct,
+                        "wall_collapse_floor_m": cfloor,
+                        "absorption_fe_ratio_min": afe,
+                        "train_sharpe": _sharpe(train_r),
+                        "test_sharpe": _sharpe(test_r),
+                        "train_trades": len(train_r),
+                        "test_trades": len(test_r),
+                        "train_win_rate_pct": round(train_w / len(train_r) * 100, 1) if train_r else 0.0,
+                        "test_win_rate_pct": round(test_w / len(test_r) * 100, 1) if test_r else 0.0,
+                        "train_total_pnl": round(sum(train_r) * R_DOLLARS, 0),
+                        "test_total_pnl": round(sum(test_r) * R_DOLLARS, 0),
+                    })
+    # Sort by test_sharpe DESC then test_total_pnl DESC
+    results.sort(
+        key=lambda r: (r["test_sharpe"] if r["test_sharpe"] is not None else -999,
+                       r["test_total_pnl"]),
+        reverse=True,
     )
-    return run_sweep(iters, cfg)
+    return results
+
+
+# v2 sweep entry point — replaces the old optimization.run_sweep call.
+# Bound to module-level _BARS_CACHE so caller doesn't have to thread bars
+# through every invocation (set once at start of main()).
+_BARS_CACHE: tuple[dict, list[int]] | None = None
+
+
+def _run_sweep(iters: list[dict]):
+    """v2 sweep using order-preserving bar walk. Requires _BARS_CACHE to be
+    populated by main() before calling. Returns list of dict results
+    (NOT the SweepResult dataclass — shape changed in v2)."""
+    if _BARS_CACHE is None:
+        raise RuntimeError("_BARS_CACHE not initialized; call _load_spx_bars first")
+    bar_by_ms, bar_ms_sorted = _BARS_CACHE
+    return _run_sweep_v2(iters, bar_by_ms, bar_ms_sorted)
 
 
 def _top1_params(results) -> dict | None:
     if not results:
         return None
     r = results[0]
+    # v2 results are dicts (not SweepResult dataclass)
     return {
-        "wall_proximity_pts": r.wall_proximity_pts,
-        "wall_collapse_pct": r.wall_collapse_pct,
-        "wall_collapse_floor_m": r.wall_collapse_floor_m,
-        "absorption_fe_ratio_min": r.absorption_fe_ratio_min,
-        "test_sharpe": r.test_sharpe,
-        "test_total_pnl": r.test_total_pnl,
-        "test_trades": r.test_trades,
+        "wall_proximity_pts": r["wall_proximity_pts"],
+        "wall_collapse_pct": r["wall_collapse_pct"],
+        "wall_collapse_floor_m": r["wall_collapse_floor_m"],
+        "absorption_fe_ratio_min": r["absorption_fe_ratio_min"],
+        "test_sharpe": r["test_sharpe"],
+        "test_total_pnl": r["test_total_pnl"],
+        "test_trades": r["test_trades"],
     }
 
 
@@ -189,6 +408,16 @@ def main() -> int:
     args = ap.parse_args()
 
     accept = _parse_account_class_arg(args.account_class)
+
+    # Load 1-min SPX bars once and bind to module-level cache so the v2
+    # sweep function can read them without thread-through arguments.
+    bar_by_ms, bar_ms_sorted = _load_spx_bars(args.date_from, args.date_to, args.db)
+    if not bar_by_ms:
+        print(f"No SPX 1-min bars in window {args.date_from}..{args.date_to}", file=sys.stderr)
+        return 1
+    global _BARS_CACHE
+    _BARS_CACHE = (bar_by_ms, bar_ms_sorted)
+
     by_regime = _load_iters_by_regime(args.date_from, args.date_to, args.db, accept)
     if not by_regime:
         print("No signal_iter rows in window", file=sys.stderr)
@@ -246,12 +475,12 @@ def main() -> int:
         lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for i, r in enumerate(full_results[:5]):
             lines.append(
-                f"| {i+1} | {r.wall_proximity_pts} | {r.wall_collapse_pct} "
-                f"| {r.wall_collapse_floor_m} | {r.absorption_fe_ratio_min} "
-                f"| {r.train_sharpe if r.train_sharpe is not None else '-'} "
-                f"| {r.test_sharpe if r.test_sharpe is not None else '-'} "
-                f"| {r.train_total_pnl:+.0f} | {r.test_total_pnl:+.0f} "
-                f"| {r.train_trades} | {r.test_trades} |"
+                f"| {i+1} | {r['wall_proximity_pts']} | {r['wall_collapse_pct']} "
+                f"| {r['wall_collapse_floor_m']} | {r['absorption_fe_ratio_min']} "
+                f"| {r['train_sharpe'] if r['train_sharpe'] is not None else '-'} "
+                f"| {r['test_sharpe'] if r['test_sharpe'] is not None else '-'} "
+                f"| {r['train_total_pnl']:+.0f} | {r['test_total_pnl']:+.0f} "
+                f"| {r['train_trades']} | {r['test_trades']} |"
             )
         lines.append("")
         lines.append("### Cross-half stability")
