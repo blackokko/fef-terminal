@@ -83,6 +83,18 @@ class MockIBKRProvider:
     def is_connected(self) -> bool:
         return self._connected
 
+    # Account-class tagging — mirrors LiveIBKRProvider's interface so the
+    # write paths in loop.py / live_trading.py can read provider.account_class
+    # uniformly. Mock data is always tagged 'mock' so it never gets mixed
+    # with paper or live trades in research output.
+    @property
+    def account_id(self) -> str:
+        return "MOCK"
+
+    @property
+    def account_class(self) -> str:
+        return "mock"
+
     async def connect(self) -> None:
         self._connected = True
 

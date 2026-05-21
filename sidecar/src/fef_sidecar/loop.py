@@ -290,8 +290,9 @@ async def fef_tick_loop(state: AppState) -> None:
 
 
 def _current_provider_mode(state: AppState) -> str:
-    """'live' / 'mock' / 'mixed' — tag for the SignalIter row so analytics
-    can later filter out test data."""
+    """'live' / 'mock' / 'mixed' — tag for the SignalIter.provider_mode column.
+    Captures whether QuantData + IBKR are real or mocked. Independent of the
+    IBKR account class (paper vs live) — see _current_account_class below."""
     qd_mock = type(state.quantdata).__name__.startswith("Mock")
     ibkr_mock = type(state.ibkr).__name__.startswith("Mock")
     if qd_mock and ibkr_mock:
@@ -299,6 +300,18 @@ def _current_provider_mode(state: AppState) -> str:
     if not qd_mock and not ibkr_mock:
         return "live"
     return "mixed"
+
+
+def _current_account_class(state: AppState) -> str:
+    """'paper' / 'live' / 'mock' / 'unknown' — tag for which IBKR account
+    class is connected. Stamped into SignalIter.extras and LiveOrder.notes
+    so research scripts can keep paper and live data strictly separated
+    once both flow through the same DB.
+
+    Reads from the IBKR provider's account_class property which is
+    populated on connect from managedAccounts(). Both LiveIBKRProvider
+    and MockIBKRProvider expose this property uniformly."""
+    return getattr(state.ibkr, "account_class", "unknown") or "unknown"
 
 
 async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
@@ -471,6 +484,12 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             "regime_at_fire": state.last_regime.regime if state.last_regime else None,
             "ml_expected_r": ml_expected_r,
             "fire_order": fire_order,
+            # Account-class tag (paper / live / mock / unknown). Lets
+            # research scripts keep paper and live data strictly separated
+            # once both flow through the same DB. Independent of
+            # provider_mode (which captures mock-vs-IBKR, not paper-vs-live).
+            "account_class": _current_account_class(state),
+            "account_id": getattr(state.ibkr, "account_id", "") or "",
             # Snapshot the latest HFT + microstructure state at fire time so
             # offline analysis (ML pattern discovery, TuningRecommendation)
             # can correlate signal outcomes with HFT/microstructure context
@@ -1569,6 +1588,11 @@ async def ibkr_health_check_loop(state: AppState) -> None:
             healthy = await state.ibkr.ping()
             current = "connected" if healthy else "disconnected"
             state.ibkr_status = current
+            # Keep state.account_class / account_id in sync with the provider.
+            # The provider populates them on connect; mirroring on state makes
+            # them accessible to read paths (UI / audit) without a provider ref.
+            state.account_class = getattr(state.ibkr, "account_class", "unknown") or "unknown"
+            state.account_id = getattr(state.ibkr, "account_id", "") or ""
 
             if current != last_status:
                 logger.info("IBKR status change: %s -> %s", last_status, current)

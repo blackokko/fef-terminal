@@ -82,6 +82,12 @@ class AppState:
     last_verdict: dict[str, object] = field(default_factory=dict)
     last_snapshot: object | None = None  # cached MarketSnapshot for FEF to consume
     ibkr_status: str = "unknown"  # "connected" | "disconnected" | "reconnecting" | "unknown"
+    # Account class — populated by the IBKR provider on connect. Determines
+    # whether SignalIter / LiveOrder writes get tagged 'paper' / 'live' /
+    # 'mock' / 'unknown'. Research scripts filter on this so paper and
+    # live data never silently mix once both flow through the same DB.
+    account_class: str = "unknown"
+    account_id: str = ""
     last_iter_perf_ms: dict[str, float] = field(default_factory=dict)  # IMPROVEMENTS #10
     session_date: str = ""  # IMPROVEMENTS #22 — tracks current session for reset detection
     last_vix: float | None = None  # IMPROVEMENTS #M

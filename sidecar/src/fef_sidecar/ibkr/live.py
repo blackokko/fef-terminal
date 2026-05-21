@@ -33,6 +33,26 @@ from fef_sidecar.ibkr.models import AccountSummary, Bar, Contract, ContractKind,
 logger = logging.getLogger(__name__)
 
 
+def _detect_account_class(account_id: str) -> str:
+    """Classify an IBKR account ID as paper / live / unknown.
+
+    IBKR convention:
+      - Paper: leading 'D' (DU... or DUM...) — these are demo / paper accounts.
+      - Live: 'U' + digits, or pure-digit account IDs.
+
+    Conservative: anything not clearly paper is treated as 'live' so a
+    misclassification fails toward more caution downstream (e.g. research
+    scripts default to filtering out 'live' data when not asked).
+    Returns 'unknown' only when the account_id is empty.
+    """
+    if not account_id:
+        return "unknown"
+    s = account_id.strip().upper()
+    if s.startswith("D"):
+        return "paper"
+    return "live"
+
+
 def _to_ib_contract(c: Contract):
     """Translate our Contract to ib_async's Contract."""
     from ib_async import ContFuture, Index, Option, Stock
@@ -90,6 +110,18 @@ class LiveIBKRProvider:
         # subscription on the same contract.
         self._ib_hist = None
         self._hist_connect_lock = asyncio.Lock()
+        # Populated in connect(). Both surface via .account_id / .account_class
+        # properties for callers (state, loop, audit log).
+        self._account_id: str = ""
+        self._account_class: str = "unknown"
+
+    @property
+    def account_id(self) -> str:
+        return self._account_id
+
+    @property
+    def account_class(self) -> str:
+        return self._account_class
 
     @property
     def is_connected(self) -> bool:
@@ -106,11 +138,30 @@ class LiveIBKRProvider:
             if self._ib is None:
                 self._ib = IB()
             await self._ib.connectAsync(self.host, self.port, clientId=self.client_id)
+            # Detect paper-vs-live account class from the managed account ID.
+            # IBKR convention:
+            #   - Paper accounts: 'DU' / 'DUM' prefix (e.g. DUM098107, DU1234567)
+            #   - Live accounts:  digits only or 'U' + digits (e.g. U1234567)
+            # Used downstream to tag signal_iter / live_order so paper and
+            # live data never get silently mixed in research output.
+            try:
+                managed = self._ib.managedAccounts()
+                if managed:
+                    self._account_id = str(managed[0])
+                    self._account_class = _detect_account_class(self._account_id)
+                else:
+                    self._account_id = ""
+                    self._account_class = "unknown"
+            except Exception:
+                self._account_id = ""
+                self._account_class = "unknown"
             logger.info(
-                "IBKR connected: host=%s port=%d client_id=%d",
+                "IBKR connected: host=%s port=%d client_id=%d account=%s class=%s",
                 self.host,
                 self.port,
                 self.client_id,
+                self._account_id or "?",
+                self._account_class,
             )
 
     async def _ensure_hist_connected(self):

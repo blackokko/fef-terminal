@@ -169,6 +169,14 @@ async def place_bracket(
         expiry=spec.expiry, strike=spec.strike, right=spec.right,
     )
 
+    # Capture account class + ID at order time so research scripts can
+    # filter paper from live data later. We stamp this into notes since
+    # the LiveOrder schema doesn't have dedicated columns; a schema
+    # migration to add proper fields is in DEFERRED_CHANGES.
+    _acct_class = getattr(ibkr, "account_class", "unknown") or "unknown"
+    _acct_id = getattr(ibkr, "account_id", "") or ""
+    _acct_tag = f"account_class={_acct_class}; account_id={_acct_id};"
+
     parent = LiveOrder(
         ticket_id=ticket_id, symbol=spec.symbol, strike=spec.strike,
         right=spec.right, expiry=spec.expiry, action="BUY", qty=spec.qty,
@@ -185,6 +193,7 @@ async def place_bracket(
         # BE ladder: starts at the original stop, ratchets up as MFE grows
         dynamic_stop_level=spec.spx_stop,
         entry_spx_price=spec.entry_spx_price,
+        notes=_acct_tag,
     )
     parent_saved = await SignalIterRepository.write_live_order(parent)
     children_saved = []
@@ -449,12 +458,19 @@ async def place_credit_spread(
 
 
 async def kill_all_orders(ibkr) -> dict:
-    """Cancel every working IBKR order for this account.
+    """Cancel every working IBKR order AND market-close every open option
+    position for this account.
 
-    Refreshes IBKR's open-order list before cancelling — ib.openTrades()
-    only returns trades the current connection knows about, which is
-    empty right after a sidecar restart even when orders are still
-    working at IBKR. We also call reqGlobalCancel() as a backstop.
+    With market-entry auto-trade, there are rarely "working orders" sitting
+    at the exchange — the parent BUY fills immediately, and watcher exits
+    are computed on-the-fly. So "Kill All Orders" without the position-close
+    leg is mostly a no-op. Most users hit this expecting their exposure to
+    go to zero. So this function does BOTH:
+      1. Cancel all working orders (reqGlobalCancel + per-trade cancel)
+      2. Market-sell every open OPT position to flatten exposure
+
+    Audit-logged. Idempotent. Auto-trade + scanner are NOT disabled —
+    use /panic/flat for the full kill-switch (cancel + close + disable).
     """
     import asyncio
     from fef_sidecar.ibkr.live import LiveIBKRProvider
@@ -504,9 +520,73 @@ async def kill_all_orders(ibkr) -> dict:
         )
         return {"ok": False, "error": str(e)}
 
+    # Now also flatten any open OPT positions (the part most users actually
+    # want when they hit "Kill All Orders").
+    #
+    # CRITICAL: `pos.contract` from `ib.positions()` is missing routing
+    # fields (no exchange, no conId-driven SMART routing). Passing it
+    # directly to placeOrder makes IBKR silently reject the order — the
+    # client assigns an ib_order_id but the order NEVER reaches the
+    # matching engine. We must rebuild a proper Contract object and
+    # qualify it before placing. Mirror what spx_target_watcher's working
+    # market-sell path does.
+    closed_positions: list[dict] = []
+    try:
+        from ib_async import MarketOrder
+        from fef_sidecar.ibkr.live import _to_ib_contract
+        from fef_sidecar.ibkr.models import Contract, ContractKind
+
+        for pos in ib.positions():
+            c = pos.contract
+            if getattr(c, "secType", "") != "OPT":
+                continue
+            qty = int(pos.position)
+            if abs(qty) < 1:
+                continue
+            action = "SELL" if qty > 0 else "BUY"
+            sym = getattr(c, "symbol", "")
+            strike = float(getattr(c, "strike", 0))
+            right = getattr(c, "right", "")
+            expiry = getattr(c, "lastTradeDateOrContractMonth", "")
+            try:
+                # Rebuild + qualify so IBKR actually accepts the order
+                opt_contract = Contract(
+                    symbol=sym, kind=ContractKind.OPTION,
+                    exchange="CBOE" if sym == "SPX" else "SMART",
+                    expiry=expiry, strike=strike, right=right,
+                )
+                ic = _to_ib_contract(opt_contract)
+                await ib.qualifyContractsAsync(ic)
+                mkt = MarketOrder(action, abs(qty), transmit=True)
+                trade = ib.placeOrder(ic, mkt)
+                closed_positions.append({
+                    "contract": f"{sym} {strike}{right}",
+                    "qty": abs(qty), "action": action,
+                    "ib_order_id": trade.order.orderId,
+                })
+            except Exception as e:
+                closed_positions.append({
+                    "contract": f"{sym} {strike}{right}",
+                    "error": str(e),
+                })
+    except Exception:
+        logger.exception("kill_all_orders position-close leg failed")
+
     await SignalIterRepository.write_audit_log(
         category="kill_switch", actor="user",
-        summary=f"Kill switch — cancelled {cancelled}/{attempted} working orders + reqGlobalCancel sent",
-        details={"cancelled_count": cancelled, "attempted_count": attempted},
+        summary=(
+            f"Kill switch — cancelled {cancelled}/{attempted} working orders + "
+            f"market-closed {len(closed_positions)} open positions"
+        ),
+        details={
+            "cancelled_count": cancelled, "attempted_count": attempted,
+            "closed_positions": closed_positions,
+        },
     )
-    return {"ok": True, "cancelled": cancelled, "attempted": attempted}
+    return {
+        "ok": True,
+        "cancelled": cancelled,
+        "attempted": attempted,
+        "positions_closed": len(closed_positions),
+        "positions_closed_detail": closed_positions,
+    }
