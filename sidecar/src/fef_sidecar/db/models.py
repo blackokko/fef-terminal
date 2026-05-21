@@ -742,6 +742,52 @@ class ShadowExitOutcome(SQLModel, table=True):
     )
 
 
+class VariantLedger(SQLModel, table=True):
+    """First-class registry of every shadow exit variant tested in any
+    analysis (ablation, shadow_replay, sweep, scratchpad).
+
+    Per Claude Chat's recommendation 2026-05-21 (multiple-testing
+    correction needs honest N_trials): without this ledger you have
+    variants in shadow + variants in old ablation files + variants in
+    scratchpads, and DSR/PBO use whatever count is convenient — which
+    systematically underestimates the correction. Methodology stats
+    must query active variant counts per family from this ledger
+    rather than hardcoding N_trials.
+
+    Idempotent upsert by variant_id at every shadow replay run. When
+    a variant is decisively retired, set still_active=False (never
+    delete — keeps audit history).
+
+    Family taxonomy (per Chat's spec):
+      - exit_logic
+          - trail_tightness (parameter sweep on trail pullback)
+          - be_ladder_combo (BE ladder + various exits)
+          - timeout (timeout-window variants)
+      - entry_filter (entry-side gates)
+      - regime_gate (regime-conditional routing)
+    DSR/PBO get applied at sub-family level for parameter sweeps,
+    family level for cross-mechanism comparisons, full-project level
+    when selecting the final shipping candidate.
+    """
+
+    __tablename__ = "variant_ledger"
+
+    id: int | None = Field(default=None, primary_key=True)
+    variant_id: str = Field(unique=True, index=True)
+    family: str = Field(index=True)
+    sub_family: str | None = Field(default=None, index=True)
+    description: str = ""
+    hypothesis: str = ""
+    registered_at: datetime = Field(default_factory=_utcnow)
+    last_seen_at: datetime = Field(default_factory=_utcnow)
+    tested_in: str = ""   # 'shadow_replay' / 'ablation_backtest' / 'per_regime_sweep'
+    sample_window: str = ""
+    outcome_summary: str = "pending"  # 'wins' / 'loses' / 'inconclusive' / 'placeholder' / 'pending'
+    still_active: bool = True
+
+    variant_params: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+
+
 class ShadowComparison(SQLModel, table=True):
     """One row per iter when shadow mode is active. Records what the
     production engine produced vs what the shadow engine would have

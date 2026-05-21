@@ -112,6 +112,23 @@ class ExitVariant:
     # pessimistic-vs-live model — useful for measuring the BE ladder's
     # incremental contribution).
     be_ladder: list[tuple[float, float]] | None = None
+    # When True, the BE ladder R-levels reference OPTION PRICE rather
+    # than SPX price (variant 2b in memory). The shadow simulator
+    # cannot evaluate this honestly without an option-price evolution
+    # model (Greeks + theta decay + IV path). Variants with this flag
+    # set return realized_r=NaN + exit_reason='requires_option_price_evolution'
+    # until the option-pricing layer ships. Hypothesis documented in
+    # the ledger so the test is reproducible whenever the simulator
+    # catches up.
+    option_price_be_ladder: bool = False
+    # Ledger metadata — populated at variant definition time, written
+    # to the variant_ledger table at every replay run. Hierarchical
+    # taxonomy enables family-level N_trials for DSR/PBO corrections
+    # per LdP/Bailey multiple-testing convention.
+    family: str = ""
+    sub_family: str | None = None
+    description: str = ""
+    hypothesis: str = ""
 
     @property
     def is_meta(self) -> bool:
@@ -133,6 +150,10 @@ REGISTERED_VARIANTS: list[ExitVariant] = [
         label="baseline_partial_50_30_20",
         stop_r=-1.0,
         targets=[(1.0, 0.5), (2.0, 0.3), (3.0, 0.2)],
+        family="exit_logic",
+        sub_family="timeout",  # 60min implicit baseline for the timeout sweep
+        description="Pessimistic shadow baseline: 50/30/20 partials + -1R fixed stop + 60min timeout. Does NOT model the live BE ladder.",
+        hypothesis="Reference. Pessimistic vs actual live (which includes BE ladder); the gap quantifies the ladder's incremental contribution.",
     ),
     ExitVariant(
         # B+C+D as evaluated in ablation_backtest._simulate_bcd: 100%
@@ -143,6 +164,10 @@ REGISTERED_VARIANTS: list[ExitVariant] = [
         targets=[(1.0, 1.0)],
         trail_peak_floor_r=0.3,
         trail_pullback_r=0.15,
+        family="exit_logic",
+        sub_family="trail_tightness",
+        description="P1 ablation B+C+D: 100% T1 hard exit + peak-trail at 15% pullback after peak >= 0.3R.",
+        hypothesis="Trail-exit on chop/red days saves stops the baseline takes at -1R. Costs upside on clean trend days.",
     ),
     ExitVariant(
         # Regime-conditional B+C+D — added 2026-05-21 per Chat's
@@ -160,6 +185,10 @@ REGISTERED_VARIANTS: list[ExitVariant] = [
             "DRIFT_BULL": "baseline_partial_50_30_20",
         },
         default_route="bcd_trail_15pct",
+        family="regime_gate",
+        sub_family=None,
+        description="Regime-conditional: baseline on TREND_DAY/DRIFT_BULL, B+C+D elsewhere.",
+        hypothesis="Routing exit logic by regime captures the trend-vs-chop trade-off identified in 5/19-5/21 shadow.",
     ),
     # Trail-pullback parameter sweep — registered 2026-05-21 per Chat's
     # "register variants proactively so you have data by session 10" plan.
@@ -169,46 +198,53 @@ REGISTERED_VARIANTS: list[ExitVariant] = [
     # optimum or actually the right pullback distance.
     ExitVariant(
         # Tighter trail — exits residual faster after MFE pullback.
-        # Hypothesis: helps on fast-reversal days like 5/21 where the
-        # current 15% lets too much MFE leak before triggering.
         label="bcd_trail_10pct",
         stop_r=-1.0,
         targets=[(1.0, 1.0)],
         trail_peak_floor_r=0.3,
         trail_pullback_r=0.10,
+        family="exit_logic",
+        sub_family="trail_tightness",
+        description="Tighter trail than B+C+D default — exits residual at 10% pullback from peak.",
+        hypothesis="On fast-reversal days like 5/21 the current 15% lets too much MFE leak before trail triggers.",
     ),
     ExitVariant(
         # Looser trail — lets winners run longer before pullback exit.
-        # Hypothesis: helps on trending days like 5/19 where the current
-        # 15% triggered too early on small intra-bar dips and missed
-        # subsequent runs (cost $5k vs baseline on that session).
         label="bcd_trail_25pct",
         stop_r=-1.0,
         targets=[(1.0, 1.0)],
         trail_peak_floor_r=0.3,
         trail_pullback_r=0.25,
+        family="exit_logic",
+        sub_family="trail_tightness",
+        description="Looser trail than B+C+D default — exits at 25% pullback.",
+        hypothesis="On trending days like 5/19 the current 15% triggers too early on small dips and misses subsequent runs.",
     ),
     # ----- Other deferred-change tests (added 2026-05-21) -----
     # Each variant below differs from the current live baseline by
     # exactly one knob, so the comparison isolates that knob's effect.
     ExitVariant(
-        # Chat-suggested: pure trail, no hard T1 target. Tests whether
-        # the +1R hard exit is adding value or whether the trail alone
-        # is doing all the work. Same stop / trail config as
-        # bcd_trail_15pct but with targets=[] (no scale-out).
+        # Pure trail, no hard T1 target.
         label="pure_trail_15pct",
         stop_r=-1.0,
         targets=[],
         trail_peak_floor_r=0.3,
         trail_pullback_r=0.15,
+        family="exit_logic",
+        sub_family="trail_tightness",
+        description="Trail-only exit (no T1 hard target). Stop at -1R, trail at 15% pullback after peak >= 0.3R.",
+        hypothesis="Hard +1R T1 caps upside on trades that run past 1R peak; trail alone captures more on big movers.",
     ),
     ExitVariant(
-        # Chat-suggested: baseline structure with longer timeout window.
-        # Tests whether 60min is cutting trending-day residual too early.
+        # Baseline structure with longer timeout window.
         label="baseline_timeout_90min",
         stop_r=-1.0,
         targets=[(1.0, 0.5), (2.0, 0.3), (3.0, 0.2)],
         timeout_minutes=90,
+        family="exit_logic",
+        sub_family="timeout",
+        description="Baseline 50/30/20 + -1R stop, but 90min timeout instead of 60min.",
+        hypothesis="60min cuts trending-day residual too early; extending lets trends run.",
     ),
     ExitVariant(
         # Deferred change: direction filter at entry (the ablation
@@ -222,6 +258,10 @@ REGISTERED_VARIANTS: list[ExitVariant] = [
         stop_r=-1.0,
         targets=[(1.0, 0.5), (2.0, 0.3), (3.0, 0.2)],
         entry_filter={"kind": "direction_30m", "params": {"threshold_pts": 3.0}},
+        family="entry_filter",
+        sub_family=None,
+        description="Block PUTS when 30m SPX > +3pt; block CALLS when 30m SPX < -3pt. Baseline exit on entries that pass.",
+        hypothesis="Direction filter blocks bad-direction fires that B+C+D's trail can't always save.",
     ),
     # ----- BE-ladder variants -----
     # Critical discovery 2026-05-21: spx_target_watcher.py applies a BE
@@ -233,46 +273,115 @@ REGISTERED_VARIANTS: list[ExitVariant] = [
     # current-live behavior, and (b) the 2b+B+C+D combination the user
     # asked about (runner protection from BE ladder + B+C+D's trail).
     ExitVariant(
-        # Accurate model of current live exit logic: partials + the
-        # live BE ladder. The right reference point for measuring the
-        # B+C+D shadow's incremental edge vs what's actually running.
         label="baseline_partial_with_be_ladder",
         stop_r=-1.0,
         targets=[(1.0, 0.5), (2.0, 0.3), (3.0, 0.2)],
         be_ladder=[(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)],
+        family="exit_logic",
+        sub_family="be_ladder_combo",
+        description="Accurate model of current live exit logic: 50/30/20 partials + live BE ladder [(0.5,0), (1.0,0.5), (1.5,1.0)].",
+        hypothesis="The pessimistic baseline understates live performance; BE ladder rescues -1R stops that ratcheted to BE first.",
     ),
     ExitVariant(
-        # The "Option 2b + B+C+D" combination: BE ladder protection on
-        # runners (stop ratchets up as MFE increases) + B+C+D's
-        # peak-trail (exit on pullback from peak). Two protection
-        # mechanisms that compose rather than conflict — ladder
-        # prevents giving back ALL of MFE on a deep reversal, trail
-        # exits earlier when intra-trade pullback exceeds threshold.
         label="bcd_trail_15pct_with_be_ladder",
         stop_r=-1.0,
         targets=[(1.0, 1.0)],
         trail_peak_floor_r=0.3,
         trail_pullback_r=0.15,
         be_ladder=[(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)],
+        family="exit_logic",
+        sub_family="be_ladder_combo",
+        description="B+C+D trail + live BE ladder. Two protection mechanisms composed.",
+        hypothesis="BE ladder + trail are complementary — ladder limits worst-case loss past T1, trail captures intermediate MFE.",
     ),
     ExitVariant(
-        # And: pure-trail + BE ladder. Tonight's surprise headline
-        # winner (pure_trail_15pct, +$32k vs baseline) PLUS the BE
-        # ladder runner protection. If trail-alone is doing the work
-        # and BE ladder protects further-out runners, this should
-        # combine the best of both.
         label="pure_trail_15pct_with_be_ladder",
         stop_r=-1.0,
         targets=[],
         trail_peak_floor_r=0.3,
         trail_pullback_r=0.15,
         be_ladder=[(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)],
+        family="exit_logic",
+        sub_family="be_ladder_combo",
+        description="Pure trail + live BE ladder. No T1 hard target.",
+        hypothesis="If trail-alone is doing the work, adding BE ladder runner protection should compose into the best variant.",
+    ),
+    # ----- Placeholder for option-price BE ladder (variant 2b proper) -----
+    ExitVariant(
+        # Variant 2b as user originally meant: BE ladder R-levels
+        # measured in OPTION PRICE units, not SPX. Captures theta drag
+        # that the SPX-based BE ladder doesn't see (a trade that hit
+        # SPX +0.5R at 11am may be option +20%; at 2pm same SPX move
+        # nets +10% because theta ate gains). Shadow simulator can't
+        # evaluate this honestly without Greeks-based option-price
+        # evolution. Registered as a placeholder so the hypothesis is
+        # captured; lights up retroactively when the option-pricing
+        # module ships post-session-10.
+        label="bcd_trail_15pct_with_option_price_be_ladder",
+        stop_r=-1.0,
+        targets=[(1.0, 1.0)],
+        trail_peak_floor_r=0.3,
+        trail_pullback_r=0.15,
+        be_ladder=[(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)],
+        option_price_be_ladder=True,
+        family="exit_logic",
+        sub_family="be_ladder_combo",
+        description="Variant 2b proper: BE ladder R-levels in OPTION PRICE units (theta-aware). NOT YET EVALUABLE — requires option-price evolution module.",
+        hypothesis="Option-price BE captures theta drag that SPX-based BE misses; should outperform on slow-moving favorable trades where theta erodes profit.",
     ),
 ]
 
 
 def _variant_by_label(label: str) -> ExitVariant | None:
     return next((v for v in REGISTERED_VARIANTS if v.label == label), None)
+
+
+def upsert_variant_ledger(
+    db_cursor,
+    variants: list[ExitVariant],
+    tested_in: str = "shadow_replay",
+    sample_window: str = "",
+) -> int:
+    """Idempotent upsert of every registered variant into variant_ledger.
+    Updates `last_seen_at` + sample_window on existing rows; preserves
+    `outcome_summary` and `still_active` (those are managed separately).
+    Called from run_replay so the ledger stays current automatically.
+
+    Returns count of rows touched."""
+    now = datetime.now(timezone.utc).isoformat()
+    n = 0
+    for v in variants:
+        params_json = json.dumps(v.to_dict())
+        # Upsert by variant_id (unique). On conflict, refresh
+        # last_seen_at + sample_window + variant_params; leave
+        # outcome_summary + still_active alone.
+        db_cursor.execute(
+            """
+            INSERT INTO variant_ledger
+                (variant_id, family, sub_family, description, hypothesis,
+                 registered_at, last_seen_at, tested_in, sample_window,
+                 outcome_summary, still_active, variant_params)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(variant_id) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at,
+                sample_window = excluded.sample_window,
+                variant_params = excluded.variant_params,
+                family = excluded.family,
+                sub_family = excluded.sub_family,
+                description = excluded.description,
+                hypothesis = excluded.hypothesis,
+                tested_in = excluded.tested_in
+            """,
+            (
+                v.label, v.family or "unclassified", v.sub_family,
+                v.description, v.hypothesis,
+                now, now, tested_in, sample_window,
+                "placeholder" if v.option_price_be_ladder else "pending",
+                params_json,
+            ),
+        )
+        n += 1
+    return n
 
 
 def _evaluate_entry_filter(
@@ -320,6 +429,14 @@ def simulate_variant(
 
     exit_reason ∈ {'no_data', 'stop', 'targets', 'trail', 'timeout'}.
     """
+    # Variants requiring option-price evolution can't be simulated by
+    # the SPX-only bar walk. Return a sentinel so the row is still
+    # persisted (for ledger continuity) but flagged as unevaluable.
+    if variant.option_price_be_ladder:
+        return {"realized_r": float("nan"),
+                "exit_reason": "requires_option_price_evolution",
+                "peak_r": 0.0, "exit_ms": None}
+
     if not fwd_bars:
         return {"realized_r": 0.0, "exit_reason": "no_data",
                 "peak_r": 0.0, "exit_ms": None}
@@ -470,6 +587,21 @@ def run_replay(
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
     cur = db.cursor()
+
+    # Auto-register variants into the ledger before doing any work.
+    # Idempotent — first run creates rows, subsequent runs touch
+    # last_seen_at + refresh metadata.
+    try:
+        upsert_variant_ledger(
+            cur, REGISTERED_VARIANTS,
+            tested_in="shadow_replay",
+            sample_window=f"{date_from}_{date_to}",
+        )
+        db.commit()
+    except sqlite3.OperationalError as e:
+        # Table doesn't exist yet (sidecar hasn't booted to run init_db).
+        # Continue without ledger — replay still works.
+        print(f"[warn] variant_ledger not available: {e}", file=sys.stderr)
 
     # Include STOPPED parents — those are exactly the failure-mode cases
     # B+C+D / trail-variants are designed to test against (would they have
@@ -641,6 +773,12 @@ def run_replay(
 
     if persist and rows:
         now_iso = datetime.now(timezone.utc).isoformat()
+        # Skip rows with NaN realized_r — placeholder variants
+        # (option-price BE ladder etc.) can't satisfy the NOT NULL
+        # constraint on realized_r and the ledger row already captures
+        # the intent. SQLite binds NaN as NULL in some driver versions,
+        # which would fail the constraint anyway.
+        persist_rows = [r for r in rows if r["realized_r"] == r["realized_r"]]
         cur.executemany(
             """
             INSERT OR REPLACE INTO shadow_exit_outcome
@@ -657,21 +795,29 @@ def run_replay(
                     json.dumps(r["variant_params"]),
                     r["realized_r"], r["exit_reason"], r["peak_r"], r["exit_ms"],
                 )
-                for r in rows
+                for r in persist_rows
             ],
         )
         db.commit()
     db.close()
 
-    # Aggregate by variant × session
+    # Aggregate by variant × session. NaN realized_r rows (variants
+    # requiring option-price evolution etc.) are excluded from sums so
+    # they don't poison the aggregates, but their count is surfaced
+    # via n_unevaluable so the placeholder is visible.
+    def _is_finite(x: float) -> bool:
+        return x == x and x not in (float("inf"), float("-inf"))
+
     by_variant: dict[str, dict] = {}
     for v in variants:
         v_rows = [r for r in rows if r["variant_label"] == v.label]
+        eval_rows = [r for r in v_rows if _is_finite(r["realized_r"])]
+        unevaluable = len(v_rows) - len(eval_rows)
         by_session: dict[str, dict] = defaultdict(
             lambda: {"n": 0, "qty_total": 0, "sum_r": 0.0, "sum_dollars": 0.0,
                      "wins": 0, "losses": 0, "exit_reasons": defaultdict(int)}
         )
-        for r in v_rows:
+        for r in eval_rows:
             b = by_session[r["session_date"]]
             b["n"] += 1
             b["qty_total"] += r["qty"]
@@ -688,11 +834,12 @@ def run_replay(
             "params": v.to_dict(),
             "by_session": dict(by_session),
             "aggregate": {
-                "n": len(v_rows),
-                "sum_r": round(sum(r["realized_r"] for r in v_rows), 4),
-                "sum_dollars": round(sum(r["dollars"] for r in v_rows), 2),
-                "wins": sum(1 for r in v_rows if r["realized_r"] > 0.05),
-                "losses": sum(1 for r in v_rows if r["realized_r"] < -0.05),
+                "n": len(eval_rows),
+                "n_unevaluable": unevaluable,
+                "sum_r": round(sum(r["realized_r"] for r in eval_rows), 4),
+                "sum_dollars": round(sum(r["dollars"] for r in eval_rows), 2),
+                "wins": sum(1 for r in eval_rows if r["realized_r"] > 0.05),
+                "losses": sum(1 for r in eval_rows if r["realized_r"] < -0.05),
                 "exit_reasons": dict(defaultdict(int, {
                     er: sum(1 for r in v_rows if r["exit_reason"] == er)
                     for er in {r["exit_reason"] for r in v_rows}
