@@ -983,6 +983,19 @@ async def diag_ibkr_executions(request: Request, days: int = 1) -> dict[str, Any
         if ts < cutoff: continue
 
         contract_key = f"{c.symbol} {c.strike}{c.right} {c.lastTradeDateOrContractMonth}"
+        # Pair the CommissionReport with the Fill (ib_async links them by execId).
+        _cr = getattr(f, "commissionReport", None)
+        comm = None
+        rpnl = None
+        if _cr is not None:
+            _v = getattr(_cr, "commission", None)
+            if _v is not None and not (isinstance(_v, float) and _v != _v):
+                try: comm = float(_v)
+                except (TypeError, ValueError): comm = None
+            _r = getattr(_cr, "realizedPNL", None)
+            if _r is not None and not (isinstance(_r, float) and _r != _r):
+                try: rpnl = float(_r)
+                except (TypeError, ValueError): rpnl = None
         rec = {
             "exec_id": ex.execId,
             "timestamp": ts.isoformat(),
@@ -994,6 +1007,8 @@ async def diag_ibkr_executions(request: Request, days: int = 1) -> dict[str, Any
             "perm_id": ex.permId,
             "cum_qty": float(ex.cumQty),
             "avg_price": float(ex.avgPrice),
+            "commission": comm,
+            "realized_pnl": rpnl,
         }
         out_exec.append(rec)
         by_contract.setdefault(contract_key, []).append(rec)
@@ -1059,6 +1074,26 @@ async def _persist_ibkr_executions(fills) -> int:
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=_tz.utc)
             sess_date = ts.astimezone(et_tz).strftime("%Y-%m-%d")
+            # CommissionReport is paired with each Fill by ib_async — extract
+            # both commission and realizedPNL when present. Paper accounts
+            # typically report 0.0 commission; live accounts report real fees.
+            comm_report = getattr(f, "commissionReport", None)
+            commission_val: float | None = None
+            realized_pnl_val: float | None = None
+            if comm_report is not None:
+                _c = getattr(comm_report, "commission", None)
+                if _c is not None and not (isinstance(_c, float) and _c != _c):  # not NaN
+                    try:
+                        commission_val = float(_c)
+                    except (TypeError, ValueError):
+                        commission_val = None
+                _rp = getattr(comm_report, "realizedPNL", None)
+                if _rp is not None and not (isinstance(_rp, float) and _rp != _rp):
+                    try:
+                        realized_pnl_val = float(_rp)
+                    except (TypeError, ValueError):
+                        realized_pnl_val = None
+
             row = IBKRExecution(
                 exec_id=ex.execId,
                 timestamp=ts,
@@ -1075,6 +1110,8 @@ async def _persist_ibkr_executions(fills) -> int:
                 ib_order_id=getattr(ex, "orderId", None),
                 perm_id=getattr(ex, "permId", None),
                 account=getattr(ex, "acctNumber", None),
+                commission=commission_val,
+                realized_pnl=realized_pnl_val,
             )
             session.add(row)
             new_count += 1
@@ -3540,6 +3577,98 @@ async def admin_backfill_live_order_fills(
         "skipped_no_matching_exec": skipped_no_match,
         "skipped_already_filled": skipped_already_filled,
         "exec_rows_scanned": len(execs),
+    }
+
+
+@router.post("/admin/backfill_commissions")
+async def admin_backfill_commissions(
+    request: Request, body: dict[str, Any] = Body(default={}),
+) -> dict[str, Any]:
+    """Backfill ibkr_execution.commission + realized_pnl from IBKR's
+    CommissionReport. Calls reqExecutionsAsync (~7-day server cache) and
+    UPDATEs existing rows by exec_id where commission is currently NULL.
+
+    Idempotent. Safe to run repeatedly. Doesn't insert new rows — that's
+    /diag/ibkr_executions's job. Only fills in the commission/pnl fields
+    on rows that were captured before the 2026-05-21 commission-capture
+    write-path fix.
+
+    Paper accounts (DUM prefix) typically have $0.00 commissions. NULL ->
+    $0 after backfill is the expected case for the existing DUM098107 data.
+
+    Body (optional): {"days": int} — limits server-side reqExecutions
+    lookback. Default 30 (IBKR caps at ~7 days regardless)."""
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import IBKRExecution
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from sqlmodel import select as _s
+
+    s = _state(request)
+    if not isinstance(s.ibkr, LiveIBKRProvider):
+        return {"ok": False, "error": "IBKR provider is not the live one — cannot fetch fills"}
+    ib = s.ibkr._ib  # type: ignore[attr-defined]
+    if ib is None:
+        return {"ok": False, "error": "IBKR not connected"}
+
+    from ib_async import ExecutionFilter
+    try:
+        fills = await ib.reqExecutionsAsync(ExecutionFilter())
+    except Exception as e:
+        return {"ok": False, "error": f"reqExecutionsAsync failed: {e}"}
+
+    # exec_id -> (commission, realized_pnl)
+    pairs: dict[str, tuple[float | None, float | None]] = {}
+    for f in fills:
+        ex = f.execution
+        if not getattr(ex, "execId", None):
+            continue
+        cr = getattr(f, "commissionReport", None)
+        comm = None
+        rpnl = None
+        if cr is not None:
+            _c = getattr(cr, "commission", None)
+            if _c is not None and not (isinstance(_c, float) and _c != _c):
+                try: comm = float(_c)
+                except (TypeError, ValueError): pass
+            _r = getattr(cr, "realizedPNL", None)
+            if _r is not None and not (isinstance(_r, float) and _r != _r):
+                try: rpnl = float(_r)
+                except (TypeError, ValueError): pass
+        pairs[ex.execId] = (comm, rpnl)
+
+    updated = 0
+    skipped_no_match = 0
+    skipped_already_set = 0
+    async with _gs() as session:
+        rows = list((await session.exec(_s(IBKRExecution))).all())
+        by_id = {r.exec_id: r for r in rows}
+        for exec_id, (comm, rpnl) in pairs.items():
+            row = by_id.get(exec_id)
+            if row is None:
+                skipped_no_match += 1
+                continue
+            changed = False
+            if row.commission is None and comm is not None:
+                row.commission = comm
+                changed = True
+            if row.realized_pnl is None and rpnl is not None:
+                row.realized_pnl = rpnl
+                changed = True
+            if changed:
+                session.add(row)
+                updated += 1
+            else:
+                skipped_already_set += 1
+        await session.commit()
+
+    return {
+        "ok": True,
+        "ibkr_fills_returned": len(fills),
+        "exec_ids_with_commission_data": sum(1 for c, _ in pairs.values() if c is not None),
+        "db_rows_updated": updated,
+        "db_rows_already_set": skipped_already_set,
+        "db_rows_no_match": skipped_no_match,
+        "note": "Paper accounts (DUM prefix) typically report $0.00 commission — that's still a valid backfill",
     }
 
 

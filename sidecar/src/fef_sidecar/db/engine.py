@@ -75,6 +75,12 @@ async def init_db() -> None:
             ("live_order", "spx_target_t2_fired", "INTEGER DEFAULT 0"),
             ("live_order", "spx_target_t3_fired", "INTEGER DEFAULT 0"),
             ("live_order", "spx_target_t1_at_spx", "REAL"),
+            ("live_order", "spx_target_t2_at_spx", "REAL"),
+            ("live_order", "spx_target_t3_at_spx", "REAL"),
+            ("tournament_run", "regime_distribution", "JSON"),
+            ("tournament_run", "dominant_regime", "TEXT DEFAULT 'UNKNOWN'"),
+            # IBKR execution persistence — table created via create_all, no
+            # columns to migrate. Listed here as a marker for the model add.
             ("live_order", "spread_kind", "TEXT"),
             ("live_order", "spread_short_strike", "REAL"),
             ("live_order", "spread_long_strike", "REAL"),
@@ -99,6 +105,23 @@ async def init_db() -> None:
             ("daily_review", "dedup_timeouts", "INTEGER DEFAULT 0"),
             ("daily_review", "dedup_win_rate_pct", "REAL DEFAULT 0.0"),
             ("daily_review", "dedup_expectancy_r", "REAL DEFAULT 0.0"),
+            ("daily_review", "sharpe_ratio", "REAL"),
+            ("daily_review", "sortino_ratio", "REAL"),
+            ("daily_review", "max_drawdown_R", "REAL"),
+            ("daily_review", "profit_factor", "REAL"),
+            ("daily_review", "ulcer_index", "REAL"),
+            # MLModelRun gains regression metrics + on-disk model path
+            ("ml_model_run", "label_kind", "TEXT DEFAULT 'r_multiple'"),
+            ("ml_model_run", "cv_mae", "REAL"),
+            ("ml_model_run", "cv_r2", "REAL"),
+            ("ml_model_run", "cv_n_folds", "INTEGER"),
+            ("ml_model_run", "model_path", "TEXT"),
+            # IBKR commission capture (2026-05-21). Paper accounts report
+            # $0; live accounts report real fees. NULL on pre-fix rows.
+            ("ibkr_execution", "commission", "REAL"),
+            ("ibkr_execution", "realized_pnl", "REAL"),
+            # SignalLookaheadOutcome — net-new table, created via create_all,
+            # listed here as a marker so the migration log shows it.
         ]
         for table, column, type_sql in migrations:
             try:

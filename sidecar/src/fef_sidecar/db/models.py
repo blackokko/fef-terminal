@@ -250,6 +250,40 @@ class HistoricalBar(SQLModel, table=True):
     volume: float = 0.0
 
 
+class SignalLookaheadOutcome(SQLModel, table=True):
+    """Per-signal forward observation — what SPX did in the N minutes
+    AFTER each SignalIter (fired or WAIT). Closes the "missed signal"
+    blind spot: outcomes for WAIT verdicts let us tell whether a WAIT
+    correctly skipped chop vs left money on the table.
+
+    Populated by a background worker that walks SignalIter rows whose
+    `timestamp + lookahead_minutes` is now in the past, joins forward
+    SPX 1-min bars from HistoricalBar, and records MFE/MAE.
+
+    `would_have_hit_t1` and `would_have_hit_stop` apply the SignalIter's
+    own t1/stop SPX levels (from extras.option_pricing) for WAIT
+    verdicts — they answer "if this WAIT had instead fired with the
+    same target/stop the engine COULD have computed, would it have
+    won?"
+    """
+
+    __tablename__ = "signal_lookahead_outcome"
+
+    id: int | None = Field(default=None, primary_key=True)
+    signal_iter_id: int = Field(foreign_key="signal_iter.id", index=True)
+    session_date: str = Field(index=True)
+    lookahead_minutes: int = Field(index=True, description="5, 15, 30, or 60")
+    spx_at_signal: float
+    spx_mfe_pts: float = Field(description="max favorable excursion in SPX points (signed by direction)")
+    spx_mae_pts: float = Field(description="max adverse excursion in SPX points (signed by direction)")
+    spx_close_at_window_end: float
+    would_have_hit_t1: bool = False
+    would_have_hit_stop: bool = False
+    direction_at_signal: str  # "LONG_CALLS" / "LONG_PUTS" / "WAIT"
+    confidence_at_signal: str
+    computed_at: datetime = Field(default_factory=_utcnow)
+
+
 class FlowSnapshot(SQLModel, table=True):
     """One QuantData market snapshot — walls, drift, max pain, aggression, IVR.
 
@@ -452,6 +486,8 @@ class LiveOrder(SQLModel, table=True):
     spx_target_t2_fired: bool = Field(default=False)
     spx_target_t3_fired: bool = Field(default=False)
     spx_target_t1_at_spx: float | None = None  # spot when T1 fired (for retrace)
+    spx_target_t2_at_spx: float | None = None  # spot when T2 fired (audit truth)
+    spx_target_t3_at_spx: float | None = None  # spot when T3 fired (audit truth)
     # Spread metadata when exit_strategy='spread_premium'
     spread_kind: str | None = None       # 'PCS' or 'CCS'
     spread_short_strike: float | None = None
@@ -526,6 +562,15 @@ class DailyReview(SQLModel, table=True):
     dedup_win_rate_pct: float = 0.0
     dedup_expectancy_r: float = 0.0
 
+    # Risk-adjusted performance metrics — computed from per-signal R outcomes
+    # in daily_review.py. NULL when there's not enough variance (n<2 or
+    # all-equal returns) for the statistic to be defined.
+    sharpe_ratio: float | None = None   # mean(R) / std(R), annualization left to caller
+    sortino_ratio: float | None = None  # mean(R) / std(R | R<0) — downside only
+    max_drawdown_R: float | None = None # largest peak-to-trough on cumulative R
+    profit_factor: float | None = None  # sum(R | R>0) / abs(sum(R | R<0))
+    ulcer_index: float | None = None    # RMS of pct drawdown — penalises long drawdowns more
+
 
 class EngineChange(SQLModel, table=True):
     """One row per engine semantic change. Lets the TuningRecommender
@@ -544,6 +589,98 @@ class EngineChange(SQLModel, table=True):
     measured_impact_r: float | None = None  # filled in post-hoc
     rollback_condition: str = ""
     git_commit_sha: str | None = None
+
+
+class TournamentRun(SQLModel, table=True):
+    """One row per Preset Tournament invocation. Persists the leaderboard
+    so you can compare day-over-day winners and track preset performance
+    over time instead of every Run being ephemeral.
+    """
+
+    __tablename__ = "tournament_run"
+
+    id: int | None = Field(default=None, primary_key=True)
+    run_at: datetime = Field(default_factory=_utcnow, index=True)
+    session_date_from: str = Field(index=True)
+    session_date_to: str = Field(index=True)
+    apply_be_ladder: bool = True
+    commission_per_contract: float = 0.65
+    preset_count: int = 0
+    notes: str = Field(default="")
+    # Regime distribution during the backtest window — pulled from
+    # SignalIter.extras.regime_at_fire across the date range. Format:
+    # {"TREND_DAY": 0.42, "CHOP": 0.31, "PIN_DAY": 0.27} (fractions sum to 1).
+    # Lets us filter "show me tournaments run on PIN_DAY windows" so preset
+    # comparisons get statistically valid faster.
+    regime_distribution: dict[str, float] = Field(default_factory=dict, sa_column=Column(JSON))
+    dominant_regime: str = Field(default="UNKNOWN", index=True)
+
+
+class TournamentRunResult(SQLModel, table=True):
+    """One row per preset per TournamentRun — the leaderboard rows."""
+
+    __tablename__ = "tournament_run_result"
+
+    id: int | None = Field(default=None, primary_key=True)
+    tournament_run_id: int = Field(foreign_key="tournament_run.id", index=True)
+    preset_id: int = Field(index=True)
+    preset_name: str = ""
+    rank: int = 0  # 1-indexed; 0 means not ranked (errored or 0 trades)
+    trade_count: int = 0
+    iters_scanned: int = 0
+    wins: int = 0
+    losses: int = 0
+    win_rate_pct: float = 0.0
+    expectancy_r: float = 0.0
+    sharpe_ratio: float | None = None
+    max_drawdown_r: float = 0.0
+    profit_factor: float | None = None
+    cumulative_r: float = 0.0
+    skipped: dict[str, int] = Field(default_factory=dict, sa_column=Column(JSON))
+    error: str | None = None
+
+
+class IBKRExecution(SQLModel, table=True):
+    """Persisted IBKR fill log. reqExecutionsAsync only returns ~7 days from
+    IBKR; we capture into DB on each /diag/ibkr_executions call so longer
+    historical audits remain possible.
+
+    Idempotent: exec_id is unique across all IBKR fills, so upsert-by-exec_id
+    means the same fill captured twice produces zero duplicates.
+    """
+
+    __tablename__ = "ibkr_execution"
+
+    id: int | None = Field(default=None, primary_key=True)
+    exec_id: str = Field(index=True, unique=True)  # IBKR's unique execution ID
+    timestamp: datetime = Field(index=True)
+    session_date: str = Field(index=True)  # YYYY-MM-DD ET, derived at capture
+
+    symbol: str = Field(index=True)
+    strike: float
+    right: str  # 'C' or 'P'
+    expiry: str  # YYYYMMDD
+
+    side: str  # 'BOT' or 'SLD'
+    shares: float
+    price: float
+    cum_qty: float = 0.0
+    avg_price: float = 0.0
+
+    ib_order_id: int | None = Field(default=None, index=True)
+    perm_id: int | None = Field(default=None, index=True)
+    account: str | None = None
+
+    # Broker-reported commission for this fill (USD). Comes from ib_async's
+    # CommissionReport event paired with each Fill. NULL when not yet
+    # captured (older rows pre-2026-05-21) or when IBKR hasn't sent the
+    # commissionReport yet at write time. $0.00 is a valid value — paper
+    # accounts (DUM prefix) typically report $0 commission since they're
+    # testing harnesses.
+    commission: float | None = None
+    realized_pnl: float | None = None  # CommissionReport.realizedPNL when present
+
+    captured_at: datetime = Field(default_factory=_utcnow)
 
 
 class ShadowComparison(SQLModel, table=True):
@@ -667,19 +804,32 @@ class WalkForwardRun(SQLModel, table=True):
 
 
 class MLModelRun(SQLModel, table=True):
-    """One trained ML model run — features, predicted win rate, importance."""
+    """One trained ML model run — features, CV metrics, persisted estimator path."""
 
     __tablename__ = "ml_model_run"
 
     id: int | None = Field(default=None, primary_key=True)
     trained_at: datetime = Field(default_factory=_utcnow, index=True)
-    algorithm: str = Field(default="RandomForestClassifier")
+    algorithm: str = Field(default="RandomForestRegressor")
     n_training_rows: int
     n_features: int
 
-    train_accuracy: float
-    test_accuracy: float
+    # Legacy classifier metrics (kept nullable for backwards-compat with
+    # older runs predating the regression switch). New regression runs leave
+    # these NULL.
+    train_accuracy: float | None = None
+    test_accuracy: float | None = None
     test_auc: float | None = None
+
+    # Regression / walk-forward CV metrics (RandomForestRegressor on R-multiple).
+    label_kind: str = Field(default="r_multiple")  # "r_multiple" | "binary_win"
+    cv_mae: float | None = None      # mean abs error in R units, averaged across TS folds
+    cv_r2: float | None = None       # coefficient of determination, averaged across folds
+    cv_n_folds: int | None = None    # how many TimeSeriesSplit folds actually ran
+
+    # Path (under FEF_MODEL_DIR or ~/.fef-terminal/models) to a joblib pickle
+    # of the fitted estimator. NULL for legacy runs that didn't persist.
+    model_path: str | None = None
 
     # Top features by importance (sorted desc): [{name, importance}, ...]
     feature_importances: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
