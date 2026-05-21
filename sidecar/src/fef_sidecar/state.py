@@ -96,6 +96,13 @@ class AppState:
     stuffing_state: object | None = None  # StuffingState
     depth_state: object | None = None  # DepthState
     hft_task: object | None = None
+    # In-memory mutex shared between the polling spx_target_watcher_loop
+    # and the new tick-driven spx_stop_tick_watcher. Both can detect a
+    # stop breach within milliseconds of each other; this set ensures
+    # only one path fires the market sell per parent. Asyncio is
+    # single-threaded so set add/discard are atomic.
+    firing_parent_ids: set[int] = field(default_factory=set)
+    spx_stop_tick_task: object | None = None
     # Update counters per data source — used by HFT panel badges to show
     # LIVE / EMPTY / SYNTH. Bumped from the actual subscription callbacks.
     tick_quote_count_live: int = 0
@@ -108,8 +115,7 @@ class AppState:
     auto_trade_enabled: bool = False
     auto_trade_confidence_floor: str = "HIGH"   # 'HIGH' / 'MEDIUM' / 'LOW'
     auto_trade_cool_down_sec: int = 300         # min seconds between auto fires
-    auto_trade_max_per_session: int = 5         # hard cap per sidecar session
-    auto_trade_count_session: int = 0           # bumped after each successful fire
+    auto_trade_count_session: int = 0           # bumped after each successful fire (display only; cap is per-symbol)
     auto_trade_last_at_ms: int = 0              # epoch ms of last fire
     auto_trade_last_block_reason: str = ""      # why most-recent eligible signal was skipped
     # Override the FEF engine's suggested_qty (which is 15/10/5 by
@@ -155,7 +161,7 @@ class AppState:
     available_symbols: list[str] = field(default_factory=lambda: [
         s.strip().upper() for s in os.environ.get(
             "FEF_AVAILABLE_SYMBOLS",
-            "SPX,SPY,QQQ,IWM,ES,NQ,RTY"
+            "SPX,SPY,QQQ,IWM,GLD,SMH,TLT,ES,NQ,RTY"
         ).split(",") if s.strip()
     ])
 
@@ -163,6 +169,19 @@ class AppState:
     # symbol switch. Read by tick/bar loops to attach prior_close to
     # TickEvent so the Live Quote panel can show day-change %.
     prior_close_by_symbol: dict[str, float] = field(default_factory=dict)
+
+    # ML inference service — loads the latest persisted RF estimator from
+    # disk and scores live signals for `ml_expected_r`. Observational only;
+    # does not affect verdict generation. None until first model is trained
+    # or if scikit-learn is unavailable.
+    ml_inference: object | None = None
+
+    # Per-symbol option expiry cache. Keyed by (symbol, session_date_et)
+    # so we hit IBKR's reqContractDetails at most once per symbol per day.
+    # Without this, the multi-symbol scanner hard-coded today's date as
+    # the option expiry for every symbol, silently failing for GLD/SMH/TLT
+    # (no 0DTE) and for SPY/QQQ/IWM on Tu/Th.
+    expiry_cache_by_key: dict[tuple, str] = field(default_factory=dict)
 
     # 30-min bar cache per symbol — feeds the credit-spread recommender's
     # TA entry detector (EMA 8/21, StdDev channel, engulfing). Re-fetched
@@ -184,11 +203,13 @@ class AppState:
     # FEFEngine in scanner_engines (lazy-created on first scan).
     scan_enabled_symbols: dict[str, bool] = field(default_factory=lambda: {
         "SPX": False, "SPY": False, "QQQ": False, "IWM": False,
+        "GLD": False, "SMH": False, "TLT": False,
     })
     scanner_engines: dict[str, object] = field(default_factory=dict)
     scanner_task: object | None = None
-    # Per-symbol auto-trade fire counters — used for the hybrid cap
-    # (global max_per_session AND per-symbol max_per_symbol).
+    # Per-symbol auto-trade fire counters — the only binding cap. Each
+    # symbol has an independent budget; the global "total budget" shown
+    # in UI = max_per_symbol × enabled_symbols (auto-derived display only).
     auto_trade_count_by_symbol: dict[str, int] = field(default_factory=dict)
     auto_trade_max_per_symbol: int = 2
     # Trigger types the auto-trader is willing to fire on. Maps engine

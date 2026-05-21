@@ -278,6 +278,10 @@ async def spx_target_watcher_loop(state) -> None:
                         logger.exception("spx_watcher market sell failed")
 
                 # Stop check uses the dynamic level (BE ladder ratchets it).
+                # If the tick-driven fast path is already firing this parent's
+                # stop, skip — avoids double-fire.
+                if p.id in state.firing_parent_ids:
+                    continue
                 effective_stop = p.dynamic_stop_level if p.dynamic_stop_level is not None else p.spx_target_stop
                 if effective_stop is not None:
                     # Distance to stop (signed by direction — positive = safe,
@@ -321,13 +325,17 @@ async def spx_target_watcher_loop(state) -> None:
                         if not p.spx_target_t3_fired and p.spx_target_t3_qty:
                             unfired_qty += p.spx_target_t3_qty
                         if unfired_qty > 0:
-                            await _market_sell(unfired_qty, "STOP")
-                            await SignalIterRepository.update_live_order(
-                                p.id, status="STOPPED",
-                                spx_target_t1_fired=True,
-                                spx_target_t2_fired=True,
-                                spx_target_t3_fired=True,
-                            )
+                            state.firing_parent_ids.add(p.id)
+                            try:
+                                await _market_sell(unfired_qty, "STOP")
+                                await SignalIterRepository.update_live_order(
+                                    p.id, status="STOPPED",
+                                    spx_target_t1_fired=True,
+                                    spx_target_t2_fired=True,
+                                    spx_target_t3_fired=True,
+                                )
+                            finally:
+                                state.firing_parent_ids.discard(p.id)
                         continue  # nothing else to do on this parent
 
                 # T1
@@ -404,3 +412,164 @@ async def spx_target_watcher_loop(state) -> None:
         except Exception:
             logger.exception("spx_target_watcher iteration failed")
         await asyncio.sleep(interval)
+
+
+async def spx_stop_tick_watcher_loop(state) -> None:
+    """Tick-driven stop fast path.
+
+    Subscribes to the broadcaster's tick stream and checks stop levels on
+    open `spx_points` parents on EVERY new SPX tick — typically ~3-10
+    ticks/sec from IBKR. Compared to the polling loop's 0.1s cadence
+    this trims stop detection latency from ~100ms worst case to ~ms-
+    of-the-tick-arrival.
+
+    Coexists with `spx_target_watcher_loop`:
+      - The poll loop still handles BE ladder ratchets, T1/T2/T3
+        detection, dollar-loss checks, runner-protect, and the periodic
+        near-stop diagnostic. Those are not as latency-critical and
+        running them at tick cadence would just multiply IBKR calls.
+      - This fast path ONLY checks stops. Per-parent firing is gated by
+        `state.firing_parent_ids` so the two paths can never race into
+        a double market-sell on the same parent.
+
+    If the tick stream stalls or this task crashes, the poll loop
+    continues to fire stops at its own cadence — defense in depth.
+    """
+    from fef_sidecar.db.models import LiveOrder
+    from fef_sidecar.db.repository import SignalIterRepository
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+
+    logger.info("SPX stop tick-watcher starting (tick-driven fast path)")
+    # Cache open parents for short windows so we don't re-query DB on
+    # every single tick. Refreshed when stale.
+    parents_cache: list = []
+    parents_cache_at_ms: int = 0
+    CACHE_TTL_MS = 500  # refresh open-parents list at most every 500ms
+
+    async with state.broadcaster.subscribe() as queue:
+        while True:
+            try:
+                event = await queue.get()
+                # Only tick events drive stop detection. Skip everything else.
+                if getattr(event, "type", None) != "tick":
+                    continue
+                spot = float(getattr(event, "spx_price", 0) or 0)
+                if spot <= 0:
+                    continue
+                symbol = getattr(event, "symbol", None) or "SPX"
+                # Only act on the symbol the user is actively trading. The
+                # tick stream sometimes carries multi-symbol ticks when the
+                # scanner has secondary subscriptions; filter to whichever
+                # is the active SPX-style symbol.
+                if symbol != "SPX":
+                    continue
+
+                now_ms = int(_time.time() * 1000)
+                if (not parents_cache) or (now_ms - parents_cache_at_ms > CACHE_TTL_MS):
+                    parents_cache = [
+                        o for o in await SignalIterRepository.query_live_orders(limit=200)
+                        if o.bracket_role == "parent"
+                        and o.exit_strategy == "spx_points"
+                        and o.status in ("SUBMITTED", "FILLED", "PARTIAL")
+                    ]
+                    parents_cache_at_ms = now_ms
+
+                for p in parents_cache:
+                    if p.id in state.firing_parent_ids:
+                        continue
+                    is_long_calls = p.right == "C"
+                    effective_stop = (
+                        p.dynamic_stop_level
+                        if p.dynamic_stop_level is not None
+                        else p.spx_target_stop
+                    )
+                    if effective_stop is None:
+                        continue
+                    stop_hit = (
+                        (is_long_calls and spot <= effective_stop)
+                        or (not is_long_calls and spot >= effective_stop)
+                    )
+                    if not stop_hit:
+                        continue
+                    # Compute unfired qty from the cached snapshot. The
+                    # long_qty position guard in the IBKR sell call will
+                    # clip if the cache is stale (e.g., T1 fired between
+                    # cache refreshes).
+                    unfired_qty = 0
+                    if not p.spx_target_t1_fired and p.spx_target_t1_qty:
+                        unfired_qty += p.spx_target_t1_qty
+                    if not p.spx_target_t2_fired and p.spx_target_t2_qty:
+                        unfired_qty += p.spx_target_t2_qty
+                    if not p.spx_target_t3_fired and p.spx_target_t3_qty:
+                        unfired_qty += p.spx_target_t3_qty
+                    if unfired_qty <= 0:
+                        continue
+                    # Acquire the firing lock — only one path may fire this
+                    # parent at a time.
+                    state.firing_parent_ids.add(p.id)
+                    try:
+                        if not isinstance(state.ibkr, LiveIBKRProvider):
+                            await SignalIterRepository.write_audit_log(
+                                category="spx_watcher", actor="system",
+                                summary=(
+                                    f"[DRY/TICK] STOP crossed: would market-sell-to-close "
+                                    f"{unfired_qty}x {p.symbol} {p.strike}{p.right} at SPX {spot:.2f}"
+                                ),
+                            )
+                        else:
+                            from ib_async import MarketOrder
+                            ib = state.ibkr._ib  # type: ignore[attr-defined]
+                            try:
+                                ic = await _qualified_ib_contract(state, p)
+                                positions = ib.positions()
+                                long_qty = sum(
+                                    int(pos.position) for pos in positions
+                                    if (getattr(pos.contract, "secType", "") == "OPT"
+                                        and getattr(pos.contract, "symbol", "") == p.symbol
+                                        and abs(float(getattr(pos.contract, "strike", 0)) - p.strike) < 0.01
+                                        and getattr(pos.contract, "right", "") == p.right
+                                        and getattr(pos.contract, "lastTradeDateOrContractMonth", "") == p.expiry
+                                        and pos.position > 0)
+                                )
+                                sell_qty = min(unfired_qty, long_qty)
+                                if sell_qty <= 0:
+                                    await SignalIterRepository.write_audit_log(
+                                        category="spx_watcher", actor="system",
+                                        summary=(
+                                            f"STOP/TICK SKIPPED: no long position to close for "
+                                            f"{p.symbol} {p.strike}{p.right} (requested {unfired_qty}, owned 0)"
+                                        ),
+                                    )
+                                else:
+                                    mkt = MarketOrder("SELL", sell_qty, transmit=True)
+                                    trade = ib.placeOrder(ic, mkt)
+                                    tick_age_ms = (
+                                        now_ms - state.last_live_tick_ms
+                                        if state.last_live_tick_ms > 0 else -1
+                                    )
+                                    await SignalIterRepository.write_audit_log(
+                                        category="spx_watcher", actor="system",
+                                        summary=(
+                                            f"STOP/TICK: market-sold-to-close {sell_qty}x "
+                                            f"{p.symbol} {p.strike}{p.right} at SPX {spot:.2f} "
+                                            f"(stop={effective_stop:.2f}, tick_age={tick_age_ms}ms, "
+                                            f"ib_order_id={trade.order.orderId})"
+                                        ),
+                                    )
+                            except Exception:
+                                logger.exception("spx_stop_tick_watcher market sell failed")
+                        await SignalIterRepository.update_live_order(
+                            p.id, status="STOPPED",
+                            spx_target_t1_fired=True,
+                            spx_target_t2_fired=True,
+                            spx_target_t3_fired=True,
+                        )
+                        # Refresh cache so the next ticks don't re-evaluate
+                        # this just-stopped parent.
+                        parents_cache = [c for c in parents_cache if c.id != p.id]
+                    finally:
+                        state.firing_parent_ids.discard(p.id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("spx_stop_tick_watcher iteration failed")

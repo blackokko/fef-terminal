@@ -154,6 +154,166 @@ async def refresh_prior_close(state: AppState) -> None:
         logger.exception("refresh_prior_close failed for %s", symbol)
 
 
+async def daily_session_audit_runner(state: AppState) -> None:
+    """Daily loop that computes + persists the DailyReview row at session
+    close. Runs at FEF_AUDIT_RUN_HOUR (default 15 = 3pm CT, which equals
+    4pm ET = market close). Survives missed days via startup catch-up
+    (see `_startup_audit_catchup`).
+
+    Why this matters: DailyReview rows drive the freeze counter
+    (`engine_freeze_state`) + the per-session baselines the user reviews
+    each morning. Forgetting to hit `/diag/signal_execution_audit`
+    manually = freeze counter stalls and baselines aren't captured.
+
+    America/Chicago zoneinfo so DST handles itself. After market close
+    we don't care about post-market movement — by 3pm CT all 0DTEs are
+    expired and IBKR fills for the session are settled.
+    """
+    import os
+    from datetime import datetime, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        chi = ZoneInfo("America/Chicago")
+    except Exception:
+        from datetime import timezone
+        chi = timezone(timedelta(hours=-6))
+
+    hour = int(os.environ.get("FEF_AUDIT_RUN_HOUR", "15"))
+    minute = int(os.environ.get("FEF_AUDIT_RUN_MINUTE", "5"))  # 3:05pm CT — let last fills settle
+    logger.info("Daily session-audit runner scheduled for %d:%02d CT", hour, minute)
+
+    while True:
+        try:
+            now = datetime.now(chi)
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= now:
+                target = target + timedelta(days=1)
+            sleep_sec = (target - now).total_seconds()
+            await asyncio.sleep(sleep_sec)
+            await _run_session_audit(state)
+            logger.info("Daily session audit fired at %s", datetime.now(chi).strftime("%I:%M%p CT"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("daily_session_audit_runner iteration failed")
+            await asyncio.sleep(60)
+
+
+async def _run_session_audit(state: AppState) -> None:
+    """Compute + persist DailyReview for today's session_date (ET)."""
+    from datetime import datetime, timedelta, timezone
+    from fef_sidecar.engine.daily_review import compute_daily_review
+    today_et = datetime.now(timezone(timedelta(hours=-4))).strftime("%Y-%m-%d")
+    try:
+        review = await compute_daily_review(today_et)
+        logger.info(
+            "DailyReview persisted for %s: actionable=%s wins=%s losses=%s expectancy_r=%.3f",
+            today_et,
+            review.actionable_signals,
+            review.wins,
+            review.losses,
+            review.expectancy_r or 0.0,
+        )
+    except Exception:
+        logger.exception("compute_daily_review failed for %s", today_et)
+
+
+async def _startup_audit_catchup(state: AppState) -> None:
+    """On startup, if the most recent DailyReview is older than yesterday
+    AND it's already past today's audit time, run the audit now. Covers
+    the "user closed the app before 3pm CT and reopens the next morning"
+    case so missed days still get a review row.
+    """
+    import os
+    from datetime import datetime, timedelta, timezone
+    from fef_sidecar.db.engine import get_session as _gs
+    from fef_sidecar.db.models import DailyReview
+    from sqlmodel import select as _s
+
+    # Wait a few seconds for IBKR + DB to be fully up
+    await asyncio.sleep(5)
+
+    try:
+        from zoneinfo import ZoneInfo
+        chi = ZoneInfo("America/Chicago")
+    except Exception:
+        chi = timezone(timedelta(hours=-6))
+
+    hour = int(os.environ.get("FEF_AUDIT_RUN_HOUR", "15"))
+    minute = int(os.environ.get("FEF_AUDIT_RUN_MINUTE", "5"))
+    now_chi = datetime.now(chi)
+    today_et = datetime.now(timezone(timedelta(hours=-4))).strftime("%Y-%m-%d")
+    past_run_time_today = (now_chi.hour, now_chi.minute) >= (hour, minute)
+
+    async with _gs() as session:
+        existing = (await session.exec(
+            _s(DailyReview)
+            .where(DailyReview.session_date == today_et)  # type: ignore[attr-defined]
+        )).first()
+
+    if existing is None and past_run_time_today:
+        logger.info("Startup audit catch-up: missed today's 3:05pm CT run — computing now")
+        await _run_session_audit(state)
+
+
+async def _load_ml_inference(state: AppState) -> None:
+    """Best-effort startup load of the most recent persisted ML estimator.
+
+    Quiet on failure — system runs fine without an ML model; the
+    `ml_expected_r` overlay just stays None.
+    """
+    try:
+        from fef_sidecar.engine.ml_inference import MLInferenceService
+        svc = await MLInferenceService.from_latest_run()
+        state.ml_inference = svc
+        if svc.is_ready():
+            buckets = list((svc.estimators or {}).keys())
+            logger.info("ML inference loaded from %s (buckets=%s)", svc.model_path, buckets)
+        else:
+            logger.info("ML inference: no persisted model yet — overlay disabled")
+    except Exception:
+        logger.exception("ML inference startup load failed")
+
+
+async def daily_prior_close_refresher(state: AppState) -> None:
+    """Daily-at-7pm-CT loop that re-fetches prior_close for the active symbol.
+
+    For futures (ES/NQ/RTY), this picks up the new session's prior close
+    right after the daily break + reopen. For cash equities, harmless —
+    SPX doesn't trade overnight so prior_close stays the same anyway.
+
+    Time configurable via FEF_PRIOR_CLOSE_REFRESH_HOUR (default 19 = 7pm CT).
+    Uses America/Chicago zoneinfo so DST is handled correctly.
+    """
+    import os
+    from datetime import datetime, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        chi = ZoneInfo("America/Chicago")
+    except Exception:
+        from datetime import timezone
+        chi = timezone(timedelta(hours=-6))  # fallback fixed offset
+
+    hour = int(os.environ.get("FEF_PRIOR_CLOSE_REFRESH_HOUR", "19"))
+    logger.info("Daily prior-close refresher scheduled for %d:00 CT", hour)
+
+    while True:
+        try:
+            now = datetime.now(chi)
+            target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if target <= now:
+                target = target + timedelta(days=1)
+            sleep_sec = (target - now).total_seconds()
+            await asyncio.sleep(sleep_sec)
+            await refresh_prior_close(state)
+            logger.info("Daily prior-close refresh fired at %s", datetime.now(chi).strftime("%I:%M%p CT"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("daily_prior_close_refresher iteration failed")
+            await asyncio.sleep(60)  # back off a minute before retrying
+
+
 def spawn_data_loops(state: AppState) -> None:
     """(Re-)spawn the per-symbol data loops. Called on startup and whenever
     the active symbol is changed via /config/symbol so the loops pick up
@@ -185,9 +345,15 @@ def spawn_data_loops(state: AppState) -> None:
     state.runner_protect_task = asyncio.create_task(
         runner_protector_loop(state), name="runner-protector-loop"
     )
-    from fef_sidecar.engine.spx_target_watcher import spx_target_watcher_loop
+    from fef_sidecar.engine.spx_target_watcher import (
+        spx_stop_tick_watcher_loop,
+        spx_target_watcher_loop,
+    )
     state.spx_target_task = asyncio.create_task(
         spx_target_watcher_loop(state), name="spx-target-watcher-loop"
+    )
+    state.spx_stop_tick_task = asyncio.create_task(
+        spx_stop_tick_watcher_loop(state), name="spx-stop-tick-watcher"
     )
     from fef_sidecar.engine.spread_exit_watcher import spread_exit_watcher_loop
     state.spread_exit_task = asyncio.create_task(
@@ -252,7 +418,13 @@ async def lifespan(app: FastAPI):
     if auto_loops:
         spawn_data_loops(state)
         asyncio.create_task(refresh_prior_close(state), name="refresh-prior-close")
+        asyncio.create_task(daily_prior_close_refresher(state), name="daily-prior-close-refresher")
         asyncio.create_task(backfill_regime_from_db(state), name="backfill-regime")
+        asyncio.create_task(_load_ml_inference(state), name="load-ml-inference")
+        asyncio.create_task(daily_session_audit_runner(state), name="daily-session-audit-runner")
+        asyncio.create_task(_startup_audit_catchup(state), name="startup-audit-catchup")
+        from fef_sidecar.engine.signal_lookahead import lookahead_worker
+        asyncio.create_task(lookahead_worker(state), name="signal-lookahead-worker")
 
         # Position reconciliation on startup — detects orphans (IBKR has,
         # DB doesn't) and phantoms (DB has, IBKR doesn't). Critical for
