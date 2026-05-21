@@ -78,6 +78,14 @@ class ExitVariant:
             close drops to (peak_r - trail_pullback_r). In R-units.
         timeout_minutes: total forward window for the walk. Residual at
             the last bar exits at its close.
+        regime_routes: optional regime → variant_label mapping. When set,
+            this variant becomes a *meta-variant*: for each parent,
+            look up the parent's regime_at_fire and dispatch to the routed
+            leaf variant. The leaf's stop/targets/trail fields are used —
+            this variant's own fields are ignored. Use default_route for
+            regimes not in the dict.
+        default_route: fallback variant_label when regime is missing or
+            not present in regime_routes. Required if regime_routes set.
     """
     label: str
     stop_r: float = -1.0
@@ -85,6 +93,12 @@ class ExitVariant:
     trail_peak_floor_r: float | None = None
     trail_pullback_r: float | None = None
     timeout_minutes: int = 60
+    regime_routes: dict[str, str] | None = None
+    default_route: str | None = None
+
+    @property
+    def is_meta(self) -> bool:
+        return self.regime_routes is not None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -113,7 +127,28 @@ REGISTERED_VARIANTS: list[ExitVariant] = [
         trail_peak_floor_r=0.3,
         trail_pullback_r=0.15,
     ),
+    ExitVariant(
+        # Regime-conditional B+C+D — added 2026-05-21 per Chat's
+        # recommendation after the shadow replay surfaced the
+        # trending-vs-chop split (B+C+D costs $5k on 5/19's trend day,
+        # saves $32k on 5/20+5/21 chop/red days).
+        # Routes:
+        #   TREND_DAY / DRIFT_BULL → baseline (timeouts ride the trend)
+        #   everything else        → bcd_trail_15pct (trail saves stops)
+        # All fields below (stop_r, targets, ...) are IGNORED — the
+        # routed leaf variant's params are used at simulate time.
+        label="bcd_only_in_chop",
+        regime_routes={
+            "TREND_DAY": "baseline_partial_50_30_20",
+            "DRIFT_BULL": "baseline_partial_50_30_20",
+        },
+        default_route="bcd_trail_15pct",
+    ),
 ]
+
+
+def _variant_by_label(label: str) -> ExitVariant | None:
+    return next((v for v in REGISTERED_VARIANTS if v.label == label), None)
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +338,47 @@ def run_replay(
         hi = bisect.bisect_right(bar_ms_sorted, end_ms)
         return [bar_by_ms[m] for m in bar_ms_sorted[lo:hi]]
 
+    # Build parent_id → regime_at_fire lookup. Match each parent to the
+    # closest signal_iter row in the 5-minute window preceding its
+    # submitted_at; parse extras JSON for regime_at_fire. Used by
+    # meta-variants (regime_routes) — leaf variants ignore it.
+    parent_regimes: dict[int, str] = {}
+    if any(v.is_meta for v in variants) and parents:
+        parent_ids = [p["id"] for p in parents]
+        sig_rows = cur.execute(
+            f"""
+            SELECT id, timestamp, extras, session_date
+            FROM signal_iter
+            WHERE session_date BETWEEN ? AND ?
+            ORDER BY timestamp
+            """,
+            (date_from, date_to),
+        ).fetchall()
+        sigs_by_session: dict[str, list[tuple[int, str]]] = defaultdict(list)
+        for s in sig_rows:
+            sigs_by_session[s["session_date"]].append((s["timestamp"], s["extras"]))
+        for p in parents:
+            parent_ms = _ts_to_ms(p["submitted_at"])
+            session_date = p["submitted_at"][:10]
+            best_regime = "UNKNOWN"
+            best_diff = 5 * 60 * 1000  # 5min window
+            for sig_ts, sig_extras in sigs_by_session.get(session_date, []):
+                sig_ms = _ts_to_ms(sig_ts)
+                diff = parent_ms - sig_ms
+                if 0 <= diff <= best_diff:
+                    best_diff = diff
+                    try:
+                        ex = json.loads(sig_extras) if sig_extras else {}
+                        regime = (
+                            ex.get("regime_at_fire")
+                            or (ex.get("regime_demoted") or {}).get("regime")
+                            or "NORMAL"
+                        )
+                        best_regime = regime
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+            parent_regimes[p["id"]] = best_regime
+
     rows: list[dict] = []
     for p in parents:
         entry_spx = float(p["entry_spx_price"])
@@ -313,13 +389,32 @@ def run_replay(
         session_date = p["submitted_at"][:10]
 
         for v in variants:
-            end_ms = entry_ms + v.timeout_minutes * 60 * 1000
+            # Resolve meta-variants to a leaf variant for this parent's
+            # regime. Leaf variants simulate directly.
+            if v.is_meta:
+                regime = parent_regimes.get(p["id"], "UNKNOWN")
+                routed_label = (v.regime_routes or {}).get(regime, v.default_route)
+                leaf = _variant_by_label(routed_label) if routed_label else None
+                if leaf is None or leaf.is_meta:
+                    # Skip — misconfigured meta-variant; persist nothing.
+                    continue
+                sim_variant = leaf
+                params_snapshot = {
+                    "meta": v.to_dict(),
+                    "resolved_regime": regime,
+                    "resolved_leaf": leaf.to_dict(),
+                }
+            else:
+                sim_variant = v
+                params_snapshot = v.to_dict()
+
+            end_ms = entry_ms + sim_variant.timeout_minutes * 60 * 1000
             fwd = bars_in_window(entry_ms, end_ms)
-            out = simulate_variant(entry_spx, direction_sign, fwd, v)
+            out = simulate_variant(entry_spx, direction_sign, fwd, sim_variant)
             rows.append({
                 "parent_order_id": p["id"],
-                "variant_label": v.label,
-                "variant_params": v.to_dict(),
+                "variant_label": v.label,  # meta label kept for grouping
+                "variant_params": params_snapshot,
                 "session_date": session_date,
                 "entry_spx": entry_spx,
                 "direction": direction,
