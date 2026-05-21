@@ -16,9 +16,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime
+
+
+def _is_nan(x) -> bool:
+    try:
+        return math.isnan(float(x))
+    except (TypeError, ValueError):
+        return True
 
 from fef_sidecar.ibkr.models import AccountSummary, Bar, Contract, ContractKind, OptionQuote, Quote
 
@@ -239,20 +247,42 @@ class LiveIBKRProvider:
             self._ib.cancelHistoricalData(bars)
 
     async def get_prior_close(self, contract: Contract) -> float | None:
-        """Fetch yesterday's daily close via reqHistoricalData('2 D', '1 day').
+        """Return the prior session's reference close.
 
-        Returns the close of the most-recent COMPLETED daily bar — i.e. the
-        bar whose date is strictly before today. Today's partial bar (if any)
-        is filtered out so the % change reflects 'change since prior close',
-        not 'change since today's open'.
+        For FUTURES: pulls `ticker.close` from a live reqMktData snapshot.
+        That field is the prior daily SETTLEMENT (CME official settle for
+        ES/NQ/RTY) — exactly what IBKR's quote panel uses to compute the
+        day-change %. The historical daily bar close drifts from this by a
+        few ticks because the bar boundary is the 5pm CT new-session start,
+        not the 3pm CT settlement.
+
+        For CASH (stocks/indices): also prefer `ticker.close` (yesterday's
+        official close), with a reqHistoricalData('2 D', '1 day') fallback
+        if the market-data tick hasn't arrived yet.
         """
-        from datetime import date as _date
+        from fef_sidecar.ibkr.models import ContractKind
         await self._ensure_connected()
         assert self._ib is not None
 
         ib_contract = _to_ib_contract(contract)
         await self._ib.qualifyContractsAsync(ib_contract)
 
+        ticker = self._ib.reqMktData(ib_contract, "", False, False)
+        try:
+            for _ in range(20):  # up to ~2s for the CLOSE tick to arrive
+                await asyncio.sleep(0.1)
+                close = getattr(ticker, "close", None)
+                if close and float(close) > 0 and not _is_nan(close):
+                    return float(close)
+        finally:
+            try:
+                self._ib.cancelMktData(ib_contract)
+            except Exception:
+                pass
+
+        # Fallback: historical daily bar (used to be the primary path).
+        is_future = contract.kind == ContractKind.FUTURE
+        use_rth = not is_future
         try:
             bars = await asyncio.wait_for(
                 self._ib.reqHistoricalDataAsync(
@@ -261,7 +291,7 @@ class LiveIBKRProvider:
                     durationStr="3 D",
                     barSizeSetting="1 day",
                     whatToShow="TRADES",
-                    useRTH=True,
+                    useRTH=use_rth,
                     formatDate=2,
                     keepUpToDate=False,
                 ),
@@ -272,19 +302,27 @@ class LiveIBKRProvider:
 
         if not bars:
             return None
-
-        today = _date.today()
         for b in reversed(bars):
-            bar_date = b.date if isinstance(b.date, _date) else None
-            if bar_date is not None and bar_date < today and float(b.close) > 0:
+            if float(b.close) > 0:
                 return float(b.close)
-            if bar_date is None and float(b.close) > 0:
-                return float(b.close)
-        return float(bars[-1].close) if float(bars[-1].close) > 0 else None
+        return None
 
     async def get_last_quote(self, contract: Contract) -> Quote:
         await self._ensure_connected()
         assert self._ib is not None
+
+        # Enable delayed market data — required for accounts without
+        # live VIX/SPX subscriptions (paper accounts are the main case).
+        # Without this, reqMktData on an unsubscribed index returns NaN
+        # for last/close and vix_poll_loop silently skips state.last_vix
+        # updates (the symptom: TopBar "VIX —" forever after restart).
+        # Idempotent: same flag the option-quote path uses.
+        if not getattr(self, "_market_data_type_set", False):
+            try:
+                self._ib.reqMarketDataType(3)  # 3 = delayed (free)
+                self._market_data_type_set = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
         ib_contract = _to_ib_contract(contract)
         await self._ib.qualifyContractsAsync(ib_contract)
@@ -294,13 +332,29 @@ class LiveIBKRProvider:
         await asyncio.sleep(1.5)
         self._ib.cancelMktData(ib_contract)
 
+        # Multi-level fallback on `last`. After-hours or for indices like
+        # VIX where ticker.last can be NaN, fall back to close, then to
+        # bid/ask mid. NaN check via the `x == x` idiom (NaN != NaN).
+        def _good(v) -> bool:
+            try:
+                return v is not None and v == v and float(v) > 0
+            except (TypeError, ValueError):
+                return False
+        last_val: float | None = None
+        if _good(ticker.last):
+            last_val = float(ticker.last)
+        elif _good(ticker.close):
+            last_val = float(ticker.close)
+        elif _good(ticker.bid) and _good(ticker.ask):
+            last_val = (float(ticker.bid) + float(ticker.ask)) / 2
+
         return Quote(
             timestamp=datetime.now(),
-            last=float(ticker.last) if ticker.last else float(ticker.close or 0),
-            bid=float(ticker.bid) if ticker.bid else None,
-            ask=float(ticker.ask) if ticker.ask else None,
-            bid_size=float(ticker.bidSize) if ticker.bidSize else None,
-            ask_size=float(ticker.askSize) if ticker.askSize else None,
+            last=float(last_val) if last_val is not None else 0.0,
+            bid=float(ticker.bid) if _good(ticker.bid) else None,
+            ask=float(ticker.ask) if _good(ticker.ask) else None,
+            bid_size=float(ticker.bidSize) if _good(ticker.bidSize) else None,
+            ask_size=float(ticker.askSize) if _good(ticker.askSize) else None,
         )
 
     async def get_option_quote(self, contract: Contract) -> OptionQuote:
@@ -407,6 +461,16 @@ class LiveIBKRProvider:
             if ticker.modelGreeks and ticker.modelGreeks.gamma is not None
             else None
         )
+        vega = (
+            float(ticker.modelGreeks.vega)
+            if ticker.modelGreeks and ticker.modelGreeks.vega is not None
+            else None
+        )
+        theta = (
+            float(ticker.modelGreeks.theta)
+            if ticker.modelGreeks and ticker.modelGreeks.theta is not None
+            else None
+        )
         iv = (
             float(ticker.modelGreeks.impliedVol)
             if ticker.modelGreeks and ticker.modelGreeks.impliedVol is not None
@@ -428,6 +492,8 @@ class LiveIBKRProvider:
             ask=ask,
             delta=delta,
             gamma=gamma,
+            vega=vega,
+            theta=theta,
             iv=iv,
             underlying_price=underlying,
         )
