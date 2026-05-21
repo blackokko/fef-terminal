@@ -211,6 +211,7 @@ def run_ablation(
 
         results.append({
             "sid": sid, "date": s["session_date"], "dir": s["direction"],
+            "timestamp_ms": sig_ms,
             "regime": _regime_from_extras(s["extras"]),
             "entry_spx": entry_spx, "spx_30m_change": round(spx_30m_change, 2),
             "baseline_r": baseline_r,
@@ -250,6 +251,13 @@ def run_ablation(
     aggregates_by_regime = {name: summary(results, key, group_key="regime")
                             for name, key in variants}
 
+    # Methodology stats (DSR + purged K-fold + PBO) — added 2026-05-21 per
+    # Claude Chat's institutional-methodology gap analysis. DSR discounts
+    # the winning variant's apparent Sharpe for the selection-bias of
+    # having tested N variants. K-fold + PBO check whether the winner's
+    # edge survives across multiple time slices.
+    methodology_stats = _methodology_stats(results, variants)
+
     return {
         "date_from": date_from,
         "date_to": date_to,
@@ -258,7 +266,71 @@ def run_ablation(
         "bcd_exit_reasons": dict(Counter(r["bcd_reason"] for r in results)),
         "aggregates": aggregates,
         "aggregates_by_regime": aggregates_by_regime,
+        "methodology_stats": methodology_stats,
         "trades": results,
+    }
+
+
+def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> dict:
+    """Compute DSR + per-fold Sharpe + PBO across the ablation variants.
+    Returns a dict ready to format in the markdown report."""
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).parent))
+    from _stats import (
+        deflated_sharpe_ratio,
+        kfold_sharpes,
+        probability_of_backtest_overfitting,
+        sharpe_ratio,
+    )
+
+    # Order results by timestamp for chronological splitting
+    sorted_results = sorted(results, key=lambda r: r["timestamp_ms"])
+    timestamps = [r["timestamp_ms"] for r in sorted_results]
+
+    per_variant: dict[str, dict] = {}
+    per_variant_per_fold: dict[str, list[float | None]] = {}
+    for name, key in variants:
+        returns = [r[key] for r in sorted_results]
+        per_variant[name] = {
+            "sharpe": sharpe_ratio(returns),
+            "n_trades": sum(1 for x in returns if abs(x) > 1e-9),
+            "sum_r": sum(returns),
+        }
+        per_variant_per_fold[name] = kfold_sharpes(returns, timestamps, k=6)
+
+    # Pick the winning variant by total R (matches headline P/L)
+    winner_name = max(variants, key=lambda v: per_variant[v[0]]["sum_r"])[0]
+    winner_key = dict(variants)[winner_name]
+    winner_returns = [r[winner_key] for r in sorted_results]
+    # Variance of the per-variant SRs across the N trials, for the DSR's
+    # null-threshold computation. Tighter than the conservative default of 1.0.
+    trial_srs = [v["sharpe"] for v in per_variant.values() if v["sharpe"] is not None]
+    if len(trial_srs) >= 2:
+        m = sum(trial_srs) / len(trial_srs)
+        var_sr = sum((s - m) ** 2 for s in trial_srs) / (len(trial_srs) - 1)
+    else:
+        var_sr = 1.0
+
+    # DSR at N_trials = N_variants (default) and at a more honest larger N
+    # to show how the metric tightens as you account for more comparisons.
+    dsr_4 = deflated_sharpe_ratio(winner_returns, n_trials=len(variants),
+                                  variance_of_sr_trials=var_sr)
+    dsr_honest = deflated_sharpe_ratio(winner_returns, n_trials=20,
+                                       variance_of_sr_trials=var_sr)
+
+    pbo = probability_of_backtest_overfitting(per_variant_per_fold)
+
+    return {
+        "per_variant_sharpe": per_variant,
+        "per_variant_per_fold_sharpes": {
+            name: [round(s, 3) if s is not None else None for s in folds]
+            for name, folds in per_variant_per_fold.items()
+        },
+        "winner": winner_name,
+        "dsr_at_n_variants": dsr_4,
+        "dsr_at_20_trials": dsr_honest,
+        "pbo": pbo,
     }
 
 
@@ -326,6 +398,73 @@ def format_report(result: dict, dollars_per_r: float = DOLLARS_PER_R) -> str:
                     lines.append(
                         f"| {name} | {regime} | {v['n']} | {v['sum_r']:+.2f} | {wr:.1f}% | {avg:+.3f} |"
                     )
+
+    # Methodology stats — DSR + purged K-fold Sharpe + PBO. The honest
+    # answer to "is the apparent winner real edge or selection bias?"
+    ms = result.get("methodology_stats") or {}
+    if ms:
+        lines.append("")
+        lines.append("### Methodology stats (DSR + purged K-fold + PBO)")
+        lines.append("")
+        lines.append(
+            "Tools from López de Prado's *Advances in Financial Machine Learning*. "
+            "**DSR** = Deflated Sharpe Ratio: probability the winner's edge is real "
+            "(not selection bias from testing N variants). **K-fold Sharpe** = "
+            "per-variant Sharpe in each chronological fold (purged with 60-min "
+            "embargo to prevent label leakage). **PBO** = Probability of Backtest "
+            "Overfitting (Bailey & López de Prado 2014): fraction of cross-period "
+            "pairs where the best-on-period-A variant ranks in the bottom half "
+            "on period B. PBO close to 0 = winners survive cross-period; PBO ≥ 0.5 "
+            "= apparent winners don't generalize."
+        )
+        lines.append("")
+        winner = ms.get("winner")
+        dsr4 = ms.get("dsr_at_n_variants") or {}
+        dsr20 = ms.get("dsr_at_20_trials") or {}
+        pbo = ms.get("pbo") or {}
+        lines.append(f"- **Winning variant**: `{winner}`")
+        if dsr4:
+            lines.append(
+                f"- **DSR @ N_trials={dsr4.get('n_trials', '?')}** "
+                f"(this ablation only): `{dsr4.get('deflated_sharpe_prob', 'n/a')}`  "
+                f"(observed SR={dsr4.get('observed_sharpe', '?')}, "
+                f"null threshold={dsr4.get('sr_zero_threshold', '?')})"
+            )
+        if dsr20:
+            lines.append(
+                f"- **DSR @ N_trials=20** (honest count including adjacent "
+                f"analyses): `{dsr20.get('deflated_sharpe_prob', 'n/a')}`"
+            )
+        if pbo and pbo.get("pbo") is not None:
+            interp = pbo.get("interpretation")
+            interp_text = interp[0] if isinstance(interp, tuple) else interp
+            lines.append(
+                f"- **PBO**: `{pbo['pbo']}` across "
+                f"{pbo.get('n_pairs_evaluated', '?')} cross-period pairs "
+                f"({pbo.get('k_folds', '?')} folds × {pbo.get('n_variants', '?')} variants) "
+                f"— {interp_text}"
+            )
+        lines.append("")
+        lines.append("#### Per-variant per-fold Sharpe (chronological, purged 60-min embargo)")
+        lines.append("")
+        per_fold = ms.get("per_variant_per_fold_sharpes") or {}
+        if per_fold:
+            n_folds = max((len(v) for v in per_fold.values()), default=0)
+            header = ["Variant"] + [f"Fold {i+1}" for i in range(n_folds)]
+            lines.append("| " + " | ".join(header) + " |")
+            lines.append("|---|" + "|".join(["---:"] * n_folds) + "|")
+            for vname, folds in per_fold.items():
+                cells = [vname]
+                for s in folds:
+                    cells.append(f"{s:+.3f}" if s is not None else "—")
+                lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+        lines.append(
+            "_DSR < 0.5 = apparent edge is probably selection bias. "
+            "DSR > 0.95 = passes formal hypothesis test as real edge. "
+            "K-fold Sharpes that consistently agree on sign = stable variant; "
+            "wildly varying signs = noise-fit._"
+        )
     return "\n".join(lines)
 
 
@@ -343,6 +482,11 @@ def main() -> int:
 
     accept = _parse_account_class_arg(args.account_class)
     result = run_ablation(args.date_from, args.date_to, args.db, accept)
+    # Windows cp1252 stdout chokes on extended chars in the markdown.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
     if args.json:
         # Drop the per-trade list for stdout JSON brevity unless asked
         print(json.dumps({k: v for k, v in result.items() if k != "trades"}, indent=2, default=str))
