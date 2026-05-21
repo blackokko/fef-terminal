@@ -439,9 +439,21 @@ async def compute_daily_review(session_date: str) -> DailyReview:
     #     SPX-target partial-flag estimator (rough, but signed-correctly
     #     per parent). Replaces the status-only ±1R math that mislabeled
     #     50/30/20 scale-outs as full losses when the residual stopped.
-    # Per-parent dollar-accurate R requires parent->bracket-child fill
-    # attribution which needs parent_id linkage on the bracket children
-    # (not currently persisted). Follow-up in DEFERRED_CHANGES.
+    #
+    # PAIR-OFF method (2026-05-21 fix): the naive sum (SLD − BOT) × 100
+    # treats open buys as realized losses, overstating the session's red
+    # number by the cost basis of any positions still open at compute
+    # time. On 5/21 the naive sum showed −$5,445 while IBKR pill showed
+    # ≈−$4,800 — the gap was the $1,310 cost basis of 3 still-open
+    # SPX 7440C contracts. Correct method:
+    #   For each (symbol, strike, right) contract:
+    #     paired_qty = min(bot_qty, sld_qty)   # closed leg
+    #     realized   = (avg_sld − avg_bot) × paired_qty × 100
+    #     open_qty   = bot_qty − sld_qty       # still long (positive)
+    #     open_cost  = avg_bot × open_qty × 100  # exposure, not a loss
+    # Session realized = SUM(realized across contracts). Unrealized P/L
+    # on open positions belongs to the next session's compute_daily_review.
+    # /diag/session_pnl_estimate already uses this method (api.py:3083-3115).
     import os as _os
     from fef_sidecar.db.models import IBKRExecution
     R_DOLLARS = float(_os.environ.get("FEF_R_DOLLARS", "400"))
@@ -449,11 +461,32 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         execs = list((await _session2.exec(
             select(IBKRExecution).where(IBKRExecution.session_date == session_date)
         )).all())
-    realized_dollars = sum(
-        float(e.shares or 0) * float(e.price or 0) * 100
-        * (1 if (e.side or "").upper() == "SLD" else -1)
-        for e in execs
-    )
+    # Group by contract for pair-off
+    by_contract: dict[tuple, dict[str, float]] = {}
+    for e in execs:
+        key = (e.symbol, float(e.strike or 0), e.right, e.expiry)
+        slot = by_contract.setdefault(key, {"bot_v": 0.0, "sld_v": 0.0, "bot_q": 0.0, "sld_q": 0.0})
+        side = (e.side or "").upper()
+        if side == "BOT":
+            slot["bot_v"] += float(e.shares or 0) * float(e.price or 0)
+            slot["bot_q"] += float(e.shares or 0)
+        elif side == "SLD":
+            slot["sld_v"] += float(e.shares or 0) * float(e.price or 0)
+            slot["sld_q"] += float(e.shares or 0)
+    realized_dollars = 0.0
+    open_cost_dollars = 0.0  # exposure on positions still long at EOD
+    for slot in by_contract.values():
+        bot_q, sld_q = slot["bot_q"], slot["sld_q"]
+        if bot_q == 0 and sld_q == 0:
+            continue
+        paired = min(bot_q, sld_q)
+        open_q = bot_q - sld_q
+        avg_bot = slot["bot_v"] / bot_q if bot_q > 0 else 0.0
+        avg_sld = slot["sld_v"] / sld_q if sld_q > 0 else 0.0
+        if paired > 0:
+            realized_dollars += (avg_sld - avg_bot) * paired * 100
+        if open_q > 0:
+            open_cost_dollars += avg_bot * open_q * 100
     actual_trades = len(live_parents)
     actual_total_R = round(realized_dollars / R_DOLLARS, 2) if R_DOLLARS > 0 else 0.0
     actual_wins = 0
