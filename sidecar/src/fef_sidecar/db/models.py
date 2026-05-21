@@ -84,6 +84,9 @@ class SignalIter(SQLModel, table=True):
     # NULL on rows created before this column existed.
     provider_mode: str | None = Field(default=None, index=True)
 
+    # Engine version tag — v1 rows backfilled as 1, v2+ rows default to 2.
+    engine_version: int = Field(default=2)
+
 
 class TradeTicket(SQLModel, table=True):
     """Order ticket generated from an actionable FEF signal.
@@ -467,6 +470,8 @@ class LiveOrder(SQLModel, table=True):
 
     # If DRY_RUN, we wrote the row but never submitted to IBKR
     dry_run: bool = Field(default=True)
+
+    engine_version: int = Field(default=2)
 
     # Exit strategy this order was placed with: 'option_price' / 'spx_points' /
     # 'fixed_dollar' / 'spread_premium'. Watchers use this to decide how to

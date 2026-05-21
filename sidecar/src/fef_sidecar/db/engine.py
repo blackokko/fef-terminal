@@ -120,6 +120,9 @@ async def init_db() -> None:
             # $0; live accounts report real fees. NULL on pre-fix rows.
             ("ibkr_execution", "commission", "REAL"),
             ("ibkr_execution", "realized_pnl", "REAL"),
+            # Engine v2 version tag — existing rows backfill as 1 (v1)
+            ("signal_iter", "engine_version", "INTEGER DEFAULT 1"),
+            ("live_order", "engine_version", "INTEGER DEFAULT 1"),
             # SignalLookaheadOutcome — net-new table, created via create_all,
             # listed here as a marker so the migration log shows it.
         ]

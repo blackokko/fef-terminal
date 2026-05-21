@@ -84,9 +84,18 @@ def parse_net_drift(data: dict[str, Any]) -> DriftSummary:
     total_put = sum(e.put_dollars for e in entries)
     total_net = total_call - total_put
 
-    if total_net > 1_000_000:
+    # v2 fix (bug #2): the old absolute $1M threshold was arbitrary and
+    # tripped near-always given typical SPX 0DTE flow magnitudes, producing
+    # the structural ~88-100% BULLISH drift_bias bias. Switch to relative
+    # dominance — need one side to exceed the other by >=15% of total flow
+    # before declaring BULLISH/BEARISH. Self-scaling at any SPX notional.
+    DOMINANCE_RATIO = 0.15
+    total_abs = abs(total_call) + abs(total_put)
+    if total_abs <= 0:
+        bias = "NEUTRAL"
+    elif total_net > DOMINANCE_RATIO * total_abs:
         bias = "BULLISH"
-    elif total_net < -1_000_000:
+    elif total_net < -DOMINANCE_RATIO * total_abs:
         bias = "BEARISH"
     else:
         bias = "NEUTRAL"

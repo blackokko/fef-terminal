@@ -213,10 +213,11 @@ class RegimeDetector:
         prices = [s.spx_price for s in self._window]
         spx_range = max(prices) - min(prices)
         drift = latest.drift_cum_net_m
-        # Loosened wall-proximity threshold: 15pts catches the cases where SPX
-        # is "near" a major wall without being tick-tight against it
+        # v2 fix (bug #6): unify wall-proximity boundary with FEF engine.
+        # FEF uses `<= self._wall_proximity_pts` (inclusive); regime used
+        # `< 15` (hardcoded exclusive). Now `<= 15` inclusive, matching FEF.
         prox_count = sum(
-            1 for s in self._window if s.wall_proximity_pts is not None and s.wall_proximity_pts < 15
+            1 for s in self._window if s.wall_proximity_pts is not None and s.wall_proximity_pts <= 15
         )
         prox_pct = prox_count / n
         aligned_count = sum(1 for s in self._window if s.aligned)

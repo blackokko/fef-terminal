@@ -125,22 +125,41 @@ class FEFEngine:
         delta_price = current.spx_price - oldest.spx_price
         delta_drift_m = current.drift_cum_net_m - oldest.drift_cum_net_m
 
-        denom = max(abs(delta_price), 0.1)
+        # v2 fix (bug #1): the old `max(abs(delta_price), 0.1)` floor inflated
+        # fe_ratio whenever price barely moved — e.g. dp=0.05, dDrift=1M gave
+        # fe_ratio=10.0, triggering false-positive absorption flags structurally.
+        # Use an additive noise floor scaled by typical SPX 2-iter range
+        # (~1pt at 120s cadence × threshold_scale) so fe_ratio scales smoothly.
+        noise_floor_pts = 1.0 * self._threshold_scale
+        denom = abs(delta_price) + noise_floor_pts
         fe_ratio = abs(delta_drift_m) / denom
 
         same_sign = (
             (delta_price > 0 and delta_drift_m > 0)
             or (delta_price < 0 and delta_drift_m < 0)
         )
-        aligned = same_sign and abs(delta_price) >= 1.0 and abs(delta_drift_m) >= 1.0
+        # v2 fix (bug #5): scale the alignment thresholds by threshold_scale
+        # so non-default cadences (e.g. 60s at scale=0.5) don't require the
+        # same magnitude as 120s. The 1.0pt baseline applies at scale=1.0.
+        align_thresh_pts = 1.0 * self._threshold_scale
+        align_thresh_drift_m = 1.0 * self._threshold_scale
+        aligned = (
+            same_sign
+            and abs(delta_price) >= align_thresh_pts
+            and abs(delta_drift_m) >= align_thresh_drift_m
+        )
 
-        # Absorption: drift moved a lot but price didn't follow. Existing
-        # opposite-sign case stays. NEW: extreme FE >= 10 ALWAYS flags
-        # absorption regardless of sign — same-sign FE 10+ is the "drift
-        # being eaten by walls" case (today's 0/7 win rate at FE>=10).
+        # Absorption: drift moved a lot but price didn't follow.
+        # v2 fix: the extreme-FE clause uses a raw ratio (without the noise
+        # floor) so it remains reachable after the v2 denominator change.
+        # The primary clause uses the smoothed fe_ratio as before.
+        fe_ratio_raw = (
+            abs(delta_drift_m) / abs(delta_price) if abs(delta_price) > 0.01 else float("inf")
+        )
+        drift_floor_m = 3.0 * self._threshold_scale
         absorption = (
-            (fe_ratio >= self._absorption_fe_min and not same_sign and abs(delta_drift_m) >= 3.0)
-            or (fe_ratio >= 10.0 and abs(delta_drift_m) >= 5.0)
+            (fe_ratio >= self._absorption_fe_min and not same_sign and abs(delta_drift_m) >= drift_floor_m)
+            or (fe_ratio_raw >= 10.0 and abs(delta_drift_m) >= 5.0)
         )
 
         nearest_strike, nearest_dist = self._nearest_dominant_wall(current)

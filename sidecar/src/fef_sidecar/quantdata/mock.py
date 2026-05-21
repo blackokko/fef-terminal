@@ -125,12 +125,22 @@ class MockQuantDataClient:
         cum_call = sum(e.call_dollars for e in entries)
         cum_put = sum(e.put_dollars for e in entries)
         cum_net = cum_call - cum_put
+        _DOMINANCE_RATIO = 0.15
+        _total_abs = abs(cum_call) + abs(cum_put)
+        if _total_abs <= 0:
+            _bias = "NEUTRAL"
+        elif cum_net > _DOMINANCE_RATIO * _total_abs:
+            _bias = "BULLISH"
+        elif cum_net < -_DOMINANCE_RATIO * _total_abs:
+            _bias = "BEARISH"
+        else:
+            _bias = "NEUTRAL"
         return DriftSummary(
             entries=entries,
             cumulative_call_m=cum_call / 1_000_000,
             cumulative_put_m=cum_put / 1_000_000,
             cumulative_net_m=cum_net / 1_000_000,
-            bias="BULLISH" if cum_net > 1_000_000 else "BEARISH" if cum_net < -1_000_000 else "NEUTRAL",
+            bias=_bias,
         )
 
     async def get_max_pain(self) -> MaxPainSnapshot:
