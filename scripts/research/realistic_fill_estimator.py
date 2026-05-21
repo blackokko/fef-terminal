@@ -90,7 +90,14 @@ DEFAULT_DB = str(Path.home() / ".fef-terminal" / "signal_log.db")
 DOLLARS_PER_R = 400.0  # 5 contracts × $2000 risk per trade
 
 # v2 constants — see methodology block in module docstring
-COMMISSION_PER_FILL_PER_CONTRACT = 1.75   # $/share, per ibkr_execution row
+COMMISSION_PER_FILL_PER_CONTRACT = 1.29   # $/share, per ibkr_execution row
+# ^ derived empirically from user's TWS UI observation (3 contracts → $3.87).
+# Used ONLY as fallback when ibkr_execution.commission is NULL or 0.00 (paper-
+# mode TWS sends commission=0.0 via API even though the UI displays simulated
+# fees — confirmed 2026-05-21 via /admin/backfill_commissions returning $0 on
+# all 38 paper fills despite TWS showing $3.87 for one of them). When the
+# user trades live, real commission values flow through CommissionReport and
+# we read those instead.
 PREMIUM_AT_RISK_FRACTION = 0.5            # heuristic: ~50% of entry premium = R
 UNREALIZED_DELTA_PROXY = 0.4              # heuristic: deep-OTM 0DTE near close
 SIGNAL_TO_PARENT_MATCH_WINDOW_S = 30      # secs between signal.timestamp and parent.submitted_at
@@ -627,7 +634,8 @@ def run_realistic_fill_estimator(
     for date in _date_range(date_from, date_to):
         execs = cur.execute(
             """
-            SELECT symbol, strike, right, expiry, side, shares, price, ib_order_id
+            SELECT symbol, strike, right, expiry, side, shares, price, ib_order_id,
+                   commission, account
             FROM ibkr_execution
             WHERE session_date = ?
             ORDER BY timestamp
@@ -636,6 +644,7 @@ def run_realistic_fill_estimator(
         ).fetchall()
         by_contract: dict[tuple, dict[str, float]] = {}
         commission_dollars = 0.0
+        commission_source = {"real_api": 0, "estimated": 0}
         n_fills = 0
         total_shares_filled = 0.0
         for e in execs:
@@ -652,8 +661,20 @@ def run_realistic_fill_estimator(
             elif side == "SLD":
                 slot["sld_v"] += sh * pr
                 slot["sld_q"] += sh
-            # Commissions: per spec, charge $1.75 × shares per execution row.
-            commission_dollars += sh * COMMISSION_PER_FILL_PER_CONTRACT
+            # Two-tier commission model:
+            #   1. If ibkr_execution.commission is non-zero (live account or
+            #      a paper account that does send via API), use the real value.
+            #   2. Otherwise fall back to the empirical estimate per contract.
+            # On paper accounts (DUM-prefix), commission column reads 0.00
+            # even though TWS UI shows simulated fees — that's the IBKR paper-
+            # mode API quirk. Estimate is closer to truth than $0 in that case.
+            real_comm = e["commission"]
+            if real_comm is not None and real_comm > 0:
+                commission_dollars += float(real_comm)
+                commission_source["real_api"] += 1
+            else:
+                commission_dollars += sh * COMMISSION_PER_FILL_PER_CONTRACT
+                commission_source["estimated"] += 1
             n_fills += 1
             total_shares_filled += sh
 
@@ -689,6 +710,8 @@ def run_realistic_fill_estimator(
             "realized_dollars": realized,
             "open_cost_dollars": open_cost,
             "commission_dollars": commission_dollars,
+            "commission_source_real_api": commission_source["real_api"],
+            "commission_source_estimated": commission_source["estimated"],
             "unrealized_dollars": unrealized,
             "spx_last": spx_last,
             "n_fills": n_fills,
@@ -1168,6 +1191,12 @@ def main() -> int:
         Path(args.out).write_text(body, encoding="utf-8")
         print(f"Wrote {args.out} ({len(body)} bytes)")
     else:
+        # Windows cp1252 stdout chokes on the U+2212 minus sign + other
+        # extended chars in the markdown. Reconfigure to utf-8 if available.
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
         print(body)
     return 0
 
