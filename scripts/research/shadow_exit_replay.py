@@ -95,6 +95,13 @@ class ExitVariant:
     timeout_minutes: int = 60
     regime_routes: dict[str, str] | None = None
     default_route: str | None = None
+    # Optional entry-side gate. None = always trade. When set, the
+    # variant evaluates the gate at parent entry time; if it blocks,
+    # the row is persisted with realized_r=0 (representing "would have
+    # skipped this fire"). Composes cleanly with any exit logic so we
+    # can isolate the entry filter as the only knob changed vs baseline.
+    # Supported kinds: 'direction_30m' (params: threshold_pts).
+    entry_filter: dict | None = None
 
     @property
     def is_meta(self) -> bool:
@@ -144,11 +151,101 @@ REGISTERED_VARIANTS: list[ExitVariant] = [
         },
         default_route="bcd_trail_15pct",
     ),
+    # Trail-pullback parameter sweep — registered 2026-05-21 per Chat's
+    # "register variants proactively so you have data by session 10" plan.
+    # Identical to bcd_trail_15pct except the pullback knob, so the 3-way
+    # comparison (10% / 15% / 25%) isolates the trail tightness as the
+    # only variable. Tests whether 15% is at a noise-influenced local
+    # optimum or actually the right pullback distance.
+    ExitVariant(
+        # Tighter trail — exits residual faster after MFE pullback.
+        # Hypothesis: helps on fast-reversal days like 5/21 where the
+        # current 15% lets too much MFE leak before triggering.
+        label="bcd_trail_10pct",
+        stop_r=-1.0,
+        targets=[(1.0, 1.0)],
+        trail_peak_floor_r=0.3,
+        trail_pullback_r=0.10,
+    ),
+    ExitVariant(
+        # Looser trail — lets winners run longer before pullback exit.
+        # Hypothesis: helps on trending days like 5/19 where the current
+        # 15% triggered too early on small intra-bar dips and missed
+        # subsequent runs (cost $5k vs baseline on that session).
+        label="bcd_trail_25pct",
+        stop_r=-1.0,
+        targets=[(1.0, 1.0)],
+        trail_peak_floor_r=0.3,
+        trail_pullback_r=0.25,
+    ),
+    # ----- Other deferred-change tests (added 2026-05-21) -----
+    # Each variant below differs from the current live baseline by
+    # exactly one knob, so the comparison isolates that knob's effect.
+    ExitVariant(
+        # Chat-suggested: pure trail, no hard T1 target. Tests whether
+        # the +1R hard exit is adding value or whether the trail alone
+        # is doing all the work. Same stop / trail config as
+        # bcd_trail_15pct but with targets=[] (no scale-out).
+        label="pure_trail_15pct",
+        stop_r=-1.0,
+        targets=[],
+        trail_peak_floor_r=0.3,
+        trail_pullback_r=0.15,
+    ),
+    ExitVariant(
+        # Chat-suggested: baseline structure with longer timeout window.
+        # Tests whether 60min is cutting trending-day residual too early.
+        label="baseline_timeout_90min",
+        stop_r=-1.0,
+        targets=[(1.0, 0.5), (2.0, 0.3), (3.0, 0.2)],
+        timeout_minutes=90,
+    ),
+    ExitVariant(
+        # Deferred change: direction filter at entry (the ablation
+        # variant we discussed but didn't ship). Filter logic identical
+        # to ablation_backtest's direction filter — block PUTS when 30m
+        # SPX > +3pt; block CALLS when 30m SPX < -3pt. Pairs with
+        # baseline exit so the filter is the only knob changed vs the
+        # current live logic (NOT mixed with B+C+D exit, per isolation
+        # requirement).
+        label="entry_dir_filter_then_baseline",
+        stop_r=-1.0,
+        targets=[(1.0, 0.5), (2.0, 0.3), (3.0, 0.2)],
+        entry_filter={"kind": "direction_30m", "params": {"threshold_pts": 3.0}},
+    ),
 ]
 
 
 def _variant_by_label(label: str) -> ExitVariant | None:
     return next((v for v in REGISTERED_VARIANTS if v.label == label), None)
+
+
+def _evaluate_entry_filter(
+    entry_filter: dict,
+    direction_sign: int,
+    prior_bars: list[dict],
+) -> tuple[bool, str]:
+    """Returns (passes, reason). `passes=False` means the trade is
+    blocked at entry and the variant's row should be persisted with
+    realized_r=0. Pure read-only — adding new filter kinds is just a
+    new elif branch here."""
+    kind = entry_filter.get("kind")
+    params = entry_filter.get("params") or {}
+    if kind == "direction_30m":
+        # Block PUTS when SPX moved up ≥ threshold pts over the prior
+        # 30 1-min bars; block CALLS when SPX moved down. Same logic as
+        # ablation_backtest's direction filter — moved into the shadow
+        # framework so we can isolate the filter's effect on real entries.
+        threshold = float(params.get("threshold_pts", 3.0))
+        if len(prior_bars) < 5:
+            return True, "no_prior_data"
+        spx_30m_change = prior_bars[-1]["close"] - prior_bars[0]["close"]
+        if direction_sign > 0 and spx_30m_change < -threshold:
+            return False, f"calls_blocked_spx_30m_{spx_30m_change:+.1f}pt"
+        if direction_sign < 0 and spx_30m_change > threshold:
+            return False, f"puts_blocked_spx_30m_{spx_30m_change:+.1f}pt"
+        return True, "passed"
+    return True, f"unknown_kind:{kind}"
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +435,11 @@ def run_replay(
         hi = bisect.bisect_right(bar_ms_sorted, end_ms)
         return [bar_by_ms[m] for m in bar_ms_sorted[lo:hi]]
 
+    def bars_before(ms: int, n: int) -> list[dict]:
+        """Up to n 1-min bars strictly prior to ms, in chronological order."""
+        idx = bisect.bisect_left(bar_ms_sorted, ms)
+        return [bar_by_ms[m] for m in bar_ms_sorted[max(0, idx - n):idx]]
+
     # Build parent_id → regime_at_fire lookup. Match each parent to the
     # closest signal_iter row in the 5-minute window preceding its
     # submitted_at; parse extras JSON for regime_at_fire. Used by
@@ -407,6 +509,38 @@ def run_replay(
             else:
                 sim_variant = v
                 params_snapshot = v.to_dict()
+
+            # Entry filter — gate evaluated before the bar walk. When the
+            # filter blocks the trade, persist realized_r=0 so portfolio
+            # aggregates correctly treat this as "did not trade." Filter
+            # is stored on the *meta or leaf* whichever exposed it; we
+            # check both so a meta-variant can specify a filter and route
+            # to leaf exit logic independently.
+            applicable_filter = v.entry_filter or sim_variant.entry_filter
+            if applicable_filter is not None:
+                prior_bars = bars_before(entry_ms, 30)
+                passes, filter_reason = _evaluate_entry_filter(
+                    applicable_filter, direction_sign, prior_bars
+                )
+                if not passes:
+                    rows.append({
+                        "parent_order_id": p["id"],
+                        "variant_label": v.label,
+                        "variant_params": {
+                            **params_snapshot,
+                            "entry_filter_eval": filter_reason,
+                        },
+                        "session_date": session_date,
+                        "entry_spx": entry_spx,
+                        "direction": direction,
+                        "qty": qty,
+                        "realized_r": 0.0,
+                        "exit_reason": f"blocked:{filter_reason}",
+                        "peak_r": 0.0,
+                        "exit_ms": None,
+                        "dollars": 0.0,
+                    })
+                    continue
 
             end_ms = entry_ms + sim_variant.timeout_minutes * 60 * 1000
             fwd = bars_in_window(entry_ms, end_ms)
