@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import JSON, Column
+from sqlalchemy import JSON, Column, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -681,6 +681,65 @@ class IBKRExecution(SQLModel, table=True):
     realized_pnl: float | None = None  # CommissionReport.realizedPNL when present
 
     captured_at: datetime = Field(default_factory=_utcnow)
+
+
+class ShadowExitOutcome(SQLModel, table=True):
+    """Per-live-order counterfactual outcome for a named exit-logic
+    variant. Multiple rows per parent — one per variant being tested.
+
+    Built 2026-05-21 post the ablation P1 finding that B+C+D was the
+    dominant post-freeze exit candidate (CI fragile but headline
+    +$6.3k on 5/19-5/21 paper). To validate live we need bar-walk-
+    measured outcomes on REAL entries, not just signal counterfactuals.
+    Populated by scripts/research/shadow_exit_replay.py post-session —
+    no live-engine code is touched.
+
+    Generalized in v1 (rather than hardcoding B+C+D + Baseline) so any
+    new exit variant (e.g., tighter trail pullback, alt partial shares,
+    timeout-driven exits) can be added by registering it in the variant
+    registry without a schema change. variant_params stores the config
+    snapshot for full reproducibility.
+
+    Methodology: bar-walk over forward SPX 1-min bars from entry_spx +
+    entry_ts. Stop-priority on ambiguous bars (matches the rest of the
+    research stack). 1R = 10pt SPX (FEF's standard 0DTE targeting).
+
+    Compare across variants: SELECT variant_label, SUM(realized_r) FROM
+    shadow_exit_outcome WHERE session_date BETWEEN ... GROUP BY variant_label.
+    """
+
+    __tablename__ = "shadow_exit_outcome"
+
+    id: int | None = Field(default=None, primary_key=True)
+    parent_order_id: int = Field(foreign_key="live_order.id", index=True)
+    variant_label: str = Field(index=True)
+    session_date: str = Field(index=True)
+    computed_at: datetime = Field(default_factory=_utcnow)
+
+    entry_spx: float
+    direction: str  # 'LONG_CALLS' or 'LONG_PUTS'
+    qty: int
+
+    # Variant config snapshot — full reproducibility without joining a
+    # separate registry table.
+    variant_params: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+
+    # Counterfactual outcome
+    realized_r: float = 0.0
+    exit_reason: str = ""  # 'stop' / 'targets' / 'trail' / 'timeout' / 'no_data'
+    peak_r: float = 0.0
+    exit_ms: int | None = None
+
+    # Actual outcome from live_order / IBKR (filled in by a separate
+    # backfill pass that pair-offs ibkr_execution rows). NULL when not
+    # yet computed or position still open.
+    actual_realized_pnl: float | None = None
+    actual_realized_r: float | None = None
+
+    __table_args__ = (
+        UniqueConstraint("parent_order_id", "variant_label",
+                         name="ux_shadow_exit_parent_variant"),
+    )
 
 
 class ShadowComparison(SQLModel, table=True):

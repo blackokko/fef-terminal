@@ -274,6 +274,29 @@ async def _backfill_live_order_fills_for(session_date: str) -> dict:
     return {"execs": len(execs), "updated": updated}
 
 
+async def _run_shadow_exit_replay(session_date: str) -> int:
+    """Invoke the shadow exit replay over today's session. Pure data
+    observation — never touches live engine code paths. Imports the
+    replay script lazily so a syntax break in the research code can't
+    crash the nightly chain."""
+    import sys as _sys
+    from pathlib import Path as _Path
+    research_dir = _Path(__file__).resolve().parents[3] / "scripts" / "research"
+    if str(research_dir) not in _sys.path:
+        _sys.path.insert(0, str(research_dir))
+    try:
+        from shadow_exit_replay import run_replay  # type: ignore
+    except ImportError:
+        logger.warning("shadow_exit_replay.py not importable from %s", research_dir)
+        return 0
+    # Run synchronously in a thread — the replay is a sqlite-bound CPU
+    # loop, not I/O bound, so no async wins available.
+    result = await asyncio.to_thread(
+        run_replay, session_date, session_date, persist=True
+    )
+    return int(result.get("n_outcome_rows", 0))
+
+
 async def _audit_data_integrity(session_date: str) -> dict:
     """Lightweight data-integrity audit for the given session. Logs any
     anomalies to audit_log so the user sees them in the morning before
@@ -377,6 +400,17 @@ async def nightly_scheduler(state) -> None:
                 await run_tuning_recommendations()
             except Exception:
                 logger.exception("Nightly: daily_review / tuning compute failed")
+
+            # 7. Shadow exit replay — compute counterfactual outcomes for
+            # every registered exit variant against today's live entries.
+            # Pure read-only-on-engine; writes to shadow_exit_outcome only.
+            # Lets us track what B+C+D / alternative exit logic WOULD have
+            # done on real entries without touching the live exit path.
+            try:
+                n = await _run_shadow_exit_replay(session_date)
+                logger.info("Nightly: shadow_exit_replay produced %d rows", n)
+            except Exception:
+                logger.exception("Nightly: shadow_exit_replay failed")
         except asyncio.CancelledError:
             raise
         except Exception:
