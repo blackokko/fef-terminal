@@ -338,6 +338,7 @@ def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> 
     from _stats import (
         cpcv_paths,
         deflated_sharpe_ratio,
+        get_ledger_variant_count,
         kfold_sharpes,
         probability_of_backtest_overfitting,
         sharpe_distribution_sequential,
@@ -372,11 +373,20 @@ def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> 
     else:
         var_sr = 1.0
 
-    # DSR at N_trials = N_variants (default) and at a more honest larger N
-    # to show how the metric tightens as you account for more comparisons.
+    # DSR at N_trials = N_variants (default) for the ablation-only count
+    # and at the honest N from the variant_ledger (every exit_logic
+    # variant ever registered across analyses). Per Claude Chat's
+    # multiple-testing discipline: hardcoding N_trials = 4 or 20
+    # underestimates the correction once the ledger has accumulated
+    # adjacent variants. Falls back to 20 if the ledger is unavailable.
+    ledger_counts = get_ledger_variant_count(family="exit_logic")
+    ledger_n_project = ledger_counts.get("in_project") or 20
+    ledger_n_family = ledger_counts.get("in_family") or len(variants)
     dsr_4 = deflated_sharpe_ratio(winner_returns, n_trials=len(variants),
                                   variance_of_sr_trials=var_sr)
-    dsr_honest = deflated_sharpe_ratio(winner_returns, n_trials=20,
+    dsr_honest = deflated_sharpe_ratio(winner_returns, n_trials=ledger_n_project,
+                                       variance_of_sr_trials=var_sr)
+    dsr_family = deflated_sharpe_ratio(winner_returns, n_trials=ledger_n_family,
                                        variance_of_sr_trials=var_sr)
 
     pbo = probability_of_backtest_overfitting(per_variant_per_fold)
@@ -412,8 +422,10 @@ def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> 
             for name, folds in per_variant_per_fold.items()
         },
         "winner": winner_name,
+        "ledger_counts": ledger_counts,
         "dsr_at_n_variants": dsr_4,
-        "dsr_at_20_trials": dsr_honest,
+        "dsr_at_ledger_family": dsr_family,
+        "dsr_at_ledger_project": dsr_honest,
         "pbo": pbo,
         "cpcv": cpcv_by_variant,
         "sequential_bootstrap": seq_boot,
@@ -507,7 +519,9 @@ def format_report(result: dict, dollars_per_r: float = DOLLARS_PER_R) -> str:
         lines.append("")
         winner = ms.get("winner")
         dsr4 = ms.get("dsr_at_n_variants") or {}
-        dsr20 = ms.get("dsr_at_20_trials") or {}
+        dsr_family = ms.get("dsr_at_ledger_family") or {}
+        dsr_project = ms.get("dsr_at_ledger_project") or {}
+        ledger_counts = ms.get("ledger_counts") or {}
         pbo = ms.get("pbo") or {}
         lines.append(f"- **Winning variant**: `{winner}`")
         if dsr4:
@@ -517,10 +531,23 @@ def format_report(result: dict, dollars_per_r: float = DOLLARS_PER_R) -> str:
                 f"(observed SR={dsr4.get('observed_sharpe', '?')}, "
                 f"null threshold={dsr4.get('sr_zero_threshold', '?')})"
             )
-        if dsr20:
+        if dsr_family:
+            family_n = dsr_family.get("n_trials", "?")
             lines.append(
-                f"- **DSR @ N_trials=20** (honest count including adjacent "
-                f"analyses): `{dsr20.get('deflated_sharpe_prob', 'n/a')}`"
+                f"- **DSR @ N_trials={family_n}** (ledger — `exit_logic` family count): "
+                f"`{dsr_family.get('deflated_sharpe_prob', 'n/a')}`"
+            )
+        if dsr_project:
+            project_n = dsr_project.get("n_trials", "?")
+            lines.append(
+                f"- **DSR @ N_trials={project_n}** (ledger — all variants in project): "
+                f"`{dsr_project.get('deflated_sharpe_prob', 'n/a')}`"
+            )
+        if ledger_counts:
+            lines.append(
+                f"- _Variant ledger counts: in_family=`{ledger_counts.get('in_family', '?')}`, "
+                f"in_project=`{ledger_counts.get('in_project', '?')}` "
+                f"(N_trials now honest re: multiple-testing per Chat)_"
             )
         if pbo and pbo.get("pbo") is not None:
             interp = pbo.get("interpretation")

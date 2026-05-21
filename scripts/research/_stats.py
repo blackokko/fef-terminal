@@ -17,10 +17,77 @@ from __future__ import annotations
 
 import math
 import random
+import sqlite3
 from itertools import combinations
+from pathlib import Path
 from typing import Callable, Sequence
 
 EULER_MASCHERONI = 0.5772156649015329
+
+
+def get_ledger_variant_count(
+    db_path: str | None = None,
+    family: str | None = None,
+    sub_family: str | None = None,
+    still_active_only: bool = True,
+) -> dict[str, int]:
+    """Query variant_ledger for honest N_trials inputs to DSR/PBO.
+
+    Per Chat's recommendation 2026-05-21: methodology stats must pull
+    variant counts from the ledger rather than hardcoding N_trials.
+    Hierarchical filtering enables sub-family corrections (strongest,
+    for parameter sweeps) and family-level corrections (cross-mechanism).
+
+    Returns a dict with multiple useful counts so a single query covers
+    the typical DSR-at-multiple-N_trials report pattern:
+        {
+            "matched": N matching the filter,
+            "in_family": N in same family (if family given),
+            "in_sub_family": N in same sub_family (if sub_family given),
+            "in_project": N across all variants,
+        }
+
+    Falls back to {"matched": 0, ...} if the ledger table doesn't exist
+    or is empty so callers can use a conservative fallback N_trials.
+    """
+    if db_path is None:
+        db_path = str(Path.home() / ".fef-terminal" / "signal_log.db")
+    out = {"matched": 0, "in_family": 0, "in_sub_family": 0, "in_project": 0}
+    try:
+        db = sqlite3.connect(db_path)
+        cur = db.cursor()
+
+        def _count(conds: list[str], args: tuple) -> int:
+            where = "WHERE " + " AND ".join(conds) if conds else ""
+            row = cur.execute(
+                f"SELECT COUNT(*) FROM variant_ledger {where}", args
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+        base = ["still_active = 1"] if still_active_only else []
+        out["in_project"] = _count(base, ())
+
+        if family:
+            conds = [*base, "family = ?"]
+            out["in_family"] = _count(conds, (family,))
+            if sub_family:
+                conds.append("sub_family = ?")
+                out["matched"] = out["in_sub_family"] = _count(
+                    conds, (family, sub_family)
+                )
+            else:
+                out["matched"] = out["in_family"]
+        elif sub_family:
+            conds = [*base, "sub_family = ?"]
+            out["matched"] = out["in_sub_family"] = _count(conds, (sub_family,))
+        else:
+            out["matched"] = out["in_project"]
+        db.close()
+    except sqlite3.OperationalError:
+        # Ledger not yet present (fresh install) — caller should fall
+        # back to a hardcoded N_trials.
+        pass
+    return out
 
 
 def sharpe_ratio(returns: Sequence[float], annualize: float | None = None) -> float | None:
