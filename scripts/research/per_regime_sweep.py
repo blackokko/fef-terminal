@@ -48,7 +48,29 @@ LOOKAHEAD_ITERS = 3
 MIN_ITERS_FOR_SWEEP = 30  # below this the sweep is too noisy to trust
 
 
-def _load_iters_by_regime(date_from: str, date_to: str, db_path: str) -> dict[str, list[dict]]:
+def _parse_account_class_arg(raw: str) -> set[str]:
+    if not raw:
+        return {"paper"}
+    raw = raw.strip().lower()
+    if raw == "all":
+        return {"paper", "live", "mock", "unknown"}
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def _passes_account_filter(extras_dict: dict, accept: set[str]) -> bool:
+    cls = (extras_dict.get("account_class") or "unknown") if isinstance(extras_dict, dict) else "unknown"
+    if cls in accept:
+        return True
+    if cls == "unknown" and "paper" in accept:
+        return True
+    return False
+
+
+def _load_iters_by_regime(
+    date_from: str, date_to: str, db_path: str,
+    accept_classes: set[str] | None = None,
+) -> dict[str, list[dict]]:
+    accept = accept_classes or {"paper"}
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
     cur = db.cursor()
@@ -82,6 +104,9 @@ def _load_iters_by_regime(date_from: str, date_to: str, db_path: str) -> dict[st
             ex = json.loads(r["extras"]) if r["extras"] else {}
         except (TypeError, json.JSONDecodeError):
             ex = {}
+        # Account-class filter (default paper; treat unknown as paper)
+        if not _passes_account_filter(ex, accept):
+            continue
         # Prefer regime_at_fire; fall back to regime_demoted.regime if present,
         # else NORMAL — same precedence as daily_review.compute_daily_review.
         regime = ex.get("regime_at_fire") or (
@@ -157,10 +182,14 @@ def main() -> int:
     ap.add_argument("date_from")
     ap.add_argument("date_to")
     ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--account-class", default="paper",
+                    help="Filter by extras.account_class. 'paper' (default), 'live', 'mock', "
+                         "'unknown', 'all', or comma-separated.")
     ap.add_argument("--out", help="markdown report path (defaults to stdout)")
     args = ap.parse_args()
 
-    by_regime = _load_iters_by_regime(args.date_from, args.date_to, args.db)
+    accept = _parse_account_class_arg(args.account_class)
+    by_regime = _load_iters_by_regime(args.date_from, args.date_to, args.db, accept)
     if not by_regime:
         print("No signal_iter rows in window", file=sys.stderr)
         return 1

@@ -113,9 +113,37 @@ def _bucket_for(direction: str, hit_t1: bool, hit_stop: bool) -> str:
     return f"{side}_NEUTRAL"
 
 
-def _load_fired_with_outcomes(cur: sqlite3.Cursor, date_from: str, date_to: str) -> list[dict]:
+def _row_account_class(d: dict) -> str:
+    """Read account_class from extras (added 2026-05-21 commit 2e2f795).
+    Falls back to 'unknown' for rows written before the tag existed."""
+    extras = d.get("extras_parsed")
+    if not extras:
+        return "unknown"
+    return str(extras.get("account_class") or "unknown")
+
+
+def _account_class_match(d: dict, accept: set[str]) -> bool:
+    """True if the row's account_class is in the accept set. 'unknown' is
+    treated as paper-equivalent ONLY when paper is in the accept set
+    (since 100% of pre-tag data is from the paper account DUM098107)."""
+    cls = _row_account_class(d)
+    if cls in accept:
+        return True
+    if cls == "unknown" and "paper" in accept:
+        return True
+    return False
+
+
+def _load_fired_with_outcomes(
+    cur: sqlite3.Cursor, date_from: str, date_to: str,
+    accept_classes: set[str] | None = None,
+) -> list[dict]:
     """Join SignalIter (fired only) with SignalLookaheadOutcome @ 60min.
-    Returns one row per fired signal with unpacked extras."""
+    Returns one row per fired signal with unpacked extras.
+
+    accept_classes filters by extras.account_class. Default = the global
+    _ACCOUNT_CLASS_ACCEPTED (set by run_research_dump from the CLI flag)."""
+    accept = accept_classes or globals().get("_ACCOUNT_CLASS_ACCEPTED", {"paper"})
     rows = cur.execute(
         """
         SELECT s.id, s.session_date, s.timestamp, s.direction, s.confidence,
@@ -138,6 +166,8 @@ def _load_fired_with_outcomes(cur: sqlite3.Cursor, date_from: str, date_to: str)
     for r in rows:
         d = dict(r)
         d["extras_parsed"] = _parse_extras(d.get("extras"))
+        if not _account_class_match(d, accept):
+            continue
         d["bucket"] = _bucket_for(
             d["direction"],
             bool(d.get("would_have_hit_t1")),
@@ -748,21 +778,43 @@ SECTION_FNS = {
 }
 
 
+_ACCOUNT_CLASS_DEFAULT: set[str] = {"paper"}
+
+
+def _parse_account_class_arg(raw: str) -> set[str]:
+    """Parse --account-class CLI value into a set. 'all' = no filter."""
+    if not raw:
+        return {"paper"}
+    raw = raw.strip().lower()
+    if raw == "all":
+        return {"paper", "live", "mock", "unknown"}
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
 def run_research_dump(
     date_from: str,
     date_to: str,
     db_path: str = DEFAULT_DB,
     sections: list[str] | None = None,
+    accept_classes: set[str] | None = None,
 ) -> str:
     sections = sections or SECTIONS_ALL
+    accept = accept_classes or set(_ACCOUNT_CLASS_DEFAULT)
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
     cur = db.cursor()
+
+    # Mutate the global default so section functions (which read extras
+    # on their own queries) pick up the same filter. Cleaner than threading
+    # the set through 14 section signatures.
+    global _ACCOUNT_CLASS_ACCEPTED
+    _ACCOUNT_CLASS_ACCEPTED = accept
 
     header = [
         f"# FEF Research Dump",
         f"",
         f"- **Window**: {date_from} to {date_to}",
+        f"- **Account classes**: {sorted(accept)}",
         f"- **Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         f"- **DB**: `{db_path}`",
         f"- **Sections**: {', '.join(sections)}",
@@ -796,11 +848,15 @@ def main() -> int:
     ap.add_argument("--db", default=DEFAULT_DB, help=f"DB path (default {DEFAULT_DB})")
     ap.add_argument("--sections", default=",".join(SECTIONS_ALL),
                     help=f"Comma-separated sections to include. Available: {','.join(SECTIONS_ALL)}")
+    ap.add_argument("--account-class", default="paper",
+                    help="Filter by extras.account_class. 'paper' (default), 'live', 'mock', "
+                         "'unknown', 'all', or comma-separated. 'unknown' is treated as paper.")
     ap.add_argument("--out", help="Write markdown to this file instead of stdout")
     args = ap.parse_args()
 
     sections = [s.strip() for s in args.sections.split(",") if s.strip()]
-    md = run_research_dump(args.date_from, args.date_to, args.db, sections)
+    accept = _parse_account_class_arg(args.account_class)
+    md = run_research_dump(args.date_from, args.date_to, args.db, sections, accept)
 
     if args.out:
         Path(args.out).write_text(md, encoding="utf-8")

@@ -119,9 +119,12 @@ async def _check_dollar_loss(state, p) -> None:
             return
         mkt = MarketOrder("SELL", sell_qty, transmit=True)
         trade = ib.placeOrder(ic, mkt)
+        # status=STOPPED is the resolved-marker. Don't overwrite the per-tier
+        # fired flags as cleanup — they record whether each tier was banked
+        # as a partial, not whether the trade resolved. (See poll-loop branch
+        # for the full rationale.)
         await SignalIterRepository.update_live_order(
             p.id, status="STOPPED",
-            spx_target_t1_fired=True, spx_target_t2_fired=True, spx_target_t3_fired=True,
         )
         await SignalIterRepository.write_audit_log(
             category="spx_watcher", actor="system",
@@ -328,11 +331,16 @@ async def spx_target_watcher_loop(state) -> None:
                             state.firing_parent_ids.add(p.id)
                             try:
                                 await _market_sell(unfired_qty, "STOP")
+                                # IMPORTANT: only set status=STOPPED. Do NOT
+                                # overwrite spx_target_t{1,2,3}_fired to True
+                                # as cleanup — those flags record whether each
+                                # tier was actually banked as a partial during
+                                # the trade. Polluting them on stop misleads
+                                # every downstream consumer (research_dump,
+                                # ablation, _estimate_parent_r, BE-kill stats).
+                                # status=STOPPED is the sole resolved-marker.
                                 await SignalIterRepository.update_live_order(
                                     p.id, status="STOPPED",
-                                    spx_target_t1_fired=True,
-                                    spx_target_t2_fired=True,
-                                    spx_target_t3_fired=True,
                                 )
                             finally:
                                 state.firing_parent_ids.discard(p.id)
@@ -558,11 +566,12 @@ async def spx_stop_tick_watcher_loop(state) -> None:
                                     )
                             except Exception:
                                 logger.exception("spx_stop_tick_watcher market sell failed")
+                        # Same as the polling-loop stop branch: status=STOPPED
+                        # is the resolved-marker. Don't overwrite the per-tier
+                        # fired flags as cleanup — that pollutes partial-tracking
+                        # for every downstream analytic.
                         await SignalIterRepository.update_live_order(
                             p.id, status="STOPPED",
-                            spx_target_t1_fired=True,
-                            spx_target_t2_fired=True,
-                            spx_target_t3_fired=True,
                         )
                         # Refresh cache so the next ticks don't re-evaluate
                         # this just-stopped parent.

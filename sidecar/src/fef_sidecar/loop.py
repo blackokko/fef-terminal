@@ -302,6 +302,71 @@ def _current_provider_mode(state: AppState) -> str:
     return "mixed"
 
 
+async def _alt_direction_30m_signal(state: AppState) -> dict | None:
+    """Compute an independent 30-min SPX EMA-8/EMA-21 stack direction
+    signal. Stamped into signal_iter.extras.alt_direction_30m at write
+    time so we can correlate engine direction (drift_bias) vs this alt
+    signal across sessions WITHOUT gating any live trade on it.
+
+    Reads the most recent 25 SPX 1-min bars from HistoricalBar.
+    Returns None on insufficient data. Cheap: indexed read, ~5ms.
+
+    Built 2026-05-21 in response to the finding that drift_bias is
+    88-100% BULLISH on 4 of 4 sessions regardless of actual SPX path.
+    Need an independent direction signal before deciding whether to
+    gate trades on it — collect data first, gate later (post-freeze)."""
+    try:
+        from sqlmodel import select
+        from fef_sidecar.db.engine import get_session
+        from fef_sidecar.db.models import HistoricalBar
+        async with get_session() as session:
+            bars = list((await session.exec(
+                select(HistoricalBar)
+                .where(HistoricalBar.symbol == "SPX")
+                .where(HistoricalBar.bar_size == "1 min")
+                .order_by(HistoricalBar.timestamp_ms.desc())  # type: ignore[attr-defined]
+                .limit(25)
+            )).all())
+        if len(bars) < 21:
+            return {"signal": "INSUFFICIENT_DATA", "n_bars": len(bars)}
+        bars.reverse()  # chronological
+        closes = [b.close for b in bars]
+
+        def _ema(values, period):
+            if len(values) < period:
+                return None
+            alpha = 2 / (period + 1)
+            ema = sum(values[:period]) / period  # SMA seed
+            for v in values[period:]:
+                ema = alpha * v + (1 - alpha) * ema
+            return ema
+
+        ema_8 = _ema(closes, 8)
+        ema_21 = _ema(closes, 21)
+        if ema_8 is None or ema_21 is None:
+            return None
+        ema_8_prev = _ema(closes[:-5], 8) if len(closes) >= 13 else None
+        ema_8_slope = ema_8 - ema_8_prev if ema_8_prev is not None else 0
+        current_spx = closes[-1]
+        if ema_8 > ema_21 * 1.0005 and current_spx > ema_8:
+            alignment = "BULLISH"
+        elif ema_8 < ema_21 * 0.9995 and current_spx < ema_8:
+            alignment = "BEARISH"
+        else:
+            alignment = "NEUTRAL"
+        return {
+            "signal": alignment,
+            "ema_8": round(ema_8, 2),
+            "ema_21": round(ema_21, 2),
+            "ema_8_slope_5bar": round(ema_8_slope, 2),
+            "spx_vs_ema8_pts": round(current_spx - ema_8, 2),
+            "n_bars": len(bars),
+        }
+    except Exception:
+        logger.exception("_alt_direction_30m_signal failed")
+        return None
+
+
 def _current_account_class(state: AppState) -> str:
     """'paper' / 'live' / 'mock' / 'unknown' — tag for which IBKR account
     class is connected. Stamped into SignalIter.extras and LiveOrder.notes
@@ -463,6 +528,14 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     except Exception:
         logger.exception("fire_order computation failed")
 
+    # Shadow-track an independent direction signal alongside drift_bias.
+    # NOT a gate — purely observational so we can correlate engine
+    # direction vs this alt signal across sessions. Built tonight after
+    # finding drift_bias is structurally 88-100% BULLISH regardless of
+    # actual SPX path; want data on whether an alt signal predicts
+    # outcomes any better before deciding to gate on it (post-freeze).
+    alt_direction = await _alt_direction_30m_signal(state)
+
     signal = await SignalIterRepository.write_iter(
         spx_price=inputs.spx_price,
         direction=verdict.direction,
@@ -490,6 +563,11 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             # provider_mode (which captures mock-vs-IBKR, not paper-vs-live).
             "account_class": _current_account_class(state),
             "account_id": getattr(state.ibkr, "account_id", "") or "",
+            # Shadow alt direction signal — 30m SPX EMA-8/EMA-21 stack.
+            # Observational only; NOT used to gate any trade. Compare
+            # against drift_bias outcomes across N sessions to decide
+            # whether to gate on it post-freeze.
+            "alt_direction_30m": alt_direction,
             # Snapshot the latest HFT + microstructure state at fire time so
             # offline analysis (ML pattern discovery, TuningRecommendation)
             # can correlate signal outcomes with HFT/microstructure context

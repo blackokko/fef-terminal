@@ -75,16 +75,47 @@ def _simulate_bcd(entry_spx: float, direction_sign: int, fwd_bars: list[dict]) -
     return final_r, "timeout"
 
 
-def run_ablation(date_from: str, date_to: str, db_path: str = DEFAULT_DB) -> dict:
+def _parse_account_class_arg(raw: str) -> set[str]:
+    if not raw:
+        return {"paper"}
+    raw = raw.strip().lower()
+    if raw == "all":
+        return {"paper", "live", "mock", "unknown"}
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def _passes_account_filter(extras_raw, accept: set[str]) -> bool:
+    """Return True if the row's extras.account_class is in accept.
+    'unknown' (pre-tag rows) is treated as paper-equivalent when paper accepted."""
+    if not extras_raw:
+        return ("paper" in accept) or ("unknown" in accept)
+    try:
+        ex = json.loads(extras_raw) if isinstance(extras_raw, str) else extras_raw
+    except json.JSONDecodeError:
+        return ("paper" in accept) or ("unknown" in accept)
+    cls = (ex.get("account_class") or "unknown") if isinstance(ex, dict) else "unknown"
+    if cls in accept:
+        return True
+    if cls == "unknown" and "paper" in accept:
+        return True
+    return False
+
+
+def run_ablation(
+    date_from: str, date_to: str, db_path: str = DEFAULT_DB,
+    accept_classes: set[str] | None = None,
+) -> dict:
     """Returns a structured dict with per-trade rows, per-variant aggregates,
-    and per-day breakdown."""
+    and per-day breakdown. accept_classes filters by extras.account_class
+    (default = {'paper'})."""
+    accept = accept_classes or {"paper"}
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
     cur = db.cursor()
 
-    signals = cur.execute(
+    raw_signals = cur.execute(
         """
-        SELECT id, session_date, timestamp, direction, spx_price
+        SELECT id, session_date, timestamp, direction, spx_price, extras
         FROM signal_iter
         WHERE session_date BETWEEN ? AND ?
           AND direction IN ('LONG_CALLS','LONG_PUTS')
@@ -93,6 +124,7 @@ def run_ablation(date_from: str, date_to: str, db_path: str = DEFAULT_DB) -> dic
         """,
         (date_from, date_to),
     ).fetchall()
+    signals = [s for s in raw_signals if _passes_account_filter(s["extras"], accept)]
 
     # Pull SPX 1-min bars covering window + buffer for 30min prior context
     bars = cur.execute(
@@ -132,6 +164,21 @@ def run_ablation(date_from: str, date_to: str, db_path: str = DEFAULT_DB) -> dic
         )
     }
 
+    def _regime_from_extras(extras_raw) -> str:
+        """Mirror compute_daily_review's precedence: regime_at_fire >
+        regime_demoted.regime > NORMAL."""
+        if not extras_raw:
+            return "NORMAL"
+        try:
+            ex = json.loads(extras_raw) if isinstance(extras_raw, str) else extras_raw
+        except json.JSONDecodeError:
+            return "NORMAL"
+        if not isinstance(ex, dict):
+            return "NORMAL"
+        return ex.get("regime_at_fire") or (
+            (ex.get("regime_demoted") or {}).get("regime") or "NORMAL"
+        )
+
     results: list[dict] = []
     for s in signals:
         sid = s["id"]
@@ -164,6 +211,7 @@ def run_ablation(date_from: str, date_to: str, db_path: str = DEFAULT_DB) -> dic
 
         results.append({
             "sid": sid, "date": s["session_date"], "dir": s["direction"],
+            "regime": _regime_from_extras(s["extras"]),
             "entry_spx": entry_spx, "spx_30m_change": round(spx_30m_change, 2),
             "baseline_r": baseline_r,
             "direction_filter_r": 0.0 if blocked else baseline_r,
@@ -173,13 +221,13 @@ def run_ablation(date_from: str, date_to: str, db_path: str = DEFAULT_DB) -> dic
             "bcd_reason": bcd_reason,
         })
 
-    def summary(rows: list[dict], key: str) -> dict:
+    def summary(rows: list[dict], key: str, group_key: str = "date") -> dict:
         totals: dict[str, dict] = defaultdict(
             lambda: {"n": 0, "sum_r": 0.0, "wins": 0, "losses": 0, "flat": 0}
         )
         for r in rows:
             v = r[key]
-            for bucket in (r["date"], "ALL"):
+            for bucket in (r[group_key], "ALL"):
                 totals[bucket]["n"] += 1
                 totals[bucket]["sum_r"] += v
                 if v > 0.05:
@@ -197,6 +245,10 @@ def run_ablation(date_from: str, date_to: str, db_path: str = DEFAULT_DB) -> dic
         ("Both (dir + B+C+D)", "combined_r"),
     ]
     aggregates = {name: summary(results, key) for name, key in variants}
+    # Per-regime breakouts so we can see if B+C+D wins in one regime and
+    # direction filter wins in another (tonight's 5/21 vs 5/18-5/20 flip).
+    aggregates_by_regime = {name: summary(results, key, group_key="regime")
+                            for name, key in variants}
 
     return {
         "date_from": date_from,
@@ -205,6 +257,7 @@ def run_ablation(date_from: str, date_to: str, db_path: str = DEFAULT_DB) -> dic
         "n_blocked_by_dir_filter": sum(1 for r in results if r["blocked_by_dir_filter"]),
         "bcd_exit_reasons": dict(Counter(r["bcd_reason"] for r in results)),
         "aggregates": aggregates,
+        "aggregates_by_regime": aggregates_by_regime,
         "trades": results,
     }
 
@@ -241,6 +294,38 @@ def format_report(result: dict, dollars_per_r: float = DOLLARS_PER_R) -> str:
         lines.append(
             f"| {name} | {v['sum_r']:+.2f} | {v['sum_r'] * dollars_per_r:+,.0f} | {per_trade:+,.2f} |"
         )
+
+    # Per-regime breakout — shows whether different variants win in different
+    # regime conditions (e.g., B+C+D wins in CHOP but loses in TREND_DAY).
+    by_regime = result.get("aggregates_by_regime") or {}
+    if by_regime:
+        # Collect all regime labels present across the variants
+        all_regimes: set[str] = set()
+        for agg in by_regime.values():
+            all_regimes.update(k for k in agg.keys() if k != "ALL")
+        if all_regimes:
+            lines.append("")
+            lines.append("### Per-regime breakout")
+            lines.append("")
+            lines.append(
+                "Same configs evaluated separately per regime_at_fire. Watch for "
+                "the same variant winning in one regime and losing in another — "
+                "that's evidence the right answer is regime-conditional gating, "
+                "not a single universal exit/entry filter."
+            )
+            lines.append("")
+            lines.append("| Variant | Regime | n | sum R | WR | avg R |")
+            lines.append("|---|---|---:|---:|---:|---:|")
+            for name, agg in by_regime.items():
+                for regime in sorted(all_regimes):
+                    v = agg.get(regime)
+                    if not v or v["n"] == 0:
+                        continue
+                    wr = (v["wins"] / (v["wins"] + v["losses"]) * 100) if (v["wins"] + v["losses"]) else 0
+                    avg = v["sum_r"] / v["n"] if v["n"] else 0
+                    lines.append(
+                        f"| {name} | {regime} | {v['n']} | {v['sum_r']:+.2f} | {wr:.1f}% | {avg:+.3f} |"
+                    )
     return "\n".join(lines)
 
 
@@ -249,11 +334,15 @@ def main() -> int:
     ap.add_argument("date_from", help="YYYY-MM-DD")
     ap.add_argument("date_to", help="YYYY-MM-DD")
     ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--account-class", default="paper",
+                    help="Filter by extras.account_class. 'paper' (default), 'live', 'mock', "
+                         "'unknown', 'all', or comma-separated.")
     ap.add_argument("--json", action="store_true", help="Emit raw JSON instead of markdown")
     ap.add_argument("--dollars-per-r", type=float, default=DOLLARS_PER_R)
     args = ap.parse_args()
 
-    result = run_ablation(args.date_from, args.date_to, args.db)
+    accept = _parse_account_class_arg(args.account_class)
+    result = run_ablation(args.date_from, args.date_to, args.db, accept)
     if args.json:
         # Drop the per-trade list for stdout JSON brevity unless asked
         print(json.dumps({k: v for k, v in result.items() if k != "trades"}, indent=2, default=str))
