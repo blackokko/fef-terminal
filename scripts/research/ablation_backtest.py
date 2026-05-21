@@ -278,6 +278,7 @@ def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> 
     from pathlib import Path as _Path
     _sys.path.insert(0, str(_Path(__file__).parent))
     from _stats import (
+        cpcv_paths,
         deflated_sharpe_ratio,
         kfold_sharpes,
         probability_of_backtest_overfitting,
@@ -321,6 +322,15 @@ def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> 
 
     pbo = probability_of_backtest_overfitting(per_variant_per_fold)
 
+    # CPCV — combinatorial paths per variant. With n_groups=6, test=2 we
+    # get C(6,2)=15 paths per variant. Each path's Sharpe is independent
+    # so we can report mean ± std + how often it's positive.
+    cpcv_by_variant: dict[str, dict] = {}
+    for name, key in variants:
+        returns_v = [r[key] for r in sorted_results]
+        cpcv_by_variant[name] = cpcv_paths(returns_v, timestamps,
+                                           n_groups=6, test_groups=2)
+
     return {
         "per_variant_sharpe": per_variant,
         "per_variant_per_fold_sharpes": {
@@ -331,6 +341,7 @@ def _methodology_stats(results: list[dict], variants: list[tuple[str, str]]) -> 
         "dsr_at_n_variants": dsr_4,
         "dsr_at_20_trials": dsr_honest,
         "pbo": pbo,
+        "cpcv": cpcv_by_variant,
     }
 
 
@@ -465,6 +476,49 @@ def format_report(result: dict, dollars_per_r: float = DOLLARS_PER_R) -> str:
             "K-fold Sharpes that consistently agree on sign = stable variant; "
             "wildly varying signs = noise-fit._"
         )
+
+        # CPCV — combinatorial paths per variant
+        cpcv = ms.get("cpcv") or {}
+        if cpcv:
+            any_paths = next(iter(cpcv.values())) if cpcv else {}
+            n_paths = any_paths.get("n_paths", 0) if isinstance(any_paths, dict) else 0
+            if n_paths > 0:
+                lines.append("")
+                lines.append("#### CPCV (Combinatorial Purged Cross-Validation)")
+                lines.append("")
+                lines.append(
+                    f"Each variant evaluated on **{n_paths} independent train/test paths** "
+                    f"(C(6,2)=15 combinations of test-groups, purged with embargo). "
+                    "Per-path Sharpe distribution shows whether the variant's edge is "
+                    "stable across many train/test routes through the time series, "
+                    "not just the one walk-forward path. Wider distributions = less "
+                    "reliable edge."
+                )
+                lines.append("")
+                lines.append("| Variant | n_paths | Sharpe mean | Sharpe std | % positive |")
+                lines.append("|---|---:|---:|---:|---:|")
+                for vname, vdata in cpcv.items():
+                    if not isinstance(vdata, dict):
+                        continue
+                    sr_m = vdata.get("sharpe_mean")
+                    sr_s = vdata.get("sharpe_std")
+                    pos_pct = vdata.get("sharpe_positive_pct")
+                    lines.append(
+                        f"| {vname} | {vdata.get('n_paths', 0)} | "
+                        f"{f'{sr_m:+.3f}' if sr_m is not None else '—'} | "
+                        f"{f'{sr_s:.3f}' if sr_s is not None else '—'} | "
+                        f"{f'{pos_pct:.0f}%' if pos_pct is not None else '—'} |"
+                    )
+                lines.append("")
+                lines.append(
+                    "_Interpretation: a variant with consistently positive Sharpe across "
+                    "all 15 CPCV paths is statistically robust. A variant with mean > 0 "
+                    "but std comparable to mean has unstable edge. % positive < 60% on "
+                    "15 paths = the apparent edge depends heavily on which time slice "
+                    "you train/test on. At n=123 trades / 6 groups = ~20 trades per "
+                    "group, per-path Sharpes are still noisy; CPCV becomes much more "
+                    "informative as data accumulates post-freeze._"
+                )
     return "\n".join(lines)
 
 

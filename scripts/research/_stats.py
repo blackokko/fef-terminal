@@ -255,6 +255,119 @@ def kfold_sharpes(
     return out
 
 
+def cpcv_paths(
+    returns: Sequence[float],
+    timestamps_ms: Sequence[int],
+    n_groups: int = 6,
+    test_groups: int = 2,
+    embargo_minutes: int = 60,
+    label_horizon_minutes: int = 60,
+) -> dict:
+    """Combinatorial Purged Cross-Validation (López de Prado 2018, ch. 12).
+
+    Splits the time series into n_groups chronological groups, then for
+    every combination of `test_groups` groups (out of n_groups), uses
+    those as test and the remaining as training. Each combination
+    produces ONE backtest path. With n_groups=6, test_groups=2 you get
+    C(6,2)=15 paths — each path is a complete backtest with the same
+    train/test split semantics as walk-forward, just along a different
+    "route" through the time series.
+
+    This is the diagnostic that distinguishes "lucky single walk-forward"
+    from "stable across many train/test routes." Each path produces its
+    own Sharpe; aggregate as mean ± std and compute Probabilistic Sharpe
+    Ratio across the path distribution.
+
+    For each path:
+      - test set = union of the selected test_groups in chronological order
+      - train set = everything else, purged + embargoed
+      - per-path metric = Sharpe of variant's returns on test indices
+
+    Args:
+        returns: per-trade returns for ONE variant.
+        timestamps_ms: per-trade epoch ms, chronological.
+        n_groups: total chronological groups (default 6).
+        test_groups: how many groups form the test set per path (default 2).
+        embargo_minutes: post-test buffer.
+        label_horizon_minutes: forward-looking label window (60 for us).
+
+    Returns: dict with
+      - paths: list of dicts with {test_groups, sharpe, n_test, sum_r}
+      - sharpe_mean, sharpe_std across paths
+      - n_paths
+    """
+    n = len(returns)
+    if n < n_groups * 3:
+        return {"paths": [], "n_paths": 0, "note": f"need >={n_groups*3} samples, have {n}"}
+    if test_groups >= n_groups or test_groups < 1:
+        return {"paths": [], "n_paths": 0, "note": "test_groups must be 1..n_groups-1"}
+
+    timestamps = list(timestamps_ms)
+    group_size = n // n_groups
+    groups: list[list[int]] = [
+        list(range(i * group_size, (i + 1) * group_size if i < n_groups - 1 else n))
+        for i in range(n_groups)
+    ]
+    embargo_ms = embargo_minutes * 60_000
+    label_ms = label_horizon_minutes * 60_000
+
+    paths: list[dict] = []
+    for combo in combinations(range(n_groups), test_groups):
+        test_idx: list[int] = []
+        for g in combo:
+            test_idx.extend(groups[g])
+        if not test_idx:
+            continue
+        # Train = remaining groups, purged + embargoed
+        train_idx: list[int] = []
+        # Build a union of forbidden time windows (each test group)
+        forbidden: list[tuple[int, int]] = []
+        for g in combo:
+            if not groups[g]:
+                continue
+            t0 = timestamps[groups[g][0]] - label_ms
+            t1 = timestamps[groups[g][-1]] + embargo_ms
+            forbidden.append((t0, t1))
+        for gi, gr in enumerate(groups):
+            if gi in combo:
+                continue
+            for j in gr:
+                ts = timestamps[j]
+                if any(t0 <= ts <= t1 for t0, t1 in forbidden):
+                    continue
+                train_idx.append(j)
+        test_returns = [returns[i] for i in test_idx]
+        sr = sharpe_ratio(test_returns)
+        sum_r = sum(test_returns)
+        paths.append({
+            "test_groups": list(combo),
+            "sharpe": round(sr, 4) if sr is not None else None,
+            "sum_r": round(sum_r, 3),
+            "n_test": len(test_idx),
+            "n_train": len(train_idx),
+        })
+
+    sharpes = [p["sharpe"] for p in paths if p["sharpe"] is not None]
+    if sharpes:
+        sr_mean = sum(sharpes) / len(sharpes)
+        sr_var = sum((s - sr_mean) ** 2 for s in sharpes) / max(len(sharpes) - 1, 1)
+        sr_std = math.sqrt(sr_var) if sr_var > 0 else 0.0
+    else:
+        sr_mean = sr_std = None
+    return {
+        "paths": paths,
+        "n_paths": len(paths),
+        "n_groups": n_groups,
+        "test_groups_per_path": test_groups,
+        "sharpe_mean": round(sr_mean, 4) if sr_mean is not None else None,
+        "sharpe_std": round(sr_std, 4) if sr_std is not None else None,
+        "sharpe_positive_pct": (
+            round(100 * sum(1 for s in sharpes if s > 0) / len(sharpes), 1)
+            if sharpes else None
+        ),
+    }
+
+
 def probability_of_backtest_overfitting(
     per_variant_per_fold_sharpes: dict[str, list[float | None]],
 ) -> dict:
