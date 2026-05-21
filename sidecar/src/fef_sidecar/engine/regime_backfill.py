@@ -74,9 +74,9 @@ async def backfill_regime_at_fire(session_date: str | None = None) -> dict:
                     # row's sample after assessing.
                     if detector.n >= 3:
                         assessment = detector.assess()
-                        new_extras = dict(ex)
-                        new_extras["regime_at_fire"] = assessment.regime
-                        r.extras = new_extras
+                        # Merge into existing extras to preserve keys written
+                        # by other backfill passes (fire_order, etc.)
+                        r.extras = {**(r.extras or {}), "regime_at_fire": assessment.regime}
                         session.add(r)
                         backfilled += 1
                 detector.push(_to_sample(r))

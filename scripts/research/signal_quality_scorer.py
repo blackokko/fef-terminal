@@ -242,8 +242,13 @@ def run_scorer(
             pearson = _pearson(numeric, r_vals)
             spearman = _spearman(numeric, r_vals)
             auc = _auc(numeric, win_lab)
-            # Top quartile carve
-            sorted_pairs = sorted(zip(numeric, r_vals), reverse=True)
+            # Top quartile carve — for inverse features (where lower values
+            # predict better outcomes, i.e. negative correlation), select the
+            # BOTTOM quartile instead of the top.
+            is_inverse = (pearson is not None and pearson < -0.05) or (
+                spearman is not None and spearman < -0.05
+            )
+            sorted_pairs = sorted(zip(numeric, r_vals), reverse=(not is_inverse))
             top_q = sorted_pairs[:max(1, len(sorted_pairs) // 4)]
             top_q_sum_r = sum(r for _, r in top_q)
             top_q_n = len(top_q)

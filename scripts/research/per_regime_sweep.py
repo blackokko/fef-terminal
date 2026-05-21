@@ -44,6 +44,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "sidecar" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # for ablation_backtest imports
 
 DEFAULT_DB = str(Path.home() / ".fef-terminal" / "signal_log.db")
 
@@ -239,8 +240,13 @@ def _run_sweep_v2(iters: list[dict], bar_by_ms: dict, bar_ms_sorted: list[int]):
     if len(iters) < 10:
         return []
     split = int(len(iters) * 0.6)
+    # Purge window: skip 3 iters between train and test to avoid
+    # information leakage from overlapping 60-min forward windows.
+    PURGE_ITERS = 3
     train_iters = iters[:split]
-    test_iters = iters[split:]
+    test_iters = iters[split + PURGE_ITERS:]
+    if len(test_iters) < 5:
+        return []
 
     def bars_in_window(start_ms: int, end_ms: int) -> list[dict]:
         lo = bisect.bisect_left(bar_ms_sorted, start_ms)
@@ -293,16 +299,19 @@ def _run_sweep_v2(iters: list[dict], bar_by_ms: dict, bar_ms_sorted: list[int]):
         return returns_R, wins, losses
 
     def _sharpe(returns):
+        """Per-trade Sharpe (mean/std of trade returns). Not annualized —
+        returns are per-trade, not daily, so sqrt(252) is incorrect."""
         if len(returns) < 5:
             return None
         mean = sum(returns) / len(returns)
         var = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
         if var <= 0:
             return None
-        return round(mean / math.sqrt(var) * math.sqrt(252), 2)
+        return round(mean / math.sqrt(var), 2)
 
-    # R-units convert to $ via the same constant as ablation_backtest.py
-    R_DOLLARS = 400.0
+    # R-units convert to $ via the standard per-R constant
+    from ablation_backtest import DOLLARS_PER_R
+    R_DOLLARS = DOLLARS_PER_R
 
     results = []
     for prox in PROXIMITY_VALUES:

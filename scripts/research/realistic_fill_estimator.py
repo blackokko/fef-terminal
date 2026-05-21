@@ -87,7 +87,7 @@ from statistics import median
 DEFAULT_DB = str(Path.home() / ".fef-terminal" / "signal_log.db")
 
 # v1 fallback (used only when v2 sizing cannot be derived for a session).
-DOLLARS_PER_R = 400.0  # 5 contracts × $2000 risk per trade
+DOLLARS_PER_R = 500.0  # 10 contracts × $50/pt × 1R (10pt SPX) = $500/R/contract
 
 # v2 constants — see methodology block in module docstring
 COMMISSION_PER_FILL_PER_CONTRACT = 1.29   # $/share, per ibkr_execution row

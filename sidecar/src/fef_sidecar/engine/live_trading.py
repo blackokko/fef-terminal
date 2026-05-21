@@ -373,7 +373,8 @@ async def place_credit_spread(
       TP: close BAG at -$0.05 net debit (basically max profit, expire worthless)
       STOP: close BAG when current debit reaches stop_multiplier × entry_credit
     """
-    live = is_live_trading_enabled() and confirm and isinstance(ibkr, LiveIBKRProvider)  # noqa: F821
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    live = is_live_trading_enabled() and confirm and isinstance(ibkr, LiveIBKRProvider)
     dry_run = not live
 
     # SAFETY GATE: same paper-account check as place_bracket.

@@ -27,7 +27,7 @@ class FillResult:
 
 # Per-symbol cost defaults — commission per contract + typical bid-ask % of mid
 DEFAULTS = {
-    "SPX": {"commission_per_contract": 0.65, "bid_ask_pct_of_mid": 0.025},
+    "SPX": {"commission_per_contract": 0.65, "bid_ask_pct_of_mid": 0.05},
     "SPY": {"commission_per_contract": 0.65, "bid_ask_pct_of_mid": 0.010},
     "QQQ": {"commission_per_contract": 0.65, "bid_ask_pct_of_mid": 0.012},
     "IWM": {"commission_per_contract": 0.65, "bid_ask_pct_of_mid": 0.020},

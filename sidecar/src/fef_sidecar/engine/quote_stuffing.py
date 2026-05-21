@@ -34,6 +34,7 @@ class StuffingSignal:
     quote_intensity_per_sec: float
     severity: Literal["NORMAL", "ELEVATED", "STUFFING"]
     reasoning: str
+    insufficient_samples: bool = False
 
 
 def push_quote(state: StuffingState, ts_ms: int) -> None:
@@ -57,7 +58,8 @@ def _evict(state: StuffingState, now_ms: int) -> None:
 def assess(state: StuffingState, now_ms: int) -> StuffingSignal:
     qc = len(state.quote_timestamps)
     tc = len(state.trade_timestamps)
-    ratio = (qc / tc) if tc > 0 else float(qc)
+    _insufficient = tc == 0
+    ratio = min(qc / tc, 100.0) if tc > 0 else min(float(qc), 100.0)
     intensity = qc / max(1, state.window_seconds)
 
     if ratio >= 50 or intensity >= 100:
@@ -69,6 +71,8 @@ def assess(state: StuffingState, now_ms: int) -> StuffingSignal:
     else:
         severity = "NORMAL"
         reason = f"ratio {ratio:.1f}x, intensity {intensity:.1f}/s"
+    if _insufficient:
+        reason += " [INSUFFICIENT_SAMPLES: tc=0]"
 
     return StuffingSignal(
         timestamp_ms=now_ms,
@@ -78,4 +82,5 @@ def assess(state: StuffingState, now_ms: int) -> StuffingSignal:
         quote_intensity_per_sec=round(intensity, 1),
         severity=severity,
         reasoning=reason,
+        insufficient_samples=_insufficient,
     )

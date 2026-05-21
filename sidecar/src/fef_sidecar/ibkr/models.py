@@ -67,6 +67,21 @@ class Contract(BaseModel):
         return cls(symbol="SPY", kind=ContractKind.STOCK, exchange="SMART")
 
     @classmethod
+    def gld_stock(cls) -> Contract:
+        """GLD — SPDR Gold Shares ETF."""
+        return cls(symbol="GLD", kind=ContractKind.STOCK, exchange="SMART")
+
+    @classmethod
+    def smh_stock(cls) -> Contract:
+        """SMH — VanEck Semiconductor ETF."""
+        return cls(symbol="SMH", kind=ContractKind.STOCK, exchange="SMART")
+
+    @classmethod
+    def tlt_stock(cls) -> Contract:
+        """TLT — iShares 20+ Year Treasury Bond ETF."""
+        return cls(symbol="TLT", kind=ContractKind.STOCK, exchange="SMART")
+
+    @classmethod
     def for_symbol(cls, symbol: str) -> Contract:
         s = symbol.upper()
         if s == "SPX":
@@ -81,6 +96,12 @@ class Contract(BaseModel):
             return cls.iwm_stock()
         if s == "SPY":
             return cls.spy_stock()
+        if s == "GLD":
+            return cls.gld_stock()
+        if s == "SMH":
+            return cls.smh_stock()
+        if s == "TLT":
+            return cls.tlt_stock()
         if s == "NQ":
             return cls.nq_future()
         if s == "RTY":
@@ -145,6 +166,8 @@ class OptionQuote(BaseModel):
     ask: float | None = None
     delta: float | None = None
     gamma: float | None = None
+    vega: float | None = None
+    theta: float | None = None
     iv: float | None = None
     underlying_price: float | None = None
 

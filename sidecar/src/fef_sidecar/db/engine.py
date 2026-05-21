@@ -54,6 +54,9 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
+        # Enable WAL mode for better concurrent read/write performance
+        await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+
         # ---- Forward-only schema migrations ----
         # Each entry: (table, column, sqlite_type_sql)
         # Add new rows here whenever a model gains a column. Wrapped in

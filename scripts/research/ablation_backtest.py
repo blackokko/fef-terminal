@@ -14,9 +14,9 @@ trail-exit logic differs between Baseline and B+C+D).
   - Direction filter (v1): block PUTS when 30m SPX change > +3pt;
     block CALLS when 30m SPX change < -3pt. Otherwise = baseline.
   - B+C+D: baseline + peak-trail exit at 15% pullback from peak (after
-    peak >= 0.3R floor). Hard +1R T1 instead of partial scale-out
-    (the existing variant — left unchanged so the trail logic is the
-    only knob being measured against baseline).
+    peak >= 0.3R floor) on the residual position. Uses same 50/30/20
+    partial scale-out as baseline — trail is the ONLY knob being
+    measured against baseline.
   - Both: direction filter + B+C+D.
 
 Limitations:
@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_DB = str(Path.home() / ".fef-terminal" / "signal_log.db")
-DOLLARS_PER_R = 400.0  # 5 contracts × $2000 risk per trade
+DOLLARS_PER_R = 500.0  # 10 contracts × $50/pt × 1R (10pt SPX) = $500/R/contract
 
 
 def _ts_to_ms(ts_str: str) -> int:
@@ -107,29 +107,57 @@ def _simulate_baseline(entry_spx: float, direction_sign: int, fwd_bars: list[dic
 
 
 def _simulate_bcd(entry_spx: float, direction_sign: int, fwd_bars: list[dict]) -> tuple[float, str]:
-    """B+C+D variant of baseline: same bar walk + partials, PLUS peak-trail
-    exit at 15% pullback from peak (after peak >= 0.3R). Returns
-    (realized_R, exit_reason)."""
+    """B+C+D variant of baseline: same bar walk + 50/30/20 partial scale-out
+    (identical to baseline), PLUS peak-trail exit at 15% pullback from peak
+    (after peak >= 0.3R) on the residual position. This isolates the trail
+    as the ONLY difference vs baseline — previous version also changed T1
+    from partial to hard exit, confounding the two variables.
+
+    Returns (realized_R, exit_reason)."""
     if not fwd_bars:
         return 0.0, "no_data"
+    realized_r = 0.0
+    remaining_share = 1.0
+    tiers_fired: set[str] = set()
+    T1_SHARE, T2_SHARE, T3_SHARE = 0.5, 0.3, 0.2
     peak_r = 0.0
     for b in fwd_bars:
         adverse_pts = b["low"] if direction_sign > 0 else b["high"]
         favor_pts = b["high"] if direction_sign > 0 else b["low"]
         adverse_r = direction_sign * (adverse_pts - entry_spx) / 10.0
         favor_r = direction_sign * (favor_pts - entry_spx) / 10.0
-        if adverse_r <= -1.0:
-            return -1.0, "stop"
-        if favor_r >= 1.0:
-            return +1.0, "t1"
+        # Stop priority on ambiguous bars (conservative — same as baseline)
+        if adverse_r <= -1.0 and remaining_share > 0:
+            realized_r += remaining_share * -1.0
+            return realized_r, "stop"
+        # Tier checks in order (identical to baseline)
+        if favor_r >= 1.0 and "T1" not in tiers_fired:
+            realized_r += T1_SHARE * 1.0
+            remaining_share -= T1_SHARE
+            tiers_fired.add("T1")
+        if favor_r >= 2.0 and "T2" not in tiers_fired:
+            realized_r += T2_SHARE * 2.0
+            remaining_share -= T2_SHARE
+            tiers_fired.add("T2")
+        if favor_r >= 3.0 and "T3" not in tiers_fired:
+            realized_r += T3_SHARE * 3.0
+            remaining_share -= T3_SHARE
+            tiers_fired.add("T3")
+        if remaining_share <= 0.001:
+            return realized_r, "t1t2t3"
+        # Peak-trail on residual position (the ONLY knob vs baseline)
         if favor_r > peak_r:
             peak_r = favor_r
-        if peak_r >= 0.3:
+        if peak_r >= 0.3 and remaining_share > 0:
             current_r = direction_sign * (b["close"] - entry_spx) / 10.0
             if current_r <= peak_r - 0.15:
-                return peak_r - 0.15, "trail"
-    final_r = direction_sign * (fwd_bars[-1]["close"] - entry_spx) / 10.0
-    return final_r, "timeout"
+                realized_r += remaining_share * (peak_r - 0.15)
+                return realized_r, "trail"
+    # Timeout — exit residual at last close
+    if remaining_share > 0:
+        final_r = direction_sign * (fwd_bars[-1]["close"] - entry_spx) / 10.0
+        realized_r += remaining_share * final_r
+    return realized_r, "timeout"
 
 
 def _parse_account_class_arg(raw: str) -> set[str]:

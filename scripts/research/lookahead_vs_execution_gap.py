@@ -299,9 +299,11 @@ def run_gap_analysis(
         hit_stop = bool(look_row["would_have_hit_stop"]) if look_row else False
         mfe_pts = float(look_row["spx_mfe_pts"]) if look_row else 0
         mae_pts = float(look_row["spx_mae_pts"]) if look_row else 0
-        # Sign MFE / MAE by direction (lookahead stores them raw)
-        signed_mfe_r = direction_sign * mfe_pts / 10.0 if direction_sign > 0 else -mae_pts / 10.0
-        signed_mae_r = direction_sign * mae_pts / 10.0 if direction_sign > 0 else -mfe_pts / 10.0
+        # MFE/MAE are already direction-signed in signal_lookahead_outcome
+        # (LONG_CALLS: mfe=max_up, mae=-max_down; LONG_PUTS: mfe=max_down,
+        # mae=-max_up). Just convert from pts to R-multiples.
+        signed_mfe_r = mfe_pts / 10.0
+        signed_mae_r = mae_pts / 10.0
 
         # Bar-walk under accurate-live exit logic
         sim_out = simulate_variant(entry_spx, direction_sign, fwd, baseline_be)

@@ -346,15 +346,14 @@ class FEFEngine:
         prev2 = self._history[-3]
         cur = self._history[-1]
 
-        if not prev.top_gex_walls or not cur.top_gex_walls or not prev2.top_gex_walls:
-            return False, None
-
-        def _check_collapse(older, newer) -> bool:
+        def _check_collapse_walls(older_walls, newer_walls) -> bool:
             """True if newer iter shows >threshold loss vs older iter at the
             dominant wall of `older`."""
-            older_top = max(older.top_gex_walls, key=lambda w: abs(w.net_m))
+            if not older_walls or not newer_walls:
+                return False
+            older_top = max(older_walls, key=lambda w: abs(w.net_m))
             newer_same = next(
-                (w for w in newer.top_gex_walls if abs(w.strike - older_top.strike) < 1.0),
+                (w for w in newer_walls if abs(w.strike - older_top.strike) < 1.0),
                 None,
             )
             if newer_same is None:
@@ -366,12 +365,34 @@ class FEFEngine:
             loss_pct = (older_abs - newer_abs) / older_abs if older_abs > 0 else 0.0
             return loss_pct >= self._wall_collapse_pct
 
-        # Both window comparisons must show the collapse
-        if not (_check_collapse(prev, cur) and _check_collapse(prev2, prev)):
+        # Check GEX wall collapse (2-iter persistence)
+        gex_collapsed = (
+            prev.top_gex_walls and cur.top_gex_walls and prev2.top_gex_walls
+            and _check_collapse_walls(prev.top_gex_walls, cur.top_gex_walls)
+            and _check_collapse_walls(prev2.top_gex_walls, prev.top_gex_walls)
+        )
+
+        # Check DEX wall collapse (2-iter persistence)
+        dex_collapsed = (
+            prev.top_dex_walls and cur.top_dex_walls and prev2.top_dex_walls
+            and _check_collapse_walls(prev.top_dex_walls, cur.top_dex_walls)
+            and _check_collapse_walls(prev2.top_dex_walls, prev.top_dex_walls)
+        )
+
+        if not gex_collapsed and not dex_collapsed:
             return False, None
 
-        # Use the prior iter's top wall as the reference for direction.
-        prior_top = max(prev.top_gex_walls, key=lambda w: abs(w.net_m))
+        # Use the prior iter's top wall from whichever source collapsed as
+        # the reference for direction.  If both collapsed, pick the one with
+        # the larger dominant wall (more meaningful collapse).
+        if gex_collapsed and dex_collapsed:
+            gex_top = max(prev.top_gex_walls, key=lambda w: abs(w.net_m))
+            dex_top = max(prev.top_dex_walls, key=lambda w: abs(w.net_m))
+            prior_top = gex_top if abs(gex_top.net_m) >= abs(dex_top.net_m) else dex_top
+        elif gex_collapsed:
+            prior_top = max(prev.top_gex_walls, key=lambda w: abs(w.net_m))
+        else:
+            prior_top = max(prev.top_dex_walls, key=lambda w: abs(w.net_m))
 
         # Direction by wall TYPE + position
         is_call_wall = prior_top.net_m > 0

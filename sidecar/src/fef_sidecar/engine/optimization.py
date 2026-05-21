@@ -45,6 +45,8 @@ class SweepResult:
     test_win_rate_pct: float
     train_total_pnl: float
     test_total_pnl: float
+    sharpe_ci_lo: float | None = None
+    sharpe_ci_hi: float | None = None
 
 
 def _proxy_pnl(direction: str, spx_now: float, spx_walk: list[float],
@@ -127,6 +129,9 @@ def _proxy_pnl(direction: str, spx_now: float, spx_walk: list[float],
 
 
 def _sharpe(returns: list[float]) -> float | None:
+    """Per-trade Sharpe ratio (mean/std of trade returns). Not annualized —
+    returns are per-trade, not daily, so sqrt(252) would be incorrect.
+    Ranking is preserved without annualization."""
     n = len(returns)
     if n < 5:
         return None
@@ -134,7 +139,32 @@ def _sharpe(returns: list[float]) -> float | None:
     variance = sum((r - mean) ** 2 for r in returns) / (n - 1)
     if variance <= 0:
         return None
-    return round(mean / math.sqrt(variance) * math.sqrt(252), 2)
+    return round(mean / math.sqrt(variance), 2)
+
+
+def _bootstrap_sharpe_ci(
+    returns: list[float], n_reps: int = 1000, ci_pct: float = 90,
+) -> tuple[float | None, float | None]:
+    """Bootstrap confidence interval on per-trade Sharpe ratio.
+    Returns (lo, hi) at the given CI percentile, or (None, None)
+    if not enough data."""
+    import random
+    n = len(returns)
+    if n < 10:
+        return None, None
+    sharpes: list[float] = []
+    for _ in range(n_reps):
+        sample = random.choices(returns, k=n)
+        s = _sharpe(sample)
+        if s is not None:
+            sharpes.append(s)
+    if len(sharpes) < n_reps // 2:
+        return None, None
+    sharpes.sort()
+    tail = (100 - ci_pct) / 200
+    lo_idx = int(len(sharpes) * tail)
+    hi_idx = int(len(sharpes) * (1 - tail))
+    return round(sharpes[lo_idx], 3), round(sharpes[min(hi_idx, len(sharpes) - 1)], 3)
 
 
 def run_sweep(
@@ -156,8 +186,13 @@ def run_sweep(
     if n < 10:
         return []
     split = int(n * train_fraction)
+    # Purge window: skip 3 iters between train and test to avoid
+    # information leakage from overlapping forward windows.
+    PURGE_ITERS = 3
     train_iters = iters[:split]
-    test_iters = iters[split:]
+    test_iters = iters[split + PURGE_ITERS:]
+    if len(test_iters) < 5:
+        return []
 
     def _eval(slice_iters: list[dict], engine: FEFEngine) -> tuple[list[float], int, int, float]:
         engine.reset()
@@ -224,6 +259,7 @@ def run_sweep(
                     )
                     train_returns, train_trades, train_wins, train_total = _eval(train_iters, engine)
                     test_returns, test_trades, test_wins, test_total = _eval(test_iters, engine)
+                    ci_lo, ci_hi = _bootstrap_sharpe_ci(test_returns)
                     results.append(SweepResult(
                         wall_proximity_pts=prox,
                         wall_collapse_pct=cpct,
@@ -237,6 +273,8 @@ def run_sweep(
                         test_win_rate_pct=round((test_wins / test_trades * 100) if test_trades else 0.0, 1),
                         train_total_pnl=round(train_total, 2),
                         test_total_pnl=round(test_total, 2),
+                        sharpe_ci_lo=ci_lo,
+                        sharpe_ci_hi=ci_hi,
                     ))
     results.sort(key=lambda r: (r.test_sharpe or -999, r.test_total_pnl), reverse=True)
     return results

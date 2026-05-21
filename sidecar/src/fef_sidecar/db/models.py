@@ -242,6 +242,8 @@ class HistoricalBar(SQLModel, table=True):
 
     __tablename__ = "historical_bar"
 
+    __table_args__ = (UniqueConstraint("symbol", "bar_size", "timestamp_ms", name="uq_bar"),)
+
     id: int | None = Field(default=None, primary_key=True)
     symbol: str = Field(index=True, description="SPX / ES / QQQ / etc.")
     bar_size: str = Field(default="1 min", description="ib_async bar_size string")

@@ -60,11 +60,24 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
 
     # Pick best by test_sharpe (or test_total_pnl if no sharpe)
     best = None
+    ci_overlap_warning: str | None = None
     if results:
-        best = max(results, key=lambda r: (
+        ranked = sorted(results, key=lambda r: (
             r.test_sharpe if r.test_sharpe is not None else -999,
             r.test_total_pnl,
-        ))
+        ), reverse=True)
+        best = ranked[0]
+        # Check if top-2 Sharpe CIs overlap (difference not significant)
+        if len(ranked) >= 2:
+            r1, r2 = ranked[0], ranked[1]
+            if (r1.sharpe_ci_lo is not None and r2.sharpe_ci_hi is not None
+                    and r1.sharpe_ci_lo <= r2.sharpe_ci_hi):
+                ci_overlap_warning = (
+                    f"Top-2 Sharpe CIs overlap: best=[{r1.sharpe_ci_lo}, {r1.sharpe_ci_hi}] "
+                    f"vs runner-up=[{r2.sharpe_ci_lo}, {r2.sharpe_ci_hi}] — "
+                    f"difference is NOT statistically significant"
+                )
+                logger.warning(ci_overlap_warning)
 
     eng = state.engine
     current = {
@@ -94,6 +107,10 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
     drift += abs(best.absorption_fe_ratio_min - current["absorption_fe_ratio_min"]) / max(current["absorption_fe_ratio_min"], 1)
     drift /= 4
 
+    notes_parts = []
+    if ci_overlap_warning:
+        notes_parts.append(ci_overlap_warning)
+
     run = WalkForwardRun(
         window_days=days,
         current_wall_proximity_pts=current["wall_proximity_pts"],
@@ -108,6 +125,7 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
         optimal_total_pnl=best.test_total_pnl,
         optimal_win_rate=best.test_win_rate_pct,
         drift_score=round(drift, 3),
+        notes="; ".join(notes_parts) if notes_parts else None,
     )
     await SignalIterRepository.write_walk_forward_run(run)
 
@@ -120,6 +138,8 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
             "wall_collapse_floor_m": best.wall_collapse_floor_m,
             "absorption_fe_ratio_min": best.absorption_fe_ratio_min,
             "test_sharpe": best.test_sharpe, "test_total_pnl": best.test_total_pnl,
+            "sharpe_ci": [best.sharpe_ci_lo, best.sharpe_ci_hi],
+            "ci_overlap_warning": ci_overlap_warning,
         }},
     )
     return run
@@ -181,12 +201,18 @@ async def _persist_today_ibkr_fills(state) -> int:
                 )).first()
                 if existing is not None:
                     changed = False
-                    if existing.commission is None and comm_val is not None:
-                        existing.commission = comm_val
-                        changed = True
-                    if existing.realized_pnl is None and rpnl_val is not None:
-                        existing.realized_pnl = rpnl_val
-                        changed = True
+                    # Retry when commission is None OR 0 — paper accounts
+                    # (DUM prefix) report $0 which is correct for them, but
+                    # live accounts may later provide the real fee. Accept
+                    # the update if the new value is non-None and non-zero.
+                    if (existing.commission is None or existing.commission == 0) and comm_val is not None:
+                        if existing.commission is None or comm_val != 0:
+                            existing.commission = comm_val
+                            changed = True
+                    if (existing.realized_pnl is None or existing.realized_pnl == 0) and rpnl_val is not None:
+                        if existing.realized_pnl is None or rpnl_val != 0:
+                            existing.realized_pnl = rpnl_val
+                            changed = True
                     if changed:
                         session.add(existing)
                     continue

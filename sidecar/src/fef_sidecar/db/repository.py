@@ -118,6 +118,7 @@ class SignalIterRepository:
                 daily.updated_at = datetime.now(UTC)
                 session.add(daily)
 
+            await session.commit()
             await session.refresh(signal)
             return signal
 

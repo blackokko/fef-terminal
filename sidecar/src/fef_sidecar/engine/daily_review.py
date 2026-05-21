@@ -504,7 +504,7 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         total_signals=len(sigs),
         actionable_signals=n_actionable,
         wins=wins, stops=stops, timeouts=timeouts,
-        win_rate_pct=round(wins / n_actionable * 100, 1) if n_actionable else 0,
+        win_rate_pct=round(wins / (wins + stops) * 100, 1) if (wins + stops) else 0,
         expectancy_r=round(realized_total / n_actionable, 3) if n_actionable else 0,
         t1_hits=tier_counts.get("T1", 0),
         t2_hits=tier_counts.get("T2", 0),
@@ -525,7 +525,7 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         dedup_wins=dedup_wins_n,
         dedup_stops=dedup_stops_n,
         dedup_timeouts=dedup_timeouts_n,
-        dedup_win_rate_pct=round(dedup_wins_n / dedup_n * 100, 1) if dedup_n else 0.0,
+        dedup_win_rate_pct=round(dedup_wins_n / (dedup_wins_n + dedup_stops_n) * 100, 1) if (dedup_wins_n + dedup_stops_n) else 0.0,
         dedup_expectancy_r=round(dedup_realized_total / dedup_n, 3) if dedup_n else 0.0,
         sharpe_ratio=sharpe_ratio,
         sortino_ratio=sortino_ratio,
@@ -534,14 +534,15 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         ulcer_index=ulcer_index,
     )
 
-    # Upsert: delete any existing row for this date first
+    # Upsert: delete + insert in a single transaction to avoid data loss
+    # if the process crashes between the two operations.
     async with get_session() as session:
         existing = (await session.exec(
             select(DailyReview).where(DailyReview.session_date == session_date)
         )).first()
         if existing is not None:
             await session.delete(existing)
-            await session.commit()
+            await session.flush()
         session.add(review)
         await session.commit()
         await session.refresh(review)

@@ -147,18 +147,16 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
             False, f"{sym} cool-down ({remaining}s remaining)", BlockReason.COOL_DOWN
         )
 
-    # Gate 7a: GLOBAL session cap (across all symbols)
-    if state.auto_trade_count_session >= state.auto_trade_max_per_session:
-        return AutoTradeDecision(
-            False, f"global session cap reached ({state.auto_trade_max_per_session})",
-            BlockReason.GLOBAL_CAP
-        )
-
-    # Gate 7b: per-symbol session sub-cap
+    # Gate 7: per-symbol session cap. Each symbol has its own budget so
+    # SPX hitting its cap doesn't block fresh QQQ/SPY/IWM signals. The
+    # implicit "global cap" = sum(per_symbol_cap for enabled symbols);
+    # there's no separate global gate — the per-symbol cap is the only
+    # binding constraint, which matches user intent (each symbol carries
+    # its own independent trade budget).
     sym_count = state.auto_trade_count_by_symbol.get(sym, 0)
     if sym_count >= state.auto_trade_max_per_symbol:
         return AutoTradeDecision(
-            False, f"{sym} sub-cap reached ({state.auto_trade_max_per_symbol})",
+            False, f"{sym} cap reached ({state.auto_trade_max_per_symbol})",
             BlockReason.SYMBOL_CAP
         )
 
@@ -220,10 +218,10 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     if strategy == "fixed_dollar":
         delta = abs(opt.get("delta") or 0.40)
         per_contract_dollar = lambda d: d / max(1, qty) / 100.0
-        t1_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t1) / max(delta, 0.05) * delta
-        t2_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t2) / max(delta, 0.05) * delta
-        t3_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t3) / max(delta, 0.05) * delta
-        stop_opt = max(0.05, float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_stop) / max(delta, 0.05) * delta)
+        t1_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t1) / max(abs(delta), 0.05)
+        t2_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t2) / max(abs(delta), 0.05)
+        t3_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t3) / max(abs(delta), 0.05)
+        stop_opt = max(0.05, float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_stop) / max(abs(delta), 0.05))
         spec = BracketSpec(
             symbol=trade_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
@@ -282,11 +280,11 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
         state.auto_trade_count_by_symbol[sym] = state.auto_trade_count_by_symbol.get(sym, 0) + 1
         logger.warning(
             "AUTO-TRADE FIRED: %s %d %s %s%.0f @ $%.2f "
-            "(global %d/%d, %s sub %d/%d)",
+            "(session total %d, %s budget %d/%d)",
             direction, qty, sym,
             "C" if direction == "LONG_CALLS" else "P",
             strike, opt["entry_limit"],
-            state.auto_trade_count_session, state.auto_trade_max_per_session,
+            state.auto_trade_count_session,
             sym, state.auto_trade_count_by_symbol[sym], state.auto_trade_max_per_symbol,
         )
 
