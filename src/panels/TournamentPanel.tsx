@@ -72,7 +72,12 @@ export function TournamentPanel() {
     return (
       <section className="sidebar-section">
         <h3 className="sidebar-section-title">Strategy tournament</h3>
-        <p className="muted small">waiting for first iter…</p>
+        <p className="muted small">
+          waiting for next FEF iter…{" "}
+          {lastIter?.iter_num
+            ? `(currently on iter ${lastIter.iter_num}; tournament data populates each new iter, default cadence 120s)`
+            : "(populates at the first iter after this panel mounts)"}
+        </p>
       </section>
     );
   }
