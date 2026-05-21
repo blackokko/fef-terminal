@@ -19,8 +19,13 @@ Mechanics per parent order:
 
   Direction LONG_PUTS: inverse comparisons.
 
-Poll rate: SPX_WATCHER_INTERVAL_SEC (default 2s). Sub-second would be
-nicer but option-quote fetches add latency.
+Poll rate: SPX_WATCHER_INTERVAL_SEC (default 0.1s). The hot path
+(stop / T1 / T2 / T3 detection) is pure arithmetic against the cached
+live SPX tick and does not require any IBKR round-trip, so a tight
+loop is cheap. The IBKR round-trips (qualify + place) only happen
+when a level is actually crossed, and the qualified contract is
+cached after the first lookup so subsequent fires skip qualify
+entirely. Reduce only if event-loop CPU pressure shows up.
 """
 
 from __future__ import annotations
@@ -28,8 +33,34 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time as _time
 
 logger = logging.getLogger(__name__)
+
+
+async def _qualified_ib_contract(state, p):
+    """Cached IB option-contract lookup. qualifyContractsAsync round-trips
+    to IBKR (~50-300ms) — caching it cuts that latency to ~0 for every
+    market-sell after the first. Cache key = (symbol, strike, right,
+    expiry). Cache lives on `state` and is hot for the sidecar lifetime."""
+    from fef_sidecar.ibkr.live import _to_ib_contract
+    from fef_sidecar.ibkr.models import Contract, ContractKind
+    if not hasattr(state, "_qualified_ib_contracts"):
+        state._qualified_ib_contracts = {}  # type: ignore[attr-defined]
+    key = (p.symbol, float(p.strike), p.right, p.expiry)
+    cached = state._qualified_ib_contracts.get(key)  # type: ignore[attr-defined]
+    if cached is not None:
+        return cached
+    opt_contract = Contract(
+        symbol=p.symbol, kind=ContractKind.OPTION,
+        exchange="CBOE" if p.symbol == "SPX" else "SMART",
+        expiry=p.expiry, strike=p.strike, right=p.right,
+    )
+    ic = _to_ib_contract(opt_contract)
+    ib = state.ibkr._ib  # type: ignore[attr-defined]
+    await ib.qualifyContractsAsync(ic)
+    state._qualified_ib_contracts[key] = ic  # type: ignore[attr-defined]
+    return ic
 
 
 async def _check_dollar_loss(state, p) -> None:
@@ -71,15 +102,8 @@ async def _check_dollar_loss(state, p) -> None:
             )
             return
         from ib_async import MarketOrder
-        from fef_sidecar.ibkr.live import _to_ib_contract
         ib = state.ibkr._ib  # type: ignore[attr-defined]
-        opt_contract = Contract(
-            symbol=p.symbol, kind=ContractKind.OPTION,
-            exchange="CBOE" if p.symbol == "SPX" else "SMART",
-            expiry=p.expiry, strike=p.strike, right=p.right,
-        )
-        ic = _to_ib_contract(opt_contract)
-        await ib.qualifyContractsAsync(ic)
+        ic = await _qualified_ib_contract(state, p)
         positions = ib.positions()
         long_qty = sum(
             int(pos.position) for pos in positions
@@ -113,8 +137,16 @@ async def spx_target_watcher_loop(state) -> None:
     from fef_sidecar.ibkr.live import LiveIBKRProvider
     from fef_sidecar.ibkr.models import Contract, ContractKind
 
-    interval = float(os.environ.get("SPX_WATCHER_INTERVAL_SEC", "0.5"))
-    logger.info("SPX target watcher loop starting (interval=%.1fs)", interval)
+    interval = float(os.environ.get("SPX_WATCHER_INTERVAL_SEC", "0.1"))
+    logger.info("SPX target watcher loop starting (interval=%.2fs)", interval)
+    # Tick-age threshold for stale-data warnings (audit-logged). If the
+    # cached SPX hasn't refreshed in this long, the IBKR tick stream is
+    # likely stalled and stop detection may be acting on stale data.
+    stale_tick_warn_ms = int(os.environ.get("SPX_WATCHER_STALE_TICK_MS", "1500"))
+    # Per-parent log throttle so the "spot near stop" diagnostic doesn't
+    # flood the audit_log when iterating at 0.1s.
+    last_near_stop_log_ms: dict[int, int] = {}
+    NEAR_STOP_LOG_INTERVAL_MS = 5000  # 5s between near-stop diagnostics per parent
 
     while True:
         try:
@@ -206,15 +238,8 @@ async def spx_target_watcher_loop(state) -> None:
                         return
                     try:
                         from ib_async import MarketOrder
-                        from fef_sidecar.ibkr.live import _to_ib_contract
                         ib = state.ibkr._ib  # type: ignore[attr-defined]
-                        opt_contract = Contract(
-                            symbol=p.symbol, kind=ContractKind.OPTION,
-                            exchange="CBOE" if p.symbol == "SPX" else "SMART",
-                            expiry=p.expiry, strike=p.strike, right=p.right,
-                        )
-                        ic = _to_ib_contract(opt_contract)
-                        await ib.qualifyContractsAsync(ic)
+                        ic = await _qualified_ib_contract(state, p)
 
                         # SAFETY: never sell more than we own. If parent BUY
                         # didn't fill (rejection / partial / illiquid), don't
@@ -255,10 +280,37 @@ async def spx_target_watcher_loop(state) -> None:
                 # Stop check uses the dynamic level (BE ladder ratchets it).
                 effective_stop = p.dynamic_stop_level if p.dynamic_stop_level is not None else p.spx_target_stop
                 if effective_stop is not None:
-                    stop_hit = (
-                        (is_long_calls and spot <= effective_stop)
-                        or (not is_long_calls and spot >= effective_stop)
+                    # Distance to stop (signed by direction — positive = safe,
+                    # negative = breached). Used for the near-stop diagnostic
+                    # below + for stale-tick warnings if a fire ever lags.
+                    dist_to_stop = (
+                        (spot - effective_stop) if is_long_calls
+                        else (effective_stop - spot)
                     )
+                    # Diagnostic: if SPX is within 2pt of the stop, audit-log
+                    # once every 5s per parent with the live-tick freshness so
+                    # we can prove watcher latency from the log timeline. Only
+                    # written when actually close to firing — won't spam.
+                    if dist_to_stop <= 2.0 and p.id is not None:
+                        try:
+                            last_log = last_near_stop_log_ms.get(p.id, 0)
+                            now_ms = int(asyncio.get_running_loop().time() * 1000)
+                            if now_ms - last_log >= NEAR_STOP_LOG_INTERVAL_MS:
+                                last_near_stop_log_ms[p.id] = now_ms
+                                tick_age_ms = (
+                                    int(_time.time() * 1000) - state.last_live_tick_ms
+                                    if state.last_live_tick_ms > 0 else -1
+                                )
+                                stale = " STALE" if tick_age_ms > stale_tick_warn_ms else ""
+                                await SignalIterRepository.write_audit_log(
+                                    category="spx_watcher", actor="system",
+                                    summary=(f"NEAR_STOP{stale}: {p.symbol} {p.strike}{p.right} "
+                                            f"spot={spot:.2f} stop={effective_stop:.2f} "
+                                            f"dist={dist_to_stop:+.2f}pt tick_age={tick_age_ms}ms"),
+                                )
+                        except Exception:
+                            pass
+                    stop_hit = dist_to_stop <= 0
                     if stop_hit:
                         # Compute remaining qty across all tiers
                         unfired_qty = 0
@@ -300,9 +352,10 @@ async def spx_target_watcher_loop(state) -> None:
                     )
                     if t2_hit:
                         await _market_sell(p.spx_target_t2_qty, "T2")
-                        p.spx_target_t2_fired = True
+                        p.spx_target_t2_fired = True; p.spx_target_t2_at_spx = spot
                         await SignalIterRepository.update_live_order(
-                            p.id, spx_target_t2_fired=True, status="PARTIAL",
+                            p.id, spx_target_t2_fired=True, spx_target_t2_at_spx=spot,
+                            status="PARTIAL",
                         )
 
                 # T3
@@ -313,9 +366,10 @@ async def spx_target_watcher_loop(state) -> None:
                     )
                     if t3_hit:
                         await _market_sell(p.spx_target_t3_qty, "T3")
-                        p.spx_target_t3_fired = True
+                        p.spx_target_t3_fired = True; p.spx_target_t3_at_spx = spot
                         await SignalIterRepository.update_live_order(
-                            p.id, spx_target_t3_fired=True, status="PARTIAL",
+                            p.id, spx_target_t3_fired=True, spx_target_t3_at_spx=spot,
+                            status="PARTIAL",
                         )
 
                 # Runner protect: if T1 has fired but T2/T3 are still open
