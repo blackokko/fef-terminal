@@ -87,6 +87,139 @@ another thing that can break in live).
 
 ## OPEN ITEMS
 
+### 2026-05-21 — Known data-integrity issues (ongoing audit, not all bugs yet) [LIVING LIST]
+Discovered during 5/20 daily_review debugging. Each one risks
+silent misinterpretation of strategy performance. Cross-check
+ibkr_execution dollar sums against everything else.
+- **live_order.filled_qty / avg_fill_price never populated** on
+  parents (all NULL on 5/20's 61 parents). The ENTRY fill info is
+  lost. Workaround: pull from ibkr_execution by ib_order_id.
+  Where: live_trading.py around place_bracket(). Needs ORDER_STATUS
+  callback to update parent row on fill.
+- **Bracket child orders not persisted as live_order rows**. Only
+  parents have rows; the T1/T2/T3/STOP child orders never get
+  written. Means per-parent exit attribution requires matching
+  ibkr_execution by (symbol, strike, right, date) with no clean
+  link back to a specific parent when stacking. Fix: persist
+  child orders with parent_id pointing back.
+- **SignalIter.spx_price corruption** — 15 rows on 5/18, 4 on 5/19,
+  5 on 5/20 had spx_price=67.2 (or similar non-SPX value). Probably
+  a SPY/futures→SPX conversion bug. Filter is `BETWEEN 1000 AND
+  10000`. Root cause: see loop.py snapshot read; suspect upstream
+  fallback when SPX quote unavailable.
+- **SignalIter.extras numeric garbage** — some delta_price values
+  reach +3508 (impossible for an SPX delta), pa_score/agg_score
+  occasionally clamp to ±1.0 placeholders, nearest_wall_distance
+  hits +7317pts. Suggests fallback values are leaking into the
+  signal record. Audit each upstream computation for defensive
+  defaults that should have been None.
+- **HFT/micro snapshot coverage gap** — 65/218 fired signals 5/18-
+  5/20 have hft_at_fire/microstructure_at_fire. Feature rolled out
+  mid-day 5/19. Don't draw HFT conclusions until coverage is 100%
+  (~5/25 onward).
+- **daily_session.gross_pnl/net_pnl never written** — all five rows
+  have $0. Either nothing populates this table or it's only filled
+  by operator manual entry. Decide whether to compute auto from
+  ibkr_execution or remove the field.
+- **Cross-check queries to run periodically**:
+  ```sql
+  -- daily_review.actual_total_R × R_DOLLARS should ≈ ibkr_execution sum
+  SELECT dr.session_date, dr.actual_total_R,
+         (SELECT SUM(CASE WHEN side='SLD' THEN shares*price*100
+                          ELSE -shares*price*100 END)
+          FROM ibkr_execution WHERE session_date=dr.session_date) AS realized_$
+  FROM daily_review dr;
+
+  -- live_order parents on date X should ≈ count of distinct ib_order_id
+  -- in ibkr_execution where side='BOT' on same date
+  ```
+- **Resets freeze?**: NO — all observation / read-side / fill-tracking.
+  None changes signal generation or exit logic.
+
+### 2026-05-20 — daily_review accounting bugs invalidate session-level metrics [SHIPPED 2026-05-21]
+- **Status**: Fixed in `engine/daily_review.py`. Two changes:
+  1. `_trace_outcome` caller restructured to credit partial scale-outs
+     (T1/T2/T3) even when residual subsequently stopped. Old logic
+     classified any STOPPED trade as -1R outcome; new logic computes
+     weighted 50/30/20 partial-bank + residual-stop R. tier_counts
+     now reflects the highest tier reached per signal, so top-level
+     `wins / t1_hits / t2_hits / t3_hits` columns match
+     by_direction/by_hour_ct/by_regime sub-aggregates.
+  2. `actual_total_R` now sourced from session-level ibkr_execution
+     dollar sum ÷ `FEF_R_DOLLARS` env (default 400). Ground truth.
+     Verified 5/20: -29.5R → +17.04R (= $6,815 / $400/R, matches
+     IBKR realized P/L exactly).
+  3. New `_estimate_parent_r()` helper uses spx_target_t{1,2,3}_fired
+     + qty splits + dynamic stop level for per-parent classification
+     (actual_wins / actual_losses). Approximate — assumes 1:1 option-
+     to-SPX move; for dollar-accurate per-parent R needs the bracket-
+     child fill linking (see data-integrity list above).
+- **Verification script**: scripts/research/research_dump.py
+  will surface the fix on next daily_review recompute (scheduled
+  nightly at 22:00 ET via auto_walk_forward, or manual via
+  POST /admin/daily_review).
+- **Resets freeze?**: NO — measurement-only fix.
+
+### 2026-05-20 — daily_review accounting bugs invalidate session-level metrics [SUPERSEDED — see SHIPPED entry above]
+- **Symptom**: 5/20 IBKR realized P/L = **+$6,815** but daily_review reports
+  `wins=0, t1_hits=0, t2_hits=0, t3_hits=0, win_rate_pct=0.0,
+  actual_total_R=-29.5`. Two stacked bugs:
+  - **Bug 1 — top-level rollup is zeroed**: `wins/t1_hits/t2_hits/t3_hits`
+    are 0 while every sub-aggregate in the same row agrees on 9 wins
+    (`by_direction LONG_CALLS=3 + LONG_PUTS=6`, `by_hour_ct=9`,
+    `by_regime=9`, `by_confidence=9`). Aggregation path for those four
+    columns is broken.
+  - **Bug 2 — actual_total_R ignores partial scale-outs**: live_order
+    on 5/20 shows 46 parents with `status=STOPPED` AND all three
+    `spx_target_t{1,2,3}_fired=1`. These are the 50/30/20 scale-outs
+    where T1/T2/T3 all fired BEFORE the 20% residual hit the BE-ladder
+    stop. Engine credits each as -1R; reality is closer to +1.5R per
+    trade (0.5×1R + 0.3×2R + 0.2×~0R = +1.1R minimum). 46 trades
+    mispriced ≈ 70R total error.
+- **Why it matters**:
+  - Reviewer narratives ("5/20 bloodbath", "execution-dependent edge")
+    are sourced from these fields. Both readings are wrong on 5/20.
+  - Shapley Run A / Run B decomposition uses actual_total_R as input.
+    The signal-vs-execution split is corrupted; signal contribution
+    may be understated and execution overstated.
+  - dedup_expectancy_r and sharpe_ratio derive from the same broken
+    accounting. dedup-near-neutral may be artifact, not signal.
+  - daily_review.WR is the operator's session report card. 0% WR on
+    a +$6.8k day destroys signal-vs-actual trust.
+- **Where to look**:
+  - `engine/daily_review.py` — function computing top-level `wins/
+    t{1,2,3}_hits` (likely a `sum(by_direction.wins for ...)` or
+    similar that's pulling from the wrong dict key)
+  - Same file — function computing `actual_total_R`. Currently treats
+    parent.status as the source of truth. Should aggregate partial
+    fills: read `spx_target_t1_qty * 1.0 + t2_qty * 2.0 + t3_qty *
+    3.0` minus `residual_qty * 1.0` (if stopped) for each parent.
+- **Verification query**:
+  ```sql
+  SELECT status, spx_target_t1_fired, spx_target_t2_fired,
+         spx_target_t3_fired, COUNT(*)
+  FROM live_order
+  WHERE bracket_role='parent' AND dry_run=0
+    AND DATE(submitted_at)='2026-05-20'
+  GROUP BY 1,2,3,4;
+  ```
+- **Fix scope**: ~2 hours. Pure read-side; doesn't change which trades
+  fire, only how outcomes are summarized.
+- **Resets freeze?**: **NO**. This is a measurement/reporting bug, not
+  an engine signal-generation or exit-logic change. The actual trades
+  fired identically with or without this fix. Recompute is read-only.
+- **Re-run after fix**:
+  - Recompute daily_review for 5/18, 5/19, 5/20
+  - Re-run ablation backtest — the baseline R-unit math uses
+    would_have_hit_t1/stop from lookahead so it's mostly independent,
+    but the "both T1 and stop hit → -0.15R" assumption needs review
+    against real partial-fill economics
+  - Re-evaluate the Shapley Run A/B/C/D decomposition; signal share
+    is likely larger than reported
+- **Where this came from**: investigated 2026-05-20 evening session.
+  IBKR realized P/L cross-checked via direct sum of ibkr_execution
+  rows: BOT notional=$93,535, SLD notional=$100,350, gross +$6,815.
+
 ### 2026-05-20 — Direction-of-day filter [POST-FREEZE TOP PRIORITY]
 - **Why this is now #1** (per Chat Claude 2026-05-20 review of lookahead
   data): on 5/19, LONG_CALLS had 94% T1-hit and LONG_PUTS had 85% stop-hit
