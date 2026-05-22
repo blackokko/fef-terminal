@@ -51,6 +51,7 @@ class BlockReason:
     INVALID_PRICING = "INVALID_PRICING"
     NO_STRIKE = "NO_STRIKE"
     PLACE_ERROR = "PLACE_ERROR"
+    DUPLICATE_PARENT = "DUPLICATE_PARENT"
     FIRED = "FIRED"
 
 
@@ -264,6 +265,50 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
             dollar_loss_cap=-3000.0,
             use_market_entry=True,
         )
+
+    # PATCH 3: Refuse to open a new parent if an active parent already exists
+    # for the same contract. Prevents stacked-parent cross-race in the watcher
+    # (see spx_target_watcher safety patch). The 7-parent SPX 7520C race that
+    # placed a naked short was created by this very gap.
+    try:
+        from sqlmodel import select as _sm_select
+        from fef_sidecar.db.engine import get_session as _gs_dup
+        from fef_sidecar.db.models import LiveOrder as _LO_dup
+        from fef_sidecar.db.repository import SignalIterRepository as _Repo_dup
+
+        _right_dup = "C" if direction == "LONG_CALLS" else "P"
+        _expiry_dup = today
+        async with _gs_dup() as _session_dup:
+            _existing_dup = list((await _session_dup.exec(
+                _sm_select(_LO_dup)
+                .where(_LO_dup.symbol == sym)
+                .where(_LO_dup.strike == float(strike))
+                .where(_LO_dup.right == _right_dup)
+                .where(_LO_dup.expiry == _expiry_dup)
+                .where(_LO_dup.bracket_role == "parent")
+                .where(_LO_dup.status.in_(("SUBMITTED", "FILLED", "PARTIAL")))
+            )).all())
+        if _existing_dup:
+            await _Repo_dup.write_audit_log(
+                category="auto_trade_block", actor="system",
+                summary=(
+                    f"BLOCKED {direction}: already have active parent at "
+                    f"{sym} {strike}{_right_dup} (parent_id={_existing_dup[0].id})"
+                ),
+                details={"block_reason_code": BlockReason.DUPLICATE_PARENT},
+            )
+            return AutoTradeDecision(
+                False,
+                f"duplicate parent at {sym} {strike}{_right_dup} (id={_existing_dup[0].id})",
+                BlockReason.DUPLICATE_PARENT,
+            )
+    except AutoTradeDecision:
+        raise
+    except Exception:
+        # If the duplicate-parent guard itself errors, log + proceed (do not
+        # block trading on a query failure). The structural HARD-BLOCK in
+        # spx_target_watcher still prevents the bad outcome.
+        logger.exception("Auto-trade duplicate-parent guard failed; proceeding")
 
     try:
         result = await place_bracket(state.ibkr, spec, confirm=True)

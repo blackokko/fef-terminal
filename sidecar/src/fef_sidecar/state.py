@@ -108,6 +108,12 @@ class AppState:
     # only one path fires the market sell per parent. Asyncio is
     # single-threaded so set add/discard are atomic.
     firing_parent_ids: set[int] = field(default_factory=set)
+    # Contract-level pending-sell reservation. Prevents cross-parent races on
+    # the same (symbol, strike, right, expiry) — each parent that places a SELL
+    # reserves its qty here, and subsequent parents subtract it from available
+    # long_qty before placing their own SELL. Decremented when the SELL fills
+    # (or after a 2s safety timeout).
+    firing_contracts: dict[tuple, int] = field(default_factory=dict)
     spx_stop_tick_task: object | None = None
     # Update counters per data source — used by HFT panel badges to show
     # LIVE / EMPTY / SYNTH. Bumped from the actual subscription callbacks.
