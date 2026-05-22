@@ -525,6 +525,8 @@ def _flow_snapshot_to_inputs(row):
         aggression_put_pct=row.aggression_put_pct,
         iv_rank_call_pct=row.iv_rank_call_pct,
         iv_rank_put_pct=row.iv_rank_put_pct,
+        top_cex_walls=_to_rows(getattr(row, "top_cex_walls", None) or []),
+        top_vex_walls=_to_rows(getattr(row, "top_vex_walls", None) or []),
     )
 
 

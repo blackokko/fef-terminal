@@ -2201,6 +2201,20 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
                                     net_m=w.get("net_m", 0))
                         for w in (s.top_dex_walls or [])
                     ]
+                    cex_rows = [
+                        ExposureRow(strike=w.get("strike", 0),
+                                    call_m=max(0, w.get("net_m", 0)),
+                                    put_m=min(0, w.get("net_m", 0)),
+                                    net_m=w.get("net_m", 0))
+                        for w in (getattr(s, "top_cex_walls", None) or [])
+                    ]
+                    vex_rows = [
+                        ExposureRow(strike=w.get("strike", 0),
+                                    call_m=max(0, w.get("net_m", 0)),
+                                    put_m=min(0, w.get("net_m", 0)),
+                                    net_m=w.get("net_m", 0))
+                        for w in (getattr(s, "top_vex_walls", None) or [])
+                    ]
                     inputs = FEFInputs(
                         timestamp_ms=int(s.timestamp.timestamp() * 1000) if s.timestamp else 0,
                         spx_price=float(s.spx_price),
@@ -2212,6 +2226,8 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
                         raw_max_pain=float(s.raw_max_pain or s.spx_price),
                         aggression_call_pct=s.aggression_call_pct,
                         aggression_put_pct=s.aggression_put_pct,
+                        top_cex_walls=cex_rows,
+                        top_vex_walls=vex_rows,
                     )
                     v = engine.push(inputs)
                     fresh_verdicts[s.id] = {

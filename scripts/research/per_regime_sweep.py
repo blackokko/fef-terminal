@@ -115,6 +115,7 @@ def _load_iters_by_regime(
         """
         SELECT timestamp, spx_price, drift_cum_net_m, drift_bias,
                ntm_max_pain, raw_max_pain, top_gex_walls, top_dex_walls,
+               top_cex_walls, top_vex_walls,
                aggression_call_pct, aggression_put_pct, extras
         FROM signal_iter
         WHERE session_date BETWEEN ? AND ?
@@ -158,6 +159,8 @@ def _load_iters_by_regime(
             "raw_max_pain": r["raw_max_pain"] or r["spx_price"],
             "top_gex_walls": _parse_walls(r["top_gex_walls"]),
             "top_dex_walls": _parse_walls(r["top_dex_walls"]),
+            "top_cex_walls": _parse_walls(r["top_cex_walls"]) if "top_cex_walls" in r.keys() else [],
+            "top_vex_walls": _parse_walls(r["top_vex_walls"]) if "top_vex_walls" in r.keys() else [],
             "aggression_call_pct": r["aggression_call_pct"],
             "aggression_put_pct": r["aggression_put_pct"],
         })

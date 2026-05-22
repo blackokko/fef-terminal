@@ -50,6 +50,8 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
          "raw_max_pain": r.raw_max_pain,
          "top_gex_walls": r.top_gex_walls or [],
          "top_dex_walls": r.top_dex_walls or [],
+         "top_cex_walls": getattr(r, "top_cex_walls", None) or [],
+         "top_vex_walls": getattr(r, "top_vex_walls", None) or [],
          "aggression_call_pct": r.aggression_call_pct or 50,
          "aggression_put_pct": r.aggression_put_pct or 50,
          "iv_rank_call_pct": r.iv_rank_call_pct or 50,

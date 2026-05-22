@@ -145,6 +145,8 @@ async def quantdata_poll_loop(state: AppState) -> None:
                     spx_price=snap.spx_price,  # type: ignore[union-attr]
                     top_gex_walls=_walls_json(snap.gex.top(5)),  # type: ignore[union-attr]
                     top_dex_walls=_walls_json(snap.dex.top(5)),  # type: ignore[union-attr]
+                    top_cex_walls=_walls_json(snap.cex.top(5)) if snap.cex else [],  # type: ignore[union-attr]
+                    top_vex_walls=_walls_json(snap.vex.top(5)) if snap.vex else [],  # type: ignore[union-attr]
                     drift_cum_net_m=snap.drift.cumulative_net_m,  # type: ignore[union-attr]
                     drift_bias=snap.drift.bias,  # type: ignore[union-attr]
                     ntm_max_pain=_ntm_max_pain(snap),
@@ -578,6 +580,8 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
         raw_max_pain=inputs.raw_max_pain,
         top_gex_walls=_walls_json(inputs.top_gex_walls),
         top_dex_walls=_walls_json(inputs.top_dex_walls),
+        top_cex_walls=_walls_json(inputs.top_cex_walls),
+        top_vex_walls=_walls_json(inputs.top_vex_walls),
         aggression_call_pct=inputs.aggression_call_pct,
         aggression_put_pct=inputs.aggression_put_pct,
         iv_rank_call_pct=inputs.iv_rank_call_pct,
@@ -606,12 +610,8 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             # than block-fire gating in that case.
             "alt_direction_30m": alt_direction,
             "alt_direction_4h": alt_direction_4h,
-            # Higher-order Greek walls captured at fire time. Research-only
-            # for now — engine doesn't gate on them. CEX drives EOD pin
-            # dynamic; VEX captures dealer hedging on IV moves. Post-freeze
-            # we'll evaluate whether they discriminate W/L beyond GEX/DEX.
-            "top_cex_walls": _walls_json(inputs.top_cex_walls),
-            "top_vex_walls": _walls_json(inputs.top_vex_walls),
+            # Higher-order Greek walls (CEX/VEX) are now top-level columns
+            # on SignalIter — not duplicated here.
             # Snapshot the latest HFT + microstructure state at fire time so
             # offline analysis (ML pattern discovery, TuningRecommendation)
             # can correlate signal outcomes with HFT/microstructure context

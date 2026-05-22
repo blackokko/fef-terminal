@@ -126,6 +126,11 @@ async def init_db() -> None:
             # Engine v2 version tag — existing rows backfill as 1 (v1)
             ("signal_iter", "engine_version", "INTEGER DEFAULT 1"),
             ("live_order", "engine_version", "INTEGER DEFAULT 1"),
+            # Higher-order Greek wall captures (CHARM + VANNA exposures)
+            ("signal_iter", "top_cex_walls", "JSON"),
+            ("signal_iter", "top_vex_walls", "JSON"),
+            ("flow_snapshot", "top_cex_walls", "JSON"),
+            ("flow_snapshot", "top_vex_walls", "JSON"),
             # SignalLookaheadOutcome — net-new table, created via create_all,
             # listed here as a marker so the migration log shows it.
         ]

@@ -69,6 +69,11 @@ class SignalIter(SQLModel, table=True):
     # Top walls captured as JSON arrays of {strike, net_m, side}
     top_gex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     top_dex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    # Higher-order Greek walls — CHARM (delta decay, drives EOD pin) and
+    # VANNA (delta sensitivity to IV moves). Research-only during freeze;
+    # engine does not gate on them yet.
+    top_cex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    top_vex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
 
     # Optional metrics (nullable)
     aggression_call_pct: float | None = None
@@ -307,6 +312,8 @@ class FlowSnapshot(SQLModel, table=True):
 
     top_gex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     top_dex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    top_cex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    top_vex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
 
     drift_cum_net_m: float = 0.0
     drift_bias: str = "NEUTRAL"

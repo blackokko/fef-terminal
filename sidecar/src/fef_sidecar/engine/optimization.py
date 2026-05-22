@@ -211,6 +211,16 @@ def run_sweep(
                             put_m=min(0, w["net_m"]), net_m=w["net_m"])
                 for w in (it.get("top_dex_walls") or [])
             ]
+            cex_rows = [
+                ExposureRow(strike=w["strike"], call_m=max(0, w["net_m"]),
+                            put_m=min(0, w["net_m"]), net_m=w["net_m"])
+                for w in (it.get("top_cex_walls") or [])
+            ]
+            vex_rows = [
+                ExposureRow(strike=w["strike"], call_m=max(0, w["net_m"]),
+                            put_m=min(0, w["net_m"]), net_m=w["net_m"])
+                for w in (it.get("top_vex_walls") or [])
+            ]
             inputs = FEFInputs(
                 timestamp_ms=0,
                 spx_price=it["spx_price"],
@@ -222,6 +232,8 @@ def run_sweep(
                 raw_max_pain=it.get("raw_max_pain", it["spx_price"]),
                 aggression_call_pct=it.get("aggression_call_pct"),
                 aggression_put_pct=it.get("aggression_put_pct"),
+                top_cex_walls=cex_rows,
+                top_vex_walls=vex_rows,
             )
             verdict = engine.push(inputs)
             if verdict.direction.value == "WAIT":
