@@ -116,7 +116,8 @@ def _load_iters_by_regime(
         SELECT timestamp, spx_price, drift_cum_net_m, drift_bias,
                ntm_max_pain, raw_max_pain, top_gex_walls, top_dex_walls,
                top_cex_walls, top_vex_walls,
-               aggression_call_pct, aggression_put_pct, extras
+               aggression_call_pct, aggression_put_pct, extras,
+               vol_drift_cum_call, vol_drift_cum_put, vol_drift_bias
         FROM signal_iter
         WHERE session_date BETWEEN ? AND ?
           AND spx_price BETWEEN 1000 AND 10000
@@ -163,6 +164,10 @@ def _load_iters_by_regime(
             "top_vex_walls": _parse_walls(r["top_vex_walls"]) if "top_vex_walls" in r.keys() else [],
             "aggression_call_pct": r["aggression_call_pct"],
             "aggression_put_pct": r["aggression_put_pct"],
+            # Research-only batch 2 — passed through for FEFInputs reconstruction
+            "vol_drift_cum_call": r["vol_drift_cum_call"] if "vol_drift_cum_call" in r.keys() else None,
+            "vol_drift_cum_put": r["vol_drift_cum_put"] if "vol_drift_cum_put" in r.keys() else None,
+            "vol_drift_bias": r["vol_drift_bias"] if "vol_drift_bias" in r.keys() else None,
         })
     return dict(by_regime)
 

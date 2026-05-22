@@ -2228,6 +2228,10 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
                         aggression_put_pct=s.aggression_put_pct,
                         top_cex_walls=cex_rows,
                         top_vex_walls=vex_rows,
+                        # Research-only batch 2
+                        vol_drift_cum_call=getattr(s, "vol_drift_cum_call", None),
+                        vol_drift_cum_put=getattr(s, "vol_drift_cum_put", None),
+                        vol_drift_bias=getattr(s, "vol_drift_bias", None),
                     )
                     v = engine.push(inputs)
                     fresh_verdicts[s.id] = {

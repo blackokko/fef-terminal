@@ -234,6 +234,10 @@ def run_sweep(
                 aggression_put_pct=it.get("aggression_put_pct"),
                 top_cex_walls=cex_rows,
                 top_vex_walls=vex_rows,
+                # Research-only batch 2 — pass through from stored iter data
+                vol_drift_cum_call=it.get("vol_drift_cum_call"),
+                vol_drift_cum_put=it.get("vol_drift_cum_put"),
+                vol_drift_bias=it.get("vol_drift_bias"),
             )
             verdict = engine.push(inputs)
             if verdict.direction.value == "WAIT":

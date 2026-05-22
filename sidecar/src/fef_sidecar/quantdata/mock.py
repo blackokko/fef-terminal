@@ -14,17 +14,25 @@ from typing import Self
 from fef_sidecar.quantdata.models import (
     AggressionStats,
     ContractAggression,
+    DarkPoolLevel,
+    DarkPoolSnapshot,
     DriftEntry,
     DriftSummary,
     ExposureRow,
     GreekType,
     IVRankByContract,
     IVRankSnapshot,
+    IVSkewRow,
+    IVSkewSnapshot,
     MarketSnapshot,
     MaxPainSnapshot,
     OIRow,
     OpenInterestSnapshot,
+    QuantAlert,
+    QuantAlertsSnapshot,
     StrikeExposureSnapshot,
+    VolDriftEntry,
+    VolDriftSummary,
 )  # noqa: F401  AggressionStats + ContractAggression used inside fetch_market_snapshot
 
 # Captured from live session 2026-05-15 around 4pm ET (SPX $7,409).
@@ -107,6 +115,53 @@ _DRIFT_ENTRIES = [
     DriftEntry(timestamp_ms=1747929480000, call_dollars=12697165, put_dollars=282831, spx_price=7408.77),
     DriftEntry(timestamp_ms=1747929540000, call_dollars=-45701, put_dollars=-456257, spx_price=7407.26),
     DriftEntry(timestamp_ms=1747929600000, call_dollars=0, put_dollars=-7845, spx_price=7407.26),
+]
+
+# ---------------------------------------------------------------------------
+# Research-only mock data — batch 2 (2026-05-21)
+# ---------------------------------------------------------------------------
+
+_VOL_DRIFT_ENTRIES = [
+    VolDriftEntry(timestamp_ms=1747929360000, call_iv=0.132, put_iv=0.148, spx_price=7407.66),
+    VolDriftEntry(timestamp_ms=1747929420000, call_iv=0.134, put_iv=0.151, spx_price=7410.77),
+    VolDriftEntry(timestamp_ms=1747929480000, call_iv=0.137, put_iv=0.154, spx_price=7408.77),
+    VolDriftEntry(timestamp_ms=1747929540000, call_iv=0.136, put_iv=0.152, spx_price=7407.26),
+    VolDriftEntry(timestamp_ms=1747929600000, call_iv=0.138, put_iv=0.156, spx_price=7407.26),
+]
+
+_IV_SKEW_ROWS = [
+    IVSkewRow(strike=7350.0, call_iv=0.165, put_iv=0.195, skew_pts=0.030),
+    IVSkewRow(strike=7375.0, call_iv=0.152, put_iv=0.178, skew_pts=0.026),
+    IVSkewRow(strike=7390.0, call_iv=0.143, put_iv=0.167, skew_pts=0.024),
+    IVSkewRow(strike=7395.0, call_iv=0.140, put_iv=0.163, skew_pts=0.023),
+    IVSkewRow(strike=7400.0, call_iv=0.136, put_iv=0.158, skew_pts=0.022),
+    IVSkewRow(strike=7405.0, call_iv=0.133, put_iv=0.153, skew_pts=0.020),
+    IVSkewRow(strike=7410.0, call_iv=0.131, put_iv=0.149, skew_pts=0.018),
+    IVSkewRow(strike=7415.0, call_iv=0.129, put_iv=0.145, skew_pts=0.016),
+    IVSkewRow(strike=7420.0, call_iv=0.127, put_iv=0.141, skew_pts=0.014),
+    IVSkewRow(strike=7450.0, call_iv=0.118, put_iv=0.128, skew_pts=0.010),
+]
+
+# SPY levels for dark pool (not SPX — SPX has no dark prints)
+_DP_LEVELS = [
+    DarkPoolLevel(price=555.00, notional_dollars=48_500_000.0, trade_count=312),
+    DarkPoolLevel(price=552.50, notional_dollars=35_200_000.0, trade_count=228),
+    DarkPoolLevel(price=557.50, notional_dollars=28_700_000.0, trade_count=185),
+    DarkPoolLevel(price=550.00, notional_dollars=22_100_000.0, trade_count=143),
+    DarkPoolLevel(price=560.00, notional_dollars=19_800_000.0, trade_count=127),
+]
+
+_QUANT_ALERTS = [
+    QuantAlert(timestamp_ms=1747929540000, alert_type="GoldenSweep", contract="CALL7400@2026-05-15",
+               premium_dollars=485_000.0, side="CALL"),
+    QuantAlert(timestamp_ms=1747929420000, alert_type="Whale", contract="PUT7380@2026-05-15",
+               premium_dollars=312_000.0, side="PUT"),
+    QuantAlert(timestamp_ms=1747929300000, alert_type="Turbo", contract="CALL7410@2026-05-15",
+               premium_dollars=198_500.0, side="CALL"),
+    QuantAlert(timestamp_ms=1747929180000, alert_type="Lightning", contract="CALL7420@2026-05-15",
+               premium_dollars=145_000.0, side="CALL"),
+    QuantAlert(timestamp_ms=1747929060000, alert_type="Momentum", contract="PUT7400@2026-05-15",
+               premium_dollars=87_200.0, side="PUT"),
 ]
 
 
@@ -209,6 +264,30 @@ class MockQuantDataClient:
     async def get_oi_by_strike(self) -> OpenInterestSnapshot:
         return OpenInterestSnapshot(spx_price=self.spx_price, rows=list(_OI_ROWS))
 
+    # Research-only mock methods — batch 2 (2026-05-21)
+
+    async def get_vol_drift(self) -> VolDriftSummary:
+        entries = list(_VOL_DRIFT_ENTRIES)
+        cum_call = entries[-1].call_iv - entries[0].call_iv if entries else 0.0
+        cum_put = entries[-1].put_iv - entries[0].put_iv if entries else 0.0
+        avg_change = (cum_call + cum_put) / 2
+        bias = "EXPANDING" if avg_change > 0.005 else ("CONTRACTING" if avg_change < -0.005 else "NEUTRAL")
+        return VolDriftSummary(
+            entries=entries,
+            cumulative_iv_change_call=cum_call,
+            cumulative_iv_change_put=cum_put,
+            bias=bias,  # type: ignore[arg-type]
+        )
+
+    async def get_vol_skew(self) -> IVSkewSnapshot:
+        return IVSkewSnapshot(spx_price=self.spx_price, rows=list(_IV_SKEW_ROWS))
+
+    async def get_dark_pool(self) -> DarkPoolSnapshot:
+        return DarkPoolSnapshot(rows=list(_DP_LEVELS))
+
+    async def get_quant_alerts(self) -> QuantAlertsSnapshot:
+        return QuantAlertsSnapshot(alerts=list(_QUANT_ALERTS))
+
     async def fetch_market_snapshot(
         self,
         *,
@@ -217,6 +296,10 @@ class MockQuantDataClient:
         include_oi: bool = True,
         include_cex: bool = True,
         include_vex: bool = True,
+        include_vol_drift: bool = True,
+        include_vol_skew: bool = True,
+        include_dark_pool: bool = True,
+        include_quant_alerts: bool = True,
     ) -> MarketSnapshot:
         """Mock snapshot with per-call variation.
 
@@ -290,6 +373,10 @@ class MockQuantDataClient:
                 oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
                 cex=StrikeExposureSnapshot(greek=GreekType.CHARM, spx_price=spx_now, rows=list(_CEX_ROWS)) if include_cex else None,
                 vex=StrikeExposureSnapshot(greek=GreekType.VANNA, spx_price=spx_now, rows=list(_VEX_ROWS)) if include_vex else None,
+                vol_drift=await self.get_vol_drift() if include_vol_drift else None,
+                vol_skew=IVSkewSnapshot(spx_price=spx_now, rows=list(_IV_SKEW_ROWS)) if include_vol_skew else None,
+                dark_pool=await self.get_dark_pool() if include_dark_pool else None,
+                quant_alerts=await self.get_quant_alerts() if include_quant_alerts else None,
                 simulated_minutes_since_open=frame.minutes_since_open,
                 simulated_phase_label=frame.label,
                 simulated_vix=frame.vix,
@@ -325,6 +412,10 @@ class MockQuantDataClient:
                 oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
                 cex=StrikeExposureSnapshot(greek=GreekType.CHARM, spx_price=spx_now, rows=list(_CEX_ROWS)) if include_cex else None,
                 vex=StrikeExposureSnapshot(greek=GreekType.VANNA, spx_price=spx_now, rows=list(_VEX_ROWS)) if include_vex else None,
+                vol_drift=await self.get_vol_drift() if include_vol_drift else None,
+                vol_skew=IVSkewSnapshot(spx_price=spx_now, rows=list(_IV_SKEW_ROWS)) if include_vol_skew else None,
+                dark_pool=await self.get_dark_pool() if include_dark_pool else None,
+                quant_alerts=await self.get_quant_alerts() if include_quant_alerts else None,
                 simulated_minutes_since_open=frame.minutes_since_open,
                 simulated_phase_label=frame.label,
                 simulated_vix=frame.vix,
@@ -356,4 +447,8 @@ class MockQuantDataClient:
             oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
             cex=StrikeExposureSnapshot(greek=GreekType.CHARM, spx_price=spx_now, rows=list(_CEX_ROWS)) if include_cex else None,
             vex=StrikeExposureSnapshot(greek=GreekType.VANNA, spx_price=spx_now, rows=list(_VEX_ROWS)) if include_vex else None,
+            vol_drift=await self.get_vol_drift() if include_vol_drift else None,
+            vol_skew=IVSkewSnapshot(spx_price=spx_now, rows=list(_IV_SKEW_ROWS)) if include_vol_skew else None,
+            dark_pool=await self.get_dark_pool() if include_dark_pool else None,
+            quant_alerts=await self.get_quant_alerts() if include_quant_alerts else None,
         )

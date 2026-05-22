@@ -14,18 +14,26 @@ from fef_sidecar.quantdata.models import (
     ContractAggression,
     ContractStats,
     ContractStatsBySide,
+    DarkPoolLevel,
+    DarkPoolSnapshot,
     DriftEntry,
     DriftSummary,
     ExposureRow,
     GreekType,
     IVRankByContract,
     IVRankSnapshot,
+    IVSkewRow,
+    IVSkewSnapshot,
     MaxPainSnapshot,
     NetFlowEntry,
     NetFlowSnapshot,
     OIRow,
     OpenInterestSnapshot,
+    QuantAlert,
+    QuantAlertsSnapshot,
     StrikeExposureSnapshot,
+    VolDriftEntry,
+    VolDriftSummary,
 )
 
 
@@ -209,3 +217,222 @@ def parse_net_flow(data: dict[str, Any]) -> NetFlowSnapshot:
             )
         )
     return NetFlowSnapshot(entries=entries)
+
+
+# ---------------------------------------------------------------------------
+# New research-only parsers (batch 2, 2026-05-21)
+# Shapes are best-guess based on QuantData API conventions. All use
+# defensive .get() throughout — unknown response shapes degrade to empty
+# collections rather than raising.
+# ---------------------------------------------------------------------------
+
+
+def parse_vol_drift(data: dict[str, Any]) -> VolDriftSummary:
+    """Parse volatility drift response.
+
+    Best-guess shape mirrors net_drift: a list of time-series rows plus
+    cumulative summary fields. QuantData may return IVs as raw decimals
+    (0.15 = 15%) or as integers (15 = 15%); we normalise to fractional.
+    """
+    resp = data.get("response", {}) if data else {}
+    raw = resp.get("volDrift", resp.get("ivDrift", []))
+
+    entries: list[VolDriftEntry] = []
+    for row in raw:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            continue
+        try:
+            ts = int(row[0])
+            call_iv = float(row[1] or 0)
+            put_iv = float(row[2] or 0)
+            spx_cents = float(row[3]) if len(row) > 3 else 0
+            # Normalise: if values look like percentages (>1) convert to fraction
+            if call_iv > 2:
+                call_iv /= 100
+            if put_iv > 2:
+                put_iv /= 100
+            entries.append(VolDriftEntry(
+                timestamp_ms=ts,
+                call_iv=call_iv,
+                put_iv=put_iv,
+                spx_price=spx_cents / 100 if spx_cents > 500 else spx_cents,
+            ))
+        except (TypeError, ValueError, IndexError):
+            continue
+
+    # Compute cumulative change (last - first)
+    cum_call = 0.0
+    cum_put = 0.0
+    if len(entries) >= 2:
+        cum_call = entries[-1].call_iv - entries[0].call_iv
+        cum_put = entries[-1].put_iv - entries[0].put_iv
+
+    # Bias: expanding if IV generally rising, contracting if falling
+    avg_change = (cum_call + cum_put) / 2
+    if avg_change > 0.005:
+        bias = "EXPANDING"
+    elif avg_change < -0.005:
+        bias = "CONTRACTING"
+    else:
+        bias = "NEUTRAL"
+
+    # Fall back to API-provided fields if present
+    bias_raw = resp.get("bias") or resp.get("ivBias")
+    if bias_raw and str(bias_raw).upper() in ("EXPANDING", "CONTRACTING", "NEUTRAL"):
+        bias = str(bias_raw).upper()  # type: ignore[assignment]
+
+    return VolDriftSummary(
+        entries=entries,
+        cumulative_iv_change_call=cum_call,
+        cumulative_iv_change_put=cum_put,
+        bias=bias,  # type: ignore[arg-type]
+    )
+
+
+def parse_vol_skew(data: dict[str, Any]) -> IVSkewSnapshot:
+    """Parse volatility skew response.
+
+    Best-guess shape: a list of per-strike rows with IV values.
+    Expects response.rows or response.strikes or similar.
+    """
+    resp = data.get("response", {}) if data else {}
+    spx_price = (resp.get("stockPriceInCents", 0) or 0) / 100
+
+    # Try multiple possible key names for the row list
+    raw_rows = (
+        resp.get("strikeToIVMap")
+        or resp.get("rows")
+        or resp.get("strikes")
+        or []
+    )
+
+    rows: list[IVSkewRow] = []
+
+    if isinstance(raw_rows, dict):
+        # Map form: {strike_cents_str: {CALL: iv, PUT: iv}}
+        for strike_str, ivs in raw_rows.items():
+            try:
+                strike = int(strike_str) / 100
+                call_iv = float((ivs.get("CALL") or ivs.get("call") or 0))
+                put_iv = float((ivs.get("PUT") or ivs.get("put") or 0))
+                if call_iv > 2:
+                    call_iv /= 100
+                if put_iv > 2:
+                    put_iv /= 100
+                rows.append(IVSkewRow.from_ivs(strike=strike, call_iv=call_iv, put_iv=put_iv))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(raw_rows, list):
+        # List form: [{strike, call_iv, put_iv}, ...]
+        for item in raw_rows:
+            if not isinstance(item, dict):
+                continue
+            try:
+                strike_raw = item.get("strikePriceInCents") or item.get("strike", 0)
+                strike = int(strike_raw) / 100 if int(strike_raw) > 500 else float(strike_raw)
+                call_iv = float(item.get("callIV") or item.get("call_iv") or 0)
+                put_iv = float(item.get("putIV") or item.get("put_iv") or 0)
+                if call_iv > 2:
+                    call_iv /= 100
+                if put_iv > 2:
+                    put_iv /= 100
+                rows.append(IVSkewRow.from_ivs(strike=strike, call_iv=call_iv, put_iv=put_iv))
+            except (TypeError, ValueError):
+                continue
+
+    rows.sort(key=lambda r: r.strike)
+    return IVSkewSnapshot(spx_price=spx_price, rows=rows)
+
+
+def parse_dark_pool(data: dict[str, Any]) -> DarkPoolSnapshot:
+    """Parse dark pool levels response for SPY.
+
+    Best-guess shape: a list of price levels with notional and count.
+    """
+    resp = data.get("response", {}) if data else {}
+
+    raw_levels = (
+        resp.get("levels")
+        or resp.get("darkPoolLevels")
+        or resp.get("priceToNotionalMap")
+        or []
+    )
+
+    dp_levels: list[DarkPoolLevel] = []
+
+    if isinstance(raw_levels, dict):
+        # Map form: {price_cents_str: {notional, count}}
+        for price_str, info in raw_levels.items():
+            try:
+                price_raw = float(price_str)
+                price = price_raw / 100 if price_raw > 500 else price_raw
+                notional = float(info.get("notionalDollars") or info.get("notional") or 0)
+                count = int(info.get("tradeCount") or info.get("count") or 0)
+                dp_levels.append(DarkPoolLevel(price=price, notional_dollars=notional, trade_count=count))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(raw_levels, list):
+        for item in raw_levels:
+            if not isinstance(item, dict):
+                continue
+            try:
+                price_raw = item.get("priceCents") or item.get("price", 0)
+                price = float(price_raw) / 100 if float(price_raw) > 500 else float(price_raw)
+                notional = float(item.get("notionalDollars") or item.get("notional") or 0)
+                count = int(item.get("tradeCount") or item.get("count") or 0)
+                dp_levels.append(DarkPoolLevel(price=price, notional_dollars=notional, trade_count=count))
+            except (TypeError, ValueError):
+                continue
+
+    dp_levels.sort(key=lambda l: l.price)
+    return DarkPoolSnapshot(rows=dp_levels)
+
+
+def parse_quant_alerts(data: dict[str, Any]) -> QuantAlertsSnapshot:
+    """Parse unusual-activity alerts response.
+
+    Best-guess shape: list of alert objects with type, contract info,
+    premium, and side. QuantData may use various key names.
+    """
+    resp = data.get("response", {}) if data else {}
+
+    raw_alerts = (
+        resp.get("alerts")
+        or resp.get("unusualActivity")
+        or resp.get("list")
+        or []
+    )
+
+    alerts: list[QuantAlert] = []
+    for item in raw_alerts:
+        if not isinstance(item, dict):
+            continue
+        try:
+            ts = int(item.get("timestampMs") or item.get("timestamp_ms") or 0)
+            alert_type = str(item.get("alertType") or item.get("alert_type") or item.get("type") or "UNKNOWN")
+            # Contract: compose from parts or use pre-formatted string
+            contract_str = item.get("contract") or item.get("contractDescription") or ""
+            if not contract_str:
+                strike = item.get("strikePriceInCents") or item.get("strike") or 0
+                right = item.get("contractType") or item.get("right") or "?"
+                expiry = item.get("expirationDate") or item.get("expiry") or "?"
+                contract_str = f"{right}{int(strike)/100 if int(strike)>500 else strike}@{expiry}"
+            premium_raw = float(item.get("premiumDollars") or item.get("premium") or 0)
+            # Some endpoints return premium in cents
+            if premium_raw > 0 and premium_raw < 100 and item.get("premiumCents"):
+                premium_raw = float(item["premiumCents"]) / 100
+            side_raw = str(item.get("side") or item.get("contractType") or "CALL").upper()
+            side = "CALL" if "CALL" in side_raw or "C" == side_raw else "PUT"
+            alerts.append(QuantAlert(
+                timestamp_ms=ts,
+                alert_type=alert_type,
+                contract=contract_str,
+                premium_dollars=premium_raw,
+                side=side,  # type: ignore[arg-type]
+            ))
+        except (TypeError, ValueError):
+            continue
+
+    # Most recent first
+    alerts.sort(key=lambda a: a.timestamp_ms, reverse=True)
+    return QuantAlertsSnapshot(alerts=alerts)

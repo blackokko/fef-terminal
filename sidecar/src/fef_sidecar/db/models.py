@@ -75,6 +75,15 @@ class SignalIter(SQLModel, table=True):
     top_cex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     top_vex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
 
+    # Research-only batch 2 (2026-05-21). Engine does NOT gate on any of
+    # these. They are here for post-freeze backtest access only.
+    vol_drift_cum_call: float | None = None
+    vol_drift_cum_put: float | None = None
+    vol_drift_bias: str | None = None
+    top_skew_rows: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    top_dp_levels: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    recent_alerts: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+
     # Optional metrics (nullable)
     aggression_call_pct: float | None = None
     aggression_put_pct: float | None = None
@@ -323,6 +332,15 @@ class FlowSnapshot(SQLModel, table=True):
     aggression_put_pct: float | None = None
     iv_rank_call_pct: float | None = None
     iv_rank_put_pct: float | None = None
+
+    # Research-only batch 2 (2026-05-21). Engine does NOT gate on any of
+    # these. They are here for post-freeze backtest access only.
+    vol_drift_cum_call: float | None = None
+    vol_drift_cum_put: float | None = None
+    vol_drift_bias: str | None = None
+    top_skew_rows: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    top_dp_levels: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    recent_alerts: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
 
 
 class MicrostructureSample(SQLModel, table=True):

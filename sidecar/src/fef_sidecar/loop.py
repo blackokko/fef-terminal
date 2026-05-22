@@ -75,6 +75,34 @@ def _walls_json(walls: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _skew_rows_json(rows: Any) -> list[dict[str, Any]]:
+    """Serialize IVSkewRow objects to compact dicts for JSON storage."""
+    return [
+        {"strike": r.strike, "call_iv": round(r.call_iv, 4),
+         "put_iv": round(r.put_iv, 4), "skew_pts": round(r.skew_pts, 4)}
+        for r in (rows or [])
+    ]
+
+
+def _dp_levels_json(levels: Any) -> list[dict[str, Any]]:
+    """Serialize DarkPoolLevel objects to compact dicts for JSON storage."""
+    return [
+        {"price": l.price, "notional_dollars": round(l.notional_dollars, 0),
+         "trade_count": l.trade_count}
+        for l in (levels or [])
+    ]
+
+
+def _alerts_json(alerts: Any) -> list[dict[str, Any]]:
+    """Serialize QuantAlert objects to compact dicts for JSON storage."""
+    return [
+        {"timestamp_ms": a.timestamp_ms, "alert_type": a.alert_type,
+         "contract": a.contract, "premium_dollars": round(a.premium_dollars, 0),
+         "side": a.side}
+        for a in (alerts or [])
+    ]
+
+
 # Per-symbol plausible price range — anything outside is rejected as
 # garbage (stale ticker route, wrong-symbol QuantData response, etc.).
 # Catches the 5/18-5/20 corruption where active_symbol=ES caused
@@ -155,6 +183,13 @@ async def quantdata_poll_loop(state: AppState) -> None:
                     aggression_put_pct=snap.aggression.put.aggression_pct if snap.aggression and snap.aggression.put else None,  # type: ignore[union-attr]
                     iv_rank_call_pct=snap.iv_rank.call.ivr_pct if snap.iv_rank and snap.iv_rank.call else None,  # type: ignore[union-attr]
                     iv_rank_put_pct=snap.iv_rank.put.ivr_pct if snap.iv_rank and snap.iv_rank.put else None,  # type: ignore[union-attr]
+                    # Research-only batch 2 (2026-05-21)
+                    vol_drift_cum_call=snap.vol_drift.cumulative_iv_change_call if snap.vol_drift else None,  # type: ignore[union-attr]
+                    vol_drift_cum_put=snap.vol_drift.cumulative_iv_change_put if snap.vol_drift else None,  # type: ignore[union-attr]
+                    vol_drift_bias=snap.vol_drift.bias if snap.vol_drift else None,  # type: ignore[union-attr]
+                    top_skew_rows=_skew_rows_json(snap.vol_skew.top(5)) if snap.vol_skew else [],  # type: ignore[union-attr]
+                    top_dp_levels=_dp_levels_json(snap.dark_pool.top(5)) if snap.dark_pool else [],  # type: ignore[union-attr]
+                    recent_alerts=_alerts_json(snap.quant_alerts.alerts) if snap.quant_alerts else [],  # type: ignore[union-attr]
                 )
             except Exception:
                 logger.exception("Failed to persist flow snapshot")
@@ -586,6 +621,13 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
         aggression_put_pct=inputs.aggression_put_pct,
         iv_rank_call_pct=inputs.iv_rank_call_pct,
         iv_rank_put_pct=inputs.iv_rank_put_pct,
+        # Research-only batch 2 (2026-05-21)
+        vol_drift_cum_call=inputs.vol_drift_cum_call,
+        vol_drift_cum_put=inputs.vol_drift_cum_put,
+        vol_drift_bias=inputs.vol_drift_bias,
+        top_skew_rows=_skew_rows_json(inputs.top_skew_rows),
+        top_dp_levels=_dp_levels_json(inputs.top_dp_levels),
+        recent_alerts=_alerts_json(inputs.recent_alerts),
         extras={
             **verdict.to_log_extras(),
             "option_pricing": _option_pricing_dict(option_targets),

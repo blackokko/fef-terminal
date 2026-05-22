@@ -29,24 +29,32 @@ from fef_sidecar.quantdata.errors import (
 from fef_sidecar.quantdata.models import (
     AggressionStats,
     ContractStats,
+    DarkPoolSnapshot,
     DriftSummary,
     GreekType,
     IVRankSnapshot,
+    IVSkewSnapshot,
     MarketSnapshot,
     MaxPainSnapshot,
     NetFlowSnapshot,
     OpenInterestSnapshot,
+    QuantAlertsSnapshot,
     StrikeExposureSnapshot,
+    VolDriftSummary,
 )
 from fef_sidecar.quantdata.parser import (
     parse_contract_stats,
+    parse_dark_pool,
     parse_exposure,
     parse_iv_rank,
     parse_max_pain,
     parse_net_drift,
     parse_net_flow,
     parse_oi_by_strike,
+    parse_quant_alerts,
     parse_trade_side_stats,
+    parse_vol_drift,
+    parse_vol_skew,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +68,11 @@ ENDPOINTS: Mapping[str, str] = {
     "net_flow": "options/net-flow",
     "oi_by_strike": "options/open-interest/strike",
     "contract_statistics": "options/contract/statistics",
+    # Research-only — batch 2 (2026-05-21). Engine does NOT gate on these.
+    "vol_drift": "options/volatility-drift",
+    "vol_skew": "options/volatility-skew",
+    "dark_pool": "darkpool/levels",
+    "quant_alerts": "alerts/list",
 }
 
 
@@ -210,6 +223,22 @@ class QuantDataClient:
             )
         return tid
 
+    def _tool_id_optional(self, canonical: str) -> str | None:
+        """Like _tool_id but returns None instead of raising if not configured.
+
+        Used by research-only fetchers (vol_drift, vol_skew, dark_pool,
+        quant_alerts) so the live call degrades gracefully when these tools
+        haven't been provisioned in the MCP config yet.
+        """
+        tid = self.config.tools.get(canonical)
+        if not tid:
+            logger.debug(
+                "Tool '%s' not configured — skipping fetch (run `quantdata-mcp setup` to provision)",
+                canonical,
+            )
+            return None
+        return tid
+
     # ------------------------------------------------------------------
     # Page filter (session date / ticker scoping)
     # ------------------------------------------------------------------
@@ -317,6 +346,47 @@ class QuantDataClient:
         return parse_net_flow(raw)
 
     # ------------------------------------------------------------------
+    # Research-only fetchers — batch 2 (2026-05-21)
+    # Engine does NOT gate on these. Graceful fallback via _tool_id_optional.
+    # ------------------------------------------------------------------
+
+    async def get_vol_drift(self) -> VolDriftSummary | None:
+        """Fetch IV time-series (volatility drift). Returns None if not configured."""
+        tid = self._tool_id_optional("vol_drift")
+        if tid is None:
+            return None
+        raw = await self._get_json(f"{ENDPOINTS['vol_drift']}/{tid}")
+        return parse_vol_drift(raw)
+
+    async def get_vol_skew(self) -> IVSkewSnapshot | None:
+        """Fetch per-strike IV snapshot (volatility skew). Returns None if not configured."""
+        tid = self._tool_id_optional("vol_skew")
+        if tid is None:
+            return None
+        raw = await self._get_json(f"{ENDPOINTS['vol_skew']}/{tid}")
+        return parse_vol_skew(raw)
+
+    async def get_dark_pool(self) -> DarkPoolSnapshot | None:
+        """Fetch dark pool levels for SPY. Returns None if not configured.
+
+        Note: dark pool data is sourced from SPY (not SPX) since SPX itself
+        has no dark prints. The page filter must be set to SPY before calling.
+        """
+        tid = self._tool_id_optional("dark_pool")
+        if tid is None:
+            return None
+        raw = await self._get_json(f"{ENDPOINTS['dark_pool']}/{tid}")
+        return parse_dark_pool(raw)
+
+    async def get_quant_alerts(self) -> QuantAlertsSnapshot | None:
+        """Fetch recent unusual-activity alerts. Returns None if not configured."""
+        tid = self._tool_id_optional("quant_alerts")
+        if tid is None:
+            return None
+        raw = await self._get_json(f"{ENDPOINTS['quant_alerts']}/{tid}")
+        return parse_quant_alerts(raw)
+
+    # ------------------------------------------------------------------
     # Composite snapshot — one call, concurrent fetches
     # ------------------------------------------------------------------
 
@@ -328,12 +398,19 @@ class QuantDataClient:
         include_oi: bool = True,
         include_cex: bool = True,
         include_vex: bool = True,
+        include_vol_drift: bool = True,
+        include_vol_skew: bool = True,
+        include_dark_pool: bool = True,
+        include_quant_alerts: bool = True,
     ) -> MarketSnapshot:
         """Fetch GEX + DEX + drift + max_pain (+ optional extras) concurrently.
 
         cex/vex reuse the same exposure-by-strike endpoint with a different
         greekModeType, so they piggyback on the existing tool_id and don't
         need separate MCP setup.
+
+        vol_drift / vol_skew / dark_pool / quant_alerts are research-only —
+        they degrade gracefully to None if the tool IDs aren't provisioned.
         """
         # NOTE: the exposure endpoint mutates tool metadata server-side (PUT
         # greekModeType), so concurrent fetches with different greek params
@@ -360,6 +437,15 @@ class QuantDataClient:
             tasks["iv_rank"] = asyncio.create_task(self.get_iv_rank())
         if include_oi:
             tasks["oi"] = asyncio.create_task(self.get_oi_by_strike())
+        # Research-only — degrade gracefully when tool IDs absent
+        if include_vol_drift:
+            tasks["vol_drift"] = asyncio.create_task(self.get_vol_drift())
+        if include_vol_skew:
+            tasks["vol_skew"] = asyncio.create_task(self.get_vol_skew())
+        if include_dark_pool:
+            tasks["dark_pool"] = asyncio.create_task(self.get_dark_pool())
+        if include_quant_alerts:
+            tasks["quant_alerts"] = asyncio.create_task(self.get_quant_alerts())
 
         results = dict(zip(tasks.keys(), await asyncio.gather(*tasks.values()), strict=True))
         exposure: dict[str, StrikeExposureSnapshot] = results["exposure"]
@@ -377,4 +463,8 @@ class QuantDataClient:
             oi=results.get("oi"),
             cex=exposure.get("cex"),
             vex=exposure.get("vex"),
+            vol_drift=results.get("vol_drift"),
+            vol_skew=results.get("vol_skew"),
+            dark_pool=results.get("dark_pool"),
+            quant_alerts=results.get("quant_alerts"),
         )
