@@ -326,11 +326,31 @@ class QuantDataClient:
         include_aggression: bool = True,
         include_iv_rank: bool = True,
         include_oi: bool = True,
+        include_cex: bool = True,
+        include_vex: bool = True,
     ) -> MarketSnapshot:
-        """Fetch GEX + DEX + drift + max_pain (+ optional extras) concurrently."""
+        """Fetch GEX + DEX + drift + max_pain (+ optional extras) concurrently.
+
+        cex/vex reuse the same exposure-by-strike endpoint with a different
+        greekModeType, so they piggyback on the existing tool_id and don't
+        need separate MCP setup.
+        """
+        # NOTE: the exposure endpoint mutates tool metadata server-side (PUT
+        # greekModeType), so concurrent fetches with different greek params
+        # would race on the same tool_id. Serialize the exposure calls into
+        # a single sequential task, then concurrent everything else.
+        async def _exposure_chain() -> dict[str, StrikeExposureSnapshot]:
+            out: dict[str, StrikeExposureSnapshot] = {}
+            out["gex"] = await self.get_exposure_by_strike(GreekType.GAMMA)
+            out["dex"] = await self.get_exposure_by_strike(GreekType.DELTA)
+            if include_cex:
+                out["cex"] = await self.get_exposure_by_strike(GreekType.CHARM)
+            if include_vex:
+                out["vex"] = await self.get_exposure_by_strike(GreekType.VANNA)
+            return out
+
         tasks: dict[str, asyncio.Task[Any]] = {
-            "gex": asyncio.create_task(self.get_exposure_by_strike(GreekType.GAMMA)),
-            "dex": asyncio.create_task(self.get_exposure_by_strike(GreekType.DELTA)),
+            "exposure": asyncio.create_task(_exposure_chain()),
             "drift": asyncio.create_task(self.get_net_drift()),
             "max_pain": asyncio.create_task(self.get_max_pain()),
         }
@@ -342,16 +362,19 @@ class QuantDataClient:
             tasks["oi"] = asyncio.create_task(self.get_oi_by_strike())
 
         results = dict(zip(tasks.keys(), await asyncio.gather(*tasks.values()), strict=True))
+        exposure: dict[str, StrikeExposureSnapshot] = results["exposure"]
 
-        gex: StrikeExposureSnapshot = results["gex"]
+        gex: StrikeExposureSnapshot = exposure["gex"]
         return MarketSnapshot(
             fetched_at_ms=int(time.time() * 1000),
             spx_price=gex.spx_price,
             gex=gex,
-            dex=results["dex"],
+            dex=exposure["dex"],
             drift=results["drift"],
             max_pain=results["max_pain"],
             aggression=results.get("aggression"),
             iv_rank=results.get("iv_rank"),
             oi=results.get("oi"),
+            cex=exposure.get("cex"),
+            vex=exposure.get("vex"),
         )

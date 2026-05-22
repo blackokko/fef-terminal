@@ -25,6 +25,12 @@ class FEFInputs:
     aggression_put_pct: float | None = None
     iv_rank_call_pct: float | None = None
     iv_rank_put_pct: float | None = None
+    # Higher-order Greek walls (CHARM = delta decay drives EOD pin/unpin,
+    # VANNA = delta sensitivity to IV moves). Populated when MarketSnapshot
+    # has cex/vex; engine doesn't gate on them yet — research-only fields
+    # recorded to signal_iter.extras for post-freeze pattern discovery.
+    top_cex_walls: list[ExposureRow] = field(default_factory=list)
+    top_vex_walls: list[ExposureRow] = field(default_factory=list)
 
 
 @dataclass

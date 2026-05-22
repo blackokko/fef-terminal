@@ -57,6 +57,32 @@ _DEX_ROWS = [
     ExposureRow(strike=7415.0, call_m=8671.86, put_m=-470269.35, net_m=-461597.49),
 ]
 
+_CEX_ROWS = [
+    ExposureRow(strike=7400.0, call_m=-12450.30, put_m=-8120.10, net_m=-20570.40),
+    ExposureRow(strike=7410.0, call_m=-9876.50, put_m=-2310.20, net_m=-12186.70),
+    ExposureRow(strike=7415.0, call_m=-7234.20, put_m=-1856.40, net_m=-9090.60),
+    ExposureRow(strike=7405.0, call_m=-8101.30, put_m=-540.10, net_m=-8641.40),
+    ExposureRow(strike=7395.0, call_m=-3210.40, put_m=4823.50, net_m=1613.10),
+    ExposureRow(strike=7420.0, call_m=-2987.10, put_m=-3456.40, net_m=-6443.50),
+    ExposureRow(strike=7390.0, call_m=-1840.20, put_m=5210.30, net_m=3370.10),
+    ExposureRow(strike=7385.0, call_m=-1120.50, put_m=6234.10, net_m=5113.60),
+    ExposureRow(strike=7425.0, call_m=-2456.30, put_m=-1834.60, net_m=-4290.90),
+    ExposureRow(strike=7380.0, call_m=-756.40, put_m=7234.50, net_m=6478.10),
+]
+
+_VEX_ROWS = [
+    ExposureRow(strike=7400.0, call_m=15234.50, put_m=-12876.30, net_m=2358.20),
+    ExposureRow(strike=7450.0, call_m=18934.20, put_m=-3456.10, net_m=15478.10),
+    ExposureRow(strike=7350.0, call_m=2876.10, put_m=-17234.50, net_m=-14358.40),
+    ExposureRow(strike=7500.0, call_m=12345.80, put_m=-987.30, net_m=11358.50),
+    ExposureRow(strike=7300.0, call_m=1234.50, put_m=-13876.40, net_m=-12641.90),
+    ExposureRow(strike=7425.0, call_m=14567.30, put_m=-7234.10, net_m=7333.20),
+    ExposureRow(strike=7375.0, call_m=5234.20, put_m=-11456.30, net_m=-6222.10),
+    ExposureRow(strike=7475.0, call_m=8765.40, put_m=-2123.50, net_m=6641.90),
+    ExposureRow(strike=7325.0, call_m=2345.60, put_m=-9876.20, net_m=-7530.60),
+    ExposureRow(strike=7410.0, call_m=11234.50, put_m=-9876.30, net_m=1358.20),
+]
+
 _OI_ROWS = [
     OIRow(strike=7400.0, call_oi=30921, put_oi=9240),
     OIRow(strike=7450.0, call_oi=8333, put_oi=6618),
@@ -117,7 +143,13 @@ class MockQuantDataClient:
     async def get_exposure_by_strike(
         self, greek: GreekType = GreekType.GAMMA
     ) -> StrikeExposureSnapshot:
-        rows = _GEX_ROWS if greek == GreekType.GAMMA else _DEX_ROWS
+        rows_by_greek = {
+            GreekType.GAMMA: _GEX_ROWS,
+            GreekType.DELTA: _DEX_ROWS,
+            GreekType.CHARM: _CEX_ROWS,
+            GreekType.VANNA: _VEX_ROWS,
+        }
+        rows = rows_by_greek.get(greek, _GEX_ROWS)
         return StrikeExposureSnapshot(greek=greek, spx_price=self.spx_price, rows=list(rows))
 
     async def get_net_drift(self) -> DriftSummary:
@@ -183,6 +215,8 @@ class MockQuantDataClient:
         include_aggression: bool = True,
         include_iv_rank: bool = True,
         include_oi: bool = True,
+        include_cex: bool = True,
+        include_vex: bool = True,
     ) -> MarketSnapshot:
         """Mock snapshot with per-call variation.
 
@@ -254,6 +288,8 @@ class MockQuantDataClient:
                 ) if include_aggression else None,
                 iv_rank=await self.get_iv_rank() if include_iv_rank else None,
                 oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
+                cex=StrikeExposureSnapshot(greek=GreekType.CHARM, spx_price=spx_now, rows=list(_CEX_ROWS)) if include_cex else None,
+                vex=StrikeExposureSnapshot(greek=GreekType.VANNA, spx_price=spx_now, rows=list(_VEX_ROWS)) if include_vex else None,
                 simulated_minutes_since_open=frame.minutes_since_open,
                 simulated_phase_label=frame.label,
                 simulated_vix=frame.vix,
@@ -287,6 +323,8 @@ class MockQuantDataClient:
                 ) if include_aggression else None,
                 iv_rank=await self.get_iv_rank() if include_iv_rank else None,
                 oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
+                cex=StrikeExposureSnapshot(greek=GreekType.CHARM, spx_price=spx_now, rows=list(_CEX_ROWS)) if include_cex else None,
+                vex=StrikeExposureSnapshot(greek=GreekType.VANNA, spx_price=spx_now, rows=list(_VEX_ROWS)) if include_vex else None,
                 simulated_minutes_since_open=frame.minutes_since_open,
                 simulated_phase_label=frame.label,
                 simulated_vix=frame.vix,
@@ -316,4 +354,6 @@ class MockQuantDataClient:
             aggression=await self.get_trade_side_stats() if include_aggression else None,
             iv_rank=await self.get_iv_rank() if include_iv_rank else None,
             oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
+            cex=StrikeExposureSnapshot(greek=GreekType.CHARM, spx_price=spx_now, rows=list(_CEX_ROWS)) if include_cex else None,
+            vex=StrikeExposureSnapshot(greek=GreekType.VANNA, spx_price=spx_now, rows=list(_VEX_ROWS)) if include_vex else None,
         )

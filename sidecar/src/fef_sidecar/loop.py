@@ -606,6 +606,12 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             # than block-fire gating in that case.
             "alt_direction_30m": alt_direction,
             "alt_direction_4h": alt_direction_4h,
+            # Higher-order Greek walls captured at fire time. Research-only
+            # for now — engine doesn't gate on them. CEX drives EOD pin
+            # dynamic; VEX captures dealer hedging on IV moves. Post-freeze
+            # we'll evaluate whether they discriminate W/L beyond GEX/DEX.
+            "top_cex_walls": _walls_json(inputs.top_cex_walls),
+            "top_vex_walls": _walls_json(inputs.top_vex_walls),
             # Snapshot the latest HFT + microstructure state at fire time so
             # offline analysis (ML pattern discovery, TuningRecommendation)
             # can correlate signal outcomes with HFT/microstructure context

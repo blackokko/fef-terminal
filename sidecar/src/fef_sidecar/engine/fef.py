@@ -41,6 +41,8 @@ def snapshot_to_inputs(snap: MarketSnapshot) -> FEFInputs:
         aggression_put_pct=snap.aggression.put.aggression_pct if snap.aggression else None,
         iv_rank_call_pct=snap.iv_rank.call.ivr_pct if snap.iv_rank and snap.iv_rank.call else None,
         iv_rank_put_pct=snap.iv_rank.put.ivr_pct if snap.iv_rank and snap.iv_rank.put else None,
+        top_cex_walls=snap.cex.top(5) if snap.cex else [],
+        top_vex_walls=snap.vex.top(5) if snap.vex else [],
     )
 
 

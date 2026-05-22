@@ -214,6 +214,13 @@ class MarketSnapshot(BaseModel):
     iv_rank: IVRankSnapshot | None = None
     oi: OpenInterestSnapshot | None = None
 
+    # Higher-order Greek exposures — pulled via same endpoint as GEX/DEX with
+    # different greekModeType. Used as research-only features during freeze;
+    # engine doesn't gate on them yet. cex captures the EOD pin/unpin force
+    # that dominates 0DTE; vex captures dealer hedging when IV moves.
+    cex: StrikeExposureSnapshot | None = None
+    vex: StrikeExposureSnapshot | None = None
+
     # Optional sim metadata — only set by the scripted-day mock. Lets the
     # regime detector use simulated time of day for testing transitions.
     simulated_minutes_since_open: int | None = None
