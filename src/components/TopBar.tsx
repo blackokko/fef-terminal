@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useSidecar } from "../context/WebSocketContext";
 import { popoutChart } from "../lib/popoutChart";
+import { displayDirection } from "../lib/displayHelpers";
 import { SymbolSelector } from "./SymbolSelector";
 
 const connectionColor: Record<string, string> = {
@@ -133,7 +134,14 @@ function FreezePill() {
   );
 }
 
-export function TopBar() {
+type Screen = "trading" | "research" | "settings";
+
+interface TopBarProps {
+  screen?: Screen;
+  onScreenChange?: (s: Screen) => void;
+}
+
+export function TopBar({ screen = "trading", onScreenChange }: TopBarProps = {}) {
   const { connection, lastTick, lastIter, lastStatus, lastSnapshot, lastAccount } = useSidecar();
   const spx = lastTick?.spx_price ?? lastIter?.spx_price;
 
@@ -175,6 +183,24 @@ export function TopBar() {
 
   return (
     <header className="topbar">
+      {onScreenChange && (
+        <div className="screen-tabs">
+          {(["trading", "research", "settings"] as Screen[]).map((s) => (
+            <button
+              key={s}
+              className={`screen-tab ${screen === s ? "active" : ""}`}
+              onClick={() => onScreenChange(s)}
+              title={s === "trading" ? "Live chart + execution panels"
+                : s === "research" ? "Backtests, preset tournament, walk-forward, patterns, engine changes, audit log"
+                : "Data maintenance, audit log, chart annotations, glossary"}
+            >
+              {s === "trading" ? "Trading"
+                : s === "research" ? "Research"
+                : "Settings"}
+            </button>
+          ))}
+        </div>
+      )}
       <SymbolSelector />
       <div className="topbar-section">
         <span className="topbar-label">PRICE</span>
@@ -196,7 +222,7 @@ export function TopBar() {
         <span className="topbar-label">Last iter</span>
         <span className="topbar-value">
           {lastIter
-            ? `#${lastIter.iter_num} ${lastIter.verdict.direction}`
+            ? `#${lastIter.iter_num} ${displayDirection(lastIter.verdict.direction)}`
             : "—"}
         </span>
         <ModelStatePill />
@@ -205,7 +231,14 @@ export function TopBar() {
 
       <div className="topbar-section">
         <span className="topbar-label">QuantData</span>
-        <span className="topbar-value">{lastStatus?.quantdata ?? "—"}</span>
+        <span className="topbar-value">
+          {(() => {
+            const q = lastStatus?.quantdata;
+            if (!q) return "—";
+            if (q.startsWith("Mock")) return "mock";
+            return "connected";
+          })()}
+        </span>
       </div>
 
       <div className="topbar-section">

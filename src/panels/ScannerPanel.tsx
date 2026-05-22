@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useToast } from "../components/Toast";
 
 const API_BASE = "http://127.0.0.1:8765";
-const SCANNER_SYMBOLS = ["SPX", "SPY", "QQQ", "IWM"];
+const SCANNER_SYMBOLS = ["SPX", "SPY", "QQQ", "IWM", "GLD", "SMH", "TLT"];
 
 interface ScannerVerdict {
   direction: string;
@@ -17,6 +17,7 @@ interface ScannerStatus {
   enabled: Record<string, boolean>;
   max_per_symbol: number;
   max_per_session_global: number;
+  implied_global_cap?: number;
   count_global: number;
   count_by_symbol: Record<string, number>;
   cool_down_sec: number;
@@ -99,15 +100,18 @@ export function ScannerPanel() {
       <h3 className="sidebar-section-title">Multi-symbol scanner</h3>
 
       <div className="muted small" style={{ marginBottom: 6 }}>
-        Global: <strong>{status.count_global}/{status.max_per_session_global}</strong> ·
-        per-symbol cap: <input
+        Per-symbol cap: <input
           type="number" min={1} max={50}
           value={status.max_per_symbol}
           onChange={(e) => void updateMaxPerSymbol(Number(e.target.value))}
           disabled={busy}
-          style={{ width: 50, marginLeft: 4 }}
+          style={{ width: 50, margin: "0 4px" }}
           className="settings-input"
-        />
+        /> ·
+        total budget: <strong>{status.count_global}/{status.max_per_session_global}</strong>
+        <span className="muted small" style={{ marginLeft: 4 }}>
+          (auto = cap × enabled symbols)
+        </span>
       </div>
 
       <table style={{ width: "100%", fontSize: 11, fontFamily: "var(--font-mono)" }}>

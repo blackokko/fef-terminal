@@ -20,18 +20,61 @@ import { formatExposureM } from "../lib/format";
 
 const API_BASE = "http://127.0.0.1:8765";
 
-// Display chart times in America/Chicago (CST/CDT) so the bar axis matches
-// the LiveQuote panel + the trader's local clock. lightweight-charts stores
-// epoch seconds internally — the formatter only changes the DISPLAYED string.
-const _CST_TIME_FMT = new Intl.DateTimeFormat("en-US", {
-  timeZone: "America/Chicago",
-  hour: "2-digit", minute: "2-digit", hour12: false,
-});
-const _CST_DATETIME_FMT = new Intl.DateTimeFormat("en-US", {
-  timeZone: "America/Chicago",
-  month: "short", day: "2-digit",
-  hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
-});
+// Display chart times in America/Chicago, 12-hour with lowercase am/pm.
+// Per user preference: NEVER show military / UTC time anywhere.
+//
+// lightweight-charts passes `Time` which can be:
+//   - UTCTimestamp (number, seconds since epoch) — intraday charts
+//   - BusinessDay ({year, month, day}) — daily/weekly timeframes
+//   - string ("YYYY-MM-DD")
+// We normalize to a Date and wrap in try/catch so a single bad value
+// never blanks the entire chart.
+function _toDate(time: unknown): Date | null {
+  try {
+    if (typeof time === "number" && isFinite(time)) {
+      return new Date(time * 1000);
+    }
+    if (typeof time === "string" && time.length > 0) {
+      const d = new Date(time);
+      return isNaN(d.getTime()) ? null : d;
+    }
+    if (typeof time === "object" && time !== null && "year" in (time as any)) {
+      const b = time as { year: number; month: number; day: number };
+      return new Date(b.year, b.month - 1, b.day);
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+
+function _fmtChartTime(time: unknown, includeDate: boolean, includeSeconds: boolean): string {
+  const date = _toDate(time);
+  if (!date) return "";
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Chicago",
+      hour: "numeric",
+      minute: "2-digit",
+      ...(includeSeconds ? { second: "2-digit" } : {}),
+      hour12: true,
+    }).formatToParts(date);
+    let h = "", m = "", s = "", period = "";
+    for (const p of parts) {
+      if (p.type === "hour") h = p.value;
+      else if (p.type === "minute") m = p.value;
+      else if (p.type === "second") s = p.value;
+      else if (p.type === "dayPeriod") period = p.value.toLowerCase();
+    }
+    const timeStr = includeSeconds ? `${h}:${m}:${s}${period}` : `${h}:${m}${period}`;
+    if (!includeDate) return timeStr;
+    const datePart = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Chicago",
+      month: "short", day: "numeric",
+    }).format(date);
+    return `${datePart}, ${timeStr}`;
+  } catch {
+    return "";
+  }
+}
 
 const DARK_THEME = {
   layout: {
@@ -43,11 +86,14 @@ const DARK_THEME = {
   crosshair: { mode: CrosshairMode.Normal },
   timeScale: {
     borderColor: "#2a323e", timeVisible: true, secondsVisible: false,
-    tickMarkFormatter: (time: number) => _CST_TIME_FMT.format(new Date(time * 1000)),
+    tickMarkFormatter: (time: unknown) => _fmtChartTime(time, false, false),
   },
   rightPriceScale: { borderColor: "#2a323e" },
   localization: {
-    timeFormatter: (time: number) => _CST_DATETIME_FMT.format(new Date(time * 1000)) + " CT",
+    timeFormatter: (time: unknown) => {
+      const formatted = _fmtChartTime(time, true, true);
+      return formatted ? `${formatted} CT` : "";
+    },
   },
 };
 
@@ -305,6 +351,13 @@ export function ChartPane() {
         for (const line of ambientLinesRef.current) seriesRef.current.removePriceLine(line);
         ambientLinesRef.current = [];
       }
+      // Re-enable price-axis autoscale. Without this, the Y-axis stays
+      // pinned to the previous symbol's range (e.g. SMH ~270) when you
+      // switch to a different price regime (ES ~7400), forcing the user
+      // to scroll/zoom the price axis manually. fitContent() only fits
+      // the time scale; price autoscale gets disabled the moment the user
+      // wheel-zooms on the Y-axis, so we explicitly re-enable it here.
+      chartRef.current?.priceScale("right").applyOptions({ autoScale: true });
     } catch {}
     void fetchBars();
     // Historical mode: no polling (the day is closed). Live mode: poll every 3s.

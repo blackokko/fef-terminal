@@ -33,7 +33,7 @@ from fef_sidecar.engine.fef import snapshot_to_inputs
 logger = logging.getLogger(__name__)
 
 
-OPTION_SYMBOLS = {"SPX", "SPY", "QQQ", "IWM"}
+OPTION_SYMBOLS = {"SPX", "SPY", "QQQ", "IWM", "GLD", "SMH", "TLT"}
 
 
 def _make_engine_for(symbol: str) -> FEFEngine:
@@ -112,8 +112,12 @@ async def _scan_one_symbol(state, symbol: str) -> None:
     if verdict.direction.value in ("LONG_CALLS", "LONG_PUTS") and verdict.strike_rec:
         try:
             from fef_sidecar.engine.option_targets import build_option_targets
+            from fef_sidecar.engine.expiry_resolver import resolve_nearest_expiry
             from fef_sidecar.ibkr.models import Contract, ContractKind
-            expiry = _today_et().replace("-", "")
+            # Per-symbol nearest-expiry resolution. Fixes the bug where
+            # GLD/SMH/TLT (no 0DTE) and SPY/QQQ/IWM on Tu/Th silently
+            # failed Gate 8 because today's expiry didn't exist.
+            expiry = await resolve_nearest_expiry(state, symbol)
             right = "C" if verdict.direction.value == "LONG_CALLS" else "P"
             opt_contract = Contract(
                 symbol=symbol, kind=ContractKind.OPTION,

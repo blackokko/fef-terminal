@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useSidecar } from "../context/WebSocketContext";
+import { formatTimeCT } from "../lib/displayHelpers";
 
 // Live quote panel reads from the SHARED WS tick stream (lastTick) — the
 // same source the chart's price updates come from. This guarantees zero
@@ -9,6 +10,7 @@ export function LiveQuotePanel() {
   const { lastTick, activeSymbol, lastStatus } = useSidecar();
   const prevLastRef = useRef<number | null>(null);
   const [flash, setFlash] = useState<"up" | "down" | null>(null);
+  const priorCloseTriedRef = useRef(false);
 
   useEffect(() => {
     if (!lastTick) return;
@@ -25,6 +27,18 @@ export function LiveQuotePanel() {
     const t = window.setTimeout(() => setFlash(null), 400);
     return () => window.clearTimeout(t);
   }, [flash]);
+
+  // If prior_close is missing on the tick (e.g. TWS was down at sidecar
+  // startup), poke the refresh endpoint once. Subsequent ticks should
+  // include the freshly-fetched value.
+  useEffect(() => {
+    if (!lastTick) return;
+    if (lastTick.prior_close != null && lastTick.prior_close > 0) return;
+    if (priorCloseTriedRef.current) return;
+    priorCloseTriedRef.current = true;
+    void fetch("http://127.0.0.1:8765/diag/refresh_prior_close", { method: "POST" })
+      .catch(() => { priorCloseTriedRef.current = false; });
+  }, [lastTick]);
 
   const symbol = lastTick?.symbol ?? activeSymbol ?? "SPX";
   const isLive = (lastStatus as any)?.ibkr === "connected"
@@ -80,7 +94,7 @@ export function LiveQuotePanel() {
             </div>
           );
         })()}
-        <div className="muted small">updated {new Date(lastTick.timestamp_ms).toLocaleTimeString("en-US", { timeZone: "America/Chicago", hour12: false })} CT</div>
+        <div className="muted small">updated {formatTimeCT(lastTick.timestamp_ms)}</div>
       </div>
 
       <div className="live-quote-book">

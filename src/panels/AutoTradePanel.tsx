@@ -9,20 +9,18 @@ interface AutoTradeStatus {
   confidence_floor: string;
   cool_down_sec: number;
   cool_down_remaining_sec: number;
-  max_per_session: number;
   count_session: number;
   last_at_ms: number;
   last_block_reason: string;
-  session_cap_reached: boolean;
   runner_protect_enabled: boolean;
   qty_override: number;
   trigger_types: string[];
 }
 
 const TRIGGER_TYPES = [
-  { value: "confluence", label: "Confluence (wall_collapse + aligned)",
+  { value: "confluence", label: "Confluence (wall collapse + aligned)",
     hint: "Today: 41% win, +0.37R — the only profitable subset so far" },
-  { value: "aligned_only", label: "Aligned-only",
+  { value: "aligned_only", label: "Aligned only",
     hint: "Today: 22% win, −0.26R — keep ON to grow sample for validation" },
 ];
 
@@ -58,8 +56,8 @@ export function AutoTradePanel() {
         `  • direction != WAIT\n` +
         `  • confidence >= ${status.confidence_floor}\n` +
         `  • not inside a calendar pause window\n` +
-        `  • >= ${status.cool_down_sec}s since last auto-trade\n` +
-        `  • session count < ${status.max_per_session}\n` +
+        `  • >= ${status.cool_down_sec}s since last auto-trade (per symbol)\n` +
+        `  • symbol budget not yet reached (set per-symbol cap in Scanner panel)\n` +
         `  • verdict has option pricing\n` +
         `  • qty within max_contracts_per_trade\n\n` +
         `Real orders. Real money. Are you sure?`
@@ -201,15 +199,6 @@ export function AutoTradePanel() {
             </td>
           </tr>
           <tr>
-            <td>Max per session</td>
-            <td>
-              <input type="number" min={1} max={50}
-                     value={status.max_per_session}
-                     onChange={(e) => void updateSetting("max_per_session", Number(e.target.value))}
-                     disabled={busy} className="settings-input" style={{ width: 80 }} />
-            </td>
-          </tr>
-          <tr>
             <td>Trigger types</td>
             <td>
               <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -251,12 +240,9 @@ export function AutoTradePanel() {
 
       <div className="auto-trade-counters">
         <div>
-          <div className="muted small">Session</div>
-          <div style={{
-            fontFamily: "var(--font-mono)", fontWeight: 600,
-            color: status.session_cap_reached ? "var(--color-red)" : "var(--color-text)",
-          }}>
-            {status.count_session} / {status.max_per_session}
+          <div className="muted small">Session activity</div>
+          <div style={{ fontFamily: "var(--font-mono)", fontWeight: 600 }}>
+            {status.count_session} {status.count_session === 1 ? "fire" : "fires"}
           </div>
         </div>
         <div>
@@ -265,11 +251,14 @@ export function AutoTradePanel() {
             {status.cool_down_remaining_sec > 0 ? `${status.cool_down_remaining_sec}s` : "ready"}
           </div>
         </div>
-        {status.session_cap_reached && (
-          <button onClick={() => void handleResetCounter()} disabled={busy} style={{ alignSelf: "center" }}>
-            Reset
-          </button>
-        )}
+        <button onClick={() => void handleResetCounter()} disabled={busy}
+                style={{ alignSelf: "center" }} title="Resets per-symbol counters (use if you hit a symbol's cap and want a fresh budget mid-session)">
+          Reset counters
+        </button>
+      </div>
+
+      <div className="muted small" style={{ marginTop: 4, fontSize: 10, fontStyle: "italic" }}>
+        Per-symbol trade budgets live in the Scanner panel ↓
       </div>
 
       <div className="muted small" style={{ marginTop: 8, borderTop: "1px solid var(--color-border)", paddingTop: 6 }}>

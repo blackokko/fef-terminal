@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useToast } from "../components/Toast";
+import { formatTimeCT } from "../lib/displayHelpers";
 
 const API_BASE = "http://127.0.0.1:8765";
 
@@ -57,12 +58,18 @@ export function LiveExecutionPanel() {
   }, []);
 
   const handleKill = async () => {
-    if (!window.confirm("Cancel all working orders? This is irreversible.")) return;
+    if (!window.confirm(
+      "Cancel all working orders AND market-close every open option position?\n\n" +
+      "This is irreversible. Auto-trade + scanner stay ON (use 🚨 FLAT for full kill-switch)."
+    )) return;
     setKilling(true);
     try {
       const r = await fetch(`${API_BASE}/live/kill`, { method: "POST" });
       const data = await r.json();
-      toast.show(`Kill switch: ${data.cancelled ?? 0} order(s) cancelled`, { variant: "warn" });
+      toast.show(
+        `Kill: ${data.cancelled ?? 0} order(s) cancelled, ${data.positions_closed ?? 0} position(s) market-closed`,
+        { variant: "warn" }
+      );
       void refresh();
     } catch (e) {
       toast.show(`Kill failed: ${(e as Error).message}`, { variant: "error" });
@@ -104,7 +111,7 @@ export function LiveExecutionPanel() {
 
       <button onClick={() => void handleKill()} disabled={killing}
               className="kill-switch-button">
-        {killing ? "Cancelling..." : "🛑 KILL ALL ORDERS"}
+        {killing ? "Closing..." : "🛑 KILL ORDERS + CLOSE POSITIONS"}
       </button>
 
       <div className="live-orders-section">
@@ -125,13 +132,8 @@ export function LiveExecutionPanel() {
                   {o.status} · {o.order_type === "MKT"
                     ? "MARKET"
                     : `LMT @ $${o.limit_price?.toFixed(2) ?? "—"}`} · {
-                    new Date(o.submitted_at + (o.submitted_at.endsWith("Z") ? "" : "Z"))
-                      .toLocaleTimeString("en-US", {
-                        timeZone: "America/Chicago",
-                        hour12: false,
-                        hour: "2-digit", minute: "2-digit", second: "2-digit",
-                      })
-                  } CT
+                    formatTimeCT(o.submitted_at + (o.submitted_at.endsWith("Z") ? "" : "Z"), { seconds: true })
+                  }
                 </div>
                 {(o as any).dynamic_stop_level != null && (o as any).entry_spx_price != null && (() => {
                   const entry = (o as any).entry_spx_price as number;

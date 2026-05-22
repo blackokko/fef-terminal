@@ -24,6 +24,15 @@ class OptionTargets:
     t2: float
     t3: float
     stop: float
+    # Additional greeks + bid/ask captured at fire time for backtester
+    # theta projection + real slippage modeling. All default to None so
+    # mock provider and older callers still construct successfully.
+    gamma: float | None = None
+    vega: float | None = None
+    theta: float | None = None
+    iv: float | None = None
+    bid: float | None = None
+    ask: float | None = None
 
 
 def _est(current_option: float, delta: float | None, current_spx: float, target_spx: float) -> float:
@@ -67,4 +76,10 @@ def build_option_targets(
         t2=_est(entry, quote.delta, spx, spx_t2),
         t3=_est(entry, quote.delta, spx, spx_t3),
         stop=_est(entry, quote.delta, spx, spx_stop),
+        gamma=getattr(quote, "gamma", None),
+        vega=getattr(quote, "vega", None),
+        theta=getattr(quote, "theta", None),
+        iv=getattr(quote, "iv", None),
+        bid=quote.bid,
+        ask=quote.ask,
     )

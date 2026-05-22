@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { formatDateTimeCT } from "../lib/displayHelpers";
 
 const API_BASE = "http://127.0.0.1:8765";
 
@@ -96,7 +97,7 @@ export function WalkForwardPanel() {
           </table>
 
           <div className="muted small" style={{ marginTop: 8 }}>
-            Last run: {new Date(latest.run_at).toLocaleString()} · {latest.window_days}d window
+            Last run: {formatDateTimeCT(latest.run_at)} · {latest.window_days}d window
           </div>
         </>
       )}

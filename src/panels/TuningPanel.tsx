@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { formatDateTimeCT } from "../lib/displayHelpers";
 
 const API_BASE = "http://127.0.0.1:8765";
 
@@ -40,12 +41,7 @@ const STATE_COLOR: Record<string, string> = {
 };
 
 const fmtTime = (iso: string): string => {
-  const date = new Date(iso + (iso.endsWith("Z") ? "" : "Z"));
-  return date.toLocaleString("en-US", {
-    timeZone: "America/Chicago",
-    month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", hour12: false,
-  });
+  return formatDateTimeCT(iso + (iso.endsWith("Z") ? "" : "Z"));
 };
 
 export function TuningPanel() {

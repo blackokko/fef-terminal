@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { formatTimeCT } from "../lib/displayHelpers";
 
 const API_BASE = "http://127.0.0.1:8765";
 
@@ -29,11 +30,7 @@ const CONF_COLOR: Record<string, string> = {
 
 const fmtTime = (iso: string): string => {
   const date = new Date(iso + (iso.endsWith("Z") ? "" : "Z"));
-  return date.toLocaleTimeString("en-US", {
-    timeZone: "America/Chicago",
-    hour12: false,
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
+  return formatTimeCT(date, { seconds: true, ct: false });
 };
 
 export function VerdictTimelinePanel() {

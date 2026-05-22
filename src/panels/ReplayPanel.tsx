@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { formatTimeCT } from "../lib/displayHelpers";
 
 // IMPROVEMENTS #19: browse past session iter-by-iter.
 
@@ -89,7 +90,7 @@ export function ReplayPanel() {
             {selected && (
               <div className="replay-detail">
                 <div className="small muted">
-                  {new Date(selected.timestamp).toLocaleTimeString()}
+                  {formatTimeCT(selected.timestamp, { seconds: true })}
                 </div>
                 <div className="small">{selected.reasoning}</div>
               </div>
