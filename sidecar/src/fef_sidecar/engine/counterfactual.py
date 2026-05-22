@@ -489,44 +489,37 @@ def _flow_snapshot_to_inputs(row):
     ExposureRow pydantic objects, so we convert here. Without this
     conversion the engine sees empty wall lists and never produces
     actionable verdicts.
-    """
-    from fef_sidecar.engine.types import FEFInputs
-    from fef_sidecar.quantdata.models import ExposureRow
 
-    def _to_rows(wall_dicts):
-        out = []
-        for d in (wall_dicts or []):
-            if isinstance(d, ExposureRow):
-                out.append(d)
-                continue
-            if not isinstance(d, dict):
-                continue
-            try:
-                out.append(ExposureRow(
-                    strike=float(d.get("strike", 0)),
-                    call_m=float(d.get("call_m", 0) or 0),
-                    put_m=float(d.get("put_m", 0) or 0),
-                    net_m=float(d.get("net_m", 0) or 0),
-                ))
-            except Exception:
-                pass
-        return out
+    Uses shared helpers from engine.types to avoid inline reconstruction
+    duplication across counterfactual / optimization / auto_walk_forward / api.
+    """
+    from fef_sidecar.engine.types import (
+        FEFInputs,
+        expiration_exposure_rows_from_dicts,
+        exposure_rows_from_dicts,
+    )
 
     return FEFInputs(
         timestamp_ms=row.timestamp_ms,
         spx_price=row.spx_price,
         drift_cum_net_m=row.drift_cum_net_m or 0.0,
         drift_bias=row.drift_bias or "NEUTRAL",
-        top_gex_walls=_to_rows(row.top_gex_walls),
-        top_dex_walls=_to_rows(row.top_dex_walls),
+        top_gex_walls=exposure_rows_from_dicts(row.top_gex_walls),
+        top_dex_walls=exposure_rows_from_dicts(row.top_dex_walls),
         ntm_max_pain=row.ntm_max_pain or row.spx_price,
         raw_max_pain=row.raw_max_pain or row.spx_price,
         aggression_call_pct=row.aggression_call_pct,
         aggression_put_pct=row.aggression_put_pct,
         iv_rank_call_pct=row.iv_rank_call_pct,
         iv_rank_put_pct=row.iv_rank_put_pct,
-        top_cex_walls=_to_rows(getattr(row, "top_cex_walls", None) or []),
-        top_vex_walls=_to_rows(getattr(row, "top_vex_walls", None) or []),
+        top_cex_walls=exposure_rows_from_dicts(getattr(row, "top_cex_walls", None) or []),
+        top_vex_walls=exposure_rows_from_dicts(getattr(row, "top_vex_walls", None) or []),
+        top_gex_by_expiry=expiration_exposure_rows_from_dicts(getattr(row, "top_gex_by_expiry", None) or []),
+        top_dex_by_expiry=expiration_exposure_rows_from_dicts(getattr(row, "top_dex_by_expiry", None) or []),
+        zero_dte_gex_net_m=getattr(row, "zero_dte_gex_net_m", None),
+        zero_dte_dex_net_m=getattr(row, "zero_dte_dex_net_m", None),
+        recent_whale_count_30m=int(getattr(row, "recent_whale_count_30m", 0) or 0),
+        recent_golden_sweep_count_30m=int(getattr(row, "recent_golden_sweep_count_30m", 0) or 0),
     )
 
 

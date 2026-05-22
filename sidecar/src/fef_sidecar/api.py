@@ -2177,7 +2177,6 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
         try:
             from fef_sidecar.engine import FEFEngine
             from fef_sidecar.engine.types import FEFInputs
-            from fef_sidecar.quantdata.models import ExposureRow
             engine = FEFEngine(
                 wall_proximity_pts=float(preset_row.wall_proximity_pts),
                 wall_collapse_pct=float(preset_row.wall_collapse_pct),
@@ -2187,47 +2186,29 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
             fresh_verdicts = {}
             for s in sigs:
                 try:
-                    gex_rows = [
-                        ExposureRow(strike=w.get("strike", 0),
-                                    call_m=max(0, w.get("net_m", 0)),
-                                    put_m=min(0, w.get("net_m", 0)),
-                                    net_m=w.get("net_m", 0))
-                        for w in (s.top_gex_walls or [])
-                    ]
-                    dex_rows = [
-                        ExposureRow(strike=w.get("strike", 0),
-                                    call_m=max(0, w.get("net_m", 0)),
-                                    put_m=min(0, w.get("net_m", 0)),
-                                    net_m=w.get("net_m", 0))
-                        for w in (s.top_dex_walls or [])
-                    ]
-                    cex_rows = [
-                        ExposureRow(strike=w.get("strike", 0),
-                                    call_m=max(0, w.get("net_m", 0)),
-                                    put_m=min(0, w.get("net_m", 0)),
-                                    net_m=w.get("net_m", 0))
-                        for w in (getattr(s, "top_cex_walls", None) or [])
-                    ]
-                    vex_rows = [
-                        ExposureRow(strike=w.get("strike", 0),
-                                    call_m=max(0, w.get("net_m", 0)),
-                                    put_m=min(0, w.get("net_m", 0)),
-                                    net_m=w.get("net_m", 0))
-                        for w in (getattr(s, "top_vex_walls", None) or [])
-                    ]
+                    from fef_sidecar.engine.types import (
+                        expiration_exposure_rows_from_dicts,
+                        exposure_rows_from_dicts,
+                    )
                     inputs = FEFInputs(
                         timestamp_ms=int(s.timestamp.timestamp() * 1000) if s.timestamp else 0,
                         spx_price=float(s.spx_price),
                         drift_cum_net_m=float(s.drift_cum_net_m or 0),
                         drift_bias=s.drift_bias or "NEUTRAL",
-                        top_gex_walls=gex_rows,
-                        top_dex_walls=dex_rows,
+                        top_gex_walls=exposure_rows_from_dicts(s.top_gex_walls),
+                        top_dex_walls=exposure_rows_from_dicts(s.top_dex_walls),
                         ntm_max_pain=float(s.ntm_max_pain or s.spx_price),
                         raw_max_pain=float(s.raw_max_pain or s.spx_price),
                         aggression_call_pct=s.aggression_call_pct,
                         aggression_put_pct=s.aggression_put_pct,
-                        top_cex_walls=cex_rows,
-                        top_vex_walls=vex_rows,
+                        top_cex_walls=exposure_rows_from_dicts(getattr(s, "top_cex_walls", None) or []),
+                        top_vex_walls=exposure_rows_from_dicts(getattr(s, "top_vex_walls", None) or []),
+                        top_gex_by_expiry=expiration_exposure_rows_from_dicts(getattr(s, "top_gex_by_expiry", None) or []),
+                        top_dex_by_expiry=expiration_exposure_rows_from_dicts(getattr(s, "top_dex_by_expiry", None) or []),
+                        zero_dte_gex_net_m=getattr(s, "zero_dte_gex_net_m", None),
+                        zero_dte_dex_net_m=getattr(s, "zero_dte_dex_net_m", None),
+                        recent_whale_count_30m=int(getattr(s, "recent_whale_count_30m", 0) or 0),
+                        recent_golden_sweep_count_30m=int(getattr(s, "recent_golden_sweep_count_30m", 0) or 0),
                     )
                     v = engine.push(inputs)
                     fresh_verdicts[s.id] = {

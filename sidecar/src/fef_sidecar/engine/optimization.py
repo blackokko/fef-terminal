@@ -180,7 +180,6 @@ def run_sweep(
     """
     from fef_sidecar.engine.fef import FEFEngine
     from fef_sidecar.engine.types import FEFInputs
-    from fef_sidecar.quantdata.models import ExposureRow
 
     n = len(iters)
     if n < 10:
@@ -201,39 +200,29 @@ def run_sweep(
         wins = 0
         total = 0.0
         for i, it in enumerate(slice_iters):
-            gex_rows = [
-                ExposureRow(strike=w["strike"], call_m=max(0, w["net_m"]),
-                            put_m=min(0, w["net_m"]), net_m=w["net_m"])
-                for w in (it.get("top_gex_walls") or [])
-            ]
-            dex_rows = [
-                ExposureRow(strike=w["strike"], call_m=max(0, w["net_m"]),
-                            put_m=min(0, w["net_m"]), net_m=w["net_m"])
-                for w in (it.get("top_dex_walls") or [])
-            ]
-            cex_rows = [
-                ExposureRow(strike=w["strike"], call_m=max(0, w["net_m"]),
-                            put_m=min(0, w["net_m"]), net_m=w["net_m"])
-                for w in (it.get("top_cex_walls") or [])
-            ]
-            vex_rows = [
-                ExposureRow(strike=w["strike"], call_m=max(0, w["net_m"]),
-                            put_m=min(0, w["net_m"]), net_m=w["net_m"])
-                for w in (it.get("top_vex_walls") or [])
-            ]
+            from fef_sidecar.engine.types import (
+                expiration_exposure_rows_from_dicts,
+                exposure_rows_from_dicts,
+            )
             inputs = FEFInputs(
                 timestamp_ms=0,
                 spx_price=it["spx_price"],
                 drift_cum_net_m=it["drift_cum_net_m"],
                 drift_bias=it.get("drift_bias", "NEUTRAL"),
-                top_gex_walls=gex_rows,
-                top_dex_walls=dex_rows,
+                top_gex_walls=exposure_rows_from_dicts(it.get("top_gex_walls")),
+                top_dex_walls=exposure_rows_from_dicts(it.get("top_dex_walls")),
                 ntm_max_pain=it.get("ntm_max_pain", it["spx_price"]),
                 raw_max_pain=it.get("raw_max_pain", it["spx_price"]),
                 aggression_call_pct=it.get("aggression_call_pct"),
                 aggression_put_pct=it.get("aggression_put_pct"),
-                top_cex_walls=cex_rows,
-                top_vex_walls=vex_rows,
+                top_cex_walls=exposure_rows_from_dicts(it.get("top_cex_walls")),
+                top_vex_walls=exposure_rows_from_dicts(it.get("top_vex_walls")),
+                top_gex_by_expiry=expiration_exposure_rows_from_dicts(it.get("top_gex_by_expiry")),
+                top_dex_by_expiry=expiration_exposure_rows_from_dicts(it.get("top_dex_by_expiry")),
+                zero_dte_gex_net_m=it.get("zero_dte_gex_net_m"),
+                zero_dte_dex_net_m=it.get("zero_dte_dex_net_m"),
+                recent_whale_count_30m=int(it.get("recent_whale_count_30m") or 0),
+                recent_golden_sweep_count_30m=int(it.get("recent_golden_sweep_count_30m") or 0),
             )
             verdict = engine.push(inputs)
             if verdict.direction.value == "WAIT":

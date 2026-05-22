@@ -14,8 +14,12 @@ from typing import Self
 from fef_sidecar.quantdata.models import (
     AggressionStats,
     ContractAggression,
+    ContractPricePoint,
+    ContractPriceTimeSnapshot,
     DriftEntry,
     DriftSummary,
+    ExpirationExposureRow,
+    ExpirationExposureSnapshot,
     ExposureRow,
     GreekType,
     IVRankByContract,
@@ -24,6 +28,8 @@ from fef_sidecar.quantdata.models import (
     MaxPainSnapshot,
     OIRow,
     OpenInterestSnapshot,
+    OrderFlowRow,
+    OrderFlowSnapshot,
     StrikeExposureSnapshot,
 )  # noqa: F401  AggressionStats + ContractAggression used inside fetch_market_snapshot
 
@@ -107,6 +113,94 @@ _DRIFT_ENTRIES = [
     DriftEntry(timestamp_ms=1747929480000, call_dollars=12697165, put_dollars=282831, spx_price=7408.77),
     DriftEntry(timestamp_ms=1747929540000, call_dollars=-45701, put_dollars=-456257, spx_price=7407.26),
     DriftEntry(timestamp_ms=1747929600000, call_dollars=0, put_dollars=-7845, spx_price=7407.26),
+]
+
+# Expiration-bucketed GEX mock (exposure_by_expiration, GAMMA).
+# 0DTE = 2026-05-21 (today); next expirations trail off in exposure.
+_GEX_BY_EXPIRY_ROWS = [
+    ExpirationExposureRow(expiration="2026-05-21", call_m=18230.50, put_m=-31456.20, net_m=-13225.70),
+    ExpirationExposureRow(expiration="2026-05-23", call_m=8340.10, put_m=-4120.40, net_m=4219.70),
+    ExpirationExposureRow(expiration="2026-05-30", call_m=5820.30, put_m=-9870.60, net_m=-4050.30),
+    ExpirationExposureRow(expiration="2026-06-20", call_m=11430.80, put_m=-6230.10, net_m=5200.70),
+    ExpirationExposureRow(expiration="2026-07-17", call_m=3210.40, put_m=-2870.90, net_m=339.50),
+    ExpirationExposureRow(expiration="2026-09-18", call_m=1980.20, put_m=-1340.60, net_m=639.60),
+]
+
+# Expiration-bucketed DEX mock (DELTA). Same expirations, different magnitudes.
+_DEX_BY_EXPIRY_ROWS = [
+    ExpirationExposureRow(expiration="2026-05-21", call_m=342180.30, put_m=-189430.60, net_m=152749.70),
+    ExpirationExposureRow(expiration="2026-05-23", call_m=124560.80, put_m=-98230.40, net_m=26330.40),
+    ExpirationExposureRow(expiration="2026-05-30", call_m=198340.20, put_m=-231450.80, net_m=-33110.60),
+    ExpirationExposureRow(expiration="2026-06-20", call_m=431200.50, put_m=-312680.30, net_m=118520.20),
+    ExpirationExposureRow(expiration="2026-07-17", call_m=89430.70, put_m=-76210.40, net_m=13220.30),
+    ExpirationExposureRow(expiration="2026-09-18", call_m=52340.10, put_m=-47890.60, net_m=4449.50),
+]
+
+# Mock order-flow: mix of whales, sweeps, blocks, and regular orders.
+# Timestamps: ~1h before session snapshot (approx 3pm ET on 5/15/2026).
+_ORDER_FLOW_ROWS = [
+    OrderFlowRow(
+        timestamp_ms=1747926600000, strike=7400.0, right="C", expiration="2026-05-21",
+        premium_dollars=1_250_000.0, side_aggression="AA",
+        is_whale=True, is_sweep=True, is_golden_sweep=True,
+        other_flags=["GOLDEN_SWEEP"],
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747926480000, strike=7390.0, right="P", expiration="2026-05-21",
+        premium_dollars=345_000.0, side_aggression="A",
+        is_sweep=True,
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747926360000, strike=7450.0, right="C", expiration="2026-05-21",
+        premium_dollars=2_100_000.0, side_aggression="AA",
+        is_whale=True, is_block=True,
+        other_flags=["BLOCK"],
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747926240000, strike=7410.0, right="P", expiration="2026-05-21",
+        premium_dollars=87_000.0, side_aggression="M",
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747926120000, strike=7405.0, right="C", expiration="2026-05-21",
+        premium_dollars=54_000.0, side_aggression="B",
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747926000000, strike=7400.0, right="P", expiration="2026-05-21",
+        premium_dollars=1_450_000.0, side_aggression="AA",
+        is_whale=True, is_sweep=True, is_golden_sweep=True,
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747925880000, strike=7420.0, right="C", expiration="2026-05-21",
+        premium_dollars=230_000.0, side_aggression="A",
+        is_sweep=True,
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747925760000, strike=7380.0, right="P", expiration="2026-05-21",
+        premium_dollars=3_200_000.0, side_aggression="AA",
+        is_whale=True, is_block=True, is_sweep=True, is_golden_sweep=True,
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747925640000, strike=7415.0, right="C", expiration="2026-05-21",
+        premium_dollars=42_000.0, side_aggression="BB",
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747925520000, strike=7395.0, right="P", expiration="2026-05-21",
+        premium_dollars=175_000.0, side_aggression="B",
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747925400000, strike=7400.0, right="C", expiration="2026-05-21",
+        premium_dollars=890_000.0, side_aggression="A",
+        is_sweep=True,
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747925280000, strike=7425.0, right="P", expiration="2026-05-21",
+        premium_dollars=61_000.0, side_aggression="M",
+    ),
+    OrderFlowRow(
+        timestamp_ms=1747925160000, strike=7300.0, right="C", expiration="2026-06-20",
+        premium_dollars=1_780_000.0, side_aggression="AA",
+        is_whale=True, is_golden_sweep=True,
+    ),
 ]
 
 
@@ -209,6 +303,41 @@ class MockQuantDataClient:
     async def get_oi_by_strike(self) -> OpenInterestSnapshot:
         return OpenInterestSnapshot(spx_price=self.spx_price, rows=list(_OI_ROWS))
 
+    async def get_exposure_by_expiration(
+        self, greek: GreekType = GreekType.GAMMA
+    ) -> ExpirationExposureSnapshot:
+        rows_by_greek = {
+            GreekType.GAMMA: _GEX_BY_EXPIRY_ROWS,
+            GreekType.DELTA: _DEX_BY_EXPIRY_ROWS,
+        }
+        rows = rows_by_greek.get(greek, _GEX_BY_EXPIRY_ROWS)
+        return ExpirationExposureSnapshot(greek=greek, spx_price=self.spx_price, rows=list(rows))
+
+    async def get_order_flow(self) -> OrderFlowSnapshot:
+        return OrderFlowSnapshot(orders=list(_ORDER_FLOW_ROWS))
+
+    async def get_contract_price_time(
+        self,
+        strike: float,
+        right: str,
+        expiration: str,
+    ) -> ContractPriceTimeSnapshot:
+        """Synthesize a mock intraday price path for any contract spec."""
+        import math as _math
+        base_price = 3.50 + abs(strike - self.spx_price) * 0.01
+        # 390 1-min bars starting at 9:30 ET (approx)
+        session_open_ms = 1747916400000  # 2026-05-21 09:30 ET
+        points = []
+        for i in range(60):
+            ts = session_open_ms + i * 60_000
+            # Simulate slight intraday drift + noise
+            price = round(base_price * (1 + 0.005 * _math.sin(i / 8)) + 0.02 * (i % 7 - 3), 2)
+            price = max(0.01, price)
+            points.append(ContractPricePoint(timestamp_ms=ts, price=price, volume=15 + i % 12))
+        return ContractPriceTimeSnapshot(
+            strike=strike, right=right, expiration=expiration, points=points
+        )
+
     async def fetch_market_snapshot(
         self,
         *,
@@ -217,6 +346,8 @@ class MockQuantDataClient:
         include_oi: bool = True,
         include_cex: bool = True,
         include_vex: bool = True,
+        include_expiry_exposure: bool = True,
+        include_order_flow: bool = True,
     ) -> MarketSnapshot:
         """Mock snapshot with per-call variation.
 
@@ -290,6 +421,9 @@ class MockQuantDataClient:
                 oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
                 cex=StrikeExposureSnapshot(greek=GreekType.CHARM, spx_price=spx_now, rows=list(_CEX_ROWS)) if include_cex else None,
                 vex=StrikeExposureSnapshot(greek=GreekType.VANNA, spx_price=spx_now, rows=list(_VEX_ROWS)) if include_vex else None,
+                gex_by_expiry=ExpirationExposureSnapshot(greek=GreekType.GAMMA, spx_price=spx_now, rows=list(_GEX_BY_EXPIRY_ROWS)) if include_expiry_exposure else None,
+                dex_by_expiry=ExpirationExposureSnapshot(greek=GreekType.DELTA, spx_price=spx_now, rows=list(_DEX_BY_EXPIRY_ROWS)) if include_expiry_exposure else None,
+                order_flow=OrderFlowSnapshot(orders=list(_ORDER_FLOW_ROWS)) if include_order_flow else None,
                 simulated_minutes_since_open=frame.minutes_since_open,
                 simulated_phase_label=frame.label,
                 simulated_vix=frame.vix,
@@ -325,6 +459,9 @@ class MockQuantDataClient:
                 oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
                 cex=StrikeExposureSnapshot(greek=GreekType.CHARM, spx_price=spx_now, rows=list(_CEX_ROWS)) if include_cex else None,
                 vex=StrikeExposureSnapshot(greek=GreekType.VANNA, spx_price=spx_now, rows=list(_VEX_ROWS)) if include_vex else None,
+                gex_by_expiry=ExpirationExposureSnapshot(greek=GreekType.GAMMA, spx_price=spx_now, rows=list(_GEX_BY_EXPIRY_ROWS)) if include_expiry_exposure else None,
+                dex_by_expiry=ExpirationExposureSnapshot(greek=GreekType.DELTA, spx_price=spx_now, rows=list(_DEX_BY_EXPIRY_ROWS)) if include_expiry_exposure else None,
+                order_flow=OrderFlowSnapshot(orders=list(_ORDER_FLOW_ROWS)) if include_order_flow else None,
                 simulated_minutes_since_open=frame.minutes_since_open,
                 simulated_phase_label=frame.label,
                 simulated_vix=frame.vix,
@@ -356,4 +493,7 @@ class MockQuantDataClient:
             oi=OpenInterestSnapshot(spx_price=spx_now, rows=list(_OI_ROWS)) if include_oi else None,
             cex=StrikeExposureSnapshot(greek=GreekType.CHARM, spx_price=spx_now, rows=list(_CEX_ROWS)) if include_cex else None,
             vex=StrikeExposureSnapshot(greek=GreekType.VANNA, spx_price=spx_now, rows=list(_VEX_ROWS)) if include_vex else None,
+            gex_by_expiry=ExpirationExposureSnapshot(greek=GreekType.GAMMA, spx_price=spx_now, rows=list(_GEX_BY_EXPIRY_ROWS)) if include_expiry_exposure else None,
+            dex_by_expiry=ExpirationExposureSnapshot(greek=GreekType.DELTA, spx_price=spx_now, rows=list(_DEX_BY_EXPIRY_ROWS)) if include_expiry_exposure else None,
+            order_flow=OrderFlowSnapshot(orders=list(_ORDER_FLOW_ROWS)) if include_order_flow else None,
         )

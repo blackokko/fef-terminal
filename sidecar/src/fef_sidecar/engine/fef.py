@@ -14,6 +14,8 @@ from collections import deque
 from collections.abc import Iterable
 from time import time
 
+import time as _time
+
 from fef_sidecar.db.models import FEFConfidence, FEFDirection
 from fef_sidecar.engine.strikes import build_plan
 from fef_sidecar.engine.types import FEFInputs, FEFVerdict
@@ -28,6 +30,20 @@ def snapshot_to_inputs(snap: MarketSnapshot) -> FEFInputs:
         if snap.oi is not None
         else snap.max_pain.max_pain
     )
+
+    # Expiration-bucketed exposure
+    today_top_gex = snap.gex_by_expiry.top(5) if snap.gex_by_expiry else []
+    today_top_dex = snap.dex_by_expiry.top(5) if snap.dex_by_expiry else []
+    zero_dte_gex = snap.gex_by_expiry.zero_dte() if snap.gex_by_expiry else None
+    zero_dte_dex = snap.dex_by_expiry.zero_dte() if snap.dex_by_expiry else None
+
+    # Order-flow summary — 30-min whale/golden-sweep counts
+    now_ms = snap.fetched_at_ms
+    cutoff_ms = now_ms - 30 * 60 * 1000
+    of_orders = snap.order_flow.orders if snap.order_flow else []
+    whale_30m = sum(1 for o in of_orders if o.is_whale and o.timestamp_ms >= cutoff_ms)
+    gs_30m = sum(1 for o in of_orders if o.is_golden_sweep and o.timestamp_ms >= cutoff_ms)
+
     return FEFInputs(
         timestamp_ms=snap.fetched_at_ms,
         spx_price=snap.spx_price,
@@ -43,6 +59,13 @@ def snapshot_to_inputs(snap: MarketSnapshot) -> FEFInputs:
         iv_rank_put_pct=snap.iv_rank.put.ivr_pct if snap.iv_rank and snap.iv_rank.put else None,
         top_cex_walls=snap.cex.top(5) if snap.cex else [],
         top_vex_walls=snap.vex.top(5) if snap.vex else [],
+        top_gex_by_expiry=today_top_gex,
+        top_dex_by_expiry=today_top_dex,
+        zero_dte_gex_net_m=zero_dte_gex.net_m if zero_dte_gex else None,
+        zero_dte_dex_net_m=zero_dte_dex.net_m if zero_dte_dex else None,
+        recent_orders=list(snap.order_flow.recent(20)) if snap.order_flow else [],
+        recent_whale_count_30m=whale_30m,
+        recent_golden_sweep_count_30m=gs_30m,
     )
 
 

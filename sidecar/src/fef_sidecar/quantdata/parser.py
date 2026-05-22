@@ -12,10 +12,14 @@ from fef_sidecar.quantdata.errors import QuantDataError
 from fef_sidecar.quantdata.models import (
     AggressionStats,
     ContractAggression,
+    ContractPricePoint,
+    ContractPriceTimeSnapshot,
     ContractStats,
     ContractStatsBySide,
     DriftEntry,
     DriftSummary,
+    ExpirationExposureRow,
+    ExpirationExposureSnapshot,
     ExposureRow,
     GreekType,
     IVRankByContract,
@@ -25,6 +29,8 @@ from fef_sidecar.quantdata.models import (
     NetFlowSnapshot,
     OIRow,
     OpenInterestSnapshot,
+    OrderFlowRow,
+    OrderFlowSnapshot,
     StrikeExposureSnapshot,
 )
 
@@ -209,3 +215,224 @@ def parse_net_flow(data: dict[str, Any]) -> NetFlowSnapshot:
             )
         )
     return NetFlowSnapshot(entries=entries)
+
+
+# ---------------------------------------------------------------------------
+# New parsers — best-guess shapes; QuantData REST schema is not fully
+# documented so each parser tries multiple key fallbacks defensively.
+# ---------------------------------------------------------------------------
+
+
+def parse_exposure_by_expiration(
+    data: dict[str, Any], greek: GreekType
+) -> ExpirationExposureSnapshot:
+    """Parse expiration-bucketed exposure from options/exposure/expiration.
+
+    Best-guess key names — QuantData may use any of:
+      expirationToExposureMap | expDateToExposureMap | byExpiration |
+      expirationDateToContractExposureMap
+    Each value is expected to be a dict with CALL/PUT exposure keys (in
+    raw dollars, cents, or millions — we try cents first, then dollars,
+    normalise to millions at the end).
+
+    If the top-level shape is a list of objects we try that too.
+    """
+    resp = _resp(data, f"{greek.value} exposure by expiration")
+    price = resp.get("stockPriceInCents", 0) / 100
+
+    # Try multiple map-key names the upstream might use
+    exp_map: dict[str, Any] = (
+        resp.get("expirationToExposureMap")
+        or resp.get("expDateToExposureMap")
+        or resp.get("byExpiration")
+        or resp.get("expirationDateToContractExposureMap")
+        or {}
+    )
+
+    rows: list[ExpirationExposureRow] = []
+
+    if isinstance(exp_map, dict):
+        for exp_str, exposure in exp_map.items():
+            if not isinstance(exposure, dict):
+                continue
+            # Exposure values may be raw dollars or cents — heuristically
+            # if the absolute values are very large (>1e6) they are likely
+            # in cents; otherwise assume dollars and convert to millions.
+            call_raw = exposure.get("CALL") or exposure.get("call") or 0
+            put_raw = exposure.get("PUT") or exposure.get("put") or 0
+            # If raw values look like cents (>1e7 for typical SPX exposure)
+            # divide by 100 first to get dollars, then by 1e6 for millions.
+            divisor = 100_000_000 if abs(call_raw or put_raw) > 1e7 else 1_000_000
+            call_m = (call_raw or 0) / divisor
+            put_m = (put_raw or 0) / divisor
+            rows.append(ExpirationExposureRow(
+                expiration=exp_str,
+                call_m=call_m,
+                put_m=put_m,
+                net_m=call_m + put_m,
+            ))
+    elif isinstance(exp_map, list):
+        # Alternate shape: list of {expiration, callExposure, putExposure, …}
+        for item in exp_map:
+            if not isinstance(item, dict):
+                continue
+            exp_str = (
+                item.get("expiration")
+                or item.get("expirationDate")
+                or item.get("expDate")
+                or ""
+            )
+            call_raw = item.get("callExposure") or item.get("CALL") or 0
+            put_raw = item.get("putExposure") or item.get("PUT") or 0
+            divisor = 100_000_000 if abs(call_raw or put_raw) > 1e7 else 1_000_000
+            call_m = (call_raw or 0) / divisor
+            put_m = (put_raw or 0) / divisor
+            rows.append(ExpirationExposureRow(
+                expiration=str(exp_str),
+                call_m=call_m,
+                put_m=put_m,
+                net_m=call_m + put_m,
+            ))
+
+    rows.sort(key=lambda r: r.expiration)
+    return ExpirationExposureSnapshot(greek=greek, spx_price=price, rows=rows)
+
+
+def parse_order_flow(data: dict[str, Any]) -> OrderFlowSnapshot:
+    """Parse consolidated order-flow from options/order-flow/consolidated.
+
+    Best-guess key names — the upstream may return a list under any of:
+      orderFlow | orders | consolidatedOrders | orderFlowList
+
+    Each item is expected to have timestamp, strike, right (C/P), expiry,
+    premium, aggression level, and classification flags (whale/sweep/etc.).
+    All fields are parsed defensively; missing fields produce defaults.
+
+    Note: QuantData's order-flow API is not fully documented. This parser
+    covers the most likely shapes based on the established MCP pattern for
+    other endpoints. Adjust key names if the real schema differs.
+    """
+    resp = _resp(data, "order flow")
+
+    raw_orders: list[Any] = (
+        resp.get("orderFlow")
+        or resp.get("orders")
+        or resp.get("consolidatedOrders")
+        or resp.get("orderFlowList")
+        or []
+    )
+
+    parsed: list[OrderFlowRow] = []
+    for item in raw_orders:
+        if not isinstance(item, dict):
+            continue
+        try:
+            ts_raw = item.get("timestamp") or item.get("timestampMs") or item.get("time") or 0
+            ts_ms = int(ts_raw) if ts_raw else 0
+            # Strike may be in cents
+            strike_raw = item.get("strikePrice") or item.get("strike") or 0
+            strike = float(strike_raw) / 100 if float(strike_raw or 0) > 10000 else float(strike_raw or 0)
+            right = str(item.get("contractType") or item.get("right") or item.get("optionType") or "C").upper()
+            right = "C" if right.startswith("C") else "P"
+            expiry = str(
+                item.get("expirationDate")
+                or item.get("expiration")
+                or item.get("expDate")
+                or ""
+            )
+            # Premium may be in cents
+            prem_raw = item.get("premium") or item.get("premiumDollars") or item.get("totalPremium") or 0
+            premium = float(prem_raw or 0) / 100 if abs(float(prem_raw or 0)) > 100_000 else float(prem_raw or 0)
+
+            side_raw = str(
+                item.get("sideAggression")
+                or item.get("aggression")
+                or item.get("tradeSide")
+                or "M"
+            ).upper()
+            # Normalise to AA/A/M/B/BB
+            if side_raw not in ("AA", "A", "M", "B", "BB"):
+                side_raw = "M"
+
+            flags: list[str] = list(item.get("flags") or item.get("otherFlags") or [])
+            # Some endpoints embed flags as boolean keys
+            is_whale = bool(item.get("isWhale") or item.get("whale") or "WHALE" in flags)
+            is_sweep = bool(item.get("isSweep") or item.get("sweep") or "SWEEP" in flags)
+            is_golden = bool(
+                item.get("isGoldenSweep")
+                or item.get("goldenSweep")
+                or "GOLDEN_SWEEP" in flags
+                or (is_sweep and premium >= 1_000_000)
+            )
+            is_block = bool(item.get("isBlock") or item.get("block") or "BLOCK" in flags)
+            other = [f for f in flags if f not in ("WHALE", "SWEEP", "GOLDEN_SWEEP", "BLOCK")]
+
+            parsed.append(OrderFlowRow(
+                timestamp_ms=ts_ms,
+                strike=strike,
+                right=right,
+                expiration=expiry,
+                premium_dollars=premium,
+                side_aggression=side_raw,
+                is_whale=is_whale,
+                is_sweep=is_sweep,
+                is_golden_sweep=is_golden,
+                is_block=is_block,
+                other_flags=other,
+            ))
+        except Exception:
+            continue
+
+    # Sort most-recent first
+    parsed.sort(key=lambda o: o.timestamp_ms, reverse=True)
+    return OrderFlowSnapshot(orders=parsed)
+
+
+def parse_contract_price_time(
+    data: dict[str, Any],
+    strike: float,
+    right: str,
+    expiration: str,
+) -> ContractPriceTimeSnapshot:
+    """Parse per-contract intraday price path from options/contract/price/time.
+
+    Best-guess shape — QuantData may return a list under:
+      priceTimeSeries | pricePath | priceData | contractPriceTime
+
+    Each element is {timestamp, price, volume} or a fixed-length array.
+    Prices are normalised from cents (if >1000) to dollars.
+    """
+    resp = _resp(data, "contract price/time")
+
+    raw: list[Any] = (
+        resp.get("priceTimeSeries")
+        or resp.get("pricePath")
+        or resp.get("priceData")
+        or resp.get("contractPriceTime")
+        or []
+    )
+
+    points: list[ContractPricePoint] = []
+    for item in raw:
+        try:
+            if isinstance(item, dict):
+                ts = int(item.get("timestamp") or item.get("timestampMs") or item.get("time") or 0)
+                price_raw = float(item.get("price") or item.get("lastPrice") or 0)
+                # Prices >1000 are likely in cents
+                price = price_raw / 100 if price_raw > 1000 else price_raw
+                vol = int(item.get("volume") or item.get("size") or 0)
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                ts = int(item[0])
+                price_raw = float(item[1])
+                price = price_raw / 100 if price_raw > 1000 else price_raw
+                vol = int(item[2]) if len(item) > 2 else 0
+            else:
+                continue
+            points.append(ContractPricePoint(timestamp_ms=ts, price=price, volume=vol))
+        except Exception:
+            continue
+
+    points.sort(key=lambda p: p.timestamp_ms)
+    return ContractPriceTimeSnapshot(
+        strike=strike, right=right, expiration=expiration, points=points
+    )

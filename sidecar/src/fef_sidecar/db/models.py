@@ -74,6 +74,17 @@ class SignalIter(SQLModel, table=True):
     # engine does not gate on them yet.
     top_cex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     top_vex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    # Expiration-bucketed GEX/DEX top-N rows. JSON arrays of
+    # {expiration, call_m, put_m, net_m}. Research-only.
+    top_gex_by_expiry: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    top_dex_by_expiry: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    zero_dte_gex_net_m: float | None = None
+    zero_dte_dex_net_m: float | None = None
+    # Order-flow summary — 20 most-recent orders + 30-min whale/golden-sweep
+    # counts. Engine does NOT gate on these; research-only.
+    recent_orders: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    recent_whale_count_30m: int = Field(default=0)
+    recent_golden_sweep_count_30m: int = Field(default=0)
 
     # Optional metrics (nullable)
     aggression_call_pct: float | None = None
@@ -314,6 +325,14 @@ class FlowSnapshot(SQLModel, table=True):
     top_dex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     top_cex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     top_vex_walls: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    # Expiration-bucketed GEX/DEX and order-flow summary (mirrors SignalIter).
+    top_gex_by_expiry: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    top_dex_by_expiry: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    zero_dte_gex_net_m: float | None = None
+    zero_dte_dex_net_m: float | None = None
+    recent_orders: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    recent_whale_count_30m: int = Field(default=0)
+    recent_golden_sweep_count_30m: int = Field(default=0)
 
     drift_cum_net_m: float = 0.0
     drift_bias: str = "NEUTRAL"

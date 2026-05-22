@@ -28,24 +28,30 @@ from fef_sidecar.quantdata.errors import (
 )
 from fef_sidecar.quantdata.models import (
     AggressionStats,
+    ContractPriceTimeSnapshot,
     ContractStats,
     DriftSummary,
+    ExpirationExposureSnapshot,
     GreekType,
     IVRankSnapshot,
     MarketSnapshot,
     MaxPainSnapshot,
     NetFlowSnapshot,
     OpenInterestSnapshot,
+    OrderFlowSnapshot,
     StrikeExposureSnapshot,
 )
 from fef_sidecar.quantdata.parser import (
+    parse_contract_price_time,
     parse_contract_stats,
     parse_exposure,
+    parse_exposure_by_expiration,
     parse_iv_rank,
     parse_max_pain,
     parse_net_drift,
     parse_net_flow,
     parse_oi_by_strike,
+    parse_order_flow,
     parse_trade_side_stats,
 )
 
@@ -53,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 ENDPOINTS: Mapping[str, str] = {
     "exposure_by_strike": "options/exposure/strike",
+    "exposure_by_expiration": "options/exposure/expiration",
     "net_drift": "options/net-drift",
     "iv_rank": "options/iv-rank",
     "contract_side_stats": "options/contract/statistics/trade-side",
@@ -60,6 +67,8 @@ ENDPOINTS: Mapping[str, str] = {
     "net_flow": "options/net-flow",
     "oi_by_strike": "options/open-interest/strike",
     "contract_statistics": "options/contract/statistics",
+    "order_flow": "options/order-flow/consolidated",
+    "contract_price_time": "options/contract/price/time",
 }
 
 
@@ -316,6 +325,63 @@ class QuantDataClient:
         raw = await self._get_json(f"{ENDPOINTS['net_flow']}/{tool_id}")
         return parse_net_flow(raw)
 
+    async def get_exposure_by_expiration(
+        self,
+        greek: GreekType = GreekType.GAMMA,
+    ) -> ExpirationExposureSnapshot:
+        """Fetch expiration-bucketed GEX or DEX.
+
+        Same greekModeType metadata dance as get_exposure_by_strike. The
+        exposure_by_expiration tool is provisioned separately from
+        exposure_by_strike so they each have their own tool_id.
+
+        Only GAMMA and DELTA are fetched via fetch_market_snapshot (CHARM/VANNA
+        skipped to limit API cost — strike-level CEX/VEX are richer anyway).
+        """
+        tool_id = self._tool_id("exposure_by_expiration")
+        await self._update_tool_metadata(tool_id, {"greekModeType": greek.value})
+        raw = await self._get_json(f"{ENDPOINTS['exposure_by_expiration']}/{tool_id}")
+        if greek != GreekType.GAMMA:
+            await self._update_tool_metadata(tool_id, {"greekModeType": "GAMMA"})
+        return parse_exposure_by_expiration(raw, greek)
+
+    async def get_order_flow(self) -> OrderFlowSnapshot:
+        """Fetch the consolidated order-flow stream.
+
+        Returns a snapshot ordered most-recent-first. Use .recent(n),
+        .whales(), .golden_sweeps() on the result for analysis.
+        """
+        tool_id = self._tool_id("order_flow")
+        raw = await self._get_json(f"{ENDPOINTS['order_flow']}/{tool_id}")
+        return parse_order_flow(raw)
+
+    async def get_contract_price_time(
+        self,
+        strike: float,
+        right: str,
+        expiration: str,
+    ) -> ContractPriceTimeSnapshot:
+        """Fetch the intraday price path for a specific option contract.
+
+        On-demand only — not part of fetch_market_snapshot. Useful for
+        post-trade review / debugging of specific contracts. Parameters
+        are set via tool metadata before the fetch (mirrors the greekModeType
+        pattern used by the exposure endpoint).
+
+        Args:
+            strike: Option strike in dollars (e.g. 7400.0).
+            right: "C" for call, "P" for put.
+            expiration: YYYY-MM-DD expiration date.
+        """
+        tool_id = self._tool_id("contract_price_time")
+        await self._update_tool_metadata(tool_id, {
+            "strike": strike,
+            "contractType": right.upper(),
+            "expirationDate": expiration,
+        })
+        raw = await self._get_json(f"{ENDPOINTS['contract_price_time']}/{tool_id}")
+        return parse_contract_price_time(raw, strike=strike, right=right, expiration=expiration)
+
     # ------------------------------------------------------------------
     # Composite snapshot — one call, concurrent fetches
     # ------------------------------------------------------------------
@@ -328,25 +394,41 @@ class QuantDataClient:
         include_oi: bool = True,
         include_cex: bool = True,
         include_vex: bool = True,
+        include_expiry_exposure: bool = True,
+        include_order_flow: bool = True,
     ) -> MarketSnapshot:
         """Fetch GEX + DEX + drift + max_pain (+ optional extras) concurrently.
 
         cex/vex reuse the same exposure-by-strike endpoint with a different
         greekModeType, so they piggyback on the existing tool_id and don't
         need separate MCP setup.
+
+        exposure_by_expiration also uses the greekModeType metadata pattern
+        so it must be serialized in the same exposure chain — it shares the
+        mutation pattern and cannot run concurrently with the strike chain.
+
+        order_flow has its own tool_id and runs concurrently with drift/max_pain.
         """
         # NOTE: the exposure endpoint mutates tool metadata server-side (PUT
         # greekModeType), so concurrent fetches with different greek params
         # would race on the same tool_id. Serialize the exposure calls into
         # a single sequential task, then concurrent everything else.
-        async def _exposure_chain() -> dict[str, StrikeExposureSnapshot]:
-            out: dict[str, StrikeExposureSnapshot] = {}
+        async def _exposure_chain() -> dict[str, Any]:
+            out: dict[str, Any] = {}
             out["gex"] = await self.get_exposure_by_strike(GreekType.GAMMA)
             out["dex"] = await self.get_exposure_by_strike(GreekType.DELTA)
             if include_cex:
                 out["cex"] = await self.get_exposure_by_strike(GreekType.CHARM)
             if include_vex:
                 out["vex"] = await self.get_exposure_by_strike(GreekType.VANNA)
+            # Expiration-bucketed exposure — serialized after strike chain.
+            # GAMMA + DELTA only (CHARM/VANNA skipped to limit API cost).
+            if include_expiry_exposure:
+                try:
+                    out["gex_by_expiry"] = await self.get_exposure_by_expiration(GreekType.GAMMA)
+                    out["dex_by_expiry"] = await self.get_exposure_by_expiration(GreekType.DELTA)
+                except Exception:
+                    logger.warning("exposure_by_expiration fetch failed — continuing without it")
             return out
 
         tasks: dict[str, asyncio.Task[Any]] = {
@@ -360,9 +442,11 @@ class QuantDataClient:
             tasks["iv_rank"] = asyncio.create_task(self.get_iv_rank())
         if include_oi:
             tasks["oi"] = asyncio.create_task(self.get_oi_by_strike())
+        if include_order_flow:
+            tasks["order_flow"] = asyncio.create_task(self.get_order_flow())
 
         results = dict(zip(tasks.keys(), await asyncio.gather(*tasks.values()), strict=True))
-        exposure: dict[str, StrikeExposureSnapshot] = results["exposure"]
+        exposure: dict[str, Any] = results["exposure"]
 
         gex: StrikeExposureSnapshot = exposure["gex"]
         return MarketSnapshot(
@@ -377,4 +461,7 @@ class QuantDataClient:
             oi=results.get("oi"),
             cex=exposure.get("cex"),
             vex=exposure.get("vex"),
+            gex_by_expiry=exposure.get("gex_by_expiry"),
+            dex_by_expiry=exposure.get("dex_by_expiry"),
+            order_flow=results.get("order_flow"),
         )

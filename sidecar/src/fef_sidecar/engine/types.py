@@ -6,7 +6,65 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fef_sidecar.db.models import FEFConfidence, FEFDirection
-from fef_sidecar.quantdata.models import ExposureRow
+from fef_sidecar.quantdata.models import (
+    ExpirationExposureRow,
+    ExposureRow,
+    OrderFlowRow,
+)
+
+
+def exposure_rows_from_dicts(dicts: list[dict] | None) -> list[ExposureRow]:
+    """Convert persisted JSON wall dicts back to ExposureRow models.
+
+    Used by every site that rebuilds FEFInputs from DB rows:
+    counterfactual, optimization, auto_walk_forward, api shadow-replay.
+
+    Idempotent — if an element is already an ExposureRow it passes through.
+    Non-dict, non-ExposureRow elements are silently skipped.
+    """
+    out: list[ExposureRow] = []
+    for d in (dicts or []):
+        if isinstance(d, ExposureRow):
+            out.append(d)
+            continue
+        if not isinstance(d, dict):
+            continue
+        try:
+            out.append(ExposureRow(
+                strike=float(d.get("strike", 0)),
+                call_m=float(d.get("call_m", 0) or 0),
+                put_m=float(d.get("put_m", 0) or 0),
+                net_m=float(d.get("net_m", 0) or 0),
+            ))
+        except Exception:
+            pass
+    return out
+
+
+def expiration_exposure_rows_from_dicts(
+    dicts: list[dict] | None,
+) -> list[ExpirationExposureRow]:
+    """Convert persisted JSON expiry dicts back to ExpirationExposureRow models.
+
+    Same pattern as exposure_rows_from_dicts but for expiration-bucketed rows.
+    """
+    out: list[ExpirationExposureRow] = []
+    for d in (dicts or []):
+        if isinstance(d, ExpirationExposureRow):
+            out.append(d)
+            continue
+        if not isinstance(d, dict):
+            continue
+        try:
+            out.append(ExpirationExposureRow(
+                expiration=str(d.get("expiration", "")),
+                call_m=float(d.get("call_m", 0) or 0),
+                put_m=float(d.get("put_m", 0) or 0),
+                net_m=float(d.get("net_m", 0) or 0),
+            ))
+        except Exception:
+            pass
+    return out
 
 
 @dataclass(frozen=True)
@@ -31,6 +89,17 @@ class FEFInputs:
     # recorded to signal_iter.extras for post-freeze pattern discovery.
     top_cex_walls: list[ExposureRow] = field(default_factory=list)
     top_vex_walls: list[ExposureRow] = field(default_factory=list)
+    # Expiration-bucketed GEX/DEX (GAMMA + DELTA only). Top-N rows by
+    # abs(net_m); 0DTE net is extracted separately. Research-only.
+    top_gex_by_expiry: list[ExpirationExposureRow] = field(default_factory=list)
+    top_dex_by_expiry: list[ExpirationExposureRow] = field(default_factory=list)
+    zero_dte_gex_net_m: float | None = None
+    zero_dte_dex_net_m: float | None = None
+    # Order-flow summary (last 20 orders + 30m whale/golden-sweep counts).
+    # Engine MUST NOT gate on these — research-only during freeze.
+    recent_orders: list[OrderFlowRow] = field(default_factory=list)
+    recent_whale_count_30m: int = 0
+    recent_golden_sweep_count_30m: int = 0
 
 
 @dataclass

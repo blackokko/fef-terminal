@@ -133,6 +133,22 @@ async def init_db() -> None:
             ("flow_snapshot", "top_vex_walls", "JSON"),
             # SignalLookaheadOutcome — net-new table, created via create_all,
             # listed here as a marker so the migration log shows it.
+            # Expiration-bucketed GEX/DEX (exposure_by_expiration pipeline)
+            ("signal_iter", "top_gex_by_expiry", "JSON"),
+            ("signal_iter", "top_dex_by_expiry", "JSON"),
+            ("signal_iter", "zero_dte_gex_net_m", "REAL"),
+            ("signal_iter", "zero_dte_dex_net_m", "REAL"),
+            ("flow_snapshot", "top_gex_by_expiry", "JSON"),
+            ("flow_snapshot", "top_dex_by_expiry", "JSON"),
+            ("flow_snapshot", "zero_dte_gex_net_m", "REAL"),
+            ("flow_snapshot", "zero_dte_dex_net_m", "REAL"),
+            # Order-flow summary (order_flow pipeline)
+            ("signal_iter", "recent_orders", "JSON"),
+            ("signal_iter", "recent_whale_count_30m", "INTEGER DEFAULT 0"),
+            ("signal_iter", "recent_golden_sweep_count_30m", "INTEGER DEFAULT 0"),
+            ("flow_snapshot", "recent_orders", "JSON"),
+            ("flow_snapshot", "recent_whale_count_30m", "INTEGER DEFAULT 0"),
+            ("flow_snapshot", "recent_golden_sweep_count_30m", "INTEGER DEFAULT 0"),
         ]
         for table, column, type_sql in migrations:
             try:

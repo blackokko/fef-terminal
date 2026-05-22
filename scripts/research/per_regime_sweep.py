@@ -116,6 +116,9 @@ def _load_iters_by_regime(
         SELECT timestamp, spx_price, drift_cum_net_m, drift_bias,
                ntm_max_pain, raw_max_pain, top_gex_walls, top_dex_walls,
                top_cex_walls, top_vex_walls,
+               top_gex_by_expiry, top_dex_by_expiry,
+               zero_dte_gex_net_m, zero_dte_dex_net_m,
+               recent_whale_count_30m, recent_golden_sweep_count_30m,
                aggression_call_pct, aggression_put_pct, extras
         FROM signal_iter
         WHERE session_date BETWEEN ? AND ?
@@ -161,6 +164,12 @@ def _load_iters_by_regime(
             "top_dex_walls": _parse_walls(r["top_dex_walls"]),
             "top_cex_walls": _parse_walls(r["top_cex_walls"]) if "top_cex_walls" in r.keys() else [],
             "top_vex_walls": _parse_walls(r["top_vex_walls"]) if "top_vex_walls" in r.keys() else [],
+            "top_gex_by_expiry": _parse_walls(r["top_gex_by_expiry"]) if "top_gex_by_expiry" in r.keys() else [],
+            "top_dex_by_expiry": _parse_walls(r["top_dex_by_expiry"]) if "top_dex_by_expiry" in r.keys() else [],
+            "zero_dte_gex_net_m": r["zero_dte_gex_net_m"] if "zero_dte_gex_net_m" in r.keys() else None,
+            "zero_dte_dex_net_m": r["zero_dte_dex_net_m"] if "zero_dte_dex_net_m" in r.keys() else None,
+            "recent_whale_count_30m": int(r["recent_whale_count_30m"] or 0) if "recent_whale_count_30m" in r.keys() else 0,
+            "recent_golden_sweep_count_30m": int(r["recent_golden_sweep_count_30m"] or 0) if "recent_golden_sweep_count_30m" in r.keys() else 0,
             "aggression_call_pct": r["aggression_call_pct"],
             "aggression_put_pct": r["aggression_put_pct"],
         })

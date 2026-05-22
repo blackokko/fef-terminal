@@ -75,6 +75,39 @@ def _walls_json(walls: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _expiry_rows_json(rows: Any) -> list[dict[str, Any]]:
+    """Serialise ExpirationExposureRow list to JSON-safe dicts."""
+    return [
+        {
+            "expiration": r.expiration,
+            "call_m": round(r.call_m, 4),
+            "put_m": round(r.put_m, 4),
+            "net_m": round(r.net_m, 4),
+        }
+        for r in (rows or [])
+    ]
+
+
+def _orders_json(orders: Any) -> list[dict[str, Any]]:
+    """Serialise OrderFlowRow list to JSON-safe dicts (top 20 most recent)."""
+    out = []
+    for o in (orders or [])[:20]:
+        out.append({
+            "timestamp_ms": o.timestamp_ms,
+            "strike": o.strike,
+            "right": o.right,
+            "expiration": o.expiration,
+            "premium_dollars": round(o.premium_dollars, 2),
+            "side_aggression": o.side_aggression,
+            "is_whale": o.is_whale,
+            "is_sweep": o.is_sweep,
+            "is_golden_sweep": o.is_golden_sweep,
+            "is_block": o.is_block,
+            "other_flags": list(o.other_flags),
+        })
+    return out
+
+
 # Per-symbol plausible price range — anything outside is rejected as
 # garbage (stale ticker route, wrong-symbol QuantData response, etc.).
 # Catches the 5/18-5/20 corruption where active_symbol=ES caused
@@ -138,6 +171,12 @@ async def quantdata_poll_loop(state: AppState) -> None:
 
             # Persist flow snapshot for historical replay + backtest
             try:
+                # Compute order-flow 30m summary for the snapshot timestamp
+                _of_orders = snap.order_flow.orders if snap.order_flow else []  # type: ignore[union-attr]
+                _of_cutoff = snap.fetched_at_ms - 30 * 60 * 1000  # type: ignore[union-attr]
+                _whale_30m = sum(1 for o in _of_orders if o.is_whale and o.timestamp_ms >= _of_cutoff)
+                _gs_30m = sum(1 for o in _of_orders if o.is_golden_sweep and o.timestamp_ms >= _of_cutoff)
+
                 await SignalIterRepository.write_flow_snapshot(
                     symbol=state.active_symbol,
                     session_date=_today_et(),
@@ -147,6 +186,13 @@ async def quantdata_poll_loop(state: AppState) -> None:
                     top_dex_walls=_walls_json(snap.dex.top(5)),  # type: ignore[union-attr]
                     top_cex_walls=_walls_json(snap.cex.top(5)) if snap.cex else [],  # type: ignore[union-attr]
                     top_vex_walls=_walls_json(snap.vex.top(5)) if snap.vex else [],  # type: ignore[union-attr]
+                    top_gex_by_expiry=_expiry_rows_json(snap.gex_by_expiry.top(5)) if snap.gex_by_expiry else [],  # type: ignore[union-attr]
+                    top_dex_by_expiry=_expiry_rows_json(snap.dex_by_expiry.top(5)) if snap.dex_by_expiry else [],  # type: ignore[union-attr]
+                    zero_dte_gex_net_m=snap.gex_by_expiry.zero_dte().net_m if snap.gex_by_expiry and snap.gex_by_expiry.zero_dte() else None,  # type: ignore[union-attr]
+                    zero_dte_dex_net_m=snap.dex_by_expiry.zero_dte().net_m if snap.dex_by_expiry and snap.dex_by_expiry.zero_dte() else None,  # type: ignore[union-attr]
+                    recent_orders=_orders_json(snap.order_flow.recent(20)) if snap.order_flow else [],  # type: ignore[union-attr]
+                    recent_whale_count_30m=_whale_30m,
+                    recent_golden_sweep_count_30m=_gs_30m,
                     drift_cum_net_m=snap.drift.cumulative_net_m,  # type: ignore[union-attr]
                     drift_bias=snap.drift.bias,  # type: ignore[union-attr]
                     ntm_max_pain=_ntm_max_pain(snap),
@@ -582,6 +628,13 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
         top_dex_walls=_walls_json(inputs.top_dex_walls),
         top_cex_walls=_walls_json(inputs.top_cex_walls),
         top_vex_walls=_walls_json(inputs.top_vex_walls),
+        top_gex_by_expiry=_expiry_rows_json(inputs.top_gex_by_expiry),
+        top_dex_by_expiry=_expiry_rows_json(inputs.top_dex_by_expiry),
+        zero_dte_gex_net_m=inputs.zero_dte_gex_net_m,
+        zero_dte_dex_net_m=inputs.zero_dte_dex_net_m,
+        recent_orders=_orders_json(inputs.recent_orders),
+        recent_whale_count_30m=inputs.recent_whale_count_30m,
+        recent_golden_sweep_count_30m=inputs.recent_golden_sweep_count_30m,
         aggression_call_pct=inputs.aggression_call_pct,
         aggression_put_pct=inputs.aggression_put_pct,
         iv_rank_call_pct=inputs.iv_rank_call_pct,
