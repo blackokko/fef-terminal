@@ -3495,6 +3495,9 @@ async def panic_flat(request: Request) -> dict[str, Any]:
     # 3. Market-sell all open option positions. Same routing-bug fix as
     # kill_all_orders — must rebuild + qualify the contract before
     # placing, otherwise IBKR silently rejects.
+    #
+    # SELL paths route through safe_market_sell — structurally impossible
+    # to naked-short.
     sells = []
     if isinstance(s.ibkr, LiveIBKRProvider) and s.ibkr._ib is not None:  # type: ignore[attr-defined]
         ib = s.ibkr._ib  # type: ignore[attr-defined]
@@ -3503,6 +3506,7 @@ async def panic_flat(request: Request) -> dict[str, Any]:
                 from ib_async import MarketOrder
                 from fef_sidecar.ibkr.live import _to_ib_contract
                 from fef_sidecar.ibkr.models import Contract, ContractKind
+                from fef_sidecar.ibkr.safe_sell import safe_market_sell
                 for p in ib.positions():
                     if getattr(p.contract, "secType", "") != "OPT": continue
                     qty = int(p.position)
@@ -3520,13 +3524,29 @@ async def panic_flat(request: Request) -> dict[str, Any]:
                         )
                         ic = _to_ib_contract(opt_contract)
                         await ib.qualifyContractsAsync(ic)
-                        order = MarketOrder(action, abs(qty), transmit=True)
-                        t = ib.placeOrder(ic, order)
-                        sells.append({
-                            "contract": f"{sym} {strike}{right}",
-                            "qty": abs(qty), "action": action,
-                            "ib_order_id": t.order.orderId,
-                        })
+                        if action == "SELL":
+                            res = await safe_market_sell(
+                                ib, ic, abs(qty), purpose="panic_flat", state=s,
+                            )
+                            if res.placed:
+                                sells.append({
+                                    "contract": f"{sym} {strike}{right}",
+                                    "qty": res.sell_qty, "action": "SELL",
+                                    "ib_order_id": res.trade.order.orderId,
+                                })
+                            else:
+                                sells.append({
+                                    "contract": f"{sym} {strike}{right}",
+                                    "skipped": True, "reason": res.reason,
+                                })
+                        else:
+                            order = MarketOrder("BUY", abs(qty), transmit=True)
+                            t = ib.placeOrder(ic, order)
+                            sells.append({
+                                "contract": f"{sym} {strike}{right}",
+                                "qty": abs(qty), "action": "BUY",
+                                "ib_order_id": t.order.orderId,
+                            })
                     except Exception as e:
                         sells.append({"contract": f"{sym} {strike}{right}", "error": str(e)})
             except Exception as e:

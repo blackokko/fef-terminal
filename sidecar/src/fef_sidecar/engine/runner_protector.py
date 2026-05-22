@@ -135,21 +135,28 @@ async def runner_protector_loop(state) -> None:
                             notes="runner_protector: T1 retrace exit",
                         )
 
-                    # Market-sell remaining qty
+                    # Market-sell remaining qty via the centralized safe-sell
+                    # helper — refuses to short if positions() shows we don't
+                    # hold enough long for the runner_qty (defense in depth on
+                    # top of the in-process LiveOrder accounting).
                     try:
-                        from ib_async import MarketOrder
                         from fef_sidecar.ibkr.live import _to_ib_contract
+                        from fef_sidecar.ibkr.safe_sell import safe_market_sell
                         ib_contract = _to_ib_contract(opt_contract)
                         await ib.qualifyContractsAsync(ib_contract)
-                        mkt = MarketOrder("SELL", runner_qty, transmit=True)
-                        mkt_trade = ib.placeOrder(ib_contract, mkt)
-                        await SignalIterRepository.write_audit_log(
-                            category="runner_protect", actor="system",
-                            summary=f"Runner protector exited {runner_qty}× {p.symbol} {p.strike}{p.right} at market (T1 fill ${t1_fill:.2f}, bid ${current_bid:.2f})",
-                            details={"parent_id": p.id, "runner_qty": runner_qty,
-                                     "t1_fill_price": t1_fill, "trigger_bid": current_bid,
-                                     "market_order_id": mkt_trade.order.orderId},
+                        result = await safe_market_sell(
+                            ib, ib_contract, runner_qty,
+                            purpose="runner_protect", state=state, parent_id=p.id,
                         )
+                        if result.placed:
+                            await SignalIterRepository.write_audit_log(
+                                category="runner_protect", actor="system",
+                                summary=f"Runner protector exited {result.sell_qty}× {p.symbol} {p.strike}{p.right} at market (T1 fill ${t1_fill:.2f}, bid ${current_bid:.2f})",
+                                details={"parent_id": p.id, "runner_qty": result.sell_qty,
+                                         "t1_fill_price": t1_fill, "trigger_bid": current_bid,
+                                         "market_order_id": result.trade.order.orderId},
+                            )
+                        # else: safe_market_sell already wrote an audit_log.
                     except Exception as e:
                         logger.exception("Market exit of runners failed")
                         await SignalIterRepository.write_audit_log(

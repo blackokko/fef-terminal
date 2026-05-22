@@ -93,15 +93,17 @@ async def _check_dollar_loss(state, p) -> None:
         pnl = (mid - p.limit_price) * open_qty * 100
         if pnl > p.dollar_loss_cap:
             return
-        # Cap breached — fire market sell directly (mirrors the watcher's
-        # _market_sell logic but inlined since we're out-of-band).
+        # Cap breached — fire market sell. Defense in depth:
+        #   1. safe_market_sell is the structural guard (cannot SELL > net_long)
+        #   2. Pending-sell reservation prevents cross-parent races against
+        #      ib.positions() lag.
         if not isinstance(state.ibkr, LiveIBKRProvider):
             await SignalIterRepository.write_audit_log(
                 category="spx_watcher", actor="system",
                 summary=f"[DRY] DOLLAR_STOP(${pnl:.0f}): would market-sell {open_qty}× {p.symbol} {p.strike}{p.right}",
             )
             return
-        from ib_async import MarketOrder
+        from fef_sidecar.ibkr.safe_sell import safe_market_sell
         ib = state.ibkr._ib  # type: ignore[attr-defined]
         ic = await _qualified_ib_contract(state, p)
         positions = ib.positions()
@@ -114,7 +116,9 @@ async def _check_dollar_loss(state, p) -> None:
                 and getattr(pos.contract, "lastTradeDateOrContractMonth", "") == p.expiry
                 and pos.position > 0)
         )
-        # PATCH 1: contract-level pending-sell reservation (see _market_sell).
+        # Contract-level pending-sell reservation — prevents cross-parent
+        # races on same contract where ib.positions() hasn't yet reflected
+        # a prior SELL.
         contract_key = (p.symbol, float(p.strike), p.right, p.expiry)
         pending = state.firing_contracts.get(contract_key, 0)
         available = max(0, long_qty - pending)
@@ -126,29 +130,6 @@ async def _check_dollar_loss(state, p) -> None:
                     f"DOLLAR_STOP SKIPPED: 0 available after reservation "
                     f"(long={long_qty}, pending={pending}, requested={open_qty}) "
                     f"for {p.symbol} {p.strike}{p.right} — refusing to short"
-                ),
-            )
-            return
-
-        # PATCH 2: HARD-BLOCK structural check (defense in depth).
-        fresh_positions = ib.positions()
-        net_long = 0
-        for pos in fresh_positions:
-            c = pos.contract
-            if (getattr(c, "symbol", "") == p.symbol
-                    and abs(float(getattr(c, "strike", 0)) - float(p.strike)) < 0.01
-                    and getattr(c, "right", "") == p.right
-                    and getattr(c, "lastTradeDateOrContractMonth", "") == p.expiry):
-                net_long += int(pos.position)
-        max_sellable = max(0, net_long)
-        if sell_qty > max_sellable:
-            sell_qty = max_sellable
-        if sell_qty <= 0:
-            await SignalIterRepository.write_audit_log(
-                category="spx_watcher", actor="system",
-                summary=(
-                    f"HARD-BLOCK: refusing to short {p.symbol} {p.strike}{p.right} "
-                    f"— net_long={net_long}, requested={open_qty} (DOLLAR_STOP)"
                 ),
             )
             return
@@ -166,8 +147,12 @@ async def _check_dollar_loss(state, p) -> None:
 
         asyncio.create_task(_release_reservation(contract_key, sell_qty))
 
-        mkt = MarketOrder("SELL", sell_qty, transmit=True)
-        trade = ib.placeOrder(ic, mkt)
+        result = await safe_market_sell(
+            ib, ic, sell_qty, purpose="dollar_cap", state=state, parent_id=p.id,
+        )
+        if not result.placed:
+            # safe_market_sell already wrote an audit_log explaining why.
+            return
         # status=STOPPED is the resolved-marker. Don't overwrite the per-tier
         # fired flags as cleanup — they record whether each tier was banked
         # as a partial, not whether the trade resolved. (See poll-loop branch
@@ -177,7 +162,7 @@ async def _check_dollar_loss(state, p) -> None:
         )
         await SignalIterRepository.write_audit_log(
             category="spx_watcher", actor="system",
-            summary=f"DOLLAR_STOP(${pnl:.0f}): market-sold-to-close {sell_qty}× {p.symbol} {p.strike}{p.right} (ib_order_id={trade.order.orderId})",
+            summary=f"DOLLAR_STOP(${pnl:.0f}): market-sold-to-close {result.sell_qty}× {p.symbol} {p.strike}{p.right} (ib_order_id={result.trade.order.orderId})",
         )
     except Exception:
         logger.exception("dollar-loss check failed for parent %s", p.id)
@@ -289,7 +274,7 @@ async def spx_target_watcher_loop(state) -> None:
                         )
                         return
                     try:
-                        from ib_async import MarketOrder
+                        from fef_sidecar.ibkr.safe_sell import safe_market_sell
                         ib = state.ibkr._ib  # type: ignore[attr-defined]
                         ic = await _qualified_ib_contract(state, p)
 
@@ -307,11 +292,12 @@ async def spx_target_watcher_loop(state) -> None:
                                 and getattr(c, "lastTradeDateOrContractMonth", "") == p.expiry
                                 and pos.position > 0):
                                 long_qty += int(pos.position)
-                        # PATCH 1: contract-level pending-sell reservation. If
-                        # another parent on the same contract has already placed
-                        # a SELL whose fill hasn't propagated through
-                        # ib.positions() yet, subtract that reserved qty from
-                        # available_long so we don't double-sell into a short.
+                        # Contract-level pending-sell reservation. If another
+                        # parent on the same contract has already placed a SELL
+                        # whose fill hasn't propagated through ib.positions()
+                        # yet, subtract that reserved qty from available_long
+                        # so we don't double-sell into a short. safe_market_sell
+                        # is the structural backstop if this reservation misses.
                         contract_key = (p.symbol, float(p.strike), p.right, p.expiry)
                         pending = state.firing_contracts.get(contract_key, 0)
                         available = max(0, long_qty - pending)
@@ -336,31 +322,6 @@ async def spx_target_watcher_loop(state) -> None:
                                 ),
                             )
 
-                        # PATCH 2: HARD-BLOCK structural check (defense in depth).
-                        # Re-read positions and clamp sell_qty to net_long.
-                        # Catches any race that bypasses Patch 1's reservation.
-                        fresh_positions = ib.positions()
-                        net_long = 0
-                        for pos in fresh_positions:
-                            c = pos.contract
-                            if (getattr(c, "symbol", "") == p.symbol
-                                    and abs(float(getattr(c, "strike", 0)) - float(p.strike)) < 0.01
-                                    and getattr(c, "right", "") == p.right
-                                    and getattr(c, "lastTradeDateOrContractMonth", "") == p.expiry):
-                                net_long += int(pos.position)
-                        max_sellable = max(0, net_long)
-                        if sell_qty > max_sellable:
-                            sell_qty = max_sellable
-                        if sell_qty <= 0:
-                            await SignalIterRepository.write_audit_log(
-                                category="spx_watcher", actor="system",
-                                summary=(
-                                    f"HARD-BLOCK: refusing to short {p.symbol} {p.strike}{p.right} "
-                                    f"— net_long={net_long}, requested={qty} ({tier_label})"
-                                ),
-                            )
-                            return
-
                         # Reserve before placing. Spawn a 2s-delayed decrement so
                         # the reservation gets released after the SELL has had
                         # time to propagate through ib.positions().
@@ -376,11 +337,17 @@ async def spx_target_watcher_loop(state) -> None:
 
                         asyncio.create_task(_release_reservation(contract_key, sell_qty))
 
-                        mkt = MarketOrder("SELL", sell_qty, transmit=True)
-                        trade = ib.placeOrder(ic, mkt)
+                        result = await safe_market_sell(
+                            ib, ic, sell_qty, purpose="watcher_close",
+                            state=state, parent_id=p.id,
+                        )
+                        if not result.placed:
+                            # safe_market_sell already wrote an audit_log
+                            # explaining why (HARD-BLOCK / no_position / etc.).
+                            return
                         await SignalIterRepository.write_audit_log(
                             category="spx_watcher", actor="system",
-                            summary=f"{tier_label}: market-sold-to-close {sell_qty}× {p.symbol} {p.strike}{p.right} at SPX {spot:.2f} (ib_order_id={trade.order.orderId})",
+                            summary=f"{tier_label}: market-sold-to-close {result.sell_qty}× {p.symbol} {p.strike}{p.right} at SPX {spot:.2f} (ib_order_id={result.trade.order.orderId})",
                         )
                     except Exception:
                         logger.exception("spx_watcher market sell failed")
@@ -630,7 +597,7 @@ async def spx_stop_tick_watcher_loop(state) -> None:
                                 ),
                             )
                         else:
-                            from ib_async import MarketOrder
+                            from fef_sidecar.ibkr.safe_sell import safe_market_sell
                             ib = state.ibkr._ib  # type: ignore[attr-defined]
                             try:
                                 ic = await _qualified_ib_contract(state, p)
@@ -644,10 +611,12 @@ async def spx_stop_tick_watcher_loop(state) -> None:
                                         and getattr(pos.contract, "lastTradeDateOrContractMonth", "") == p.expiry
                                         and pos.position > 0)
                                 )
-                                # PATCH 1: contract-level pending-sell reservation.
+                                # Contract-level pending-sell reservation.
                                 # Prevents cross-parent races on same contract —
                                 # the 7-parent SPX 7520C race that placed a
-                                # naked short occurred here.
+                                # naked short occurred here. safe_market_sell
+                                # is the structural backstop if this reservation
+                                # misses.
                                 contract_key = (p.symbol, float(p.strike), p.right, p.expiry)
                                 pending = state.firing_contracts.get(contract_key, 0)
                                 available = max(0, long_qty - pending)
@@ -662,45 +631,25 @@ async def spx_stop_tick_watcher_loop(state) -> None:
                                         ),
                                     )
                                 else:
-                                    # PATCH 2: HARD-BLOCK structural check
-                                    # (defense in depth).
-                                    fresh_positions = ib.positions()
-                                    net_long = 0
-                                    for pos in fresh_positions:
-                                        c = pos.contract
-                                        if (getattr(c, "symbol", "") == p.symbol
-                                                and abs(float(getattr(c, "strike", 0)) - float(p.strike)) < 0.01
-                                                and getattr(c, "right", "") == p.right
-                                                and getattr(c, "lastTradeDateOrContractMonth", "") == p.expiry):
-                                            net_long += int(pos.position)
-                                    max_sellable = max(0, net_long)
-                                    if sell_qty > max_sellable:
-                                        sell_qty = max_sellable
-                                    if sell_qty <= 0:
-                                        await SignalIterRepository.write_audit_log(
-                                            category="spx_watcher", actor="system",
-                                            summary=(
-                                                f"HARD-BLOCK: refusing to short {p.symbol} {p.strike}{p.right} "
-                                                f"— net_long={net_long}, requested={unfired_qty} (STOP/TICK)"
-                                            ),
-                                        )
-                                    else:
-                                        # Reserve before placing. Spawn a 2s-delayed
-                                        # decrement (see _market_sell rationale).
-                                        state.firing_contracts[contract_key] = pending + sell_qty
+                                    # Reserve before placing. Spawn a 2s-delayed
+                                    # decrement (see _market_sell rationale).
+                                    state.firing_contracts[contract_key] = pending + sell_qty
 
-                                        async def _release_reservation(key, amount):
-                                            try:
-                                                await asyncio.sleep(2.0)
-                                                cur = state.firing_contracts.get(key, 0)
-                                                state.firing_contracts[key] = max(0, cur - amount)
-                                            except Exception:
-                                                pass
+                                    async def _release_reservation(key, amount):
+                                        try:
+                                            await asyncio.sleep(2.0)
+                                            cur = state.firing_contracts.get(key, 0)
+                                            state.firing_contracts[key] = max(0, cur - amount)
+                                        except Exception:
+                                            pass
 
-                                        asyncio.create_task(_release_reservation(contract_key, sell_qty))
+                                    asyncio.create_task(_release_reservation(contract_key, sell_qty))
 
-                                        mkt = MarketOrder("SELL", sell_qty, transmit=True)
-                                        trade = ib.placeOrder(ic, mkt)
+                                    result = await safe_market_sell(
+                                        ib, ic, sell_qty, purpose="watcher_close",
+                                        state=state, parent_id=p.id,
+                                    )
+                                    if result.placed:
                                         tick_age_ms = (
                                             now_ms - state.last_live_tick_ms
                                             if state.last_live_tick_ms > 0 else -1
@@ -708,12 +657,14 @@ async def spx_stop_tick_watcher_loop(state) -> None:
                                         await SignalIterRepository.write_audit_log(
                                             category="spx_watcher", actor="system",
                                             summary=(
-                                                f"STOP/TICK: market-sold-to-close {sell_qty}x "
+                                                f"STOP/TICK: market-sold-to-close {result.sell_qty}x "
                                                 f"{p.symbol} {p.strike}{p.right} at SPX {spot:.2f} "
                                                 f"(stop={effective_stop:.2f}, tick_age={tick_age_ms}ms, "
-                                                f"ib_order_id={trade.order.orderId})"
+                                                f"ib_order_id={result.trade.order.orderId})"
                                             ),
                                         )
+                                    # else: safe_market_sell already wrote
+                                    # an audit_log (HARD-BLOCK / no_position).
                             except Exception:
                                 logger.exception("spx_stop_tick_watcher market sell failed")
                         # Same as the polling-loop stop branch: status=STOPPED

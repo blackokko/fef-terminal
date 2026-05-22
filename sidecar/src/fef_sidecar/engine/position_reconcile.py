@@ -183,6 +183,8 @@ async def sweep_orphan_positions(state) -> dict[str, Any]:
     if ib is None or not ib.isConnected():
         return {"mode": "disconnected", "swept": 0}
 
+    from fef_sidecar.ibkr.safe_sell import safe_market_sell
+
     recon = await reconcile_positions(state)
     swept: list[dict] = []
     for o in recon.get("orphans_detail", []):
@@ -196,12 +198,28 @@ async def sweep_orphan_positions(state) -> dict[str, Any]:
                 if abs(qty) < 1: continue
                 action = "SELL" if qty > 0 else "BUY"
                 try:
-                    order = MarketOrder(action, abs(qty), transmit=True)
-                    t = ib.placeOrder(c, order)
-                    swept.append({
-                        "contract": o["contract"], "qty": abs(qty),
-                        "action": action, "ib_order_id": t.order.orderId,
-                    })
+                    if action == "SELL":
+                        res = await safe_market_sell(
+                            ib, c, abs(qty),
+                            purpose="orphan_sweep", state=state,
+                        )
+                        if res.placed:
+                            swept.append({
+                                "contract": o["contract"], "qty": res.sell_qty,
+                                "action": "SELL", "ib_order_id": res.trade.order.orderId,
+                            })
+                        else:
+                            swept.append({
+                                "contract": o["contract"], "skipped": True,
+                                "reason": res.reason,
+                            })
+                    else:
+                        order = MarketOrder("BUY", abs(qty), transmit=True)
+                        t = ib.placeOrder(c, order)
+                        swept.append({
+                            "contract": o["contract"], "qty": abs(qty),
+                            "action": "BUY", "ib_order_id": t.order.orderId,
+                        })
                 except Exception as e:
                     swept.append({"contract": o["contract"], "error": str(e)})
     await SignalIterRepository.write_audit_log(

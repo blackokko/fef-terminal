@@ -422,7 +422,42 @@ async def place_credit_spread(
             "reason": "DRY_RUN — spread exit watcher will simulate exits",
         }
 
-    # Live: build BAG with ComboLegs
+    # Live: build BAG with ComboLegs.
+    #
+    # CREDIT-SPREAD GATE: this is the ONE legitimate naked-short path in the
+    # codebase. The short leg is uncovered until the long leg fills (typically
+    # a few ms later via the combo's atomic-fill semantics, but still naked
+    # in the worst case if a partial happens). We gate this behind an explicit
+    # env var so it can't fire without user opt-in.
+    gate = os.environ.get("FEF_ALLOW_CREDIT_SPREADS", "false").lower() in (
+        "true", "1", "yes", "on",
+    )
+    if not gate:
+        await SignalIterRepository.write_audit_log(
+            category="safe_sell_blocked", actor="system",
+            summary=(
+                f"CREDIT_SPREAD_GATE: refusing to submit {spec.kind} "
+                f"{spec.short_strike}/{spec.long_strike} × {spec.qty} — "
+                "FEF_ALLOW_CREDIT_SPREADS env var is not set. Naked-short "
+                "paths require explicit opt-in."
+            ),
+            details={
+                "purpose": "credit_spread_short_leg", "qty": spec.qty,
+                "parent_id": saved.id, "kind": spec.kind,
+                "short": spec.short_strike, "long": spec.long_strike,
+            },
+        )
+        await SignalIterRepository.update_live_order(
+            saved.id, status="REJECTED",
+            notes="FEF_ALLOW_CREDIT_SPREADS gate off",
+        )
+        return {
+            "ok": False,
+            "error": "FEF_ALLOW_CREDIT_SPREADS env var is not set",
+            "refused_credit_spread_gate": True,
+            "parent_order_id": saved.id,
+        }
+
     try:
         from ib_async import Bag, ComboLeg, LimitOrder, Option
         ib = ibkr._ib  # type: ignore[attr-defined]
@@ -442,7 +477,11 @@ async def place_credit_spread(
                      exchange="CBOE" if spec.symbol == "SPX" else "SMART"),
         ]
 
-        # SELL the bag for net credit
+        # SELL the bag for net credit. This is the gated naked-short path —
+        # the env-var check above guarantees the user has opted in. The bag
+        # itself is a combo, not a single option, so safe_market_sell's
+        # net_long check doesn't apply; the gate is the sole structural
+        # protection on this path.
         entry_order = LimitOrder("SELL", spec.qty, spec.entry_credit, transmit=True)
         trade = ib.placeOrder(bag, entry_order)
         await SignalIterRepository.update_live_order(
@@ -537,6 +576,14 @@ async def kill_all_orders(ibkr) -> dict:
         from fef_sidecar.ibkr.live import _to_ib_contract
         from fef_sidecar.ibkr.models import Contract, ContractKind
 
+        from fef_sidecar.ibkr.safe_sell import safe_market_sell
+        # kill_all_orders is invoked from /panic/flat and /live/kill which
+        # have access to state via the request; but kill_all_orders itself
+        # is called with just `ibkr`. Synthesize a minimal stand-in object
+        # that carries the firing_contracts dict so safe_market_sell can
+        # write its audit_log. (audit_log writes don't actually need state.)
+        _state_stub = type("KillStateStub", (), {"firing_contracts": {}})()
+
         for pos in ib.positions():
             c = pos.contract
             if getattr(c, "secType", "") != "OPT":
@@ -558,13 +605,31 @@ async def kill_all_orders(ibkr) -> dict:
                 )
                 ic = _to_ib_contract(opt_contract)
                 await ib.qualifyContractsAsync(ic)
-                mkt = MarketOrder(action, abs(qty), transmit=True)
-                trade = ib.placeOrder(ic, mkt)
-                closed_positions.append({
-                    "contract": f"{sym} {strike}{right}",
-                    "qty": abs(qty), "action": action,
-                    "ib_order_id": trade.order.orderId,
-                })
+                if action == "SELL":
+                    result = await safe_market_sell(
+                        ib, ic, abs(qty),
+                        purpose="kill_switch", state=_state_stub,
+                    )
+                    if result.placed:
+                        closed_positions.append({
+                            "contract": f"{sym} {strike}{right}",
+                            "qty": result.sell_qty, "action": "SELL",
+                            "ib_order_id": result.trade.order.orderId,
+                        })
+                    else:
+                        closed_positions.append({
+                            "contract": f"{sym} {strike}{right}",
+                            "skipped": True, "reason": result.reason,
+                        })
+                else:
+                    # BUY-to-close (short → flat) is not a naked-short path.
+                    mkt = MarketOrder("BUY", abs(qty), transmit=True)
+                    trade = ib.placeOrder(ic, mkt)
+                    closed_positions.append({
+                        "contract": f"{sym} {strike}{right}",
+                        "qty": abs(qty), "action": "BUY",
+                        "ib_order_id": trade.order.orderId,
+                    })
             except Exception as e:
                 closed_positions.append({
                     "contract": f"{sym} {strike}{right}",
