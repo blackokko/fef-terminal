@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fef_sidecar.db.models import FEFConfidence, FEFDirection
-from fef_sidecar.quantdata.models import DarkPoolLevel, ExposureRow, IVSkewRow, QuantAlert
+from fef_sidecar.quantdata.models import ExposureRow
 
 
 @dataclass(frozen=True)
@@ -31,14 +31,6 @@ class FEFInputs:
     # recorded to signal_iter.extras for post-freeze pattern discovery.
     top_cex_walls: list[ExposureRow] = field(default_factory=list)
     top_vex_walls: list[ExposureRow] = field(default_factory=list)
-    # Research-only batch 2 (2026-05-21). Engine MUST NOT gate on these.
-    # Flows into persistent storage for backtest access only.
-    vol_drift_cum_call: float | None = None
-    vol_drift_cum_put: float | None = None
-    vol_drift_bias: str | None = None
-    top_skew_rows: list[IVSkewRow] = field(default_factory=list)
-    top_dp_levels: list[DarkPoolLevel] = field(default_factory=list)
-    recent_alerts: list[QuantAlert] = field(default_factory=list)
 
 
 @dataclass

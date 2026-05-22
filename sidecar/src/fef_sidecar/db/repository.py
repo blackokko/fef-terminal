@@ -73,13 +73,6 @@ class SignalIterRepository:
         extras: dict[str, Any] | None = None,
         session_date: str | None = None,
         provider_mode: str | None = None,
-        # Research-only batch 2 (2026-05-21)
-        vol_drift_cum_call: float | None = None,
-        vol_drift_cum_put: float | None = None,
-        vol_drift_bias: str | None = None,
-        top_skew_rows: list[dict[str, Any]] | None = None,
-        top_dp_levels: list[dict[str, Any]] | None = None,
-        recent_alerts: list[dict[str, Any]] | None = None,
     ) -> SignalIter:
         """Persist one FEF iter and bump the DailySession counters atomically."""
         date = session_date or _today_et()
@@ -106,12 +99,6 @@ class SignalIterRepository:
             iv_rank_put_pct=iv_rank_put_pct,
             extras=extras or {},
             provider_mode=provider_mode,
-            vol_drift_cum_call=vol_drift_cum_call,
-            vol_drift_cum_put=vol_drift_cum_put,
-            vol_drift_bias=vol_drift_bias,
-            top_skew_rows=top_skew_rows or [],
-            top_dp_levels=top_dp_levels or [],
-            recent_alerts=recent_alerts or [],
         )
 
         async with get_session() as session:
@@ -223,13 +210,6 @@ class SignalIterRepository:
         iv_rank_call_pct: float | None, iv_rank_put_pct: float | None,
         top_cex_walls: list | None = None,
         top_vex_walls: list | None = None,
-        # Research-only batch 2 (2026-05-21)
-        vol_drift_cum_call: float | None = None,
-        vol_drift_cum_put: float | None = None,
-        vol_drift_bias: str | None = None,
-        top_skew_rows: list | None = None,
-        top_dp_levels: list | None = None,
-        recent_alerts: list | None = None,
     ) -> None:
         async with get_session() as session:
             session.add(FlowSnapshot(
@@ -244,12 +224,6 @@ class SignalIterRepository:
                 aggression_put_pct=aggression_put_pct,
                 iv_rank_call_pct=iv_rank_call_pct,
                 iv_rank_put_pct=iv_rank_put_pct,
-                vol_drift_cum_call=vol_drift_cum_call,
-                vol_drift_cum_put=vol_drift_cum_put,
-                vol_drift_bias=vol_drift_bias,
-                top_skew_rows=top_skew_rows or [],
-                top_dp_levels=top_dp_levels or [],
-                recent_alerts=recent_alerts or [],
             ))
 
     @staticmethod

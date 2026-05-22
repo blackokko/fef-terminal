@@ -55,11 +55,7 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
          "aggression_call_pct": r.aggression_call_pct or 50,
          "aggression_put_pct": r.aggression_put_pct or 50,
          "iv_rank_call_pct": r.iv_rank_call_pct or 50,
-         "iv_rank_put_pct": r.iv_rank_put_pct or 50,
-         # Research-only batch 2
-         "vol_drift_cum_call": getattr(r, "vol_drift_cum_call", None),
-         "vol_drift_cum_put": getattr(r, "vol_drift_cum_put", None),
-         "vol_drift_bias": getattr(r, "vol_drift_bias", None)}
+         "iv_rank_put_pct": r.iv_rank_put_pct or 50}
         for r in rows
     ]
     results = run_sweep(iters=iters_data, cfg=cfg) if iters_data else []

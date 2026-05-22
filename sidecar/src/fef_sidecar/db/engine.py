@@ -133,20 +133,6 @@ async def init_db() -> None:
             ("flow_snapshot", "top_vex_walls", "JSON"),
             # SignalLookaheadOutcome — net-new table, created via create_all,
             # listed here as a marker so the migration log shows it.
-            # Research-only batch 2 (2026-05-21) — vol drift + skew + dark pool + alerts.
-            # Engine does NOT gate on these. 6 columns on each of 2 tables = 12 total.
-            ("signal_iter", "vol_drift_cum_call", "REAL"),
-            ("signal_iter", "vol_drift_cum_put", "REAL"),
-            ("signal_iter", "vol_drift_bias", "TEXT"),
-            ("signal_iter", "top_skew_rows", "JSON"),
-            ("signal_iter", "top_dp_levels", "JSON"),
-            ("signal_iter", "recent_alerts", "JSON"),
-            ("flow_snapshot", "vol_drift_cum_call", "REAL"),
-            ("flow_snapshot", "vol_drift_cum_put", "REAL"),
-            ("flow_snapshot", "vol_drift_bias", "TEXT"),
-            ("flow_snapshot", "top_skew_rows", "JSON"),
-            ("flow_snapshot", "top_dp_levels", "JSON"),
-            ("flow_snapshot", "recent_alerts", "JSON"),
         ]
         for table, column, type_sql in migrations:
             try:

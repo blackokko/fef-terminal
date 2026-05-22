@@ -43,13 +43,6 @@ def snapshot_to_inputs(snap: MarketSnapshot) -> FEFInputs:
         iv_rank_put_pct=snap.iv_rank.put.ivr_pct if snap.iv_rank and snap.iv_rank.put else None,
         top_cex_walls=snap.cex.top(5) if snap.cex else [],
         top_vex_walls=snap.vex.top(5) if snap.vex else [],
-        # Research-only batch 2 — engine does NOT gate on these
-        vol_drift_cum_call=snap.vol_drift.cumulative_iv_change_call if snap.vol_drift else None,
-        vol_drift_cum_put=snap.vol_drift.cumulative_iv_change_put if snap.vol_drift else None,
-        vol_drift_bias=snap.vol_drift.bias if snap.vol_drift else None,
-        top_skew_rows=snap.vol_skew.top(5) if snap.vol_skew else [],
-        top_dp_levels=snap.dark_pool.top(5) if snap.dark_pool else [],
-        recent_alerts=list(snap.quant_alerts.alerts) if snap.quant_alerts else [],
     )
 
 

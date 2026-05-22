@@ -26,7 +26,6 @@ class GreekType(str, Enum):
 
 WallSide = Literal["CALL", "PUT"]
 DriftBias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
-IVDriftBias = Literal["EXPANDING", "CONTRACTING", "NEUTRAL"]
 
 
 class ExposureRow(BaseModel):
@@ -199,99 +198,6 @@ class NetFlowSnapshot(BaseModel):
     entries: list[NetFlowEntry]
 
 
-class VolDriftEntry(BaseModel):
-    """One per-minute IV drift entry — tracks IV evolution intraday."""
-
-    timestamp_ms: int
-    call_iv: float
-    put_iv: float
-    spx_price: float
-
-    @property
-    def iv_spread(self) -> float:
-        return self.put_iv - self.call_iv
-
-
-class VolDriftSummary(BaseModel):
-    """Cumulative IV drift across the session — like DriftSummary but for IV."""
-
-    entries: list[VolDriftEntry]
-    cumulative_iv_change_call: float
-    cumulative_iv_change_put: float
-    bias: IVDriftBias
-
-    def recent(self, n: int = 5) -> list[VolDriftEntry]:
-        return self.entries[-n:] if self.entries else []
-
-
-class IVSkewRow(BaseModel):
-    """Per-strike IV snapshot row — like ExposureRow but values are IV percentages."""
-
-    strike: float
-    call_iv: float
-    put_iv: float
-    skew_pts: float = Field(description="put_iv - call_iv; positive = put skew (normal)")
-
-    @classmethod
-    def from_ivs(cls, strike: float, call_iv: float, put_iv: float) -> "IVSkewRow":
-        return cls(strike=strike, call_iv=call_iv, put_iv=put_iv, skew_pts=put_iv - call_iv)
-
-
-class IVSkewSnapshot(BaseModel):
-    """IV skew snapshot across strikes — like StrikeExposureSnapshot but for IV."""
-
-    spx_price: float
-    rows: list[IVSkewRow]
-
-    def top(self, n: int = 10) -> list[IVSkewRow]:
-        """Top N rows by abs(skew_pts) — highest skew differential first."""
-        return sorted(self.rows, key=lambda r: abs(r.skew_pts), reverse=True)[:n]
-
-
-class DarkPoolLevel(BaseModel):
-    """One price level of dark pool activity for SPY."""
-
-    price: float
-    notional_dollars: float
-    trade_count: int
-
-
-class DarkPoolSnapshot(BaseModel):
-    """Dark pool levels snapshot — SPY price levels with summed notional."""
-
-    rows: list[DarkPoolLevel]
-
-    def top(self, n: int = 10) -> list[DarkPoolLevel]:
-        """Top N levels by abs(notional_dollars)."""
-        return sorted(self.rows, key=lambda r: abs(r.notional_dollars), reverse=True)[:n]
-
-
-class QuantAlert(BaseModel):
-    """One unusual-activity event (Whale/Lightning/Turbo/Bargain/Momentum/Ditto/Golden Sweep)."""
-
-    timestamp_ms: int
-    alert_type: str
-    contract: str = Field(description="Compact contract description: strike + right + expiry")
-    premium_dollars: float
-    side: WallSide
-
-
-class QuantAlertsSnapshot(BaseModel):
-    """Recent unusual-activity alerts (last ~30 min)."""
-
-    alerts: list[QuantAlert]
-
-    def recent(self, cutoff_ms: int | None = None, n: int | None = None) -> list[QuantAlert]:
-        """Return alerts within the last `cutoff_ms` milliseconds, or most recent n."""
-        if cutoff_ms is not None:
-            import time as _time
-            threshold = int(_time.time() * 1000) - cutoff_ms
-            return [a for a in self.alerts if a.timestamp_ms >= threshold]
-        if n is not None:
-            return self.alerts[-n:] if self.alerts else []
-        return list(self.alerts)
-
-
 class MarketSnapshot(BaseModel):
     """Composite snapshot — one call gathers everything the FEF engine needs.
 
@@ -314,17 +220,6 @@ class MarketSnapshot(BaseModel):
     # that dominates 0DTE; vex captures dealer hedging when IV moves.
     cex: StrikeExposureSnapshot | None = None
     vex: StrikeExposureSnapshot | None = None
-
-    # New research-only metrics — added in batch 2 (2026-05-21). Engine does
-    # NOT gate on these; they flow into persistent storage for backtest access.
-    # vol_drift: IV time-series (tracks IV evolution intraday)
-    vol_drift: VolDriftSummary | None = None
-    # vol_skew: per-strike IV snapshot (IV percentages per strike)
-    vol_skew: IVSkewSnapshot | None = None
-    # dark_pool: per-price-level summed notional for SPY dark prints
-    dark_pool: DarkPoolSnapshot | None = None
-    # quant_alerts: recent unusual-activity events (Whale/Lightning/Turbo/etc.)
-    quant_alerts: QuantAlertsSnapshot | None = None
 
     # Optional sim metadata — only set by the scripted-day mock. Lets the
     # regime detector use simulated time of day for testing transitions.
