@@ -256,6 +256,24 @@ class IVRankSnapshot(BaseModel):
     call: IVRankByContract | None = None
     put: IVRankByContract | None = None
 
+    @property
+    def vix_proxy(self) -> float | None:
+        """VIX-equivalent from SPX ~30-day ATM IV (annualized percent).
+
+        QuantData's iv_rank tracks the ~30-day expiry chain in annualized
+        percent — same construction/scale as CBOE VIX (within ~1-2 points).
+        Used as a fallback when the IBKR VIX feed is unavailable (paper
+        accounts often have intermittent VIX subscription).
+
+        Returns the average of call/put last_iv when both are present;
+        falls back to whichever side is available; None if neither.
+        """
+        c = self.call.last_iv if self.call else None
+        p = self.put.last_iv if self.put else None
+        if c is not None and p is not None:
+            return (c + p) / 2
+        return c if c is not None else p
+
 
 class ContractAggression(BaseModel):
     """One side's aggression breakdown (AA/A/M/B/BB are dollar premium totals)."""

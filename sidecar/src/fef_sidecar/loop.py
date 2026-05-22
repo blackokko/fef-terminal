@@ -1181,21 +1181,48 @@ async def bar_stream_loop(state: AppState) -> None:
 
 
 async def vix_poll_loop(state: AppState) -> None:
-    """IMPROVEMENTS #M — refresh VIX every FEF_VIX_POLL_INTERVAL_SEC (default 30s)."""
+    """IMPROVEMENTS #M — refresh VIX every FEF_VIX_POLL_INTERVAL_SEC (default 30s).
+
+    Primary source: IBKR ^VIX index quote. Fallback: QuantData iv_rank.last_iv
+    (SPX ~30-day ATM IV, same scale as VIX within ~1-2 points). The fallback
+    kicks in when the IBKR VIX subscription is unavailable (paper accounts
+    often lack it intermittently). When neither source has a value, last_vix
+    stays at its prior reading.
+    """
     from fef_sidecar.events import StatusEvent
+    import time as _time
 
     interval = float(os.environ.get("FEF_VIX_POLL_INTERVAL_SEC", "30"))
     logger.info("Starting VIX poll loop (interval=%.1fs)", interval)
     while True:
         try:
+            vix_value: float | None = None
+            vix_ts_ms: int | None = None
+            source: str | None = None
+
             quote = await state.ibkr.get_last_quote(Contract.vix_index())
-            if quote and quote.last > 0:
-                state.last_vix = quote.last
-                # Persist for historical VIX timeline
+            if quote and quote.last and quote.last > 0:
+                vix_value = float(quote.last)
+                vix_ts_ms = int(quote.timestamp.timestamp() * 1000)
+                source = "ibkr"
+            else:
+                # Fallback to QuantData iv_rank proxy. last_snapshot is the most
+                # recent MarketSnapshot from the QuantData poll loop, refreshed
+                # every ~15s. Its iv_rank field is parsed from options/iv-rank.
+                snap = getattr(state, "last_snapshot", None)
+                iv = getattr(snap, "iv_rank", None) if snap is not None else None
+                proxy = iv.vix_proxy if iv is not None else None
+                if proxy is not None and proxy > 0:
+                    vix_value = float(proxy)
+                    vix_ts_ms = int(_time.time() * 1000)
+                    source = "quantdata_iv_proxy"
+
+            if vix_value is not None:
+                state.last_vix = vix_value
                 try:
                     await SignalIterRepository.write_vix(
-                        timestamp_ms=int(quote.timestamp.timestamp() * 1000),
-                        value=quote.last,
+                        timestamp_ms=vix_ts_ms or int(_time.time() * 1000),
+                        value=vix_value,
                     )
                 except Exception:
                     logger.exception("Failed to persist VIX sample")
@@ -1209,6 +1236,8 @@ async def vix_poll_loop(state: AppState) -> None:
                         vix=state.last_vix,
                     )
                 )
+                if source == "quantdata_iv_proxy":
+                    logger.debug("VIX from QuantData iv_rank proxy: %.2f", vix_value)
         except asyncio.CancelledError:
             raise
         except Exception:
