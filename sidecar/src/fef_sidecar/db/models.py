@@ -324,6 +324,8 @@ class SignalLookaheadOutcome(SQLModel, table=True):
     spx_mae_pts: float = Field(description="max adverse excursion in SPX points (signed by direction)")
     spx_close_at_window_end: float
     would_have_hit_t1: bool = False
+    would_have_hit_t2: bool = False
+    would_have_hit_t3: bool = False
     would_have_hit_stop: bool = False
     direction_at_signal: str  # "LONG_CALLS" / "LONG_PUTS" / "WAIT"
     confidence_at_signal: str

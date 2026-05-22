@@ -131,6 +131,9 @@ async def init_db() -> None:
             ("signal_iter", "top_vex_walls", "JSON"),
             ("flow_snapshot", "top_cex_walls", "JSON"),
             ("flow_snapshot", "top_vex_walls", "JSON"),
+            # T2/T3 lookahead tracking — lets B+C+D scale-out evaluate properly
+            ("signal_lookahead_outcome", "would_have_hit_t2", "INTEGER DEFAULT 0"),
+            ("signal_lookahead_outcome", "would_have_hit_t3", "INTEGER DEFAULT 0"),
             # SignalLookaheadOutcome — net-new table, created via create_all,
             # listed here as a marker so the migration log shows it.
             # Expiration-bucketed GEX/DEX (exposure_by_expiration pipeline)

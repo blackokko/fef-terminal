@@ -64,22 +64,30 @@ async def _populate_one(signal: SignalIter, lookahead_min: int) -> SignalLookahe
     extras = signal.extras or {}
     opt_pricing = extras.get("option_pricing") or {}
     t1_spx = opt_pricing.get("t1") if opt_pricing else extras.get("t1")
+    t2_spx = opt_pricing.get("t2") if opt_pricing else extras.get("t2")
+    t3_spx = opt_pricing.get("t3") if opt_pricing else extras.get("t3")
     stop_spx = opt_pricing.get("stop") if opt_pricing else extras.get("stop")
 
     if direction == "LONG_CALLS":
         mfe_pts = max_up
         mae_pts = -max_down
         hit_t1 = bool(t1_spx and max(highs) >= float(t1_spx))
+        hit_t2 = bool(t2_spx and max(highs) >= float(t2_spx))
+        hit_t3 = bool(t3_spx and max(highs) >= float(t3_spx))
         hit_stop = bool(stop_spx and min(lows) <= float(stop_spx))
     elif direction == "LONG_PUTS":
         mfe_pts = max_down
         mae_pts = -max_up
         hit_t1 = bool(t1_spx and min(lows) <= float(t1_spx))
+        hit_t2 = bool(t2_spx and min(lows) <= float(t2_spx))
+        hit_t3 = bool(t3_spx and min(lows) <= float(t3_spx))
         hit_stop = bool(stop_spx and max(highs) >= float(stop_spx))
     else:  # WAIT — no directional bias; report unsigned ranges
         mfe_pts = max(max_up, max_down)
         mae_pts = -min(max_up, max_down)
         hit_t1 = False
+        hit_t2 = False
+        hit_t3 = False
         hit_stop = False
 
     confidence = signal.confidence.value if hasattr(signal.confidence, "value") else str(signal.confidence)
@@ -93,6 +101,8 @@ async def _populate_one(signal: SignalIter, lookahead_min: int) -> SignalLookahe
         spx_mae_pts=float(mae_pts),
         spx_close_at_window_end=close_end,
         would_have_hit_t1=hit_t1,
+        would_have_hit_t2=hit_t2,
+        would_have_hit_t3=hit_t3,
         would_have_hit_stop=hit_stop,
         direction_at_signal=direction,
         confidence_at_signal=confidence,
