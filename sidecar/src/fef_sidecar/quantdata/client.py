@@ -360,25 +360,70 @@ class QuantDataClient:
         strike: float,
         right: str,
         expiration: str,
+        *,
+        ticker: str = "SPX",
     ) -> ContractPriceTimeSnapshot:
         """Fetch the intraday price path for a specific option contract.
 
         On-demand only — not part of fetch_market_snapshot. Useful for
-        post-trade review / debugging of specific contracts. Parameters
-        are set via tool metadata before the fetch (mirrors the greekModeType
-        pattern used by the exposure endpoint).
+        post-trade review / debugging of specific contracts.
+
+        Unlike the exposure endpoints (which use a flat `greekModeType` key
+        at metadata top level), this tool uses a nested `metadata.filter`
+        object — each filterable field is `{filterOperationType, value}`.
+        Strike is in cents, ticker is a plain string (not a list).
+        Verified against the live API 2026-05-22.
 
         Args:
             strike: Option strike in dollars (e.g. 7400.0).
-            right: "C" for call, "P" for put.
+            right: "C" or "CALL" / "P" or "PUT".
             expiration: YYYY-MM-DD expiration date.
+            ticker: Underlying ticker (default SPX).
         """
         tool_id = self._tool_id("contract_price_time")
-        await self._update_tool_metadata(tool_id, {
-            "strike": strike,
-            "contractType": right.upper(),
-            "expirationDate": expiration,
-        })
+
+        # Normalise right to QuantData's CALL/PUT format.
+        right_upper = right.upper()
+        contract_type = "CALL" if right_upper.startswith("C") else "PUT"
+
+        # Strike must be sent in cents for this endpoint.
+        strike_cents = int(round(strike * 100))
+
+        # Merge the nested filter sub-tree into existing metadata.filter so
+        # we preserve the chartType / aggregationPeriodType / type fields
+        # the tool needs to keep working.
+        resp = await self._get_json(f"tool/{tool_id}")
+        current = resp.get("response", {}).get("toolDTO")
+        if current is None:
+            raise QuantDataError(
+                f"Unexpected get_tool response for contract_price_time {tool_id[:8]}..."
+            )
+
+        metadata = current.get("metadata", {})
+        filter_block = metadata.get("filter", {})
+        filter_block["contractType"] = {
+            "filterOperationType": "EQUALS",
+            "value": contract_type,
+        }
+        filter_block["expirationDate"] = {
+            "filterOperationType": "EQUALS",
+            "value": expiration,
+        }
+        filter_block["strikePriceInCents"] = {
+            "filterOperationType": "EQUALS",
+            "value": strike_cents,
+        }
+        # Ticker must be a plain string here (sending a list returns 400 —
+        # different shape than the page-filter endpoint, which takes a list).
+        filter_block["ticker"] = {
+            "filterOperationType": "EQUALS",
+            "value": ticker,
+        }
+        metadata["filter"] = filter_block
+        current["metadata"] = metadata
+        current["lastUpdatedTime"] = int(datetime.now(UTC).timestamp() * 1000)
+        await self._request("PUT", "tool", json=current)
+
         raw = await self._get_json(f"{ENDPOINTS['contract_price_time']}/{tool_id}")
         return parse_contract_price_time(raw, strike=strike, right=right, expiration=expiration)
 

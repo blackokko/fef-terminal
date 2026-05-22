@@ -228,71 +228,94 @@ def parse_exposure_by_expiration(
 ) -> ExpirationExposureSnapshot:
     """Parse expiration-bucketed exposure from options/exposure/expiration.
 
-    Best-guess key names — QuantData may use any of:
-      expirationToExposureMap | expDateToExposureMap | byExpiration |
-      expirationDateToContractExposureMap
-    Each value is expected to be a dict with CALL/PUT exposure keys (in
-    raw dollars, cents, or millions — we try cents first, then dollars,
-    normalise to millions at the end).
+    Actual QuantData shape (verified 2026-05-22):
+        response.expirationDateToStrikePriceInCentsToContractExposureMap
+            = { "<expDate>": { "<strikeCents>": {"CALL": <raw>, "PUT": <raw>} } }
 
-    If the top-level shape is a list of objects we try that too.
+    Same nested map as the exposure-by-strike endpoint — the upstream
+    reuses the same key shape and the only difference is *what data* it
+    contains. Strike values in cents, exposures in raw dollars (sum across
+    all strikes per expiration). Output is normalised to millions.
+
+    Fallback keys retained so a future schema change won't silently break.
     """
     resp = _resp(data, f"{greek.value} exposure by expiration")
     price = resp.get("stockPriceInCents", 0) / 100
 
-    # Try multiple map-key names the upstream might use
-    exp_map: dict[str, Any] = (
-        resp.get("expirationToExposureMap")
-        or resp.get("expDateToExposureMap")
-        or resp.get("byExpiration")
-        or resp.get("expirationDateToContractExposureMap")
-        or {}
-    )
+    # Primary key — verified against live API. Same envelope as the
+    # exposure-by-strike endpoint; we sum across all strikes per expiration
+    # to get the bucket totals.
+    nested_map = resp.get("expirationDateToStrikePriceInCentsToContractExposureMap")
 
     rows: list[ExpirationExposureRow] = []
 
-    if isinstance(exp_map, dict):
-        for exp_str, exposure in exp_map.items():
-            if not isinstance(exposure, dict):
+    if isinstance(nested_map, dict) and nested_map:
+        for exp_str, strike_map in nested_map.items():
+            if not isinstance(strike_map, dict):
                 continue
-            # Exposure values may be raw dollars or cents — heuristically
-            # if the absolute values are very large (>1e6) they are likely
-            # in cents; otherwise assume dollars and convert to millions.
-            call_raw = exposure.get("CALL") or exposure.get("call") or 0
-            put_raw = exposure.get("PUT") or exposure.get("put") or 0
-            # If raw values look like cents (>1e7 for typical SPX exposure)
-            # divide by 100 first to get dollars, then by 1e6 for millions.
-            divisor = 100_000_000 if abs(call_raw or put_raw) > 1e7 else 1_000_000
-            call_m = (call_raw or 0) / divisor
-            put_m = (put_raw or 0) / divisor
-            rows.append(ExpirationExposureRow(
-                expiration=exp_str,
-                call_m=call_m,
-                put_m=put_m,
-                net_m=call_m + put_m,
-            ))
-    elif isinstance(exp_map, list):
-        # Alternate shape: list of {expiration, callExposure, putExposure, …}
-        for item in exp_map:
-            if not isinstance(item, dict):
-                continue
-            exp_str = (
-                item.get("expiration")
-                or item.get("expirationDate")
-                or item.get("expDate")
-                or ""
-            )
-            call_raw = item.get("callExposure") or item.get("CALL") or 0
-            put_raw = item.get("putExposure") or item.get("PUT") or 0
-            divisor = 100_000_000 if abs(call_raw or put_raw) > 1e7 else 1_000_000
-            call_m = (call_raw or 0) / divisor
-            put_m = (put_raw or 0) / divisor
+            call_sum = 0.0
+            put_sum = 0.0
+            for _strike_cents, exposure in strike_map.items():
+                if not isinstance(exposure, dict):
+                    continue
+                call_sum += exposure.get("CALL", 0) or 0
+                put_sum += exposure.get("PUT", 0) or 0
+            # Raw exposures are dollars (not cents) for this endpoint —
+            # same convention as parse_exposure().
+            call_m = call_sum / 1_000_000
+            put_m = put_sum / 1_000_000
             rows.append(ExpirationExposureRow(
                 expiration=str(exp_str),
                 call_m=call_m,
                 put_m=put_m,
                 net_m=call_m + put_m,
             ))
+    else:
+        # Defensive fallbacks for legacy / alternate shapes the upstream
+        # might switch to. Only fire if the primary key is absent.
+        exp_map: Any = (
+            resp.get("expirationToExposureMap")
+            or resp.get("expDateToExposureMap")
+            or resp.get("byExpiration")
+            or resp.get("expirationDateToContractExposureMap")
+            or {}
+        )
+        if isinstance(exp_map, dict):
+            for exp_str, exposure in exp_map.items():
+                if not isinstance(exposure, dict):
+                    continue
+                call_raw = exposure.get("CALL") or exposure.get("call") or 0
+                put_raw = exposure.get("PUT") or exposure.get("put") or 0
+                divisor = 100_000_000 if abs(call_raw or put_raw) > 1e7 else 1_000_000
+                call_m = (call_raw or 0) / divisor
+                put_m = (put_raw or 0) / divisor
+                rows.append(ExpirationExposureRow(
+                    expiration=str(exp_str),
+                    call_m=call_m,
+                    put_m=put_m,
+                    net_m=call_m + put_m,
+                ))
+        elif isinstance(exp_map, list):
+            for item in exp_map:
+                if not isinstance(item, dict):
+                    continue
+                exp_str = (
+                    item.get("expiration")
+                    or item.get("expirationDate")
+                    or item.get("expDate")
+                    or ""
+                )
+                call_raw = item.get("callExposure") or item.get("CALL") or 0
+                put_raw = item.get("putExposure") or item.get("PUT") or 0
+                divisor = 100_000_000 if abs(call_raw or put_raw) > 1e7 else 1_000_000
+                call_m = (call_raw or 0) / divisor
+                put_m = (put_raw or 0) / divisor
+                rows.append(ExpirationExposureRow(
+                    expiration=str(exp_str),
+                    call_m=call_m,
+                    put_m=put_m,
+                    net_m=call_m + put_m,
+                ))
 
     rows.sort(key=lambda r: r.expiration)
     return ExpirationExposureSnapshot(greek=greek, spx_price=price, rows=rows)
@@ -301,21 +324,39 @@ def parse_exposure_by_expiration(
 def parse_order_flow(data: dict[str, Any]) -> OrderFlowSnapshot:
     """Parse consolidated order-flow from options/order-flow/consolidated.
 
-    Best-guess key names — the upstream may return a list under any of:
-      orderFlow | orders | consolidatedOrders | orderFlowList
+    Actual QuantData shape (verified 2026-05-22):
+        response.trades = [
+            {
+              "tradeTime": 1779459336947,
+              "ticker": "SPX",
+              "expirationDate": "2026-05-22",
+              "strikePriceInCents": 752000,
+              "contractType": "CALL",       # CALL or PUT
+              "tradeSideCode": "M",          # AA / A / M / B / BB
+              "premiumInCents": 4256000,
+              "tradeType": "AUTO",           # AUTO / BLOCK
+              "tradeConsolidationType": "SPLIT",  # SPLIT = swept across exchanges
+              "isGoldenSweep": false,
+              "isUnusual": false,
+              "isVolumeGreaterThanOpenInterest": true,
+              ...
+            }, ...
+        ]
+        response.statistics.optionsOrderFlowContractTradeSideStatisticsSumMap = {...}
 
-    Each item is expected to have timestamp, strike, right (C/P), expiry,
-    premium, aggression level, and classification flags (whale/sweep/etc.).
-    All fields are parsed defensively; missing fields produce defaults.
+    QuantData doesn't expose an "isWhale" flag — we derive it as
+    premium >= $1M. "Sweep" is derived from tradeConsolidationType == SPLIT
+    (multi-exchange split fills). "Block" comes from tradeType == BLOCK.
 
-    Note: QuantData's order-flow API is not fully documented. This parser
-    covers the most likely shapes based on the established MCP pattern for
-    other endpoints. Adjust key names if the real schema differs.
+    Fallback keys retained for the legacy guessed shape so a future API
+    change doesn't silently produce empty results.
     """
     resp = _resp(data, "order flow")
 
+    # Primary key — verified against live API.
     raw_orders: list[Any] = (
-        resp.get("orderFlow")
+        resp.get("trades")
+        or resp.get("orderFlow")
         or resp.get("orders")
         or resp.get("consolidatedOrders")
         or resp.get("orderFlowList")
@@ -327,45 +368,129 @@ def parse_order_flow(data: dict[str, Any]) -> OrderFlowSnapshot:
         if not isinstance(item, dict):
             continue
         try:
-            ts_raw = item.get("timestamp") or item.get("timestampMs") or item.get("time") or 0
+            # Timestamp — QuantData uses tradeTime (ms since epoch)
+            ts_raw = (
+                item.get("tradeTime")
+                or item.get("timestamp")
+                or item.get("timestampMs")
+                or item.get("time")
+                or 0
+            )
             ts_ms = int(ts_raw) if ts_raw else 0
-            # Strike may be in cents
-            strike_raw = item.get("strikePrice") or item.get("strike") or 0
-            strike = float(strike_raw) / 100 if float(strike_raw or 0) > 10000 else float(strike_raw or 0)
-            right = str(item.get("contractType") or item.get("right") or item.get("optionType") or "C").upper()
-            right = "C" if right.startswith("C") else "P"
+
+            # Strike — primary key is strikePriceInCents (always cents).
+            # Fallbacks cover alternate shapes the API might switch to.
+            strike_cents_raw = item.get("strikePriceInCents")
+            if strike_cents_raw is not None:
+                strike = float(strike_cents_raw) / 100
+            else:
+                # Fallback for legacy field names
+                strike_raw = item.get("strikePrice") or item.get("strike") or 0
+                # Heuristic: dollars vs cents
+                strike = (
+                    float(strike_raw) / 100
+                    if float(strike_raw or 0) > 10000
+                    else float(strike_raw or 0)
+                )
+
+            # Contract type — primary is contractType ("CALL"/"PUT")
+            right_raw = str(
+                item.get("contractType")
+                or item.get("right")
+                or item.get("optionType")
+                or "C"
+            ).upper()
+            right = "C" if right_raw.startswith("C") else "P"
+
             expiry = str(
                 item.get("expirationDate")
                 or item.get("expiration")
                 or item.get("expDate")
                 or ""
             )
-            # Premium may be in cents
-            prem_raw = item.get("premium") or item.get("premiumDollars") or item.get("totalPremium") or 0
-            premium = float(prem_raw or 0) / 100 if abs(float(prem_raw or 0)) > 100_000 else float(prem_raw or 0)
 
+            # Premium — primary key is premiumInCents
+            prem_cents_raw = item.get("premiumInCents")
+            if prem_cents_raw is not None:
+                premium = float(prem_cents_raw) / 100
+            else:
+                # Fallback for alternate shapes
+                prem_raw = (
+                    item.get("premium")
+                    or item.get("premiumDollars")
+                    or item.get("totalPremium")
+                    or 0
+                )
+                premium = (
+                    float(prem_raw or 0) / 100
+                    if abs(float(prem_raw or 0)) > 100_000
+                    else float(prem_raw or 0)
+                )
+
+            # Aggression side — primary key is tradeSideCode
             side_raw = str(
-                item.get("sideAggression")
+                item.get("tradeSideCode")
+                or item.get("sideAggression")
                 or item.get("aggression")
                 or item.get("tradeSide")
                 or "M"
             ).upper()
-            # Normalise to AA/A/M/B/BB
             if side_raw not in ("AA", "A", "M", "B", "BB"):
                 side_raw = "M"
 
-            flags: list[str] = list(item.get("flags") or item.get("otherFlags") or [])
-            # Some endpoints embed flags as boolean keys
-            is_whale = bool(item.get("isWhale") or item.get("whale") or "WHALE" in flags)
-            is_sweep = bool(item.get("isSweep") or item.get("sweep") or "SWEEP" in flags)
+            # Classification flags — derived from QuantData fields.
+            #   isGoldenSweep is a direct field.
+            #   tradeConsolidationType == "SPLIT" indicates a sweep
+            #     (split across multiple exchanges).
+            #   tradeType == "BLOCK" indicates a block trade.
+            #   Whale = premium >= $1M (QuantData doesn't expose this flag).
+            flags_raw: list[Any] = list(item.get("flags") or item.get("otherFlags") or [])
+            flags: list[str] = [str(f) for f in flags_raw]
+
+            consolidation = str(item.get("tradeConsolidationType") or "").upper()
+            trade_type = str(item.get("tradeType") or "").upper()
+
             is_golden = bool(
                 item.get("isGoldenSweep")
                 or item.get("goldenSweep")
                 or "GOLDEN_SWEEP" in flags
-                or (is_sweep and premium >= 1_000_000)
             )
-            is_block = bool(item.get("isBlock") or item.get("block") or "BLOCK" in flags)
-            other = [f for f in flags if f not in ("WHALE", "SWEEP", "GOLDEN_SWEEP", "BLOCK")]
+            is_sweep = bool(
+                consolidation == "SPLIT"
+                or item.get("isSweep")
+                or item.get("sweep")
+                or "SWEEP" in flags
+                or is_golden  # a golden sweep is also a sweep
+            )
+            is_block = bool(
+                trade_type == "BLOCK"
+                or item.get("isBlock")
+                or item.get("block")
+                or "BLOCK" in flags
+            )
+            # Whale: $1M+ premium — also pick up explicit flag if upstream
+            # ever adds one.
+            is_whale = bool(
+                premium >= 1_000_000
+                or item.get("isWhale")
+                or item.get("whale")
+                or "WHALE" in flags
+            )
+
+            # Preserve any additional flags we didn't already account for
+            # (e.g. Lightning / Turbo / Bargain / Momentum / Ditto from the
+            # docs). Also surface isUnusual and isVolumeGreaterThanOpenInterest
+            # as text tags for downstream research consumers.
+            other: list[str] = [
+                f for f in flags
+                if f.upper() not in ("WHALE", "SWEEP", "GOLDEN_SWEEP", "BLOCK")
+            ]
+            if item.get("isUnusual"):
+                other.append("UNUSUAL")
+            if item.get("isVolumeGreaterThanOpenInterest"):
+                other.append("VOL_GT_OI")
+            if item.get("isOpeningPosition"):
+                other.append("OPENING")
 
             parsed.append(OrderFlowRow(
                 timestamp_ms=ts_ms,
@@ -396,16 +521,30 @@ def parse_contract_price_time(
 ) -> ContractPriceTimeSnapshot:
     """Parse per-contract intraday price path from options/contract/price/time.
 
-    Best-guess shape — QuantData may return a list under:
-      priceTimeSeries | pricePath | priceData | contractPriceTime
+    Actual QuantData shape (verified 2026-05-22):
+        response.optionPriceOverTime = [
+            [ts_ms, open_cents, high_cents, low_cents, close_cents,
+             volume, spx_open_cents, spx_high_cents, spx_low_cents, spx_close_cents],
+            ...
+        ]
 
-    Each element is {timestamp, price, volume} or a fixed-length array.
-    Prices are normalised from cents (if >1000) to dollars.
+    Each bar is a fixed-length 10-element array. We extract close price
+    (index 4) as the canonical price, sum volume from index 5. The trailing
+    SPX OHLC fields are ignored — they're already captured elsewhere.
+
+    Empty response is normal:
+      - Filter not yet set (strike/contractType/expirationDate must be
+        configured on the tool's metadata.filter before fetching).
+      - Contract has no trades yet for the session.
+
+    Fallback shape keys retained for safety.
     """
     resp = _resp(data, "contract price/time")
 
+    # Primary key — verified against live API.
     raw: list[Any] = (
-        resp.get("priceTimeSeries")
+        resp.get("optionPriceOverTime")
+        or resp.get("priceTimeSeries")
         or resp.get("pricePath")
         or resp.get("priceData")
         or resp.get("contractPriceTime")
@@ -415,13 +554,34 @@ def parse_contract_price_time(
     points: list[ContractPricePoint] = []
     for item in raw:
         try:
-            if isinstance(item, dict):
-                ts = int(item.get("timestamp") or item.get("timestampMs") or item.get("time") or 0)
-                price_raw = float(item.get("price") or item.get("lastPrice") or 0)
-                # Prices >1000 are likely in cents
+            if isinstance(item, (list, tuple)) and len(item) >= 5:
+                # QuantData OHLCV bar: [ts_ms, o, h, l, c, vol, ...]
+                # Use close as the canonical price (index 4).
+                ts = int(item[0])
+                close_cents = float(item[4])
+                price = close_cents / 100  # cents → dollars
+                vol = int(item[5]) if len(item) > 5 else 0
+            elif isinstance(item, dict):
+                # Fallback shape — defensive coverage for future API change.
+                ts = int(
+                    item.get("timestamp")
+                    or item.get("timestampMs")
+                    or item.get("time")
+                    or item.get("tradeTime")
+                    or 0
+                )
+                price_raw = float(
+                    item.get("close")
+                    or item.get("closePrice")
+                    or item.get("price")
+                    or item.get("lastPrice")
+                    or 0
+                )
+                # Heuristic for cents vs dollars
                 price = price_raw / 100 if price_raw > 1000 else price_raw
                 vol = int(item.get("volume") or item.get("size") or 0)
             elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                # Minimal fallback: [ts, price, vol?]
                 ts = int(item[0])
                 price_raw = float(item[1])
                 price = price_raw / 100 if price_raw > 1000 else price_raw
