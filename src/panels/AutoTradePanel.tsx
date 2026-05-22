@@ -17,6 +17,17 @@ interface AutoTradeStatus {
   trigger_types: string[];
 }
 
+interface AutoTradePreset {
+  id: number;
+  name: string;
+  description: string;
+  confidence_floor: string;
+  cool_down_sec: number;
+  trigger_types: string[];
+  qty_override: number;
+  runner_protect_enabled: boolean;
+}
+
 const TRIGGER_TYPES = [
   { value: "confluence", label: "Confluence (wall collapse + aligned)",
     hint: "Today: 41% win, +0.37R — the only profitable subset so far" },
@@ -27,6 +38,8 @@ const TRIGGER_TYPES = [
 export function AutoTradePanel() {
   const [status, setStatus] = useState<AutoTradeStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  const [presets, setPresets] = useState<AutoTradePreset[]>([]);
+  const [selectedPresetId, setSelectedPresetId] = useState<number | "">("");
   const toast = useToast();
 
   const refresh = async () => {
@@ -36,11 +49,97 @@ export function AutoTradePanel() {
     } catch {}
   };
 
+  const refreshPresets = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/auto_trade/presets`);
+      if (r.ok) setPresets(await r.json());
+    } catch {}
+  };
+
   useEffect(() => {
     void refresh();
+    void refreshPresets();
     const id = window.setInterval(refresh, 3000);
     return () => window.clearInterval(id);
   }, []);
+
+  const handleApplyPreset = async (presetId: number) => {
+    setBusy(true);
+    try {
+      const r = await fetch(`${API_BASE}/auto_trade/presets/${presetId}/apply`, { method: "POST" });
+      if (r.ok) {
+        const data = await r.json();
+        toast.show(`Preset applied: ${data.applied}`, { variant: "success" });
+        await refresh();
+      } else {
+        toast.show("Failed to apply preset", { variant: "error" });
+      }
+    } catch (e) {
+      toast.show(`Apply failed: ${(e as Error).message}`, { variant: "error" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSavePreset = async () => {
+    if (!status) return;
+    const name = window.prompt(
+      "Save current auto-trade settings as a preset.\n\nName:",
+      ""
+    )?.trim();
+    if (!name) return;
+    const description = window.prompt("Description (optional):", "") ?? "";
+
+    setBusy(true);
+    try {
+      const r = await fetch(`${API_BASE}/auto_trade/presets`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name, description,
+          confidence_floor: status.confidence_floor,
+          cool_down_sec: status.cool_down_sec,
+          trigger_types: status.trigger_types,
+          qty_override: status.qty_override,
+          runner_protect_enabled: status.runner_protect_enabled,
+        }),
+      });
+      const data = await r.json();
+      if (r.ok) {
+        toast.show(`Preset '${data.name}' saved`, { variant: "success" });
+        await refreshPresets();
+        setSelectedPresetId(data.preset_id);
+      } else {
+        toast.show(`Save failed: ${data.detail || "unknown"}`, { variant: "error" });
+      }
+    } catch (e) {
+      toast.show(`Save failed: ${(e as Error).message}`, { variant: "error" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDeletePreset = async () => {
+    if (!selectedPresetId) return;
+    const preset = presets.find(p => p.id === selectedPresetId);
+    if (!preset) return;
+    if (!window.confirm(`Delete preset '${preset.name}'? This can't be undone.`)) return;
+    setBusy(true);
+    try {
+      const r = await fetch(`${API_BASE}/auto_trade/presets/${selectedPresetId}`, { method: "DELETE" });
+      if (r.ok) {
+        toast.show(`Preset '${preset.name}' deleted`, { variant: "success" });
+        setSelectedPresetId("");
+        await refreshPresets();
+      } else {
+        toast.show("Delete failed", { variant: "error" });
+      }
+    } catch (e) {
+      toast.show(`Delete failed: ${(e as Error).message}`, { variant: "error" });
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const handleToggle = async () => {
     if (!status) return;
@@ -98,6 +197,8 @@ export function AutoTradePanel() {
 
   const updateSetting = async (key: string, value: any) => {
     setBusy(true);
+    // Clear preset selection — manual edit means current state no longer matches a preset.
+    if (selectedPresetId !== "") setSelectedPresetId("");
     try {
       await fetch(`${API_BASE}/auto_trade/toggle`, {
         method: "POST",
@@ -171,6 +272,55 @@ export function AutoTradePanel() {
          status.enabled ? "🛑 DISABLE AUTO-TRADE" : "▶ ENABLE AUTO-TRADE"}
       </button>
 
+      <div style={{
+        display: "flex", gap: 6, alignItems: "center", marginBottom: 8,
+        padding: "6px 8px", background: "var(--color-bg-elevated)",
+        borderRadius: 4, fontSize: 11,
+      }}>
+        <span className="muted small" style={{ fontWeight: 600 }}>Preset:</span>
+        <select
+          value={selectedPresetId}
+          onChange={(e) => {
+            const val = e.target.value;
+            if (val === "") { setSelectedPresetId(""); return; }
+            const id = Number(val);
+            setSelectedPresetId(id);
+            void handleApplyPreset(id);
+          }}
+          disabled={busy || presets.length === 0}
+          className="settings-input"
+          style={{ flex: 1, minWidth: 0 }}
+          title={
+            selectedPresetId !== ""
+              ? presets.find(p => p.id === selectedPresetId)?.description || ""
+              : "Select a saved preset to apply its settings"
+          }
+        >
+          <option value="">— select preset —</option>
+          {presets.map(p => (
+            <option key={p.id} value={p.id}>{p.name}</option>
+          ))}
+        </select>
+        <button
+          onClick={() => void handleSavePreset()}
+          disabled={busy}
+          title="Save the current settings as a new preset"
+          style={{ fontSize: 11, padding: "2px 8px" }}
+        >
+          Save as…
+        </button>
+        {selectedPresetId !== "" && (
+          <button
+            onClick={() => void handleDeletePreset()}
+            disabled={busy}
+            title="Delete the currently selected preset"
+            style={{ fontSize: 11, padding: "2px 8px", color: "var(--color-red)" }}
+          >
+            ✕
+          </button>
+        )}
+      </div>
+
       <table className="auto-trade-settings">
         <tbody>
           <tr>
@@ -230,9 +380,6 @@ export function AutoTradePanel() {
                      onChange={(e) => void updateSetting("qty_override", Number(e.target.value))}
                      disabled={busy} className="settings-input" style={{ width: 80 }}
                      title="Fixed contract size for every auto-trade fire. 0 = use FEF's confidence-tier default (HIGH=15, MEDIUM=10, LOW=5)" />
-              <span className="muted small" style={{ marginLeft: 6 }}>
-                {status.qty_override === 0 ? "(auto: 15/10/5 by conf)" : `fixed`}
-              </span>
             </td>
           </tr>
         </tbody>
@@ -268,6 +415,7 @@ export function AutoTradePanel() {
             checked={status.runner_protect_enabled}
             onChange={async (e) => {
               setBusy(true);
+              if (selectedPresetId !== "") setSelectedPresetId("");
               try {
                 await fetch(`${API_BASE}/auto_trade/runner_protect`, {
                   method: "POST",

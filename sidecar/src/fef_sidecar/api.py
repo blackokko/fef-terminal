@@ -639,6 +639,196 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
     }
 
 
+# ---------------------------------------------------------------------------
+# Auto-trade presets — save/load/apply named auto-trade settings
+# Lets the user swap between Conservative/Standard/Aggressive (or custom) with
+# one click instead of re-entering confidence_floor/cool_down/triggers/qty/
+# runner-protect every session.
+# ---------------------------------------------------------------------------
+
+_AUTO_TRADE_DEFAULT_PRESETS = [
+    {
+        "name": "Conservative",
+        "description": "HIGH conviction only, longer cool-down, confluence trigger — for choppy or uncertain sessions",
+        "confidence_floor": "HIGH",
+        "cool_down_sec": 600,
+        "trigger_types": ["confluence"],
+        "qty_override": 10,
+        "runner_protect_enabled": True,
+    },
+    {
+        "name": "Standard",
+        "description": "HIGH floor, 5-min cool-down, confluence + aligned triggers, FEF auto-qty by confidence",
+        "confidence_floor": "HIGH",
+        "cool_down_sec": 300,
+        "trigger_types": ["confluence", "aligned_only"],
+        "qty_override": 0,
+        "runner_protect_enabled": True,
+    },
+    {
+        "name": "Aggressive",
+        "description": "MEDIUM floor, 3-min cool-down, all triggers, larger size — trending high-confidence days",
+        "confidence_floor": "MEDIUM",
+        "cool_down_sec": 180,
+        "trigger_types": ["confluence", "aligned_only"],
+        "qty_override": 15,
+        "runner_protect_enabled": False,
+    },
+]
+
+
+@router.get("/auto_trade/presets")
+async def list_auto_trade_presets() -> list[dict[str, Any]]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import AutoTradePreset
+
+    async with get_session() as session:
+        rows = (await session.exec(select(AutoTradePreset).order_by(AutoTradePreset.name))).all()
+        return [
+            {
+                "id": p.id,
+                "name": p.name,
+                "description": p.description,
+                "confidence_floor": p.confidence_floor,
+                "cool_down_sec": p.cool_down_sec,
+                "trigger_types": p.trigger_types,
+                "qty_override": p.qty_override,
+                "runner_protect_enabled": p.runner_protect_enabled,
+            }
+            for p in rows
+        ]
+
+
+@router.post("/auto_trade/presets")
+async def create_auto_trade_preset(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    from datetime import UTC, datetime
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import AutoTradePreset
+
+    async with get_session() as session:
+        preset = AutoTradePreset(
+            name=str(body["name"]).strip(),
+            description=str(body.get("description", "")),
+            confidence_floor=str(body.get("confidence_floor", "HIGH")).upper(),
+            cool_down_sec=max(60, int(body.get("cool_down_sec", 300))),
+            trigger_types=list(body.get("trigger_types", ["confluence"])) or ["confluence"],
+            qty_override=max(0, min(100, int(body.get("qty_override", 0)))),
+            runner_protect_enabled=bool(body.get("runner_protect_enabled", True)),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        session.add(preset)
+        await session.flush()
+        return {"ok": True, "preset_id": preset.id, "name": preset.name}
+
+
+@router.delete("/auto_trade/presets/{preset_id}")
+async def delete_auto_trade_preset(preset_id: int) -> dict[str, Any]:
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import AutoTradePreset
+
+    async with get_session() as session:
+        preset = (await session.exec(select(AutoTradePreset).where(AutoTradePreset.id == preset_id))).first()
+        if preset is None:
+            raise HTTPException(404, f"AutoTradePreset {preset_id} not found")
+        name = preset.name
+        await session.delete(preset)
+        return {"ok": True, "deleted": name}
+
+
+@router.post("/auto_trade/presets/seed_defaults")
+async def seed_default_auto_trade_presets() -> dict[str, Any]:
+    """Insert built-in auto-trade presets if not already present. Idempotent."""
+    from datetime import UTC, datetime
+
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import AutoTradePreset
+
+    added: list[str] = []
+    async with get_session() as session:
+        for tpl in _AUTO_TRADE_DEFAULT_PRESETS:
+            existing = (
+                await session.exec(select(AutoTradePreset).where(AutoTradePreset.name == tpl["name"]))
+            ).first()
+            if existing:
+                continue
+            session.add(
+                AutoTradePreset(
+                    name=tpl["name"],
+                    description=tpl["description"],
+                    confidence_floor=tpl["confidence_floor"],
+                    cool_down_sec=tpl["cool_down_sec"],
+                    trigger_types=list(tpl["trigger_types"]),
+                    qty_override=tpl["qty_override"],
+                    runner_protect_enabled=tpl["runner_protect_enabled"],
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            added.append(tpl["name"])
+    return {"ok": True, "added": added}
+
+
+@router.post("/auto_trade/presets/{preset_id}/apply")
+async def apply_auto_trade_preset(preset_id: int, request: Request) -> dict[str, Any]:
+    """Apply a saved preset's settings to the live auto-trade state.
+
+    Mutates state directly (same fields the toggle endpoint writes) plus the
+    runner-protect flag. Does NOT enable auto-trade — user still controls
+    enable/disable separately.
+    """
+    from sqlmodel import select
+
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import AutoTradePreset
+    from fef_sidecar.db.repository import SignalIterRepository
+
+    s = _state(request)
+    async with get_session() as session:
+        preset = (await session.exec(select(AutoTradePreset).where(AutoTradePreset.id == preset_id))).first()
+        if preset is None:
+            raise HTTPException(404, f"AutoTradePreset {preset_id} not found")
+
+        s.auto_trade_confidence_floor = preset.confidence_floor
+        s.auto_trade_cool_down_sec = max(60, preset.cool_down_sec)
+        s.auto_trade_qty_override = max(0, min(100, preset.qty_override))
+        valid_triggers = {"confluence", "aligned_only", "wall_only"}
+        types = [t for t in preset.trigger_types if t in valid_triggers]
+        s.auto_trade_trigger_types = types if types else ["confluence"]
+        s.runner_protect_enabled = bool(preset.runner_protect_enabled)
+
+        await SignalIterRepository.write_audit_log(
+            category="auto_trade_preset_apply", actor="user",
+            summary=f"Applied auto-trade preset '{preset.name}'",
+            details={
+                "preset_id": preset_id, "name": preset.name,
+                "confidence_floor": preset.confidence_floor,
+                "cool_down_sec": preset.cool_down_sec,
+                "trigger_types": preset.trigger_types,
+                "qty_override": preset.qty_override,
+                "runner_protect_enabled": preset.runner_protect_enabled,
+            },
+        )
+        return {
+            "ok": True,
+            "applied": preset.name,
+            "settings": {
+                "confidence_floor": s.auto_trade_confidence_floor,
+                "cool_down_sec": s.auto_trade_cool_down_sec,
+                "trigger_types": s.auto_trade_trigger_types,
+                "qty_override": s.auto_trade_qty_override,
+                "runner_protect_enabled": s.runner_protect_enabled,
+            },
+        }
+
+
 @router.get("/scanner/symbols")
 async def scanner_symbols_get(request: Request) -> dict[str, Any]:
     """Return per-symbol scanner enable state + caps."""

@@ -50,7 +50,7 @@ async def _seed_defaults_on_first_run() -> None:
     from sqlmodel import select
 
     from fef_sidecar.db.engine import get_session
-    from fef_sidecar.db.models import Pattern, StrategyPreset
+    from fef_sidecar.db.models import AutoTradePreset, Pattern, StrategyPreset
     from fef_sidecar.engine.patterns import DEFAULT_TEMPLATES
     from fef_sidecar.engine.preset_templates import DEFAULT_PRESETS
 
@@ -59,6 +59,7 @@ async def _seed_defaults_on_first_run() -> None:
     async with get_session() as session:
         pattern_count = len((await session.exec(select(Pattern))).all())
         preset_count = len((await session.exec(select(StrategyPreset))).all())
+        at_preset_count = len((await session.exec(select(AutoTradePreset))).all())
 
         if pattern_count == 0:
             for tpl in DEFAULT_TEMPLATES:
@@ -84,6 +85,30 @@ async def _seed_defaults_on_first_run() -> None:
                     updated_at=datetime.now(UTC),
                 ))
             logger.info("Seeded %d default presets", len(DEFAULT_PRESETS))
+
+        if at_preset_count == 0:
+            # Built-in auto-trade presets — lets user swap settings with one click
+            # instead of re-entering confidence/cool-down/triggers/qty/runner-protect
+            # every session. Definitions duplicated from api.py to avoid circular
+            # import on startup.
+            defaults = [
+                ("Conservative", "HIGH conviction only, longer cool-down, confluence trigger — for choppy or uncertain sessions",
+                 "HIGH", 600, ["confluence"], 10, True),
+                ("Standard", "HIGH floor, 5-min cool-down, confluence + aligned triggers, FEF auto-qty by confidence",
+                 "HIGH", 300, ["confluence", "aligned_only"], 0, True),
+                ("Aggressive", "MEDIUM floor, 3-min cool-down, all triggers, larger size — trending high-confidence days",
+                 "MEDIUM", 180, ["confluence", "aligned_only"], 15, False),
+            ]
+            for name, desc, floor, cool, triggers, qty, runner in defaults:
+                session.add(AutoTradePreset(
+                    name=name, description=desc,
+                    confidence_floor=floor, cool_down_sec=cool,
+                    trigger_types=list(triggers), qty_override=qty,
+                    runner_protect_enabled=runner,
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                ))
+            logger.info("Seeded %d default auto-trade presets", len(defaults))
 
 
 async def backfill_regime_from_db(state: AppState) -> None:

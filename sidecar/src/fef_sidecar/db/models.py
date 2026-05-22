@@ -166,6 +166,31 @@ class StrategyPreset(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
+class AutoTradePreset(SQLModel, table=True):
+    """Named auto-trade settings the user can swap into the live state.
+
+    Lets the user save common configurations (Conservative / Standard /
+    Aggressive / custom) and apply them with one click instead of
+    re-entering confidence_floor / cool_down / trigger types / qty /
+    runner-protect every session.
+    """
+
+    __tablename__ = "auto_trade_preset"
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(unique=True, index=True)
+    description: str = Field(default="")
+
+    confidence_floor: str = "HIGH"  # HIGH / MEDIUM / LOW
+    cool_down_sec: int = 300
+    trigger_types: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    qty_override: int = 0  # 0 = use FEF auto (HIGH=15, MEDIUM=10, LOW=5)
+    runner_protect_enabled: bool = True
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
 class ChartAnnotation(SQLModel, table=True):
     """IMPROVEMENTS #Q — user-marked horizontal levels persisted to the chart."""
 

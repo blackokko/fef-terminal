@@ -111,15 +111,21 @@ def _load_iters_by_regime(
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
     cur = db.cursor()
+    # Discover available columns so the query degrades gracefully on older DBs
+    available_cols = {r[1] for r in cur.execute("PRAGMA table_info(signal_iter)").fetchall()}
+    desired_cols = [
+        "timestamp", "spx_price", "drift_cum_net_m", "drift_bias",
+        "ntm_max_pain", "raw_max_pain", "top_gex_walls", "top_dex_walls",
+        "top_cex_walls", "top_vex_walls",
+        "top_gex_by_expiry", "top_dex_by_expiry",
+        "zero_dte_gex_net_m", "zero_dte_dex_net_m",
+        "recent_whale_count_30m", "recent_golden_sweep_count_30m",
+        "aggression_call_pct", "aggression_put_pct", "extras",
+    ]
+    select_cols = [c for c in desired_cols if c in available_cols]
     rows = cur.execute(
-        """
-        SELECT timestamp, spx_price, drift_cum_net_m, drift_bias,
-               ntm_max_pain, raw_max_pain, top_gex_walls, top_dex_walls,
-               top_cex_walls, top_vex_walls,
-               top_gex_by_expiry, top_dex_by_expiry,
-               zero_dte_gex_net_m, zero_dte_dex_net_m,
-               recent_whale_count_30m, recent_golden_sweep_count_30m,
-               aggression_call_pct, aggression_put_pct, extras
+        f"""
+        SELECT {', '.join(select_cols)}
         FROM signal_iter
         WHERE session_date BETWEEN ? AND ?
           AND spx_price BETWEEN 1000 AND 10000
