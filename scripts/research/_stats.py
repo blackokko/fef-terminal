@@ -45,6 +45,16 @@ def get_ledger_variant_count(
             "in_family": N in same family (if family given),
             "in_sub_family": N in same sub_family (if sub_family given),
             "in_project": N across all variants,
+            # Honest counts including DROPPED / SUPERSEDED variants that
+            # never landed in the SQL `variant_ledger` table. Per
+            # Harvey & Liu 2015: N_trials must include every variant
+            # ever tested, not just the survivors. The SQL ledger tracks
+            # only the 12 registered shadow variants — the markdown
+            # roll-up at scripts/research/VARIANT_LEDGER.md is the
+            # canonical project-wide ledger.
+            "in_project_honest": project-wide honest count from
+                _variant_ledger.HONEST_N_PROJECT,
+            "in_family_honest": per-family honest count (if family given),
         }
 
     Falls back to {"matched": 0, ...} if the ledger table doesn't exist
@@ -52,7 +62,10 @@ def get_ledger_variant_count(
     """
     if db_path is None:
         db_path = str(Path.home() / ".fef-terminal" / "signal_log.db")
-    out = {"matched": 0, "in_family": 0, "in_sub_family": 0, "in_project": 0}
+    out = {
+        "matched": 0, "in_family": 0, "in_sub_family": 0, "in_project": 0,
+        "in_project_honest": 0, "in_family_honest": 0,
+    }
     try:
         db = sqlite3.connect(db_path)
         cur = db.cursor()
@@ -86,6 +99,23 @@ def get_ledger_variant_count(
     except sqlite3.OperationalError:
         # Ledger not yet present (fresh install) — caller should fall
         # back to a hardcoded N_trials.
+        pass
+
+    # Layer on the honest counts from the markdown ledger
+    # (scripts/research/VARIANT_LEDGER.md → _variant_ledger.py). These
+    # include DROPPED / SUPERSEDED variants the SQL table never knew
+    # about because they predate the shadow framework.
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).parent))
+        from _variant_ledger import HONEST_N_BY_FAMILY, HONEST_N_PROJECT
+        out["in_project_honest"] = HONEST_N_PROJECT
+        if family:
+            out["in_family_honest"] = HONEST_N_BY_FAMILY.get(family, HONEST_N_PROJECT)
+    except ImportError:
+        # Companion file missing — leave the honest counts at 0 so
+        # callers fall back to the SQL-derived counts.
         pass
     return out
 
@@ -245,6 +275,219 @@ def deflated_sharpe_ratio(
         "deflated_sharpe_prob": round(dsr, 4),
         "n_trades": T, "n_trials": n_trials,
     }
+
+
+def _correlation_matrix(
+    per_variant_returns: dict[str, Sequence[float]],
+) -> tuple[list[str], list[list[float]]]:
+    """Build Pearson correlation matrix across variants (variant × time
+    returns). Variants are columns; returns are rows. Returns
+    (variant_order, matrix) where matrix[i][j] = corr(variant_i, variant_j).
+
+    Missing/degenerate columns get correlation 0 vs everyone (so they're
+    treated as independent).
+    """
+    names = list(per_variant_returns.keys())
+    if not names:
+        return [], []
+    n_obs = min((len(per_variant_returns[v]) for v in names), default=0)
+    if n_obs < 3:
+        return names, [[1.0 if i == j else 0.0
+                        for j in range(len(names))] for i in range(len(names))]
+    # Truncate everyone to common length
+    cols: list[list[float]] = [list(per_variant_returns[v][:n_obs]) for v in names]
+    # Means / stds
+    means: list[float] = []
+    stds: list[float] = []
+    for c in cols:
+        m = sum(c) / len(c)
+        means.append(m)
+        var = sum((x - m) ** 2 for x in c) / (len(c) - 1)
+        stds.append(math.sqrt(var) if var > 0 else 0.0)
+    matrix: list[list[float]] = [[1.0 if i == j else 0.0
+                                  for j in range(len(names))] for i in range(len(names))]
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            si, sj = stds[i], stds[j]
+            if si == 0 or sj == 0:
+                rho = 0.0
+            else:
+                cov = sum((cols[i][k] - means[i]) * (cols[j][k] - means[j])
+                          for k in range(n_obs)) / (n_obs - 1)
+                rho = cov / (si * sj)
+                # Clip floating-point overshoot
+                if rho > 1.0:
+                    rho = 1.0
+                elif rho < -1.0:
+                    rho = -1.0
+            matrix[i][j] = rho
+            matrix[j][i] = rho
+    return names, matrix
+
+
+def _mean_off_diagonal(matrix: list[list[float]]) -> float:
+    """Mean of off-diagonal entries of a square matrix. 0 for matrices
+    smaller than 2x2."""
+    n = len(matrix)
+    if n < 2:
+        return 0.0
+    total = 0.0
+    count = 0
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            total += matrix[i][j]
+            count += 1
+    return total / count if count else 0.0
+
+
+def dsr_at_effective_n(
+    winner_returns: Sequence[float],
+    per_variant_returns: dict[str, Sequence[float]] | None,
+    n_honest: int,
+    variance_of_sr_trials: float | None = None,
+) -> dict | None:
+    """Correlation-aware Deflated Sharpe Ratio (Harvey & Liu 2015 §5).
+
+    Per Audit priority #9 (2026-05-22): the honest N_trials (project-wide
+    count, e.g., 58) implicitly assumes all trials are independent, but
+    in practice they share underlying signal streams, exit logic, etc.,
+    so per-trial returns are highly correlated. Harvey & Liu's
+    correlation adjustment computes an effective independent count:
+
+        N_eff = N_honest * (1 - mean_off_diagonal_correlation)
+
+    where the correlation matrix is built across the variant × time
+    return matrix (correlations between columns). This is the simple
+    proxy from Harvey & Liu 2015 §5 — a more rigorous treatment uses
+    1 / (1 + (N-1) * rho_bar) but the proxy form is closer in spirit
+    to the "shrink N by the average dependence" intuition. When all
+    variants are perfectly correlated (rho_bar = 1), N_eff = 0 trials,
+    meaning DSR collapses to single-strategy hypothesis test. When
+    they're independent (rho_bar = 0), N_eff = N_honest.
+
+    Falls back to DSR at N_honest if the correlation matrix can't be
+    built (e.g., single variant, missing data).
+
+    Returns a dict with the DSR result + the N_eff / rho_bar diagnostics
+    so the report can show what was computed. Returns None on insufficient
+    winner data.
+    """
+    if not winner_returns or len(winner_returns) < 5:
+        return None
+    if not per_variant_returns or len(per_variant_returns) < 2:
+        # No correlation matrix — fall back to honest N.
+        dsr = deflated_sharpe_ratio(
+            winner_returns, n_trials=n_honest,
+            variance_of_sr_trials=variance_of_sr_trials,
+        )
+        if dsr is None:
+            return None
+        return {
+            **dsr,
+            "n_honest": n_honest,
+            "n_effective": n_honest,
+            "mean_off_diagonal_correlation": None,
+            "note": "single-variant or insufficient data; effective N = honest N",
+        }
+    names, matrix = _correlation_matrix(per_variant_returns)
+    rho_bar = _mean_off_diagonal(matrix)
+    # Harvey & Liu 2015 §5 proxy: N_eff = N * (1 - rho_bar). Clamp to
+    # [1, N_honest] — N_eff < 1 is degenerate (use min 1), and N_eff
+    # can't be honestly larger than N_honest itself.
+    n_eff_raw = n_honest * (1.0 - rho_bar)
+    n_eff = max(1, min(n_honest, int(round(n_eff_raw))))
+    dsr = deflated_sharpe_ratio(
+        winner_returns, n_trials=n_eff,
+        variance_of_sr_trials=variance_of_sr_trials,
+    )
+    if dsr is None:
+        return None
+    return {
+        **dsr,
+        "n_honest": n_honest,
+        "n_effective": n_eff,
+        "n_effective_raw": round(n_eff_raw, 3),
+        "mean_off_diagonal_correlation": round(rho_bar, 4),
+        "correlation_variants": names,
+    }
+
+
+def stratified_pbo_by_regime(
+    sorted_results: Sequence[dict],
+    variants: Sequence[tuple[str, str]],
+    kfold_sharpes_fn: Callable,
+    pbo_fn: Callable,
+    min_n: int = 20,
+    borderline_n: int = 30,
+    k_folds: int = 6,
+    embargo_minutes: int = 60,
+    label_horizon_minutes: int = 60,
+) -> dict[str, dict]:
+    """Per-regime PBO: group sorted_results by regime_at_fire, then run PBO
+    separately on each regime where n >= min_n. Returns a dict keyed by
+    regime label, mirroring the shape of `_stratified_cpcv_by_regime`.
+
+    Per Audit priority #6 (2026-05-22): the aggregate PBO above pools
+    variant ranks across folds that may be regime-imbalanced (one fold
+    all TREND_DAY, another all CHOP). The stratified version runs PBO
+    separately within each regime, surfacing whether the winner survives
+    cross-period within the same regime. Same threshold pattern as
+    stratified CPCV — n < min_n is skipped, min_n <= n < borderline_n
+    is flagged borderline.
+
+    Schema:
+        {
+            "<regime>": {
+                "n": int,
+                "skipped": bool,
+                "borderline": bool,
+                "note": str | None,
+                "pbo": {... pbo_fn(...) output ...} | None,
+            },
+            ...
+        }
+    """
+    from collections import defaultdict as _defaultdict
+    by_regime: dict[str, list[dict]] = _defaultdict(list)
+    for r in sorted_results:
+        regime = r.get("regime") or "NORMAL"
+        by_regime[regime].append(r)
+
+    out: dict[str, dict] = {}
+    for regime, rows in sorted(by_regime.items()):
+        n = len(rows)
+        entry: dict = {
+            "n": n,
+            "skipped": False,
+            "borderline": False,
+            "note": None,
+            "pbo": None,
+        }
+        if n < min_n:
+            entry["skipped"] = True
+            entry["note"] = f"n={n} < {min_n} — undersampled, PBO skipped"
+            out[regime] = entry
+            continue
+        if n < borderline_n:
+            entry["borderline"] = True
+            entry["note"] = (
+                f"n={n} < {borderline_n} — borderline; per-fold rankings "
+                f"will be noisy"
+            )
+        ts_regime = [r["timestamp_ms"] for r in rows]
+        per_variant_per_fold: dict[str, list[float | None]] = {}
+        for name, key in variants:
+            returns_v = [r[key] for r in rows]
+            per_variant_per_fold[name] = kfold_sharpes_fn(
+                returns_v, ts_regime, k=k_folds,
+                embargo_minutes=embargo_minutes,
+                label_horizon_minutes=label_horizon_minutes,
+            )
+        entry["pbo"] = pbo_fn(per_variant_per_fold)
+        out[regime] = entry
+    return out
 
 
 def purged_kfold_indices(
@@ -649,11 +892,104 @@ def _classical_bootstrap_sharpe_distribution(
     }
 
 
+def median_trade_duration_minutes(
+    db_path: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    account_class: str = "paper",
+) -> float | None:
+    """Median observed trade duration in minutes across closed live_order parents.
+
+    Pulls (last_status_at - submitted_at) deltas for non-dry-run parent
+    orders with status in {CLOSED, STOPPED}. Used by `_methodology_stats`
+    to calibrate the sequential bootstrap's label horizon to the actual
+    observed holding period (typically much shorter than the 60-min
+    lookahead horizon — 5/22 median was 21.4 min).
+
+    Returns None if no rows match (caller should fall back to 60).
+
+    Per Audit priority #7 (2026-05-22): hardcoding label_horizon_min=60
+    in the sequential bootstrap was a residual research-script default
+    from when 60-min was the lookahead window. The honest horizon is
+    the median observed trade duration, since that's the window over
+    which one signal's outcome competes with the next signal's outcome
+    for the same minute-bars (i.e., the uniqueness denominator).
+    """
+    if db_path is None:
+        db_path = str(Path.home() / ".fef-terminal" / "signal_log.db")
+    try:
+        db = sqlite3.connect(db_path)
+        cur = db.cursor()
+        # Closed parent durations, optionally bounded by date range.
+        # account_class filter is intentionally lenient (no extras join here —
+        # 5/19+ rows are all paper anyway, and the caller can post-filter).
+        conds = ["lo.bracket_role = 'parent'", "lo.dry_run = 0",
+                 "lo.status IN ('CLOSED','STOPPED')"]
+        args: list = []
+        if date_from:
+            conds.append("substr(lo.submitted_at, 1, 10) >= ?")
+            args.append(date_from)
+        if date_to:
+            conds.append("substr(lo.submitted_at, 1, 10) <= ?")
+            args.append(date_to)
+        where = " AND ".join(conds)
+        rows = cur.execute(
+            f"""
+            SELECT (julianday(lo.last_status_at) - julianday(lo.submitted_at)) * 24 * 60
+            FROM live_order lo
+            WHERE {where}
+              AND lo.last_status_at IS NOT NULL
+              AND lo.submitted_at IS NOT NULL
+            """,
+            tuple(args),
+        ).fetchall()
+        db.close()
+        durations = [float(r[0]) for r in rows if r[0] is not None and r[0] > 0]
+        if not durations:
+            return None
+        durations.sort()
+        n = len(durations)
+        if n % 2 == 1:
+            return durations[n // 2]
+        return 0.5 * (durations[n // 2 - 1] + durations[n // 2])
+    except sqlite3.OperationalError:
+        return None
+
+
+def _median_trade_duration_min(
+    results: Sequence[dict] | None = None,
+    db_path: str | None = None,
+) -> float | None:
+    """Helper that derives the median observed trade duration in minutes.
+
+    First tries the `results` ablation rows for embedded duration info
+    (none today, but kept for future extension). Otherwise queries
+    live_order via `median_trade_duration_minutes` over the date range
+    inferred from `results` timestamps.
+
+    Returns None if no signal lives. Callers fall back to 60.
+    """
+    if not results:
+        return median_trade_duration_minutes(db_path=db_path)
+    timestamps = [r.get("timestamp_ms") for r in results if r.get("timestamp_ms")]
+    if not timestamps:
+        return median_trade_duration_minutes(db_path=db_path)
+    import datetime as _dt
+    min_ts_ms = min(timestamps)
+    max_ts_ms = max(timestamps)
+    date_from = _dt.datetime.fromtimestamp(min_ts_ms / 1000, tz=_dt.timezone.utc).date().isoformat()
+    date_to = _dt.datetime.fromtimestamp(max_ts_ms / 1000, tz=_dt.timezone.utc).date().isoformat()
+    return median_trade_duration_minutes(
+        db_path=db_path, date_from=date_from, date_to=date_to,
+    )
+
+
 def sharpe_distribution_sequential(
     returns: Sequence[float],
     signal_start_times_ms: Sequence[int],
     n_bootstraps: int = 1000,
     label_horizon_minutes: int = 60,
+    label_horizon_min: int | None = None,
     seed: int | None = None,
 ) -> dict:
     """Sequential-bootstrap Sharpe distribution (López de Prado AFML ch. 4).
@@ -677,12 +1013,26 @@ def sharpe_distribution_sequential(
         returns: per-signal realized return.
         signal_start_times_ms: per-signal epoch ms of signal fire.
         n_bootstraps: number of bootstrap reps (default 1000).
-        label_horizon_minutes: forward label window (default 60).
+        label_horizon_minutes: forward label window (default 60). LEGACY ALIAS.
+        label_horizon_min: forward label window (preferred argument name —
+            per Audit priority #7 (2026-05-22) we now ship the
+            median-observed-trade-duration version alongside the legacy
+            60-min version). When both are supplied, label_horizon_min wins.
+            Pass `_median_trade_duration_min(results)` for the calibrated
+            (honest) horizon; pass 60 for the legacy back-compat run.
         seed: random seed for reproducibility.
 
     Returns: dict with sharpe_mean/std/CI/p_negative for the sequential
     bootstrap, plus classical_bootstrap_comparison block for context.
     """
+    # Resolve the preferred new-name parameter when both are passed.
+    if label_horizon_min is not None:
+        try:
+            label_horizon_minutes = int(round(float(label_horizon_min)))
+        except (TypeError, ValueError):
+            pass
+    if label_horizon_minutes < 1:
+        label_horizon_minutes = 1
     n = len(returns)
     if n < 5 or len(signal_start_times_ms) != n:
         return {

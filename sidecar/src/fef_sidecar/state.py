@@ -259,6 +259,9 @@ class AppState:
     # without subscribing to every IterEvent in render.
     last_scanner_verdict_by_symbol: dict[str, dict] = field(default_factory=dict)
 
+    # Option chain capture loop task handle. Owned task, cancelled on shutdown.
+    option_chain_capture_task: object | None = None
+
     @classmethod
     def build(cls) -> AppState:
         return cls(

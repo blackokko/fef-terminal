@@ -102,6 +102,10 @@ async def init_db() -> None:
             ("daily_review", "actual_losses", "INTEGER DEFAULT 0"),
             ("daily_review", "actual_total_R", "REAL DEFAULT 0.0"),
             ("audit_log", "block_reason_code", "TEXT"),
+            # LiveOrder.parent_id has been on the model since inception; the
+            # migration entry is here as a no-op safety net for any old DB
+            # where the create_all path missed it.
+            ("live_order", "parent_id", "INTEGER REFERENCES live_order(id)"),
             ("daily_review", "dedup_actionable", "INTEGER DEFAULT 0"),
             ("daily_review", "dedup_wins", "INTEGER DEFAULT 0"),
             ("daily_review", "dedup_stops", "INTEGER DEFAULT 0"),
@@ -134,6 +138,8 @@ async def init_db() -> None:
             # T2/T3 lookahead tracking — lets B+C+D scale-out evaluate properly
             ("signal_lookahead_outcome", "would_have_hit_t2", "INTEGER DEFAULT 0"),
             ("signal_lookahead_outcome", "would_have_hit_t3", "INTEGER DEFAULT 0"),
+            # Audit priority #2 — within-bar order probability for T1 vs stop
+            ("signal_lookahead_outcome", "t1_hit_probability", "REAL DEFAULT 0.0"),
             # SignalLookaheadOutcome — net-new table, created via create_all,
             # listed here as a marker so the migration log shows it.
             # Expiration-bucketed GEX/DEX (exposure_by_expiration pipeline)
@@ -172,6 +178,35 @@ async def init_db() -> None:
                 logging.getLogger(__name__).warning(
                     "Migration check %s.%s failed (likely fresh install): %s",
                     table, column, e,
+                )
+
+        # ---- Index migrations (CREATE INDEX IF NOT EXISTS) ----
+        # SQLModel/create_all already provisions the column indexes declared
+        # via Field(index=True). This list captures composite unique indexes
+        # that the model can't express via Field(...) alone — required for
+        # idempotent inserts (insert-and-swallow-IntegrityError pattern).
+        index_migrations: list[tuple[str, str]] = [
+            # historical_option_chain_point: dedup re-captures of the same
+            # contract at the same minute (multiple capture loops, restarts).
+            (
+                "idx_chain_pt_unique",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_pt_unique "
+                "ON historical_option_chain_point "
+                "(timestamp_ms, strike, right, expiry)",
+            ),
+        ]
+        for index_name, sql in index_migrations:
+            try:
+                await conn.exec_driver_sql(sql)
+                import logging
+                logging.getLogger(__name__).info(
+                    "Index migration applied: %s", index_name,
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Index migration %s failed (table may not exist yet): %s",
+                    index_name, e,
                 )
 
 

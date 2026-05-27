@@ -24,6 +24,7 @@ from fef_sidecar.engine.counterfactual import (
 )
 from fef_sidecar.engine.signal_lookahead import (
     LOOKAHEAD_MINUTES,
+    _compute_t1_hit_probability,
     backfill_session,
     populate_for_signal,
 )
@@ -220,3 +221,110 @@ def test_counterfactual_zero_qty_returns_zero() -> None:
     result = simulate_one(parent)
     assert result["counterfactual_pnl_dollars"] == 0.0
     assert result["unchanged"] is True
+
+
+# --- Within-bar T1-hit-probability tests (audit priority #2) ---
+
+
+def _bar(open_: float, high: float, low: float, close: float | None = None) -> HistoricalBar:
+    """Build a synthetic HistoricalBar for geometry tests."""
+    return HistoricalBar(
+        symbol="SPX", bar_size="1 min", timestamp_ms=0,
+        open=open_, high=high, low=low,
+        close=close if close is not None else open_,
+        volume=0.0,
+    )
+
+
+def test_t1_probability_only_t1_touched_returns_1() -> None:
+    """Bar where high reaches T1 but low never touches stop → p=1.0."""
+    bars = [_bar(open_=7400.0, high=7406.0, low=7399.0)]
+    p = _compute_t1_hit_probability(bars, t1_spx=7405.0, stop_spx=7395.0,
+                                    direction="LONG_CALLS")
+    assert p == 1.0
+
+
+def test_t1_probability_only_stop_touched_returns_0() -> None:
+    """Bar where low touches stop but high never reaches T1 → p=0.0."""
+    bars = [_bar(open_=7400.0, high=7402.0, low=7394.0)]
+    p = _compute_t1_hit_probability(bars, t1_spx=7405.0, stop_spx=7395.0,
+                                    direction="LONG_CALLS")
+    assert p == 0.0
+
+
+def test_t1_probability_both_touched_buy_pressure_dominant() -> None:
+    """Both touched, but high-open=8 vs open-low=2 → p≈0.8 (buy-pressure)."""
+    bars = [_bar(open_=7400.0, high=7408.0, low=7398.0)]
+    # T1=7405 (within high), stop=7398 (low touches it).
+    p = _compute_t1_hit_probability(bars, t1_spx=7405.0, stop_spx=7398.0,
+                                    direction="LONG_CALLS")
+    assert abs(p - 0.8) < 0.01
+
+
+def test_t1_probability_both_touched_sell_pressure_dominant() -> None:
+    """Both touched, but high-open=2 vs open-low=8 → p≈0.2 (sell-pressure)."""
+    bars = [_bar(open_=7400.0, high=7402.0, low=7392.0)]
+    # T1=7401 (within high), stop=7395 (low touches it).
+    p = _compute_t1_hit_probability(bars, t1_spx=7401.0, stop_spx=7395.0,
+                                    direction="LONG_CALLS")
+    assert abs(p - 0.2) < 0.01
+
+
+def test_t1_probability_walks_bars_to_first_touch() -> None:
+    """Bar 1: nothing touched. Bar 2: only T1 touched → p=1.0 from bar 2."""
+    bars = [
+        _bar(open_=7400.0, high=7402.0, low=7399.0),  # neither
+        _bar(open_=7402.0, high=7408.0, low=7401.0),  # T1 touched, stop not
+    ]
+    p = _compute_t1_hit_probability(bars, t1_spx=7405.0, stop_spx=7395.0,
+                                    direction="LONG_CALLS")
+    assert p == 1.0
+
+
+def test_t1_probability_long_puts_inverted_geometry() -> None:
+    """LONG_PUTS: T1 below entry, stop above. Sell-pressure dominant bar
+    (open-low=8 vs high-open=2) favors T1 first → p≈0.8."""
+    bars = [_bar(open_=7400.0, high=7402.0, low=7392.0)]
+    # For puts: T1=7395 (low touches), stop=7402 (high touches).
+    p = _compute_t1_hit_probability(bars, t1_spx=7395.0, stop_spx=7402.0,
+                                    direction="LONG_PUTS")
+    assert abs(p - 0.8) < 0.01
+
+
+def test_t1_probability_t1_never_touched_returns_0() -> None:
+    """No bar reaches T1 → p=0.0."""
+    bars = [
+        _bar(open_=7400.0, high=7402.0, low=7399.0),
+        _bar(open_=7400.0, high=7403.0, low=7398.0),
+    ]
+    p = _compute_t1_hit_probability(bars, t1_spx=7405.0, stop_spx=7395.0,
+                                    direction="LONG_CALLS")
+    assert p == 0.0
+
+
+@pytest.mark.asyncio
+async def test_populate_records_t1_hit_probability() -> None:
+    """End-to-end: outcome rows expose t1_hit_probability for downstream stats."""
+    from datetime import timezone
+    ts = datetime(2026, 5, 1, 14, 0, 0, tzinfo=timezone.utc)
+    await _seed_signal(
+        signal_id=1, ts=ts, spx=7400.0,
+        direction=FEFDirection.LONG_CALLS,
+        extras={"t1": 7405.0, "stop": 7395.0,
+                "option_pricing": {"t1": 7405.0, "stop": 7395.0}},
+    )
+    # SPX rises +10 over 60min — T1 hit cleanly, stop never touched
+    spx_path = [7400.0 + i * 0.2 for i in range(65)]
+    await _seed_bars("SPX", ts, 65, spx_path)
+
+    await populate_for_signal(1)
+
+    async with get_session() as session:
+        from sqlmodel import select
+        rows = list((await session.exec(select(SignalLookaheadOutcome))).all())
+
+    for r in rows:
+        if r.would_have_hit_t1 and not r.would_have_hit_stop:
+            assert r.t1_hit_probability == 1.0
+        elif not r.would_have_hit_t1:
+            assert r.t1_hit_probability == 0.0

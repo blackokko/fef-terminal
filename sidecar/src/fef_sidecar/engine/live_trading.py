@@ -155,11 +155,13 @@ async def place_bracket(
         try:
             await assert_paper_if_required(ibkr)
         except RuntimeError as e:
+            from fef_sidecar.engine.auto_trader import BlockReason as _BR_or
             await SignalIterRepository.write_audit_log(
                 category="order_refused", actor="system",
                 summary=f"REFUSED: {e}",
                 details={"reason": str(e), "spec_qty": spec.qty,
                          "spec_strike": spec.strike, "spec_right": spec.right},
+                block_reason_code=_BR_or.ORDER_REFUSED,
             )
             return {"ok": False, "error": str(e), "refused_safety_gate": True}
 
@@ -382,11 +384,13 @@ async def place_credit_spread(
         try:
             await assert_paper_if_required(ibkr)
         except RuntimeError as e:
+            from fef_sidecar.engine.auto_trader import BlockReason as _BR_ors
             await SignalIterRepository.write_audit_log(
                 category="order_refused", actor="system",
                 summary=f"REFUSED SPREAD: {e}",
                 details={"reason": str(e), "kind": spec.kind, "qty": spec.qty,
                          "short": spec.short_strike, "long": spec.long_strike},
+                block_reason_code=_BR_ors.ORDER_REFUSED,
             )
             return {"ok": False, "error": str(e), "refused_safety_gate": True}
 
@@ -433,6 +437,7 @@ async def place_credit_spread(
         "true", "1", "yes", "on",
     )
     if not gate:
+        from fef_sidecar.engine.auto_trader import BlockReason as _BR_csg
         await SignalIterRepository.write_audit_log(
             category="safe_sell_blocked", actor="system",
             summary=(
@@ -446,6 +451,7 @@ async def place_credit_spread(
                 "parent_id": saved.id, "kind": spec.kind,
                 "short": spec.short_strike, "long": spec.long_strike,
             },
+            block_reason_code=_BR_csg.CREDIT_SPREAD_GATE_OFF,
         )
         await SignalIterRepository.update_live_order(
             saved.id, status="REJECTED",

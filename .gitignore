@@ -43,3 +43,27 @@ sidecar/build/
 
 # Bundled sidecar binaries (built per release, not checked in)
 src-tauri/binaries/
+
+# Analysis output + scratch (regenerable from scripts/research/, not source)
+audit_package_2/
+audit_package_2.zip
+AUDIT_PACKAGE_*.md
+research_*_final.md
+per_regime_*.md
+scripts/research/*.json
+scripts/research/*_out.txt
+# Malformed-path junk from a redirect bug (fullwidth-colon filenames)
+C：*
+*Usersdiantprojects*
+
+# Python bytecode (global — supersedes the sidecar-specific rules above)
+__pycache__/
+*.pyc
+*.cpython-*.pyc
+
+# Throwaway DB-probe scripts + scratch analysis outputs (regenerable)
+scripts/research/_schema_probe*.py
+scripts/research/*_output.txt
+scripts/research/*_verbose.md
+research_dump_*.md
+today_*.md

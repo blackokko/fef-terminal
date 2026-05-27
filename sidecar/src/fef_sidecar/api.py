@@ -874,7 +874,7 @@ async def scanner_symbols_set(request: Request, body: dict[str, Any] = Body(...)
             if sym_u in s.scan_enabled_symbols:
                 s.scan_enabled_symbols[sym_u] = bool(on)
     if "max_per_symbol" in body:
-        s.auto_trade_max_per_symbol = max(1, min(50, int(body["max_per_symbol"])))
+        s.auto_trade_max_per_symbol = max(1, min(100, int(body["max_per_symbol"])))
     return {
         "ok": True,
         "enabled": dict(s.scan_enabled_symbols),
@@ -2468,12 +2468,18 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
 
     trades: list[dict[str, Any]] = []
     skipped = {"no_dir": 0, "no_opt": 0, "no_targets": 0, "exception": 0}
+    # Track when entry_limit was synthesized (preset re-eval fires on a
+    # signal that the live engine WAITed on, so no stored option_pricing).
+    # The R-multiple math is SPX-point based, so a placeholder entry_limit
+    # only affects commission cost (tiny relative to R).
+    synth_entry_count = 0
     for idx, s_ in enumerate(sigs):
       try:
         ex = s_.extras or {}
         # If we have a preset's fresh verdicts, use those. Otherwise fall
         # back to the stored SignalIter.direction + extras.t1/t2/t3.
         fresh = fresh_verdicts.get(s_.id) if fresh_verdicts else None
+        used_preset_verdict = fresh is not None
         if fresh:
             dir_val = fresh["direction"]
             t1 = fresh.get("t1"); t2 = fresh.get("t2")
@@ -2483,13 +2489,31 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
             t1 = ex.get("t1"); t2 = ex.get("t2"); t3 = ex.get("t3"); stop = ex.get("stop")
         if dir_val not in ("LONG_CALLS", "LONG_PUTS"):
             skipped["no_dir"] += 1; continue
-        # Entry limit still comes from stored option_pricing (we don't
-        # rebuild option quotes for the preset re-eval). If a preset would
-        # have fired but the stored row lacked pricing, we skip.
+        # Bug #11 fix: when a PRESET re-eval fires on a signal that the live
+        # engine WAITed on (e.g. tight-pin preset has tighter wall-prox so it
+        # accepts more signals), the stored signal has no option_pricing.
+        # Previously this caused all preset re-evals to converge to the same
+        # ~220 trades (the count of LIVE-fired signals that had pricing).
+        #
+        # Synthesize a placeholder entry_limit from the SPX distance to t1
+        # (approx atm option price) when stored option_pricing is missing.
+        # The R-multiple itself is SPX-point based, so this only affects the
+        # commission cost (~0.05R per trade — small enough not to dominate).
         opt = ex.get("option_pricing") or {}
         entry_limit = opt.get("entry_limit")
         if not entry_limit or entry_limit <= 0:
-            skipped["no_opt"] += 1; continue
+            if used_preset_verdict and t1 is not None and stop is not None:
+                # Crude ATM option price: ~half the risk distance in SPX pts.
+                # For SPX 0DTE ATM, an option premium of 5-15$ is typical for
+                # 10-20pt risk distances. Use max(5.0, risk_pts * 0.5) clamped.
+                try:
+                    risk_pts = abs(float(s_.spx_price) - float(stop))
+                    entry_limit = max(5.0, min(50.0, risk_pts * 0.5))
+                    synth_entry_count += 1
+                except (TypeError, ValueError):
+                    skipped["no_opt"] += 1; continue
+            else:
+                skipped["no_opt"] += 1; continue
         if t1 is None or t2 is None or t3 is None or stop is None:
             skipped["no_targets"] += 1; continue
         # Defensive: ensure numeric (older rows might have string/Decimal)
@@ -2633,6 +2657,7 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
             "trade_count": 0,
             "iters_scanned": len(sigs),
             "skipped": skipped,
+            "synthesized_entry_limit_count": synth_entry_count,
             "note": "no trades fired in this window — see 'skipped' for reasons",
         }
 
@@ -2672,6 +2697,7 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
         "trade_count": len(trades),
         "iters_scanned": len(sigs),
         "skipped": skipped,
+        "synthesized_entry_limit_count": synth_entry_count,
         "wins": wins,
         "losses": len(trades) - wins,
         "win_rate_pct": round(win_rate, 2),

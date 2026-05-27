@@ -199,3 +199,80 @@ async def test_degenerate_risk_tickets_are_skipped() -> None:
     assert len(y) == 3
     # And the rows are in chronological order
     assert ts == sorted(ts)
+
+
+@pytest.mark.asyncio
+async def test_lookahead_fallback_when_tickets_empty(monkeypatch) -> None:
+    """Bug #9 regression: when trade_ticket is empty, train_model falls back
+    to signal_lookahead_outcome and produces training rows from the lookahead
+    outcome table instead of returning n_train=0.
+    """
+    from fef_sidecar.db.models import SignalLookaheadOutcome
+    from fef_sidecar.engine.ml_patterns import train_model
+
+    base = datetime(2026, 5, 1, 10, 0, 0)
+    async with get_session() as session:
+        for i in range(40):
+            # Seed actionable signals (no tickets) + lookahead outcomes.
+            sig = SignalIter(
+                session_date=base.strftime("%Y-%m-%d"),
+                iter_num=i + 1,
+                timestamp=base + timedelta(minutes=i),
+                spx_price=7400.0,
+                direction=FEFDirection.LONG_CALLS if i % 2 == 0 else FEFDirection.LONG_PUTS,
+                confidence=FEFConfidence.MEDIUM,
+                reasoning="seed-lookahead",
+                drift_cum_net_m=float(i),
+                drift_bias="BULLISH",
+                ntm_max_pain=7395.0,
+                raw_max_pain=7300.0,
+                top_gex_walls=[{"strike": 7410.0, "net_m": 50.0, "side": "CALL"}],
+                top_dex_walls=[{"strike": 7390.0, "net_m": 100.0, "side": "PUT"}],
+                aggression_call_pct=55.0,
+                aggression_put_pct=45.0,
+                iv_rank_call_pct=60.0,
+                iv_rank_put_pct=40.0,
+                extras={"fe_ratio": 3.0, "delta_price": 2.0, "delta_drift_m": 5.0},
+            )
+            session.add(sig)
+            await session.flush()
+            # Mix of outcomes: some T1 hits, some stops, some timeouts.
+            outcome = SignalLookaheadOutcome(
+                signal_iter_id=sig.id,
+                session_date=base.strftime("%Y-%m-%d"),
+                lookahead_minutes=15,
+                spx_at_signal=7400.0,
+                spx_mfe_pts=10.0 if i % 3 != 0 else 1.0,
+                spx_mae_pts=-2.0 if i % 3 != 0 else -15.0,
+                spx_close_at_window_end=7405.0,
+                would_have_hit_t1=(i % 3 != 0),
+                would_have_hit_stop=(i % 3 == 0),
+                direction_at_signal=sig.direction.value,
+                confidence_at_signal=sig.confidence.value,
+                computed_at=datetime(2026, 5, 2, 0, 0, 0),
+            )
+            session.add(outcome)
+
+    # No TradeTickets created — must fall back to lookahead.
+    result = await train_model(min_rows=30, n_splits=5)
+    assert result is not None
+    assert result.n_training_rows == 40, "Should have pulled 40 rows from lookahead fallback"
+    assert result.n_features > 0
+    assert result.cv_n_folds >= 2
+    assert result.cv_mae is not None
+    assert result.model_path is not None
+
+
+@pytest.mark.asyncio
+async def test_lookahead_r_multiple_conversion() -> None:
+    """Synthetic R from boolean outcomes follows the documented convention."""
+    from fef_sidecar.engine.ml_patterns import _lookahead_r_multiple
+
+    assert _lookahead_r_multiple(hit_t1=True, hit_t2=True, hit_t3=True, hit_stop=False) == 3.0
+    assert _lookahead_r_multiple(hit_t1=True, hit_t2=True, hit_t3=False, hit_stop=False) == 2.0
+    assert _lookahead_r_multiple(hit_t1=True, hit_t2=False, hit_t3=False, hit_stop=False) == 1.0
+    assert _lookahead_r_multiple(hit_t1=False, hit_t2=False, hit_t3=False, hit_stop=True) == -1.0
+    assert _lookahead_r_multiple(hit_t1=False, hit_t2=False, hit_t3=False, hit_stop=False) == 0.0
+    # T1 hit AND stop hit (chop) — count as the win since it was reached first
+    # in our convention.
+    assert _lookahead_r_multiple(hit_t1=True, hit_t2=False, hit_t3=False, hit_stop=True) == 1.0

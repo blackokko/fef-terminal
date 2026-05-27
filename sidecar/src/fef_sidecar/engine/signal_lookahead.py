@@ -29,11 +29,86 @@ logger = logging.getLogger(__name__)
 LOOKAHEAD_MINUTES: tuple[int, ...] = (5, 15, 30, 60)
 
 
+def _compute_t1_hit_probability(
+    bars: list[HistoricalBar],
+    t1_spx: float | None,
+    stop_spx: float | None,
+    direction: str,
+) -> float:
+    """Estimate P(T1 fired before stop) using within-bar geometry.
+
+    Audit priority #2 (Claude Chat methodology review 2026-05-21): the
+    boolean would_have_hit_t1 / would_have_hit_stop fields treat 1-min
+    bars as atomic — a bar whose low touched stop AND high touched T1
+    records BOTH True even though only one fired first in real ticks.
+    This systematically overstates T1 win rates.
+
+    Heuristic (Brownian-bridge–style proxy; see Glasserman, "Monte Carlo
+    Methods in Financial Engineering" (2004) Ch 6 for the academic
+    treatment): scan bars in time order, return the first bar where
+    EITHER T1 or stop was touched. If only one was touched in that bar,
+    the answer is deterministic (1.0 or 0.0). If BOTH were touched in
+    the same bar, use the open-relative excursion split as the proxy for
+    buy/sell-pressure dominance:
+
+        p_t1_first = upward_excursion / (upward_excursion + downward_excursion)
+
+    For LONG_CALLS, upward_excursion = high - open (favors T1).
+    For LONG_PUTS, downward_excursion = open - low (favors T1, since T1
+    is below entry for puts), so we invert the ratio.
+
+    Returns 0.0 if T1 was never touched, 1.0 if T1 touched and stop
+    never did across the window, fractional in the ambiguous case.
+    """
+    if not t1_spx:
+        return 0.0
+    t1 = float(t1_spx)
+    stop = float(stop_spx) if stop_spx else None
+
+    for b in bars:
+        if direction == "LONG_CALLS":
+            t1_touched = b.high >= t1
+            stop_touched = stop is not None and b.low <= stop
+        elif direction == "LONG_PUTS":
+            t1_touched = b.low <= t1
+            stop_touched = stop is not None and b.high >= stop
+        else:
+            return 0.0
+
+        if not t1_touched and not stop_touched:
+            continue
+        if t1_touched and not stop_touched:
+            return 1.0
+        if stop_touched and not t1_touched:
+            return 0.0
+        # Both touched in this bar — geometry proxy off the open.
+        up = max(0.0, b.high - b.open)
+        down = max(0.0, b.open - b.low)
+        total = up + down
+        if total <= 0.0:
+            return 0.5  # degenerate flat bar; uninformative
+        if direction == "LONG_CALLS":
+            return up / total
+        else:  # LONG_PUTS — downward excursion favors T1
+            return down / total
+
+    # T1 never touched across the window
+    return 0.0
+
+
 async def _populate_one(signal: SignalIter, lookahead_min: int) -> SignalLookaheadOutcome | None:
     """Compute outcome for ONE signal at ONE lookahead window.
 
     Returns None if SPX bars aren't yet available for the full window
     (signal too recent, or bars not yet persisted).
+
+    NOTE on within-bar ambiguity: the boolean `would_have_hit_t1` and
+    `would_have_hit_stop` fields are computed independently per bar and
+    will BOTH be True on any bar that straddled both levels. Callers
+    doing win-rate statistics should prefer `t1_hit_probability` (a
+    geometry-weighted P(T1 first | both touched) ∈ [0,1]) for
+    statistically honest counts. The booleans are retained for
+    backwards compatibility with existing analyses.
     """
     start_ms = int(signal.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000) \
         if signal.timestamp.tzinfo is None \
@@ -90,6 +165,18 @@ async def _populate_one(signal: SignalIter, lookahead_min: int) -> SignalLookahe
         hit_t3 = False
         hit_stop = False
 
+    # Within-bar order probability — fast paths for the unambiguous cases,
+    # geometry proxy for the both-touched case. See _compute_t1_hit_probability.
+    if direction in ("LONG_CALLS", "LONG_PUTS"):
+        if not hit_t1:
+            t1_prob = 0.0
+        elif hit_t1 and not hit_stop:
+            t1_prob = 1.0
+        else:  # both flagged across the window — walk bars to find first-touch
+            t1_prob = _compute_t1_hit_probability(bars, t1_spx, stop_spx, direction)
+    else:
+        t1_prob = 0.0
+
     confidence = signal.confidence.value if hasattr(signal.confidence, "value") else str(signal.confidence)
 
     return SignalLookaheadOutcome(
@@ -104,6 +191,7 @@ async def _populate_one(signal: SignalIter, lookahead_min: int) -> SignalLookahe
         would_have_hit_t2=hit_t2,
         would_have_hit_t3=hit_t3,
         would_have_hit_stop=hit_stop,
+        t1_hit_probability=float(t1_prob),
         direction_at_signal=direction,
         confidence_at_signal=confidence,
     )

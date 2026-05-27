@@ -6,9 +6,11 @@ so we can swap storage later without touching call sites.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from fef_sidecar.db.engine import get_session
@@ -25,6 +27,7 @@ from fef_sidecar.db.models import (
     MLModelRun,
     MicrostructureSample,
     SignalIter,
+    SignalLookaheadOutcome,
     TradeTicket,
     VixSample,
     WalkForwardRun,
@@ -34,6 +37,151 @@ from fef_sidecar.db.models import (
 def _today_et() -> str:
     et = timezone(timedelta(hours=-4))
     return datetime.now(et).strftime("%Y-%m-%d")
+
+
+def build_actionable_signals_sql(
+    *,
+    session_date: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    paper_only: bool = True,
+    price_band: tuple[float, float] | None = (1000.0, 10000.0),
+    require_lookahead: bool = False,
+    select_clause: str = "s.*",
+) -> tuple[str, list]:
+    """Build the canonical 'actionable signals' SELECT for raw sqlite3
+    callers (research scripts).
+
+    Mirrors :func:`fetch_actionable_signals` semantics: actionable = direction
+    != 'WAIT', with explicit paper_only / price_band / require_lookahead /
+    date-range axes. Each research script that filters on 'actionable'
+    should call this and pass the args explicitly so we can SEE what
+    definition is in use.
+
+    The paper_only filter is implemented in SQL via a json_extract on
+    extras.account_class (SQLite has the json_extract function; sqlmodel
+    layer's helper does post-query filtering instead — same semantics).
+
+    Args mirror :func:`fetch_actionable_signals`. Returns (sql, params)
+    suitable for ``cursor.execute(sql, params)``.
+
+    Example:
+        sql, params = build_actionable_signals_sql(
+            date_from='2026-05-18', date_to='2026-05-22',
+            paper_only=True, price_band=(1000.0, 10000.0),
+        )
+        rows = cur.execute(sql, params).fetchall()
+    """
+    where: list[str] = ["s.direction != 'WAIT'"]
+    params: list = []
+    if session_date is not None:
+        where.append("s.session_date = ?")
+        params.append(session_date)
+    elif date_from is not None and date_to is not None:
+        where.append("s.session_date BETWEEN ? AND ?")
+        params.extend([date_from, date_to])
+    if price_band is not None:
+        lo, hi = price_band
+        where.append("s.spx_price BETWEEN ? AND ?")
+        params.extend([lo, hi])
+    if paper_only:
+        # SQLite's json_extract on extras returns NULL when missing.
+        # Pre-tag rows (account_class missing) are treated as paper-equivalent.
+        where.append(
+            "("
+            "json_extract(s.extras, '$.account_class') IS NULL "
+            "OR json_extract(s.extras, '$.account_class') = 'paper'"
+            ")"
+        )
+    if require_lookahead:
+        where.append(
+            "EXISTS (SELECT 1 FROM signal_lookahead_outcome o "
+            "WHERE o.signal_iter_id = s.id AND o.lookahead_minutes = 60)"
+        )
+    sql = (
+        f"SELECT {select_clause} FROM signal_iter s "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY s.session_date, s.timestamp"
+    )
+    return sql, params
+
+
+async def fetch_actionable_signals(
+    session: AsyncSession,
+    *,
+    session_date: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    paper_only: bool = True,
+    price_band: tuple[float, float] | None = (1000.0, 10000.0),
+    require_lookahead: bool = False,
+) -> list[SignalIter]:
+    """Single source of truth for fetching 'actionable' SignalIter rows.
+
+    Canonical definition: `direction != FEFDirection.WAIT` (matches the
+    DailySession.actionable_signals counter and daily_review's
+    actionable_signals column).
+
+    Chat audit Priority 10 (2026-05-22): the "actionable" filter varied
+    across 10 research sites; counts (268, 307, 43) diverged due to
+    inconsistent date range, account-class filter, and price-band guard.
+    This helper centralises the three axes of variation so each caller
+    SETS them explicitly and we can SEE what definition is being used.
+
+    Args:
+        session: an open AsyncSession (callers manage the session lifecycle).
+        session_date: single YYYY-MM-DD. Mutually exclusive with the range.
+        date_from / date_to: inclusive YYYY-MM-DD range. Both must be set
+            to filter on range; either alone is ignored.
+        paper_only: when True, filters out extras.account_class != 'paper'
+            but keeps rows where account_class is missing (pre-tag rows,
+            treated as paper-equivalent — 100% of pre-5/21 data is from the
+            paper account DUM098107). When False, all account classes pass.
+        price_band: (lo, hi) inclusive SPX sanity bounds. Drops rows where
+            spx_price is outside the band (catches test/mock rows with
+            spx_price like 67.20). Set to None to disable.
+        require_lookahead: when True, only return signals that have a
+            matching SignalLookaheadOutcome row at lookahead_minutes=60.
+            Use this when downstream analysis needs forward outcomes.
+
+    Returns: list of SignalIter rows ordered by id ascending (chronological
+    within a session, monotonic across sessions).
+    """
+    stmt = select(SignalIter).where(SignalIter.direction != FEFDirection.WAIT)
+    if session_date is not None:
+        stmt = stmt.where(SignalIter.session_date == session_date)
+    elif date_from is not None and date_to is not None:
+        stmt = stmt.where(SignalIter.session_date >= date_from)
+        stmt = stmt.where(SignalIter.session_date <= date_to)
+    if price_band is not None:
+        lo, hi = price_band
+        stmt = stmt.where(SignalIter.spx_price >= lo)
+        stmt = stmt.where(SignalIter.spx_price <= hi)
+    if require_lookahead:
+        # Inner join on signal_lookahead_outcome @ 60min — only signals with
+        # a forward outcome row are returned. Done as a subquery so the
+        # primary SignalIter row still comes back as a SignalIter object.
+        lookahead_subq = (
+            select(SignalLookaheadOutcome.signal_iter_id)
+            .where(SignalLookaheadOutcome.lookahead_minutes == 60)
+        ).subquery()
+        stmt = stmt.where(SignalIter.id.in_(select(lookahead_subq)))  # type: ignore[attr-defined]
+    stmt = stmt.order_by(SignalIter.id.asc())  # type: ignore[attr-defined]
+    result = await session.exec(stmt)
+    rows = list(result.all())
+    if paper_only:
+        # account_class lives in extras (JSON column). Filtering it post-
+        # query is cheaper than expression-indexing the JSON, and
+        # 'unknown'/missing should pass — 100% of pre-tag data is paper.
+        filtered: list[SignalIter] = []
+        for r in rows:
+            ex = r.extras if isinstance(r.extras, dict) else {}
+            cls = (ex.get("account_class") if isinstance(ex, dict) else None) or "unknown"
+            cls = str(cls).lower()
+            if cls in ("paper", "unknown"):
+                filtered.append(r)
+        rows = filtered
+    return rows
 
 
 class SignalIterRepository:
@@ -161,17 +309,19 @@ class SignalIterRepository:
 
     @staticmethod
     async def actionable_today(session_date: str | None = None) -> list[SignalIter]:
-        """Return all actionable (non-WAIT) iters from today's session."""
+        """Return all actionable (non-WAIT) iters from today's session.
+
+        Thin wrapper around :func:`fetch_actionable_signals` for the common
+        "today, paper, with price-band guard" case.
+        """
         date = session_date or _today_et()
         async with get_session() as session:
-            stmt = (
-                select(SignalIter)
-                .where(SignalIter.session_date == date)
-                .where(SignalIter.direction != FEFDirection.WAIT)
-                .order_by(SignalIter.iter_num.asc())  # type: ignore[attr-defined]
+            return await fetch_actionable_signals(
+                session,
+                session_date=date,
+                paper_only=True,
+                price_band=(1000.0, 10000.0),
             )
-            result = await session.exec(stmt)
-            return list(result.all())
 
     # ------------------------------------------------------------------
     # Historical persistence — bars, flow snapshots, microstructure, VIX
@@ -319,10 +469,29 @@ class SignalIterRepository:
 
     @staticmethod
     async def write_audit_log(category: str, summary: str,
-                              actor: str = "user", details: dict | None = None) -> None:
+                              actor: str = "user", details: dict | None = None,
+                              block_reason_code: str | None = None) -> None:
+        """Append an AuditLog row.
+
+        block_reason_code: structured code for WAIT/block rows (matches
+        auto_trader.BlockReason values). Populates the dedicated column
+        so aggregation queries don't have to dig into the details JSON.
+        Leave None for non-block rows (kill_switch, config, order, etc.).
+        """
+        d = dict(details or {})
+        # Keep details["block_reason_code"] in sync if the kwarg is set —
+        # historical callers stuffed it into details; downstream readers
+        # (research scripts) check both locations.
+        if block_reason_code is not None and "block_reason_code" not in d:
+            d["block_reason_code"] = block_reason_code
+        # Build payload conditionally because old DBs missed the column
+        # before the migration ran (init_db tolerates the schema gap).
+        kwargs: dict[str, Any] = dict(category=category, summary=summary,
+                                       actor=actor, details=d)
+        if block_reason_code is not None:
+            kwargs["block_reason_code"] = block_reason_code
         async with get_session() as session:
-            session.add(AuditLog(category=category, summary=summary,
-                                 actor=actor, details=details or {}))
+            session.add(AuditLog(**kwargs))
 
     @staticmethod
     async def query_audit_log(*, category: str | None = None, limit: int = 200) -> list[AuditLog]:
@@ -367,6 +536,52 @@ class SignalIterRepository:
             await session.flush()
             await session.refresh(order)
             return order
+
+    @staticmethod
+    async def write_watcher_sell_child(
+        *,
+        parent: LiveOrder,
+        bracket_role: str,
+        qty: int,
+        ib_order_id: int | None,
+        ib_perm_id: int | None = None,
+        avg_fill_price: float | None = None,
+        notes: str = "",
+    ) -> LiveOrder:
+        """Persist a child LiveOrder row for a watcher-fired market SELL.
+
+        The watcher fires market sells outside the place_bracket pipeline
+        (SPX-points exits, dollar-loss cap, runner-protect, post-T1 trail).
+        Those fires previously only landed in ibkr_execution, so per-parent
+        prorated P&L attribution had to dedup by contract-stacking heuristic.
+        This writer makes the parent_id linkage explicit on the LiveOrder
+        side so attribution is unambiguous.
+
+        bracket_role values: 't1' / 't2' / 't3' / 'stop' / 'runner_protect'
+                             / 'dollar_cap' / 'trail_after_t1'
+        """
+        child = LiveOrder(
+            ticket_id=parent.ticket_id,
+            parent_id=parent.id,
+            symbol=parent.symbol,
+            strike=parent.strike,
+            right=parent.right,
+            expiry=parent.expiry,
+            action="SELL",
+            qty=qty,
+            order_type="MKT",
+            limit_price=None,
+            bracket_role=bracket_role,
+            status="FILLED" if avg_fill_price is not None else "SUBMITTED",
+            filled_qty=qty if avg_fill_price is not None else 0,
+            avg_fill_price=avg_fill_price,
+            ib_order_id=ib_order_id,
+            ib_perm_id=ib_perm_id,
+            dry_run=parent.dry_run,
+            engine_version=parent.engine_version,
+            notes=notes,
+        )
+        return await SignalIterRepository.write_live_order(child)
 
     @staticmethod
     async def query_live_orders(*, status: str | None = None,

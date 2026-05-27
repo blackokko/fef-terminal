@@ -53,6 +53,15 @@ class BlockReason:
     PLACE_ERROR = "PLACE_ERROR"
     DUPLICATE_PARENT = "DUPLICATE_PARENT"
     FIRED = "FIRED"
+    # Non-auto-trader codes for other gate paths — used so all block-style
+    # audit_log rows carry a structured tag for aggregation.
+    OPTION_QUOTE_FAIL = "OPTION_QUOTE_FAIL"
+    SAFE_SELL_NO_POSITION = "SAFE_SELL_NO_POSITION"
+    SAFE_SELL_SHORT_BLOCKED = "SAFE_SELL_SHORT_BLOCKED"
+    SAFE_SELL_CLAMPED = "SAFE_SELL_CLAMPED"
+    SAFE_SELL_ERROR = "SAFE_SELL_ERROR"
+    CREDIT_SPREAD_GATE_OFF = "CREDIT_SPREAD_GATE_OFF"
+    ORDER_REFUSED = "ORDER_REFUSED"
 
 
 def _verdict_trigger_type(v: dict) -> str:
@@ -296,6 +305,7 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
                     f"{sym} {strike}{_right_dup} (parent_id={_existing_dup[0].id})"
                 ),
                 details={"block_reason_code": BlockReason.DUPLICATE_PARENT},
+                block_reason_code=BlockReason.DUPLICATE_PARENT,
             )
             return AutoTradeDecision(
                 False,

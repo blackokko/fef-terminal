@@ -862,6 +862,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
                         "reason": decision.reason,
                         "reason_code": decision.reason_code,
                     },
+                    block_reason_code=decision.reason_code,
                 )
             except Exception:
                 pass
@@ -1044,6 +1045,40 @@ async def _evaluate_patterns(
             )
 
 
+async def _fetch_option_quote_with_retry(
+    fetch_fn,
+    *,
+    max_retries: int = 3,
+    backoff_ms: int = 200,
+) -> tuple[Any | None, list[tuple[str, str]]]:
+    """Retry an option-chain quote fetch on transient failures.
+
+    EOD strikes (last ~10min of session) sometimes return empty IBKR option
+    chain data: either get_option_quote raises ValidationError (last=None
+    fails pydantic), or returns a quote with all-NaN/0 pricing. Both are
+    typically resolved by retrying after a short backoff while the chain
+    populates.
+
+    Returns (quote, attempts_log) where attempts_log is a list of
+    (error_type, error_msg) tuples for each failed attempt. attempts_log is
+    empty on first-try success. Does NOT change strike selection — only
+    whether the chain fetch itself is retried.
+    """
+    attempts: list[tuple[str, str]] = []
+    for attempt in range(max_retries):
+        try:
+            quote = await fetch_fn()
+            if quote is not None:
+                return quote, attempts
+            attempts.append(("None", "fetch returned None"))
+        except Exception as e:
+            attempts.append((type(e).__name__, str(e)))
+        # Linear backoff: 200ms, 400ms, 600ms
+        if attempt < max_retries - 1:
+            await asyncio.sleep(backoff_ms / 1000 * (attempt + 1))
+    return None, attempts
+
+
 async def _maybe_fetch_option_targets(
     state: AppState,
     verdict: Any,
@@ -1067,16 +1102,32 @@ async def _maybe_fetch_option_targets(
         right=right,
     )
 
-    try:
-        quote = await state.ibkr.get_option_quote(contract)
-    except Exception as e:
-        logger.warning("Could not fetch option quote for %s: %s", contract, e)
+    quote, attempts = await _fetch_option_quote_with_retry(
+        lambda: state.ibkr.get_option_quote(contract),
+        max_retries=3,
+        backoff_ms=200,
+    )
+    if quote is None:
+        # All retries exhausted — log the structured failure and skip.
+        last_err_type, last_err_msg = (attempts[-1] if attempts else ("Unknown", "no attempts recorded"))
+        if attempts:
+            logger.warning(
+                "Could not fetch option quote for %s after %d retries: last error %s: %s",
+                contract, len(attempts), last_err_type, last_err_msg,
+            )
         try:
+            from fef_sidecar.engine.auto_trader import BlockReason as _BR_oqf
             await SignalIterRepository.write_audit_log(
                 category="option_quote_fail", actor="system",
-                summary=f"get_option_quote raised: SPX {expiry} {verdict.strike_rec}{right}: {type(e).__name__}: {e}",
+                summary=(
+                    f"get_option_quote failed after {len(attempts)} retries: "
+                    f"SPX {expiry} {verdict.strike_rec}{right}: {last_err_type}: {last_err_msg}"
+                ),
                 details={"strike": verdict.strike_rec, "right": right, "expiry": expiry,
-                         "error_type": type(e).__name__, "error": str(e)},
+                         "error_type": last_err_type, "error": last_err_msg,
+                         "retry_attempts": len(attempts),
+                         "all_errors": [{"type": t, "msg": m} for t, m in attempts]},
+                block_reason_code=_BR_oqf.OPTION_QUOTE_FAIL,
             )
         except Exception:
             pass
@@ -1088,6 +1139,7 @@ async def _maybe_fetch_option_targets(
     )
     if targets is None:
         try:
+            from fef_sidecar.engine.auto_trader import BlockReason as _BR_oqf2
             await SignalIterRepository.write_audit_log(
                 category="option_quote_fail", actor="system",
                 summary=(
@@ -1097,7 +1149,9 @@ async def _maybe_fetch_option_targets(
                 ),
                 details={"strike": verdict.strike_rec, "right": right, "expiry": expiry,
                          "last": quote.last, "bid": quote.bid, "ask": quote.ask,
-                         "delta": quote.delta},
+                         "delta": quote.delta,
+                         "retry_attempts": len(attempts)},
+                block_reason_code=_BR_oqf2.OPTION_QUOTE_FAIL,
             )
         except Exception:
             pass

@@ -388,6 +388,14 @@ def spawn_data_loops(state: AppState) -> None:
     state.scanner_task = asyncio.create_task(
         multi_symbol_scanner_loop(state), name="multi-symbol-scanner-loop"
     )
+    # Option chain capture — snapshots ATM±25pt × {C,P} via IBKR every 2 min
+    # so shadow variants can replay alternate-strike outcomes. Isolated task:
+    # failure won't affect signal/auto-trade loops. Disable via
+    # FEF_CHAIN_CAPTURE_ENABLED=false.
+    from fef_sidecar.engine.option_chain_capture import option_chain_capture_loop
+    state.option_chain_capture_task = asyncio.create_task(
+        option_chain_capture_loop(state), name="option-chain-capture-loop"
+    )
 
 
 async def cancel_data_loops(state: AppState) -> None:
@@ -485,6 +493,7 @@ async def lifespan(app: FastAPI):
             state.account_task,
             state.microstructure_task,
             state.hft_task,
+            state.option_chain_capture_task,
         ):
             if task is not None:
                 task.cancel()  # type: ignore[attr-defined]

@@ -97,15 +97,20 @@ def _trace_outcome(start_ms: int, spx_entry: float, t1: float, t2: float,
 
 def _estimate_parent_r(p) -> float:
     """Estimate realized R for one LiveOrder parent from SPX-target firing
-    flags + dynamic stop level. Accounts for the 50/30/20 partial scale-out
-    so a STOPPED parent that fired T1+T2+T3 before its residual stopped
-    gets credited as a winner (+1.1R to +1.5R), not -1R.
+    flags + dynamic stop level. **SECONDARY fallback** — only used when
+    there are no ``ibkr_execution`` rows for the session (e.g. shadow /
+    paper-only days). For real fills, ``compute_parent_wl_from_fills``
+    in ``engine/exec_pair_off`` is the canonical FIFO pair-off source of
+    truth.
+
+    Accounts for the 50/30/20 partial scale-out so a STOPPED parent that
+    fired T1+T2+T3 before its residual stopped gets credited as a winner
+    (+1.1R to +1.5R), not -1R.
 
     Approximation: assumes partial fills happened at the SPX target levels
     (T1 = +1R, T2 = +2R, T3 = +3R). Actual option-price slippage may
     deviate, but this is much closer to reality than the prior status-only
-    +1.1/-1R math. For ground truth, sum ibkr_execution fills per parent
-    by ib_order_id (planned follow-up).
+    +1.1/-1R math.
 
     Open/working positions return 0 (not yet resolved)."""
     status = (p.status or "").upper()
@@ -430,73 +435,61 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         else: reason = "UNKNOWN"
         block_reasons[reason] += 1
 
-    # Actual trades (real fills). Two layers:
-    #   - actual_total_R = SESSION-LEVEL realized $ from ibkr_execution
-    #     divided by per-R dollar assumption (FEF_R_DOLLARS env, default
-    #     400 = 5 contracts × $2000 risk). Ground truth for "did the
-    #     bot make money today" since it sums actual fill prices.
-    #   - actual_wins / actual_losses = PER-PARENT count using the
-    #     SPX-target partial-flag estimator (rough, but signed-correctly
-    #     per parent). Replaces the status-only ±1R math that mislabeled
-    #     50/30/20 scale-outs as full losses when the residual stopped.
+    # Actual trades (real fills). Source of truth = broker-confirmed
+    # ``ibkr_execution`` rows, FIFO-paired-off per (symbol, strike, right,
+    # expiry) and attributed back to parents via ``parent_id``. The
+    # canonical helper lives in ``engine/exec_pair_off`` so daily_review
+    # and ``recompute_daily_session_wl.py`` produce bit-for-bit identical
+    # numbers.
     #
-    # PAIR-OFF method (2026-05-21 fix): the naive sum (SLD − BOT) × 100
-    # treats open buys as realized losses, overstating the session's red
-    # number by the cost basis of any positions still open at compute
-    # time. On 5/21 the naive sum showed −$5,445 while IBKR pill showed
-    # ≈−$4,800 — the gap was the $1,310 cost basis of 3 still-open
-    # SPX 7440C contracts. Correct method:
-    #   For each (symbol, strike, right) contract:
-    #     paired_qty = min(bot_qty, sld_qty)   # closed leg
-    #     realized   = (avg_sld − avg_bot) × paired_qty × 100
-    #     open_qty   = bot_qty − sld_qty       # still long (positive)
-    #     open_cost  = avg_bot × open_qty × 100  # exposure, not a loss
-    # Session realized = SUM(realized across contracts). Unrealized P/L
-    # on open positions belongs to the next session's compute_daily_review.
-    # /diag/session_pnl_estimate already uses this method (api.py:3083-3115).
+    #   - ``actual_total_R``  = SESSION-LEVEL realized $ from FIFO pair-off
+    #     divided by per-R dollar assumption (FEF_R_DOLLARS env, default
+    #     400 = 5 contracts × $2000 risk).
+    #   - ``actual_wins`` / ``actual_losses`` = PER-PARENT W/L from FIFO
+    #     attribution. A partially-scaled parent counts as W/L on the
+    #     realized portion (residual still long counts as "open" but
+    #     doesn't preempt classification).
+    #
+    # Fallback: when there are NO execs for the session (paper-only /
+    # shadow days), fall back to ``_estimate_parent_r`` so dry-run /
+    # mock sessions still get a signed W/L count from the SPX-target
+    # flag estimator. That path is intentionally secondary now.
+    #
+    # FIFO method (vs the previous avg-price approximation): on partial
+    # scale-out days the avg-price approach drifts by a few percent from
+    # the true FIFO sum (e.g. 5/22 differs by $70). FIFO matches
+    # ``daily_session.gross_pnl`` to the penny on 5/19, 5/20, 5/21.
     import os as _os
-    from fef_sidecar.db.models import IBKRExecution
+    from fef_sidecar.engine.exec_pair_off import compute_parent_wl_from_fills
     R_DOLLARS = float(_os.environ.get("FEF_R_DOLLARS", "400"))
-    async with get_session() as _session2:
-        execs = list((await _session2.exec(
-            select(IBKRExecution).where(IBKRExecution.session_date == session_date)
-        )).all())
-    # Group by contract for pair-off
-    by_contract: dict[tuple, dict[str, float]] = {}
-    for e in execs:
-        key = (e.symbol, float(e.strike or 0), e.right, e.expiry)
-        slot = by_contract.setdefault(key, {"bot_v": 0.0, "sld_v": 0.0, "bot_q": 0.0, "sld_q": 0.0})
-        side = (e.side or "").upper()
-        if side == "BOT":
-            slot["bot_v"] += float(e.shares or 0) * float(e.price or 0)
-            slot["bot_q"] += float(e.shares or 0)
-        elif side == "SLD":
-            slot["sld_v"] += float(e.shares or 0) * float(e.price or 0)
-            slot["sld_q"] += float(e.shares or 0)
-    realized_dollars = 0.0
-    open_cost_dollars = 0.0  # exposure on positions still long at EOD
-    for slot in by_contract.values():
-        bot_q, sld_q = slot["bot_q"], slot["sld_q"]
-        if bot_q == 0 and sld_q == 0:
-            continue
-        paired = min(bot_q, sld_q)
-        open_q = bot_q - sld_q
-        avg_bot = slot["bot_v"] / bot_q if bot_q > 0 else 0.0
-        avg_sld = slot["sld_v"] / sld_q if sld_q > 0 else 0.0
-        if paired > 0:
-            realized_dollars += (avg_sld - avg_bot) * paired * 100
-        if open_q > 0:
-            open_cost_dollars += avg_bot * open_q * 100
+    fill_summary = await compute_parent_wl_from_fills(session_date)
     actual_trades = len(live_parents)
-    actual_total_R = round(realized_dollars / R_DOLLARS, 2) if R_DOLLARS > 0 else 0.0
-    actual_wins = 0
-    actual_losses = 0
-    for p in live_parents:
-        r_est = _estimate_parent_r(p)
-        if r_est > 0.05:
-            actual_wins += 1
-        elif r_est < -0.05:
-            actual_losses += 1
+    if fill_summary.n_execs > 0:
+        # Primary path: FIFO from broker fills
+        realized_dollars = fill_summary.total_realized_dollars
+        actual_total_R = (
+            round(realized_dollars / R_DOLLARS, 2) if R_DOLLARS > 0 else 0.0
+        )
+        actual_wins = fill_summary.wins
+        actual_losses = fill_summary.losses
+        best_pnl = fill_summary.best_pnl
+        worst_pnl = fill_summary.worst_pnl
+    else:
+        # Fallback path: no broker fills (paper / shadow / dry-run only).
+        # Use the legacy SPX-target flag estimator so dry-run sessions
+        # still get a signed W/L count.
+        realized_dollars = 0.0
+        actual_total_R = 0.0
+        actual_wins = 0
+        actual_losses = 0
+        for p in live_parents:
+            r_est = _estimate_parent_r(p)
+            if r_est > 0.05:
+                actual_wins += 1
+            elif r_est < -0.05:
+                actual_losses += 1
+        best_pnl = 0.0
+        worst_pnl = 0.0
 
     review = DailyReview(
         session_date=session_date,
@@ -547,24 +540,14 @@ async def compute_daily_review(session_date: str) -> DailyReview:
         await session.commit()
         await session.refresh(review)
 
-    # Cascade: keep DailySession in sync from the same source of truth.
-    # daily_session.gross_pnl/net_pnl used to be never written ($0 across
-    # all rows). Auto-compute from ibkr_execution + the per-contract
-    # realized P/L for best/worst trade fields. Net = gross for now
-    # (commission data isn't reliably captured on ibkr_execution).
+    # Cascade: keep DailySession in sync from the SAME source of truth
+    # (FIFO pair-off, via compute_parent_wl_from_fills above). Net = gross
+    # for now (commission data isn't reliably captured on ibkr_execution
+    # — paper accounts report $0 commissions even with realistic fees).
+    # `best_pnl` / `worst_pnl` are PER-PARENT extremes from the FIFO
+    # summary — the prior sign-based per-contract aggregate was confused
+    # by partial scale-outs and produced misleading best/worst values.
     from fef_sidecar.db.models import DailySession
-    # Per-contract P/L for best/worst surfacing
-    best_pnl = 0.0
-    worst_pnl = 0.0
-    if execs:
-        by_contract: dict[tuple, float] = {}
-        for e in execs:
-            key = (e.symbol, e.strike, e.right, e.expiry)
-            sign = 1 if (e.side or "").upper() == "SLD" else -1
-            by_contract[key] = by_contract.get(key, 0.0) + sign * float(e.shares or 0) * float(e.price or 0) * 100
-        if by_contract:
-            best_pnl = max(by_contract.values())
-            worst_pnl = min(by_contract.values())
     async with get_session() as session:
         existing_ds = (await session.exec(
             select(DailySession).where(DailySession.session_date == session_date)

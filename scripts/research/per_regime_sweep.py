@@ -123,6 +123,13 @@ def _load_iters_by_regime(
         "aggression_call_pct", "aggression_put_pct", "extras",
     ]
     select_cols = [c for c in desired_cols if c in available_cols]
+    # Note (Chat audit Priority 10 — 2026-05-22): this script intentionally
+    # does NOT use the canonical actionable filter (`direction != WAIT`)
+    # because the sweep REPLAYS the engine under different configurations
+    # to GENERATE new verdicts. We load every persisted iter and let the
+    # engine re-decide direction. The price-band guard + paper post-filter
+    # below are equivalent to build_actionable_signals_sql's price_band +
+    # paper_only flags applied to a `direction == ANY` superset.
     rows = cur.execute(
         f"""
         SELECT {', '.join(select_cols)}
@@ -186,6 +193,15 @@ def _load_iters_by_regime(
 RISK_PTS = 10.0          # T1=±10pt SPX from entry, stop=∓10pt
 T1_SHARE, T2_SHARE, T3_SHARE = 0.5, 0.3, 0.2  # 50/30/20 scale-out
 
+# Note (Chat audit Priority 3 — 2026-05-22): the canonical R-unit elsewhere
+# in the research stack is per-signal |entry - stop_spx|. This sweep replays
+# the engine over candidate configurations to GENERATE signals (the engine
+# doesn't know stop until it picks targets), so 10pt is used as a sensible
+# fallback for the per-fire risk. Callers can override risk_pts on
+# `_simulate_partial_walk_v2` (e.g., to test a 7pt-stop config). For
+# matching daily_review numbers on real fires, use ablation_backtest.py
+# instead — it pulls each signal's actual stop from extras.
+
 
 def _simulate_partial_walk_v2(
     direction: str, entry_spx: float, fwd_bars: list[dict],
@@ -199,7 +215,9 @@ def _simulate_partial_walk_v2(
     priority if both stop and a tier level are crossed.
 
     T1 = entry ± 1R; T2 = ± 2R; T3 = ± 3R; stop = ∓ 1R.
-    R = `risk_pts` SPX (default 10).
+    R = `risk_pts` SPX (default 10pt — this is a sweep over hypothetical
+    configurations, not real fires; for real-fire R use the canonical
+    per-signal |entry-stop| via ablation_backtest.py).
     Scale-out: 50% at T1, 30% at T2, 20% at T3. After partials, residual
     sells at the (still original) stop if it hits. If 60 min elapses
     without full exit, the residual exits at the last bar's close."""

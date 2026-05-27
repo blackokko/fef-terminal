@@ -156,6 +156,19 @@ async def runner_protector_loop(state) -> None:
                                          "t1_fill_price": t1_fill, "trigger_bid": current_bid,
                                          "market_order_id": result.trade.order.orderId},
                             )
+                            try:
+                                await SignalIterRepository.write_watcher_sell_child(
+                                    parent=p, bracket_role="trail_after_t1",
+                                    qty=int(result.sell_qty),
+                                    ib_order_id=int(result.trade.order.orderId),
+                                    ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
+                                    notes=f"runner_protect t1_fill=${t1_fill:.2f},bid=${current_bid:.2f}",
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "runner_protect: write_watcher_sell_child failed for parent %s",
+                                    p.id,
+                                )
                         # else: safe_market_sell already wrote an audit_log.
                     except Exception as e:
                         logger.exception("Market exit of runners failed")

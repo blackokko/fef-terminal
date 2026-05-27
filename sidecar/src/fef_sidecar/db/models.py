@@ -327,6 +327,17 @@ class SignalLookaheadOutcome(SQLModel, table=True):
     would_have_hit_t2: bool = False
     would_have_hit_t3: bool = False
     would_have_hit_stop: bool = False
+    # Audit priority #2 (Claude Chat methodology review): boolean
+    # would_have_hit_t1 overstates win rate on bars where BOTH T1 and stop
+    # touched within the same 1-min bar (within-bar tick sequence is lost).
+    # t1_hit_probability uses bar geometry as a Brownian-bridge–style proxy
+    # for P(T1 fired first | both touched) — see Glasserman (2004) Ch 6.
+    # Prefer this field over the boolean for statistics.
+    t1_hit_probability: float = Field(
+        default=0.0,
+        description="P(T1 hit before stop) ∈ [0,1]. 1.0 if only T1 hit, "
+                    "0.0 if stop hit / T1 untouched, fractional if both touched.",
+    )
     direction_at_signal: str  # "LONG_CALLS" / "LONG_PUTS" / "WAIT"
     confidence_at_signal: str
     computed_at: datetime = Field(default_factory=_utcnow)
@@ -442,6 +453,59 @@ class VixSample(SQLModel, table=True):
     value: float
 
 
+class HistoricalOptionChainPoint(SQLModel, table=True):
+    """One snapshot of a single option contract's market data.
+
+    Captured via IBKR reqMktData(snapshot=True) every 2 min for ATM±25pt
+    × {C,P} = 22 contracts per snapshot. Powers shadow variants that need
+    alternate-strike replay (e.g., 'what would ATM call have done'). The
+    QuantData EOD backfill path populates source='quantdata_backfill' rows
+    with bid/ask/last from minute-resolution intraday price paths (no
+    greeks available from that endpoint).
+
+    Idempotency: a UNIQUE index on (timestamp_ms, strike, right, expiry)
+    is created by init_db; same-minute re-captures silently no-op via
+    sqlite's IntegrityError on the unique constraint.
+    """
+
+    __tablename__ = "historical_option_chain_point"
+
+    id: int | None = Field(default=None, primary_key=True)
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
+    timestamp_ms: int = Field(index=True)  # ms since epoch at capture time
+    session_date: str = Field(index=True)  # YYYY-MM-DD ET
+    signal_iter_id: int | None = Field(
+        default=None,
+        foreign_key="signal_iter.id",
+        index=True,
+        description="Nearest signal_iter by time; nullable for standalone captures",
+    )
+
+    symbol: str = Field(index=True)
+    strike: float = Field(index=True)
+    right: str  # 'C' or 'P'
+    expiry: str = Field(index=True)  # YYYYMMDD
+
+    # SPX spot at moment of capture (denormalized for fast queries — saves
+    # a join back to signal_iter when computing what was ATM at the time)
+    spot_at_capture: float
+
+    bid: float | None = None
+    ask: float | None = None
+    last: float | None = None
+    mid: float | None = None  # (bid + ask) / 2 when both present
+    volume: int | None = None
+    open_interest: int | None = None
+
+    iv: float | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+
+    source: str = Field(default="ibkr_snapshot")  # 'ibkr_snapshot' / 'quantdata_backfill'
+
+
 # ---------------------------------------------------------------------------
 # Audit log — every config change, override, kill switch
 # ---------------------------------------------------------------------------
@@ -459,6 +523,10 @@ class AuditLog(SQLModel, table=True):
     actor: str = Field(default="user", description="user / system / sidecar / auto-walk-forward")
     summary: str
     details: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Structured BlockReason code for WAIT / gate-blocked rows. NULL on
+    # non-block rows (kill_switch, config, order, etc.). Populated alongside
+    # details["block_reason_code"] for backwards compat.
+    block_reason_code: str | None = Field(default=None, index=True)
 
 
 # ---------------------------------------------------------------------------

@@ -46,9 +46,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-# Local import — ablation backtest
+# Local import — ablation backtest + canonical actionable helper
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sidecar" / "src"))
 from ablation_backtest import DOLLARS_PER_R, format_report as format_ablation_report, run_ablation
+from fef_sidecar.db.repository import build_actionable_signals_sql  # noqa: E402
 
 DEFAULT_DB = str(Path.home() / ".fef-terminal" / "signal_log.db")
 SECTIONS_ALL = [
@@ -142,31 +144,55 @@ def _load_fired_with_outcomes(
     Returns one row per fired signal with unpacked extras.
 
     accept_classes filters by extras.account_class. Default = the global
-    _ACCOUNT_CLASS_ACCEPTED (set by run_research_dump from the CLI flag)."""
+    _ACCOUNT_CLASS_ACCEPTED (set by run_research_dump from the CLI flag).
+
+    Uses the canonical `build_actionable_signals_sql` helper for the
+    actionable filter (Chat audit Priority 10 — 2026-05-22). Signals here
+    are ALL actionable rows with optional outcomes attached (LEFT JOIN);
+    the post-query filter applies the broader account_class accept set
+    when not strictly paper-only."""
     accept = accept_classes or globals().get("_ACCOUNT_CLASS_ACCEPTED", {"paper"})
-    rows = cur.execute(
-        """
-        SELECT s.id, s.session_date, s.timestamp, s.direction, s.confidence,
-               s.spx_price, s.drift_cum_net_m, s.drift_bias,
-               s.aggression_call_pct, s.aggression_put_pct,
-               s.iv_rank_call_pct, s.iv_rank_put_pct, s.extras,
-               o.would_have_hit_t1, o.would_have_hit_stop,
-               o.spx_mfe_pts, o.spx_mae_pts, o.spx_close_at_window_end
-        FROM signal_iter s
-        LEFT JOIN signal_lookahead_outcome o
-          ON o.signal_iter_id = s.id AND o.lookahead_minutes = 60
-        WHERE s.session_date BETWEEN ? AND ?
-          AND s.direction IN ('LONG_CALLS','LONG_PUTS')
-          AND s.spx_price BETWEEN 1000 AND 10000
-        ORDER BY s.session_date, s.timestamp
-        """,
-        (date_from, date_to),
-    ).fetchall()
+    # The canonical builder handles direction != WAIT + price band + paper
+    # filter. We add the lookahead LEFT JOIN ourselves since this caller
+    # WANTS rows without outcomes (require_lookahead=False) but with the
+    # outcome columns LEFT-joined in. Build the base subquery via the
+    # helper, then wrap with the LEFT JOIN.
+    paper_only = accept == {"paper"} or accept == {"paper", "unknown"}
+    base_sql, params = build_actionable_signals_sql(
+        date_from=date_from, date_to=date_to,
+        paper_only=paper_only,
+        price_band=(1000.0, 10000.0),
+        require_lookahead=False,
+        select_clause=(
+            "s.id, s.session_date, s.timestamp, s.direction, s.confidence, "
+            "s.spx_price, s.drift_cum_net_m, s.drift_bias, "
+            "s.aggression_call_pct, s.aggression_put_pct, "
+            "s.iv_rank_call_pct, s.iv_rank_put_pct, s.extras"
+        ),
+    )
+    # Wrap the canonical query in a CTE so we can LEFT JOIN the lookahead
+    # outcome columns onto it without duplicating the WHERE clause.
+    sql = (
+        f"WITH actionable AS ({base_sql}) "
+        "SELECT a.id, a.session_date, a.timestamp, a.direction, a.confidence, "
+        "       a.spx_price, a.drift_cum_net_m, a.drift_bias, "
+        "       a.aggression_call_pct, a.aggression_put_pct, "
+        "       a.iv_rank_call_pct, a.iv_rank_put_pct, a.extras, "
+        "       o.would_have_hit_t1, o.would_have_hit_stop, "
+        "       o.spx_mfe_pts, o.spx_mae_pts, o.spx_close_at_window_end "
+        "FROM actionable a "
+        "LEFT JOIN signal_lookahead_outcome o "
+        "  ON o.signal_iter_id = a.id AND o.lookahead_minutes = 60"
+    )
+    rows = cur.execute(sql, params).fetchall()
     out: list[dict] = []
     for r in rows:
         d = dict(r)
         d["extras_parsed"] = _parse_extras(d.get("extras"))
-        if not _account_class_match(d, accept):
+        # When paper_only fired in SQL, the account_class post-filter is
+        # redundant; for the broader accept-set case the helper passed
+        # paper_only=False and we filter here.
+        if not paper_only and not _account_class_match(d, accept):
             continue
         d["bucket"] = _bucket_for(
             d["direction"],

@@ -164,6 +164,19 @@ async def _check_dollar_loss(state, p) -> None:
             category="spx_watcher", actor="system",
             summary=f"DOLLAR_STOP(${pnl:.0f}): market-sold-to-close {result.sell_qty}× {p.symbol} {p.strike}{p.right} (ib_order_id={result.trade.order.orderId})",
         )
+        try:
+            await SignalIterRepository.write_watcher_sell_child(
+                parent=p, bracket_role="dollar_cap",
+                qty=int(result.sell_qty),
+                ib_order_id=int(result.trade.order.orderId),
+                ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
+                notes=f"dollar_cap pnl=${pnl:.0f}",
+            )
+        except Exception:
+            logger.exception(
+                "dollar_cap: write_watcher_sell_child failed for parent %s",
+                p.id,
+            )
     except Exception:
         logger.exception("dollar-loss check failed for parent %s", p.id)
 
@@ -349,6 +362,25 @@ async def spx_target_watcher_loop(state) -> None:
                             category="spx_watcher", actor="system",
                             summary=f"{tier_label}: market-sold-to-close {result.sell_qty}× {p.symbol} {p.strike}{p.right} at SPX {spot:.2f} (ib_order_id={result.trade.order.orderId})",
                         )
+                        # Persist a child LiveOrder row so per-parent P&L
+                        # attribution can join cleanly (parent_id link).
+                        try:
+                            _role = {
+                                "T1": "t1", "T2": "t2", "T3": "t3",
+                                "STOP": "stop", "RUNNER_PROTECT": "runner_protect",
+                            }.get(tier_label, tier_label.lower())
+                            await SignalIterRepository.write_watcher_sell_child(
+                                parent=p, bracket_role=_role,
+                                qty=int(result.sell_qty),
+                                ib_order_id=int(result.trade.order.orderId),
+                                ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
+                                notes=f"watcher_close@SPX={spot:.2f}",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "spx_watcher: write_watcher_sell_child failed for parent %s",
+                                p.id,
+                            )
                     except Exception:
                         logger.exception("spx_watcher market sell failed")
 
@@ -663,6 +695,19 @@ async def spx_stop_tick_watcher_loop(state) -> None:
                                                 f"ib_order_id={result.trade.order.orderId})"
                                             ),
                                         )
+                                        try:
+                                            await SignalIterRepository.write_watcher_sell_child(
+                                                parent=p, bracket_role="stop",
+                                                qty=int(result.sell_qty),
+                                                ib_order_id=int(result.trade.order.orderId),
+                                                ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
+                                                notes=f"stop_tick@SPX={spot:.2f},age={tick_age_ms}ms",
+                                            )
+                                        except Exception:
+                                            logger.exception(
+                                                "stop_tick: write_watcher_sell_child failed for parent %s",
+                                                p.id,
+                                            )
                                     # else: safe_market_sell already wrote
                                     # an audit_log (HARD-BLOCK / no_position).
                             except Exception:

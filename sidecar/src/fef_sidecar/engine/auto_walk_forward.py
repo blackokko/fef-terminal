@@ -359,14 +359,61 @@ async def _audit_data_integrity(session_date: str) -> dict:
         # 3. IBKR fills present at all?
         if not execs:
             findings.append("NO IBKR fills persisted for this session — check connection / write-through")
+        # 4. ORPHAN BUYs — BOT execs with no matching parent live_order on
+        # same contract within ±60s of fill. Discovered 2026-05-22: 2 untracked
+        # BUYs (ib_order_id IS NULL) added 3 SPX 7520C contracts at 16:17 with
+        # no parent — likely residue from a pre-safe_market_sell naked-short
+        # cover. The structural patch prevents new naked-shorts, but this
+        # detector surfaces any future occurrence (covers, manual flattens,
+        # external orders) before it pollutes attribution.
+        from fef_sidecar.db.models import LiveOrder
+        bot_execs = [e for e in execs if (e.side or "").upper() == "BOT"]
+        if bot_execs:
+            # LiveOrder has no session_date column — filter by submitted_at ET-day.
+            from datetime import timedelta as _td2
+            day_start = datetime.fromisoformat(session_date).replace(hour=13, minute=0, tzinfo=UTC)
+            day_end = day_start + _td2(hours=12)
+            parents = list((await ss.exec(
+                select(LiveOrder).where(LiveOrder.action == "BUY")  # type: ignore[arg-type]
+                .where(LiveOrder.submitted_at >= day_start)  # type: ignore[arg-type]
+                .where(LiveOrder.submitted_at <= day_end)  # type: ignore[arg-type]
+            )).all())
+            orphan_buys: list[dict] = []
+            for e in bot_execs:
+                # Candidate parent: same contract + within 60s of exec timestamp
+                e_ts = e.timestamp
+                candidates = [
+                    p for p in parents
+                    if p.symbol == e.symbol
+                    and (p.strike or 0) == (e.strike or 0)
+                    and (p.right or "") == (e.right or "")
+                    and (p.expiry or "") == (e.expiry or "")
+                    and abs((p.submitted_at - e_ts).total_seconds()) <= 60.0
+                ]
+                if not candidates:
+                    orphan_buys.append({
+                        "ibkr_execution_id": e.id,
+                        "ib_order_id": e.ib_order_id,
+                        "contract": f"{e.symbol} {e.strike}{e.right} {e.expiry}",
+                        "qty": e.shares,
+                        "timestamp": e_ts.isoformat(),
+                    })
+            if orphan_buys:
+                findings.append(
+                    f"{len(orphan_buys)} ORPHAN BUY exec(s) (no parent live_order within ±60s) — "
+                    f"possible cover/flatten/external residue; first: {orphan_buys[0]['contract']}"
+                )
 
     summary = (
         "data_integrity OK" if not findings
         else "data_integrity: " + " | ".join(findings)
     )
+    details: dict = {"findings": findings, "session_date": session_date}
+    if 'orphan_buys' in locals() and orphan_buys:
+        details["orphan_buys"] = orphan_buys
     await SignalIterRepository.write_audit_log(
         category="data_integrity", actor="system",
-        summary=summary, details={"findings": findings, "session_date": session_date},
+        summary=summary, details=details,
     )
     return {"findings": findings, "ok": not findings}
 
@@ -445,6 +492,22 @@ async def nightly_scheduler(state) -> None:
                 logger.info("Nightly: shadow_exit_replay produced %d rows", n)
             except Exception:
                 logger.exception("Nightly: shadow_exit_replay failed")
+
+            # 8. Option chain backfill from QuantData — fills in price-only
+            # rows for ATM±25pt strike grid so alternate-strike shadow
+            # variants have data even when the live IBKR capture loop
+            # didn't run (e.g., sidecar started post-session, or a strike
+            # outside the live ±25 range becomes interesting later).
+            # Idempotent against the live capture's IBKR rows via UNIQUE
+            # index — no duplicates even if both ran on the same minute.
+            try:
+                from fef_sidecar.engine.option_chain_backfill import (
+                    backfill_session_chains_quantdata,
+                )
+                n = await backfill_session_chains_quantdata(state, session_date)
+                logger.info("Nightly: backfilled %d chain points via QuantData", n)
+            except Exception:
+                logger.exception("Nightly: chain backfill failed")
         except asyncio.CancelledError:
             raise
         except Exception:

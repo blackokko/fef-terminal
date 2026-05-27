@@ -121,6 +121,7 @@ async def safe_market_sell(
             "true", "1", "yes", "on",
         )
         if not gate:
+            from fef_sidecar.engine.auto_trader import BlockReason as _BR
             await SignalIterRepository.write_audit_log(
                 category="safe_sell_blocked", actor="system",
                 summary=(
@@ -130,6 +131,7 @@ async def safe_market_sell(
                     "paths require explicit opt-in."
                 ),
                 details={"purpose": purpose, "qty": qty, "parent_id": parent_id},
+                block_reason_code=_BR.CREDIT_SPREAD_GATE_OFF,
             )
             return SafeSellResult(
                 placed=False, sell_qty=0, requested_qty=qty, net_long=0,
@@ -149,10 +151,12 @@ async def safe_market_sell(
                 reason="credit_spread_leg", trade=trade,
             )
         except Exception as e:
+            from fef_sidecar.engine.auto_trader import BlockReason as _BR
             await SignalIterRepository.write_audit_log(
                 category="safe_sell_error", actor="system",
                 summary=f"Credit-spread leg placeOrder failed: {e}",
                 details={"purpose": purpose, "qty": qty, "parent_id": parent_id},
+                block_reason_code=_BR.SAFE_SELL_ERROR,
             )
             return SafeSellResult(
                 placed=False, sell_qty=0, requested_qty=qty, net_long=0,
@@ -173,6 +177,8 @@ async def safe_market_sell(
     sell_qty = min(qty, max_sellable)
 
     if sell_qty <= 0:
+        from fef_sidecar.engine.auto_trader import BlockReason as _BR
+        _code = _BR.SAFE_SELL_NO_POSITION if net_long == 0 else _BR.SAFE_SELL_SHORT_BLOCKED
         await SignalIterRepository.write_audit_log(
             category="safe_sell_blocked", actor="system",
             summary=(
@@ -185,6 +191,7 @@ async def safe_market_sell(
                 "purpose": purpose, "qty": qty, "net_long": net_long,
                 "parent_id": parent_id,
             },
+            block_reason_code=_code,
         )
         return SafeSellResult(
             placed=False, sell_qty=0, requested_qty=qty, net_long=net_long,
@@ -201,6 +208,7 @@ async def safe_market_sell(
             sell_qty, qty, net_long, purpose,
         )
         if sell_qty < qty:
+            from fef_sidecar.engine.auto_trader import BlockReason as _BR
             await SignalIterRepository.write_audit_log(
                 category="safe_sell_clamped", actor="system",
                 summary=(
@@ -213,12 +221,14 @@ async def safe_market_sell(
                     "sell_qty": sell_qty, "net_long": net_long,
                     "parent_id": parent_id,
                 },
+                block_reason_code=_BR.SAFE_SELL_CLAMPED,
             )
         return SafeSellResult(
             placed=True, sell_qty=sell_qty, requested_qty=qty, net_long=net_long,
             reason="ok" if sell_qty == qty else "clamped_to_long", trade=trade,
         )
     except Exception as e:
+        from fef_sidecar.engine.auto_trader import BlockReason as _BR
         await SignalIterRepository.write_audit_log(
             category="safe_sell_error", actor="system",
             summary=f"Safe-sell placeOrder failed: {e}",
@@ -226,6 +236,7 @@ async def safe_market_sell(
                 "purpose": purpose, "qty": qty, "net_long": net_long,
                 "parent_id": parent_id,
             },
+            block_reason_code=_BR.SAFE_SELL_ERROR,
         )
         return SafeSellResult(
             placed=False, sell_qty=0, requested_qty=qty, net_long=net_long,
