@@ -1022,7 +1022,17 @@ def format_report(result: dict, verbose: bool = False) -> str:
     lines.append("### v1 vs v2 comparison")
     lines.append("")
     lines.append(
-        "| Date | v1 paper $ | v2 paper $ | v1 real $ | v2 real $ (net) | dir agree? |"
+        "> **Report 28 (2026-05-27):** the **v1 paper $** column uses the legacy "
+        "flat R×$500/contract conversion, which assumes ATM delta≈0.50 and "
+        "overstates realized dollars at the live 35pt-OTM strike by ~7×. It is "
+        "kept ONLY to reproduce the old methodology side-by-side. The **v2 paper "
+        "$** column is the honest figure — it sizes each signal by the matched "
+        "parent's `qty × entry_premium × 100 × 0.5` (delta-aware, per-strike). "
+        "Never quote the v1 column as a realized-dollar figure."
+    )
+    lines.append("")
+    lines.append(
+        "| Date | v1 paper $ (ATM — inflated) | v2 paper $ | v1 real $ | v2 real $ (net) | dir agree? |"
     )
     lines.append(
         "|---|---:|---:|---:|---:|:---:|"
@@ -1043,7 +1053,10 @@ def format_report(result: dict, verbose: bool = False) -> str:
     lines.append("")
     lines.append(f"- Fired signals (paper-class): **{t['n_signals']}**")
     lines.append(f"- Live parent orders: **{t['n_parents']}**")
-    lines.append(f"- Paper P/L v2: **${t['paper_v2_dollars']:+,.0f}**  (v1 was ${t['paper_v1_dollars']:+,.0f})")
+    lines.append(
+        f"- Paper P/L v2 (delta-aware): **${t['paper_v2_dollars']:+,.0f}**  "
+        f"(v1 legacy R×$500 ATM — INFLATED ~7×: ${t['paper_v1_dollars']:+,.0f})"
+    )
     lines.append(f"- Real realized $: ${t['real_realized_dollars']:+,.0f}")
     lines.append(f"- Commissions $: −${t['commission_dollars']:,.0f}")
     lines.append(f"- Unrealized (open positions, crude): ${t['unrealized_dollars']:+,.0f}")

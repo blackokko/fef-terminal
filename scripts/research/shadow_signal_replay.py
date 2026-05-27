@@ -826,12 +826,24 @@ def apply_variant(
 # ---------------------------------------------------------------------------
 
 def _expected_r(rec: dict) -> float:
-    """R-multiple proxy for a single actionable signal.
+    """LEGACY binary R-multiple proxy — fallback ONLY when bar data is
+    unavailable (synthetic test DBs without `historical_bar`).
+
+    METHODOLOGY BUG (fixed 2026-05-27): this binary T1-or-stop scoring was
+    the live metrics path through 2026-05-26 and overstated counter-bias
+    direction filters ~15× (conjunction_req_2 showed +54R here vs −1.16R
+    under ablation_backtest's bar walk). The binary rule counts any 60-min
+    T1 touch as a full +1.5R win, but the partial-scale-out bar walk reveals
+    many of those "T1 hits" are fast-reversal stop-outs (intra-bar dip to
+    −1R, then rip through T1) that realize a net loss. The canonical R path
+    is now `_score_r` → `_simulate_realized_r` (bar walk + 50/30/20 partials),
+    matching ablation_backtest._simulate_baseline / daily_review /
+    per_regime_sweep v2. This function survives only for the no-bars path.
 
     Uses the binary would_have_hit_t1 / would_have_hit_stop flags
-    as the source of truth (per report 19 caveat that
-    `t1_hit_probability` is effectively binary for 99% of rows and
-    is 0.0 for many older rows where it was never computed):
+    (per report 19 caveat that `t1_hit_probability` is effectively binary
+    for 99% of rows and is 0.0 for many older rows where it was never
+    computed):
       T1 hit ⇒ +1.5R; stop hit ⇒ -1R; neither ⇒ 0R.
     Returns NaN when both T1 and stop flags are missing.
 
@@ -855,6 +867,35 @@ def _expected_r(rec: dict) -> float:
     if stop:
         return R_STOP
     return 0.0
+
+
+def _score_r(rec: dict) -> float:
+    """Canonical per-signal realized R for the metrics layer.
+
+    Prefers the bar-walk + 50/30/20 partial-scale-out simulation
+    (`_simulate_realized_r`, which delegates to
+    ablation_backtest._simulate_baseline) when forward 1-min bars are
+    attached to the record (`fwd_bars`). Falls back to the LEGACY binary
+    T1/stop scoring (`_expected_r`) only when bars are unavailable — i.e.
+    synthetic test DBs without a `historical_bar` table, or signals whose
+    timestamp lies outside the loaded bar window.
+
+    Returns NaN when neither path can score the signal (caller filters
+    NaN out of the R aggregation, identical to the prior `_expected_r`
+    NaN handling).
+
+    This is the methodology fix shipped 2026-05-27: the prior live path
+    used `_expected_r` directly, which overstated counter-bias direction
+    filters ~15× vs the bar walk (see `_expected_r` docstring + the
+    `_simulate_realized_r` block above).
+    """
+    fwd_bars = rec.get("fwd_bars")
+    if fwd_bars:
+        r = _simulate_realized_r(rec, fwd_bars)
+        if r == r:  # not NaN — bar walk succeeded
+            return r
+    # No bars (synthetic test DB) or bar walk returned NaN → legacy binary.
+    return _expected_r(rec)
 
 
 def compute_outcome_metrics(applied_signals: list[dict]) -> dict:
@@ -894,7 +935,10 @@ def compute_outcome_metrics(applied_signals: list[dict]) -> dict:
     )
     n_changed = sum(1 for s in applied_signals if s["changed"])
 
-    # Aligned vs counter-bias R aggregation (on rows with lookahead).
+    # Aligned vs counter-bias R aggregation. R is the canonical bar-walk
+    # realized R (50/30/20 partials) via _score_r; the n_t1/n_stop counters
+    # remain the descriptive lookahead-flag hit rates (independent of the R
+    # methodology — kept for the T1%/stop% report columns).
     aligned_r: list[float] = []
     cb_r: list[float] = []
     overall_r: list[float] = []
@@ -902,7 +946,7 @@ def compute_outcome_metrics(applied_signals: list[dict]) -> dict:
     n_stop = 0
     n_eval = 0
     for s in actionable:
-        er = _expected_r(s)
+        er = _score_r(s)
         if er != er:  # NaN
             continue
         overall_r.append(er)
@@ -945,7 +989,7 @@ def compute_outcome_metrics(applied_signals: list[dict]) -> dict:
             hour = ct.hour
         except (KeyError, ValueError, TypeError):
             hour = -1
-        er = _expected_r(s)
+        er = _score_r(s)
         is_finite = er == er
         is_cb = _is_counter_bias(s["new_direction"], s["drift_bias"] or "")
         for d in (by_regime[regime], by_confidence[conf], by_hour[hour]):
@@ -1184,6 +1228,16 @@ def run_replay(
     signals = load_signals(date_from, date_to, db_path)
     vix_table = _load_vix_table(db_path)
 
+    # Attach forward 1-min bars to every signal so the canonical bar-walk
+    # realized-R (50/30/20 partial scale-out, matching
+    # ablation_backtest._simulate_baseline) can be computed in
+    # compute_outcome_metrics. Done ONCE here so the K-variant fan-out below
+    # reuses the same fwd_bars list instead of re-running the bisect lookup
+    # per variant. When historical_bar is absent (synthetic test DBs) the
+    # field is None and compute_outcome_metrics falls back to binary scoring.
+    bar_by_ms, bar_ms_sorted = _load_spx_bars(db_path, date_from, date_to)
+    _attach_forward_bars(signals, bar_by_ms, bar_ms_sorted)
+
     # Apply each variant, compute metrics.
     applied: dict[str, list[dict]] = {}
     metrics: dict[str, dict] = {}
@@ -1408,9 +1462,13 @@ def format_report(result: dict) -> str:
         "independent. DSR family correction applies."
     )
     out.append(
-        "- The `t1_hit_probability` column is effectively binary "
-        "(0 or 1) per report 19 caveat; expected-R reduces to the "
-        "binary T1/stop case in practice."
+        "- Realized-R is the canonical bar-walk + 50/30/20 partial "
+        "scale-out (matching ablation_backtest._simulate_baseline), NOT "
+        "the legacy binary T1-or-stop scoring. The binary path overstated "
+        "counter-bias direction filters ~15x (methodology fix 2026-05-27) "
+        "and now survives only as a no-bars fallback for synthetic test "
+        "DBs. The T1%/stop% columns remain the descriptive lookahead-flag "
+        "hit rates and are independent of the R methodology."
     )
     out.append(
         "- Vol-adaptive strike P&L impact is NOT measured — chain "

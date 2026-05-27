@@ -345,9 +345,37 @@ def _run_sweep_v2(iters: list[dict], bar_by_ms: dict, bar_ms_sorted: list[int]):
             return None
         return round(mean / math.sqrt(var), 2)
 
-    # R-units convert to $ via the standard per-R constant
+    # R→$ conversion (Report 28 — 2026-05-27). The legacy flat R×$500/contract
+    # (imported from ablation_backtest.DOLLARS_PER_R) assumed ATM delta≈0.50 and
+    # overstated realized dollars at the live 35pt-OTM strike picker by ~7×.
+    # Derive a delta-aware $/R via BSM at the 35pt offset over the test iters.
+    # The sweep RANKING is by Sharpe (R-based, unaffected); only the $ columns
+    # change. No DB cursor in this scope, so IV uses the BSM default fallback.
     from ablation_backtest import DOLLARS_PER_R
-    R_DOLLARS = DOLLARS_PER_R
+    from shadow_exit_replay import (
+        BSM_DEFAULT_IV, _bsm_call, _time_to_expiry_years,
+    )
+
+    def _effective_r_dollars(sample_iters: list[dict]) -> float:
+        per: list[float] = []
+        for it in sample_iters:
+            spot = it.get("spx_price")
+            ts_ms = it.get("timestamp_ms")
+            if not spot or not ts_ms or spot <= 0:
+                continue
+            session_date = datetime.fromtimestamp(
+                ts_ms / 1000.0, tz=timezone.utc
+            ).strftime("%Y-%m-%d")
+            T = _time_to_expiry_years(int(ts_ms), session_date)
+            strike = round((spot + 35.0) / 5.0) * 5.0  # 35pt OTM call proxy
+            px0 = _bsm_call(spot, strike, T, BSM_DEFAULT_IV)
+            px1 = _bsm_call(spot + 10.0, strike, T, BSM_DEFAULT_IV)  # +1R = 10pt
+            dpr = abs(px1 - px0) * 100.0
+            if dpr > 0:
+                per.append(dpr)
+        return (sum(per) / len(per)) if per else DOLLARS_PER_R
+
+    R_DOLLARS = _effective_r_dollars(test_iters or train_iters)
 
     results = []
     for prox in PROXIMITY_VALUES:

@@ -65,7 +65,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_DB = str(Path.home() / ".fef-terminal" / "signal_log.db")
-DOLLARS_PER_R_PER_CONTRACT = 500.0  # 10pt SPX × $50/pt × 1 contract
+# DEPRECATED for legacy exit-logic variants (Report 28 — 2026-05-27). The flat
+# R×$500/contract conversion implicitly assumes ATM delta≈0.50. At the live
+# 35pt-OTM strike picker (engine/strikes.py offset_pts=35.0) the realized $/R is
+# ~$70/contract (delta≈0.09), so R×$500 overstated every legacy-variant $ figure
+# by ~7×. Legacy variants now route their `dollars` field through
+# _compute_bsm_strike_dollars at LIVE_STRIKE_OFFSET_PTS (delta-aware, per-strike
+# BSM) — the SAME machinery the strike-offset BSM variants already use. R-
+# multiples, win/loss, peak_r, exit_reason, and per-variant cumR ordering are
+# unchanged; only the $ conversion is corrected. The constant is retained only
+# for delta-equivalence reasoning ("how many R-units for a typical ATM trade")
+# and is no longer used for any realized-dollar figure.
+DOLLARS_PER_R_PER_CONTRACT = 500.0  # 10pt SPX × $50/pt × 1 contract (ATM-delta — DEPRECATED, see above)
+# The live engine's hardcoded strike offset (engine/strikes.py:24-30). Legacy
+# exit-logic variants are priced at this offset so their $ matches what the
+# current strike picker actually realizes.
+LIVE_STRIKE_OFFSET_PTS = 35.0
 
 # BSM-pricing defaults for strike-offset shadow variants (added 2026-05-26
 # per Report 26 — quantify expected R/$ impact of changing strike picker's
@@ -1331,10 +1346,12 @@ def run_replay(
     # strike-offset variants (need vix_at_fire to bound IV).
     parent_regimes: dict[int, str] = {}
     parent_signal_extras: dict[int, str | None] = {}
-    needs_signal_extras = (
-        any(v.is_meta for v in variants)
-        or any(v.strike_offset_pts is not None for v in variants)
-    )
+    # Report 28 (2026-05-27): legacy exit-logic variants now price their
+    # dollars via BSM at the live 35pt offset, which benefits from per-signal
+    # vix_at_fire to pin IV. Always build the extras lookup so the IV resolver
+    # gets the best source (it degrades gracefully to vix_sample / default if a
+    # given parent has no matched signal extras).
+    needs_signal_extras = True
     if needs_signal_extras and parents:
         sig_rows = cur.execute(
             """
@@ -1569,10 +1586,47 @@ def run_replay(
                     })
                 continue
 
+            # Legacy exit-logic variants (baseline, bcd_trail, theta-tighten,
+            # be_ladder, etc.) — those without strike_offset / strike_selection.
+            # Report 28 (2026-05-27): dollars were R×$500/contract, which assumes
+            # ATM delta≈0.50 and overstated the live 35pt-OTM realized $ by ~7×.
+            # Route the SAME bar-walk realized_r through BSM priced at the live
+            # 35pt offset so the $ figure reflects what the current strike picker
+            # actually realizes. realized_r / exit_reason / peak_r are untouched.
+            #
+            # We map the variant's realized_r onto an exit SPX level
+            # (entry + direction_sign * realized_r * risk_pts) and price entry vs
+            # that level with BSM at the 35pt OTM strike. This is the delta-aware
+            # analogue of the old flat conversion: a +1R bar-walk result is priced
+            # as the option-premium change for a +1R SPX move at the live strike,
+            # rather than a flat $500.
+            realized_r_legacy = out["realized_r"]
+            if realized_r_legacy != realized_r_legacy:  # NaN (unevaluable variants)
+                legacy_dollars = float("nan")
+                bsm_diag_legacy: dict = {"note": "unevaluable_nan_realized_r"}
+            else:
+                implied_exit_spx = (
+                    entry_spx + direction_sign * realized_r_legacy * risk_pts
+                )
+                legacy_dollars, bsm_diag_legacy = _compute_bsm_strike_dollars(
+                    cur,
+                    strike_offset_pts=LIVE_STRIKE_OFFSET_PTS,
+                    direction_sign=direction_sign,
+                    entry_spx=entry_spx,
+                    entry_ms=entry_ms,
+                    exit_ms=out.get("exit_ms") or end_ms,
+                    exit_spx=implied_exit_spx,
+                    session_date=session_date,
+                    qty=qty,
+                    signal_iter_extras_json=parent_signal_extras.get(p["id"]),
+                )
             rows.append({
                 "parent_order_id": p["id"],
                 "variant_label": v.label,  # meta label kept for grouping
-                "variant_params": params_snapshot,
+                "variant_params": {
+                    **params_snapshot,
+                    "bsm_diag_35pt": bsm_diag_legacy,
+                },
                 "session_date": session_date,
                 "entry_spx": entry_spx,
                 "direction": direction,
@@ -1581,9 +1635,7 @@ def run_replay(
                 "exit_reason": out["exit_reason"],
                 "peak_r": round(out["peak_r"], 4),
                 "exit_ms": out["exit_ms"],
-                "dollars": round(
-                    out["realized_r"] * DOLLARS_PER_R_PER_CONTRACT * qty, 2
-                ),
+                "dollars": round(legacy_dollars, 2) if legacy_dollars == legacy_dollars else 0.0,
             })
 
     if persist and rows:

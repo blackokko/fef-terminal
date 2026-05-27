@@ -56,7 +56,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_DB = str(Path.home() / ".fef-terminal" / "signal_log.db")
-DOLLARS_PER_R = 500.0  # 10 contracts × $50/pt × 1R (10pt SPX) = $500/R/contract
+# DEPRECATED as a realized-dollar conversion (Report 28 — 2026-05-27). The flat
+# R×$500/contract assumes ATM delta≈0.50; at the live 35pt-OTM strike picker the
+# realized $/R is ~$70/contract (delta≈0.09), so R×$500 overstated every paper $
+# figure by ~7×. run_ablation now derives a delta-aware effective $/R per
+# contract from BSM priced at the live 35pt offset over the actual signals in
+# the window (`effective_dollars_per_r`), and format_report uses THAT instead of
+# this constant. R-multiples, win/loss, per-variant cumR ordering are unchanged
+# — only the $ conversion is corrected. The constant is retained as a fallback
+# when no signal/IV data is available, and for the ATM delta-equivalence view.
+DOLLARS_PER_R = 500.0  # ATM-delta $/R (DEPRECATED for realized $ — see above)
+# Live engine strike offset (engine/strikes.py:24-30) — used to BSM-price the
+# delta-aware effective $/R.
+LIVE_STRIKE_OFFSET_PTS = 35.0
 
 # Canonical R-unit helper (Chat audit Priority 3 — 2026-05-22).
 # R is the per-signal SPX-point distance from entry to stop, NOT a hardcoded
@@ -81,6 +93,94 @@ from fef_sidecar.db.repository import build_actionable_signals_sql  # noqa: E402
 from shadow_signal_replay import (  # noqa: E402
     _conjunction_req_2_re_verdict,
 )
+
+# Delta-aware $/R conversion (Report 28 — 2026-05-27). Reuse the BSM machinery
+# the strike-offset shadow variants already use rather than re-implementing it.
+from shadow_exit_replay import (  # noqa: E402
+    _bsm_call,
+    _bsm_delta,
+    _resolve_iv_for_signal,
+    _time_to_expiry_years,
+)
+
+
+def _effective_dollars_per_r(
+    cur,
+    signals: list,
+    *,
+    offset_pts: float = LIVE_STRIKE_OFFSET_PTS,
+    fallback: float = DOLLARS_PER_R,
+) -> dict:
+    """Delta-aware $/R per contract at the live strike offset (Report 28).
+
+    The legacy flat R×$500/contract assumes ATM delta≈0.50. At the 35pt-OTM
+    strike the realized $/R is far smaller. For each actionable signal we BSM-
+    price a +1R favorable SPX move (= the signal's risk_pts) at the
+    `offset_pts`-OTM strike and take the resulting per-contract premium change.
+    The mean across signals is the honest $/R multiplier to convert aggregate
+    R into realized dollars at the live strike picker.
+
+    Returns {dollars_per_r, n, median, p25, p75, source, offset_pts}.
+    Falls back to `fallback` (the ATM constant) when no signal/IV data exists.
+    R-multiples are NOT affected — this only calibrates the $ conversion.
+    """
+    per_signal: list[float] = []
+    for s in signals:
+        try:
+            entry_spx = float(s["spx_price"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if entry_spx <= 0:
+            continue
+        try:
+            ex = json.loads(s["extras"]) if s["extras"] else {}
+        except (json.JSONDecodeError, TypeError):
+            ex = {}
+        stop_spx = ex.get("stop") if isinstance(ex, dict) else None
+        risk_pts = compute_r_unit(entry_spx, stop_spx, default_pts=10.0)
+        direction_sign = +1 if s["direction"] == "LONG_CALLS" else -1
+        sig_ms = _ts_to_ms(s["timestamp"])
+        session_date = s["session_date"]
+        iv, _ = _resolve_iv_for_signal(cur, sig_ms, s["extras"] if "extras" in s.keys() else None)
+        T = _time_to_expiry_years(sig_ms, session_date)
+        offset_signed = offset_pts if direction_sign > 0 else -offset_pts
+        strike = round((entry_spx + offset_signed) / 5.0) * 5.0
+        right = "C" if direction_sign > 0 else "P"
+        # Price entry and a +1R favorable move (risk_pts in SPX points).
+        if right == "C":
+            px0 = _bsm_call(entry_spx, strike, T, iv)
+            px1 = _bsm_call(entry_spx + risk_pts, strike, T, iv)
+        else:
+            from shadow_exit_replay import _bsm_put
+            px0 = _bsm_put(entry_spx, strike, T, iv)
+            px1 = _bsm_put(entry_spx - risk_pts, strike, T, iv)
+        dollars_per_r = abs(px1 - px0) * 100.0  # per contract, +1R favorable
+        if dollars_per_r > 0:
+            per_signal.append(dollars_per_r)
+
+    if not per_signal:
+        return {
+            "dollars_per_r": fallback, "n": 0, "median": fallback,
+            "p25": fallback, "p75": fallback,
+            "source": "fallback_atm_constant", "offset_pts": offset_pts,
+        }
+    per_signal.sort()
+    n = len(per_signal)
+    mean = sum(per_signal) / n
+
+    def _pct(p: float) -> float:
+        idx = min(n - 1, max(0, int(round(p * (n - 1)))))
+        return per_signal[idx]
+
+    return {
+        "dollars_per_r": round(mean, 2),
+        "n": n,
+        "median": round(_pct(0.5), 2),
+        "p25": round(_pct(0.25), 2),
+        "p75": round(_pct(0.75), 2),
+        "source": f"bsm_{int(offset_pts)}pt_otm",
+        "offset_pts": offset_pts,
+    }
 
 
 def _ts_to_ms(ts_str: str) -> int:
@@ -487,6 +587,12 @@ def run_ablation(
     aggregates_by_regime = {name: summary(results, key, group_key="regime")
                             for name, key in variants}
 
+    # Delta-aware effective $/R at the live 35pt strike (Report 28 — 2026-05-27).
+    # Replaces the flat R×$500/contract conversion (which assumed ATM delta≈0.50)
+    # for all realized-dollar figures in the report. Computed from BSM over the
+    # actual signals in the window. R-multiples themselves are unaffected.
+    effective_dpr = _effective_dollars_per_r(cur, signals)
+
     # Methodology stats (DSR + purged K-fold + PBO) — added 2026-05-21 per
     # Claude Chat's institutional-methodology gap analysis. DSR discounts
     # the winning variant's apparent Sharpe for the selection-bias of
@@ -506,6 +612,10 @@ def run_ablation(
         "bcd_exit_reasons": dict(Counter(r["bcd_reason"] for r in results)),
         "aggregates": aggregates,
         "aggregates_by_regime": aggregates_by_regime,
+        # Delta-aware $/R at the live 35pt offset (Report 28). The report's
+        # dollar columns use effective_dollars_per_r.dollars_per_r, NOT the
+        # legacy ATM $500 constant.
+        "effective_dollars_per_r": effective_dpr,
         "methodology_stats": methodology_stats,
         "r_unit_migration_sample": migration_sample,
         "actionable_count_check": {
@@ -1225,8 +1335,16 @@ def _append_conjunction_tldr(
     lines.append("")
 
 
-def format_report(result: dict, dollars_per_r: float = DOLLARS_PER_R) -> str:
-    """Markdown report string."""
+def format_report(result: dict, dollars_per_r: float | None = None) -> str:
+    """Markdown report string.
+
+    `dollars_per_r`: explicit override for the R→$ conversion. When None
+    (default), uses the delta-aware effective $/R at the live 35pt strike
+    computed by run_ablation (Report 28 — 2026-05-27). The legacy flat $500
+    ATM constant is only used as a fallback when no signal/IV data exists."""
+    eff = result.get("effective_dollars_per_r") or {}
+    if dollars_per_r is None:
+        dollars_per_r = eff.get("dollars_per_r", DOLLARS_PER_R)
     lines: list[str] = []
     lines.append(f"## Ablation Backtest: {result['date_from']} to {result['date_to']}")
     lines.append("")
@@ -1260,7 +1378,28 @@ def format_report(result: dict, dollars_per_r: float = DOLLARS_PER_R) -> str:
                 f"| {name} | {date} | {v['n']} | {v['sum_r']:+.2f} | {v['wins']} | {v['losses']} | {v['flat']} | {wr:.1f}% | {avg:+.3f} |"
             )
     lines.append("")
-    lines.append(f"### Dollar P/L (${dollars_per_r:.0f}/R, ALL trades)")
+    src = eff.get("source", "fallback_atm_constant")
+    if src.startswith("bsm"):
+        lines.append(
+            f"### Dollar P/L (delta-aware **${dollars_per_r:,.0f}/R** at live "
+            f"{int(eff.get('offset_pts', LIVE_STRIKE_OFFSET_PTS))}pt OTM, ALL trades)"
+        )
+        lines.append("")
+        lines.append(
+            f"> **Report 28 (2026-05-27):** $ figures use the **delta-aware** $/R "
+            f"derived via BSM at the live {int(eff.get('offset_pts', LIVE_STRIKE_OFFSET_PTS))}pt-OTM "
+            f"strike picker over {eff.get('n', 0)} signals "
+            f"(median `${eff.get('median', 0):,.0f}`/R, IQR "
+            f"`${eff.get('p25', 0):,.0f}`–`${eff.get('p75', 0):,.0f}`). The legacy "
+            f"flat **$500/R** assumed ATM delta≈0.50 and overstated realized "
+            f"dollars at this strike by ~{500.0 / max(dollars_per_r, 1.0):.1f}×. "
+            f"R-multiples, win/loss, and per-variant ordering are unchanged."
+        )
+    else:
+        lines.append(
+            f"### Dollar P/L (${dollars_per_r:,.0f}/R [ATM fallback — no signal/IV "
+            f"data], ALL trades)"
+        )
     lines.append("")
     lines.append("| Variant | Sum R | $ Total | $/trade |")
     lines.append("|---|---:|---:|---:|")
@@ -1781,7 +1920,12 @@ def main() -> int:
                     help="Filter by extras.account_class. 'paper' (default), 'live', 'mock', "
                          "'unknown', 'all', or comma-separated.")
     ap.add_argument("--json", action="store_true", help="Emit raw JSON instead of markdown")
-    ap.add_argument("--dollars-per-r", type=float, default=DOLLARS_PER_R)
+    ap.add_argument(
+        "--dollars-per-r", type=float, default=None,
+        help="Override R→$ conversion. Default: delta-aware effective $/R at the "
+             "live 35pt strike (Report 28). The legacy flat $500/R assumed ATM "
+             "delta and overstated 35pt-OTM dollars ~7×.",
+    )
     args = ap.parse_args()
 
     accept = _parse_account_class_arg(args.account_class)
