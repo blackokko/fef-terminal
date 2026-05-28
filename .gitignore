@@ -46,7 +46,7 @@ src-tauri/binaries/
 
 # Analysis output + scratch (regenerable from scripts/research/, not source)
 audit_package_2/
-audit_package_2.zip
+*.zip
 AUDIT_PACKAGE_*.md
 research_*_final.md
 per_regime_*.md
