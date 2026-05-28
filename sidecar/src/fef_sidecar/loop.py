@@ -88,6 +88,219 @@ def _expiry_rows_json(rows: Any) -> list[dict[str, Any]]:
     ]
 
 
+# ±N-strike window (around spot) for the full-chain exposure capture. Keeps
+# storage bounded while still covering the gamma-flip zone. Full chain is ~200
+# strikes × 4 greeks/poll (~312k rows/session); the ±60 window is ~24 strikes ×
+# 4 greeks/poll (~37k rows/session). The flip is always near spot, so the
+# window loses nothing the regime classifier needs. See [[freeze-scope]] — pure
+# persistence, no engine impact.
+EXPOSURE_CHAIN_WINDOW_PTS = float(os.environ.get("FEF_EXPOSURE_CHAIN_WINDOW_PTS", "60"))
+
+# ±N-strike window (around spot) for the full-chain OI capture — kept
+# consistent with the exposure-chain window. The OI chain QuantData returns is
+# ~238 strikes; the ±60 window is ~24 strikes. Slow-moving OI is captured at
+# REDUCED cadence (once per minute, gated below) — per-poll @15s would be
+# ~1.3M rows/session. Aggression is tiny (one row) so it's stored every poll.
+# See [[freeze-scope]] — pure persistence, no engine impact.
+OI_CHAIN_WINDOW_PTS = float(os.environ.get("FEF_OI_CHAIN_WINDOW_PTS", "60"))
+# Minimum seconds between OI chain captures. OI barely moves intraday, so once
+# per minute is plenty and keeps storage bounded (~4 captures/min @15s poll
+# would be wasteful). Overridable for tests / tuning.
+OI_CHAIN_MIN_INTERVAL_SEC = float(os.environ.get("FEF_OI_CHAIN_MIN_INTERVAL_SEC", "60"))
+
+# Per-symbol last OI-chain capture timestamp (ms since epoch of the snapshot).
+# Gates the reduced (1/min) OI cadence so we don't write the slow-moving OI
+# chain on every 15s poll. In-process state — resets on restart, which is fine
+# (idempotent unique index dedups any boundary double-write anyway).
+_last_oi_capture_ms: dict[str, int] = {}
+
+
+def _build_exposure_chain_rows(snap: Any, symbol: str, session_date: str) -> list[Any]:
+    """Build ExposureChainPoint rows for all 4 greeks within ±WINDOW of spot.
+
+    Best-effort: any greek snapshot that's missing is skipped. Returns an empty
+    list rather than raising so the poll loop never breaks on a malformed snap.
+    """
+    from fef_sidecar.db.models import ExposureChainPoint
+
+    spot = getattr(snap, "spx_price", None)
+    if not spot or spot <= 0:
+        return []
+    ts = getattr(snap, "fetched_at_ms", None)
+    if not ts:
+        return []
+    lo, hi = spot - EXPOSURE_CHAIN_WINDOW_PTS, spot + EXPOSURE_CHAIN_WINDOW_PTS
+
+    greek_snaps = {
+        "GAMMA": getattr(snap, "gex", None),
+        "DELTA": getattr(snap, "dex", None),
+        "CHARM": getattr(snap, "cex", None),
+        "VANNA": getattr(snap, "vex", None),
+    }
+    rows: list[Any] = []
+    for greek_type, gsnap in greek_snaps.items():
+        if gsnap is None:
+            continue
+        for r in getattr(gsnap, "rows", []) or []:
+            if not (lo <= r.strike <= hi):
+                continue
+            rows.append(ExposureChainPoint(
+                timestamp_ms=int(ts),
+                session_date=session_date,
+                symbol=symbol,
+                greek_type=greek_type,
+                strike=float(r.strike),
+                net_m=round(float(r.net_m), 4),
+                call_m=round(float(r.call_m), 4),
+                put_m=round(float(r.put_m), 4),
+                spot_at_capture=float(spot),
+                source="live_poll",
+            ))
+    return rows
+
+
+async def _persist_exposure_chain_rows(rows: list[Any]) -> int:
+    """Idempotent bulk insert of ExposureChainPoint rows. Same insert-and-
+    swallow-IntegrityError pattern as option_chain_backfill._persist_rows."""
+    if not rows:
+        return 0
+    from sqlalchemy.exc import IntegrityError
+
+    from fef_sidecar.db.engine import get_session
+
+    try:
+        async with get_session() as session:
+            session.add_all(rows)
+            await session.flush()
+        return len(rows)
+    except IntegrityError:
+        pass
+    except Exception:
+        logger.exception("Exposure-chain bulk persist failed; trying per-row")
+
+    n = 0
+    for r in rows:
+        try:
+            async with get_session() as session:
+                session.add(r)
+                await session.flush()
+            n += 1
+        except IntegrityError:
+            continue
+        except Exception:
+            logger.exception("Exposure-chain per-row persist failed (%s %s)",
+                             getattr(r, "greek_type", "?"), getattr(r, "strike", "?"))
+    return n
+
+
+def _build_oi_chain_rows(snap: Any, symbol: str, session_date: str) -> list[Any]:
+    """Build OiChainPoint rows within ±OI_CHAIN_WINDOW_PTS of spot.
+
+    Mirrors _build_exposure_chain_rows. Best-effort: returns [] (never raises)
+    if the snapshot is missing the OI chain or spot/timestamp.
+    """
+    from fef_sidecar.db.models import OiChainPoint
+
+    spot = getattr(snap, "spx_price", None)
+    if not spot or spot <= 0:
+        return []
+    ts = getattr(snap, "fetched_at_ms", None)
+    if not ts:
+        return []
+    oi_snap = getattr(snap, "oi", None)
+    if oi_snap is None:
+        return []
+    lo, hi = spot - OI_CHAIN_WINDOW_PTS, spot + OI_CHAIN_WINDOW_PTS
+
+    rows: list[Any] = []
+    for r in getattr(oi_snap, "rows", []) or []:
+        if not (lo <= r.strike <= hi):
+            continue
+        rows.append(OiChainPoint(
+            timestamp_ms=int(ts),
+            session_date=session_date,
+            symbol=symbol,
+            strike=float(r.strike),
+            call_oi=int(r.call_oi),
+            put_oi=int(r.put_oi),
+            spot_at_capture=float(spot),
+            source="live_poll",
+        ))
+    return rows
+
+
+def _build_aggression_detail_row(snap: Any, symbol: str, session_date: str) -> Any | None:
+    """Build a single AggressionDetailPoint from the full AA/A/M/B/BB buckets.
+
+    Best-effort: returns None (never raises) if the snapshot has no aggression
+    stats or no spot/timestamp.
+    """
+    from fef_sidecar.db.models import AggressionDetailPoint
+
+    spot = getattr(snap, "spx_price", None)
+    if not spot or spot <= 0:
+        return None
+    ts = getattr(snap, "fetched_at_ms", None)
+    if not ts:
+        return None
+    agg = getattr(snap, "aggression", None)
+    if agg is None or agg.call is None or agg.put is None:
+        return None
+
+    c, p = agg.call, agg.put
+    return AggressionDetailPoint(
+        timestamp_ms=int(ts),
+        session_date=session_date,
+        symbol=symbol,
+        spot_at_capture=float(spot),
+        call_aa=float(c.aa),
+        call_a=float(c.a),
+        call_mid=float(c.mid),
+        call_b=float(c.b),
+        call_bb=float(c.bb),
+        put_aa=float(p.aa),
+        put_a=float(p.a),
+        put_mid=float(p.mid),
+        put_b=float(p.b),
+        put_bb=float(p.bb),
+        source="live_poll",
+    )
+
+
+async def _persist_rows_idempotent(rows: list[Any], label: str) -> int:
+    """Idempotent bulk insert with per-row fallback (same insert-and-swallow-
+    IntegrityError pattern as _persist_exposure_chain_rows). Generic over the
+    row model so OI + aggression share one path."""
+    if not rows:
+        return 0
+    from sqlalchemy.exc import IntegrityError
+
+    from fef_sidecar.db.engine import get_session
+
+    try:
+        async with get_session() as session:
+            session.add_all(rows)
+            await session.flush()
+        return len(rows)
+    except IntegrityError:
+        pass
+    except Exception:
+        logger.exception("%s bulk persist failed; trying per-row", label)
+
+    n = 0
+    for r in rows:
+        try:
+            async with get_session() as session:
+                session.add(r)
+                await session.flush()
+            n += 1
+        except IntegrityError:
+            continue
+        except Exception:
+            logger.exception("%s per-row persist failed", label)
+    return n
+
+
 def _orders_json(orders: Any) -> list[dict[str, Any]]:
     """Serialise OrderFlowRow list to JSON-safe dicts (top 20 most recent)."""
     out = []
@@ -204,6 +417,53 @@ async def quantdata_poll_loop(state: AppState) -> None:
                 )
             except Exception:
                 logger.exception("Failed to persist flow snapshot")
+
+            # Persist the FULL (±window) per-strike exposure chain for all 4
+            # greeks. The flow_snapshot write above keeps only top-5 walls; this
+            # captures the whole chain near spot so cumulative-gamma / gamma-flip
+            # queries are possible. Independent best-effort block — must never
+            # break the flow_snapshot persistence above or the poll cadence.
+            try:
+                _chain_rows = _build_exposure_chain_rows(
+                    snap, state.active_symbol, _today_et(),
+                )
+                if _chain_rows:
+                    await _persist_exposure_chain_rows(_chain_rows)
+            except Exception:
+                logger.exception("Failed to persist exposure chain")
+
+            # Persist the FULL (±window) per-strike OI chain at REDUCED cadence
+            # (once per OI_CHAIN_MIN_INTERVAL_SEC — OI is slow-moving; per-poll
+            # would balloon storage). Independent best-effort block. Report 36
+            # gap: flow_snapshot collapses OI to max-pain scalars. See
+            # [[freeze-scope]] — pure persistence.
+            try:
+                _now_ms = int(snap.fetched_at_ms)  # type: ignore[arg-type]
+                _last_ms = _last_oi_capture_ms.get(state.active_symbol, 0)
+                if _now_ms - _last_ms >= OI_CHAIN_MIN_INTERVAL_SEC * 1000:
+                    _oi_rows = _build_oi_chain_rows(
+                        snap, state.active_symbol, _today_et(),
+                    )
+                    if _oi_rows:
+                        await _persist_rows_idempotent(_oi_rows, "OI-chain")
+                    # Advance the gate even if rows were empty so we don't retry
+                    # a missing-OI snapshot every poll.
+                    _last_oi_capture_ms[state.active_symbol] = _now_ms
+            except Exception:
+                logger.exception("Failed to persist OI chain")
+
+            # Persist the FULL raw aggression buckets (AA/A/M/B/BB per side)
+            # EVERY poll — it's a single tiny row. Report 36 gap: flow_snapshot
+            # collapses aggression to call_pct/put_pct scalars, losing the
+            # capitulation-vs-chase detail. Independent best-effort block.
+            try:
+                _agg_row = _build_aggression_detail_row(
+                    snap, state.active_symbol, _today_et(),
+                )
+                if _agg_row is not None:
+                    await _persist_rows_idempotent([_agg_row], "aggression-detail")
+            except Exception:
+                logger.exception("Failed to persist aggression detail")
 
             event = SnapshotEvent(
                 timestamp_ms=snap.fetched_at_ms,  # type: ignore[union-attr]

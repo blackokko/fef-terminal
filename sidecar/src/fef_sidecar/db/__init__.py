@@ -18,10 +18,13 @@ Public entrypoints:
 
 from fef_sidecar.db.engine import dispose_db, get_session, init_db
 from fef_sidecar.db.models import (
+    AggressionDetailPoint,
     ChartAnnotation,
     DailySession,
+    ExposureChainPoint,
     FEFConfidence,
     FEFDirection,
+    OiChainPoint,
     Pattern,
     PatternMatch,
     SignalIter,
@@ -32,10 +35,13 @@ from fef_sidecar.db.models import (
 from fef_sidecar.db.repository import SignalIterRepository
 
 __all__ = [
+    "AggressionDetailPoint",
     "ChartAnnotation",
     "DailySession",
+    "ExposureChainPoint",
     "FEFConfidence",
     "FEFDirection",
+    "OiChainPoint",
     "Pattern",
     "PatternMatch",
     "SignalIter",

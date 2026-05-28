@@ -194,6 +194,32 @@ async def init_db() -> None:
                 "ON historical_option_chain_point "
                 "(timestamp_ms, strike, right, expiry)",
             ),
+            # exposure_chain_point: dedup re-captures of the same strike+greek
+            # at the same instant (multiple poll iterations, backfill reruns).
+            # Required for the insert-and-swallow-IntegrityError idempotency.
+            (
+                "idx_exposure_chain_pt_unique",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_exposure_chain_pt_unique "
+                "ON exposure_chain_point "
+                "(timestamp_ms, greek_type, strike)",
+            ),
+            # oi_chain_point: dedup re-captures of the same strike at the same
+            # instant (live poll + backfill reruns). Required for the
+            # insert-and-swallow-IntegrityError idempotency.
+            (
+                "idx_oi_chain_pt_unique",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_oi_chain_pt_unique "
+                "ON oi_chain_point "
+                "(timestamp_ms, strike)",
+            ),
+            # aggression_detail_point: one row per poll, dedup re-captures of
+            # the same (instant, symbol).
+            (
+                "idx_aggression_detail_pt_unique",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_aggression_detail_pt_unique "
+                "ON aggression_detail_point "
+                "(timestamp_ms, symbol)",
+            ),
         ]
         for index_name, sql in index_migrations:
             try:

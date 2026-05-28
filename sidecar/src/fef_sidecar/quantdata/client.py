@@ -281,9 +281,31 @@ class QuantDataClient:
     async def get_exposure_by_strike(
         self,
         greek: GreekType = GreekType.GAMMA,
+        *,
+        time_minutes: int | None = None,
     ) -> StrikeExposureSnapshot:
+        """Fetch the per-strike exposure chain for one greek.
+
+        Scopes to whatever session_date/ticker the last set_page_filter()
+        established — so historical backfill works by setting the page filter
+        to a past date and calling this.
+
+        ``time_minutes`` (minutes since RTH open, e.g. 30 == 10:00 ET) is
+        plumbed through to a metadata ``time`` hint for intraday playback.
+        NOTE (verified 2026-05-28 against the live API): exposure_by_strike
+        does NOT honour any intraday time hint — query params and metadata
+        time fields are all ignored, and the endpoint always returns the
+        single latest (EOD/current) chain for the page-filter's session_date.
+        The param is retained for forward-compat / explicit caller intent, but
+        callers should treat the result as one-snapshot-per-session.
+        """
         tool_id = self._tool_id("exposure_by_strike")
-        await self._update_tool_metadata(tool_id, {"greekModeType": greek.value})
+        metadata: dict[str, Any] = {"greekModeType": greek.value}
+        if time_minutes is not None:
+            # Best-effort intraday hint (currently a no-op server-side — see
+            # docstring). Sent as minutes-since-open in the metadata.
+            metadata["time"] = int(time_minutes)
+        await self._update_tool_metadata(tool_id, metadata)
         raw = await self._get_json(f"{ENDPOINTS['exposure_by_strike']}/{tool_id}")
         # Restore to GAMMA for next caller (matches MCP behavior)
         if greek != GreekType.GAMMA:

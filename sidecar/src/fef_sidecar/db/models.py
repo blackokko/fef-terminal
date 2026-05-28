@@ -506,6 +506,146 @@ class HistoricalOptionChainPoint(SQLModel, table=True):
     source: str = Field(default="ibkr_snapshot")  # 'ibkr_snapshot' / 'quantdata_backfill'
 
 
+class ExposureChainPoint(SQLModel, table=True):
+    """One strike's exposure for one greek at one moment in time.
+
+    Captures the FULL per-strike exposure chain that QuantData returns from
+    exposure_by_strike (~200 strikes × {GAMMA,DELTA,CHARM,VANNA}), rather than
+    just snap.gex.top(5) which the flow_snapshot path truncates to. Per-strike
+    rows (not a JSON blob) are what cumulative-gamma / gamma-flip queries need:
+    sort by strike, accumulate net_m, find the sign-change crossing near spot.
+
+    Two write paths:
+      - source='live_poll'  — quantdata_poll_loop persists the ±60-strike-
+        around-spot window every poll (keeps storage bounded; covers the flip
+        zone). The existing top-5 wall persistence to flow_snapshot is kept.
+      - source='backfill'   — backfill_exposure_chains.py persists the FULL
+        chain pulled per historical session_date via set_page_filter.
+
+    Idempotency: a UNIQUE index on (timestamp_ms, greek_type, strike) is
+    created by init_db; same-instant re-captures silently no-op via sqlite's
+    IntegrityError on the unique constraint.
+    """
+
+    __tablename__ = "exposure_chain_point"
+
+    id: int | None = Field(default=None, primary_key=True)
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
+    timestamp_ms: int = Field(index=True)  # ms since epoch at capture time
+    session_date: str = Field(index=True)  # YYYY-MM-DD ET
+
+    symbol: str = Field(default="SPX", index=True)
+    greek_type: str = Field(index=True)  # GAMMA / DELTA / CHARM / VANNA
+    strike: float = Field(index=True)
+
+    # Exposure values in millions of dollars (signed). net_m = call_m + put_m.
+    net_m: float
+    call_m: float
+    put_m: float
+
+    # SPX spot at moment of capture (denormalized — lets flip-point queries run
+    # without joining back to signal_iter / flow_snapshot).
+    spot_at_capture: float
+
+    source: str = Field(default="live_poll", index=True)  # 'live_poll' / 'backfill'
+
+
+class OiChainPoint(SQLModel, table=True):
+    """One strike's open interest (call + put) at one moment in time.
+
+    Captures the FULL per-strike OI chain that QuantData returns from
+    get_oi_by_strike (~238 strikes), rather than collapsing to the
+    ntm_max_pain/raw_max_pain scalars that flow_snapshot keeps. Per-strike OI
+    rows are what pinning / range-regime detection need: where is the largest
+    open interest sitting relative to spot, and how does the OI wall map move
+    over the session.
+
+    Mirrors ExposureChainPoint exactly (Report 36 — same gap, same fix).
+
+    Two write paths:
+      - source='live_poll'  — quantdata_poll_loop persists the ±60-strike-
+        around-spot window at REDUCED cadence (once per minute, NOT every 15s
+        poll — OI is slow-moving, per-poll would be ~1.3M rows/session).
+      - source='backfill'   — backfill_oi_and_aggression.py persists the FULL
+        chain pulled per historical session_date via set_page_filter.
+
+    Idempotency: a UNIQUE index on (timestamp_ms, strike) is created by
+    init_db; same-instant re-captures silently no-op via sqlite's
+    IntegrityError on the unique constraint.
+    """
+
+    __tablename__ = "oi_chain_point"
+
+    id: int | None = Field(default=None, primary_key=True)
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
+    timestamp_ms: int = Field(index=True)  # ms since epoch at capture time
+    session_date: str = Field(index=True)  # YYYY-MM-DD ET
+
+    symbol: str = Field(default="SPX", index=True)
+    strike: float = Field(index=True)
+
+    # OI in raw contract counts.
+    call_oi: int = 0
+    put_oi: int = 0
+
+    # SPX spot at moment of capture (denormalized — lets pin/range queries run
+    # without joining back to signal_iter / flow_snapshot).
+    spot_at_capture: float
+
+    source: str = Field(default="live_poll", index=True)  # 'live_poll' / 'backfill'
+
+
+class AggressionDetailPoint(SQLModel, table=True):
+    """Full raw trade-side aggression buckets at one moment in time.
+
+    Captures the FULL AA/A/M/B/BB bucket set per side that QuantData returns
+    from get_trade_side_stats, rather than collapsing to the single
+    aggression_call_pct/aggression_put_pct scalars that flow_snapshot keeps.
+    The raw buckets preserve capitulation-vs-chase detail: AA/A are aggressive
+    (lifting offers / hitting bids at the extreme), M is mid, B/BB are passive.
+    The collapsed pct loses the BB (extreme-passive) vs M (neutral) distinction.
+
+    Bucket values are dollar premium totals (per ContractAggression: aa/a/mid/
+    b/bb). Stored fully — it's one row per poll (tiny), so no windowing.
+
+    Two write paths:
+      - source='live_poll'  — quantdata_poll_loop persists every poll (1 row).
+      - source='backfill'   — backfill_oi_and_aggression.py persists one row
+        per historical session_date via set_page_filter.
+
+    Idempotency: a UNIQUE index on (timestamp_ms, symbol) is created by
+    init_db; same-instant re-captures silently no-op via sqlite's
+    IntegrityError on the unique constraint.
+    """
+
+    __tablename__ = "aggression_detail_point"
+
+    id: int | None = Field(default=None, primary_key=True)
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
+    timestamp_ms: int = Field(index=True)  # ms since epoch at capture time
+    session_date: str = Field(index=True)  # YYYY-MM-DD ET
+
+    symbol: str = Field(default="SPX", index=True)
+
+    # SPX spot at moment of capture (denormalized).
+    spot_at_capture: float
+
+    # Raw aggression buckets — dollar premium totals. Names mirror
+    # ContractAggression.{aa,a,mid,b,bb} per side (CALL / PUT).
+    call_aa: float = 0.0
+    call_a: float = 0.0
+    call_mid: float = 0.0
+    call_b: float = 0.0
+    call_bb: float = 0.0
+    put_aa: float = 0.0
+    put_a: float = 0.0
+    put_mid: float = 0.0
+    put_b: float = 0.0
+    put_bb: float = 0.0
+
+    source: str = Field(default="live_poll", index=True)  # 'live_poll' / 'backfill'
+
+
 # ---------------------------------------------------------------------------
 # Audit log — every config change, override, kill switch
 # ---------------------------------------------------------------------------
