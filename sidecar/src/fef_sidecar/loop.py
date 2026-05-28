@@ -418,14 +418,13 @@ async def quantdata_poll_loop(state: AppState) -> None:
             except Exception:
                 logger.exception("Failed to persist flow snapshot")
 
-            # KILL-SWITCH (2026-05-28): the full-chain captures below are OFF
-            # by default. Running them every 15s with no DB busy_timeout caused
-            # write-lock contention that hung the poll + engine loops mid-session
-            # (auto-trading regression). They stay disabled until re-enabled
-            # explicitly — busy_timeout is now set, so re-enabling is safer, but
-            # default-off keeps live trading on the known-stable write profile.
-            # Set FEF_CAPTURE_ENABLED=true to collect the full chains.
-            _capture_on = os.environ.get("FEF_CAPTURE_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+            # Full-chain captures below default ON — we need this data for the
+            # new exposures-as-regime strategy. The 2026-05-28 hang was the
+            # missing DB busy_timeout (writers instant-failed on lock collision),
+            # NOT the capture itself; busy_timeout=30s (db/engine.py) is the
+            # root-cause fix. Kept as a kill-switch: set FEF_CAPTURE_ENABLED=false
+            # to disable without a code change if contention ever recurs.
+            _capture_on = os.environ.get("FEF_CAPTURE_ENABLED", "true").lower() in ("true", "1", "yes", "on")
 
             # Persist the FULL (±window) per-strike exposure chain for all 4
             # greeks. The flow_snapshot write above keeps only top-5 walls; this
