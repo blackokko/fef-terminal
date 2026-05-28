@@ -418,6 +418,15 @@ async def quantdata_poll_loop(state: AppState) -> None:
             except Exception:
                 logger.exception("Failed to persist flow snapshot")
 
+            # KILL-SWITCH (2026-05-28): the full-chain captures below are OFF
+            # by default. Running them every 15s with no DB busy_timeout caused
+            # write-lock contention that hung the poll + engine loops mid-session
+            # (auto-trading regression). They stay disabled until re-enabled
+            # explicitly — busy_timeout is now set, so re-enabling is safer, but
+            # default-off keeps live trading on the known-stable write profile.
+            # Set FEF_CAPTURE_ENABLED=true to collect the full chains.
+            _capture_on = os.environ.get("FEF_CAPTURE_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+
             # Persist the FULL (±window) per-strike exposure chain for all 4
             # greeks. The flow_snapshot write above keeps only top-5 walls; this
             # captures the whole chain near spot so cumulative-gamma / gamma-flip
@@ -426,7 +435,7 @@ async def quantdata_poll_loop(state: AppState) -> None:
             try:
                 _chain_rows = _build_exposure_chain_rows(
                     snap, state.active_symbol, _today_et(),
-                )
+                ) if _capture_on else []
                 if _chain_rows:
                     await _persist_exposure_chain_rows(_chain_rows)
             except Exception:
@@ -440,7 +449,7 @@ async def quantdata_poll_loop(state: AppState) -> None:
             try:
                 _now_ms = int(snap.fetched_at_ms)  # type: ignore[arg-type]
                 _last_ms = _last_oi_capture_ms.get(state.active_symbol, 0)
-                if _now_ms - _last_ms >= OI_CHAIN_MIN_INTERVAL_SEC * 1000:
+                if _capture_on and _now_ms - _last_ms >= OI_CHAIN_MIN_INTERVAL_SEC * 1000:
                     _oi_rows = _build_oi_chain_rows(
                         snap, state.active_symbol, _today_et(),
                     )
@@ -459,7 +468,7 @@ async def quantdata_poll_loop(state: AppState) -> None:
             try:
                 _agg_row = _build_aggression_detail_row(
                     snap, state.active_symbol, _today_et(),
-                )
+                ) if _capture_on else None
                 if _agg_row is not None:
                     await _persist_rows_idempotent([_agg_row], "aggression-detail")
             except Exception:

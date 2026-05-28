@@ -33,7 +33,13 @@ def _get_engine():
         url = os.environ.get("FEF_DB_URL", _default_url())
         if url.startswith("sqlite+aiosqlite:///") and ":memory:" not in url:
             DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
-        _engine = create_async_engine(url, echo=False, future=True)
+        # busy_timeout (seconds): make concurrent writers WAIT for the write
+        # lock instead of failing immediately. Critical — multiple async loops
+        # (engine + poll + watcher + captures) write to one SQLite file; with
+        # the default no-wait behavior, lock collisions raised "database is
+        # locked" and hung the loops (2026-05-28 regression).
+        _connect_args = {"timeout": 30} if url.startswith("sqlite") else {}
+        _engine = create_async_engine(url, echo=False, future=True, connect_args=_connect_args)
         _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
     return _engine
 
