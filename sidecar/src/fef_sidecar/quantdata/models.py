@@ -380,6 +380,10 @@ class MarketSnapshot(BaseModel):
     # loop. Not persisted as a blob — only summary counts flow to DB columns.
     order_flow: OrderFlowSnapshot | None = None
 
+    # Intraday net-flow series (call/put premium sums per minute). Pairs with
+    # `drift` (signed net premium) to populate flow_series_point.
+    net_flow: NetFlowSnapshot | None = None
+
     # Optional sim metadata — only set by the scripted-day mock. Lets the
     # regime detector use simulated time of day for testing transitions.
     simulated_minutes_since_open: int | None = None

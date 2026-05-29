@@ -646,6 +646,72 @@ class AggressionDetailPoint(SQLModel, table=True):
     source: str = Field(default="live_poll", index=True)  # 'live_poll' / 'backfill'
 
 
+class FlowSeriesPoint(SQLModel, table=True):
+    """One minute of intraday call/put premium flow (net-drift + net-flow).
+
+    The official QuantData API serves the FULL intraday time-series per
+    sessionDate from net-drift (signed net call/put premium) and net-flow
+    (call/put premium sums). flow_snapshot only stores the per-poll cumulative
+    scalar (drift_cum_net_m); this table preserves the per-minute series — a
+    clean direction/trend-from-flow input for the post-FEF strategy, and the
+    one part of an outage gap that's recoverable (exposure is EOD-only).
+
+    Two write paths:
+      - source='live_poll' — quantdata_poll_loop upserts new minutes each poll.
+      - source='backfill'  — backfill_flow_series.py pulls a full session.
+
+    Idempotency: UNIQUE (timestamp_ms, symbol) created by init_db.
+    """
+
+    __tablename__ = "flow_series_point"
+
+    id: int | None = Field(default=None, primary_key=True)
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
+    timestamp_ms: int = Field(index=True)  # minute bucket, UTC ms (from QuantData)
+    session_date: str = Field(index=True)  # YYYY-MM-DD ET
+    symbol: str = Field(default="SPX", index=True)
+
+    # net-drift: signed net premium flow into calls / puts this minute (dollars).
+    drift_net_call: float = 0.0
+    drift_net_put: float = 0.0
+    # net-flow: call / put premium sums this minute (dollars, NET_PREMIUM mode).
+    flow_call_sum: float = 0.0
+    flow_put_sum: float = 0.0
+
+    spx_price: float = 0.0  # underlying at this minute (from the series)
+    source: str = Field(default="live_poll", index=True)
+
+
+class EsVwapPoint(SQLModel, table=True):
+    """One minute of ES (E-mini S&P) session-anchored VWAP + bar VWAP.
+
+    VWAP is computed from ES 1-min TRADES bars (IBKR): each bar carries
+    `average` (the bar's own VWAP) and `volume`. session_vwap is the
+    volume-weighted cumulative average from RTH open through this bar.
+
+    ES — not SPX cash — because VWAP needs traded volume; the SPX index has
+    none. ES is already the project's microstructure lead for the S&P. A
+    direction/trend anchor for the post-FEF strategy (price vs session VWAP).
+
+    Idempotency: UNIQUE (timestamp_ms, symbol) created by init_db.
+    """
+
+    __tablename__ = "es_vwap_point"
+
+    id: int | None = Field(default=None, primary_key=True)
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
+    timestamp_ms: int = Field(index=True)  # bar start, UTC ms
+    session_date: str = Field(index=True)  # YYYY-MM-DD ET
+    symbol: str = Field(default="ES", index=True)
+
+    close: float = 0.0          # bar close
+    bar_vwap: float = 0.0       # this bar's own VWAP (IBKR bar.average)
+    bar_volume: float = 0.0     # this bar's volume
+    session_vwap: float = 0.0   # cumulative volume-weighted avg from RTH open
+    cum_volume: float = 0.0     # cumulative session volume through this bar
+    source: str = Field(default="live_loop", index=True)
+
+
 # ---------------------------------------------------------------------------
 # Audit log — every config change, override, kill switch
 # ---------------------------------------------------------------------------

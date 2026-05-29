@@ -226,6 +226,21 @@ async def init_db() -> None:
                 "ON aggression_detail_point "
                 "(timestamp_ms, symbol)",
             ),
+            # flow_series_point: one row per (minute, symbol) — dedup across
+            # poll upserts + backfill reruns of the full intraday series.
+            (
+                "idx_flow_series_pt_unique",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_series_pt_unique "
+                "ON flow_series_point "
+                "(timestamp_ms, symbol)",
+            ),
+            # es_vwap_point: one row per (bar, symbol).
+            (
+                "idx_es_vwap_pt_unique",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_es_vwap_pt_unique "
+                "ON es_vwap_point "
+                "(timestamp_ms, symbol)",
+            ),
         ]
         for index_name, sql in index_migrations:
             try:

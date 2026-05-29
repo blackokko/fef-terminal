@@ -2231,6 +2231,36 @@ async def diag_backfill_spx_bars(
     }
 
 
+@router.post("/diag/backfill_es_vwap")
+async def diag_backfill_es_vwap(
+    request: Request,
+    duration: str = "5 D",
+) -> dict[str, Any]:
+    """Compute ES session-anchored VWAP from IBKR 1-min TRADES bars and upsert
+    into es_vwap_point.
+
+    ES (not SPX cash) because VWAP needs traded volume; the index has none.
+    Each bar carries `average` (its own VWAP) and `volume`; session_vwap is the
+    cumulative volume-weighted average from RTH open, reset per ET session.
+    Idempotent (unique on symbol+timestamp_ms). Serves both backfill and the
+    on-demand refresh the live loop also performs.
+    """
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from fef_sidecar.loop import refresh_es_vwap
+
+    s = _state(request)
+    if not isinstance(s.ibkr, LiveIBKRProvider):
+        return {"mode": "mock", "added": 0}
+    ib = getattr(s.ibkr, "_ib", None)
+    if ib is None or not ib.isConnected():
+        return {"mode": "disconnected"}
+    try:
+        added = await refresh_es_vwap(ib, duration=duration)
+    except Exception as e:
+        return {"error": f"ES VWAP backfill failed: {type(e).__name__}: {e}"}
+    return {"symbol": "ES", "duration": duration, "added_to_db": added}
+
+
 @router.get("/backtest/full_pipeline")
 async def backtest_full_pipeline(
     request: Request,

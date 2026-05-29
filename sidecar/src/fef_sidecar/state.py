@@ -261,6 +261,8 @@ class AppState:
 
     # Option chain capture loop task handle. Owned task, cancelled on shutdown.
     option_chain_capture_task: object | None = None
+    # ES VWAP capture loop task handle.
+    es_vwap_task: object | None = None
 
     @classmethod
     def build(cls) -> AppState:

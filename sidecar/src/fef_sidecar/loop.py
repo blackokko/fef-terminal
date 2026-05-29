@@ -114,6 +114,12 @@ OI_CHAIN_MIN_INTERVAL_SEC = float(os.environ.get("FEF_OI_CHAIN_MIN_INTERVAL_SEC"
 # (idempotent unique index dedups any boundary double-write anyway).
 _last_oi_capture_ms: dict[str, int] = {}
 
+# Per-session last flow-series minute persisted (ms). Lets the poll loop insert
+# only NEW minutes from the full intraday net-drift/net-flow series each poll
+# (the endpoint returns the whole day every call). In-process; idempotent index
+# dedups across restarts.
+_last_flow_series_ms: dict[str, int] = {}
+
 
 def _build_exposure_chain_rows(snap: Any, symbol: str, session_date: str) -> list[Any]:
     """Build ExposureChainPoint rows for all 4 greeks within ±WINDOW of spot.
@@ -301,6 +307,141 @@ async def _persist_rows_idempotent(rows: list[Any], label: str) -> int:
     return n
 
 
+def _build_flow_series_rows(snap: Any, symbol: str, session_date: str, since_ms: int) -> list[Any]:
+    """Merge snap.drift + snap.net_flow into per-minute FlowSeriesPoint rows for
+    minutes strictly newer than since_ms. The full intraday series is returned
+    every poll, so we only persist the new tail."""
+    from fef_sidecar.db.models import FlowSeriesPoint
+
+    merged: dict[int, dict[str, float]] = {}
+    for e in (getattr(snap.drift, "entries", None) or []):
+        if e.timestamp_ms <= since_ms:
+            continue
+        m = merged.setdefault(e.timestamp_ms, {})
+        m["drift_net_call"] = e.call_dollars
+        m["drift_net_put"] = e.put_dollars
+        m["spx_price"] = e.spx_price
+    nf = getattr(snap, "net_flow", None)
+    for e in (getattr(nf, "entries", None) or []):
+        if e.timestamp_ms <= since_ms:
+            continue
+        m = merged.setdefault(e.timestamp_ms, {})
+        m["flow_call_sum"] = e.call_dollars
+        m["flow_put_sum"] = e.put_dollars
+    return [
+        FlowSeriesPoint(
+            timestamp_ms=ts, session_date=session_date, symbol=symbol,
+            drift_net_call=v.get("drift_net_call", 0.0),
+            drift_net_put=v.get("drift_net_put", 0.0),
+            flow_call_sum=v.get("flow_call_sum", 0.0),
+            flow_put_sum=v.get("flow_put_sum", 0.0),
+            spx_price=v.get("spx_price", 0.0), source="live_poll",
+        )
+        for ts, v in sorted(merged.items())
+    ]
+
+
+def _et_date_from_ms(ts_ms: int) -> str:
+    """ET (UTC-4) session date YYYY-MM-DD for an epoch-ms timestamp."""
+    from datetime import datetime, timedelta, timezone
+    et = timezone(timedelta(hours=-4))
+    return datetime.fromtimestamp(ts_ms / 1000, et).strftime("%Y-%m-%d")
+
+
+async def refresh_es_vwap(ib: Any, duration: str = "1 D") -> int:
+    """Compute ES session-anchored VWAP from IBKR 1-min TRADES bars and upsert
+    into es_vwap_point. Shared by the live loop and the diag/backfill endpoint
+    so both use identical methodology. Idempotent; returns rows inserted.
+
+    VWAP = Σ(bar_vwap × volume)/Σ(volume) cumulative from RTH open, per ET
+    session. bar_vwap uses IBKR's per-bar `average` (true bar VWAP), falling
+    back to typical price (H+L+C)/3 if absent.
+    """
+    from fef_sidecar.ibkr.live import _to_ib_contract
+    from fef_sidecar.ibkr.models import Contract
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import EsVwapPoint
+    from sqlmodel import select as _s
+    from sqlalchemy.exc import IntegrityError
+
+    ib_contract = _to_ib_contract(Contract.for_symbol("ES"))
+    await ib.qualifyContractsAsync(ib_contract)
+    bars = await ib.reqHistoricalDataAsync(
+        ib_contract, endDateTime="", durationStr=duration,
+        barSizeSetting="1 min", whatToShow="TRADES", useRTH=True,
+        formatDate=2, keepUpToDate=False,
+    )
+
+    cum_pv: dict[str, float] = {}
+    cum_v: dict[str, float] = {}
+    rows: list[Any] = []
+    for b in bars:
+        try:
+            ts_ms = int(b.date.timestamp() * 1000) if hasattr(b.date, "timestamp") else int(b.date * 1000)
+        except Exception:
+            continue
+        sd = _et_date_from_ms(ts_ms)
+        vol = float(b.volume or 0)
+        bar_vwap = float(getattr(b, "average", 0) or 0) or (float(b.high) + float(b.low) + float(b.close)) / 3
+        cum_pv[sd] = cum_pv.get(sd, 0.0) + bar_vwap * vol
+        cum_v[sd] = cum_v.get(sd, 0.0) + vol
+        sess_vwap = (cum_pv[sd] / cum_v[sd]) if cum_v[sd] > 0 else bar_vwap
+        rows.append(EsVwapPoint(
+            timestamp_ms=ts_ms, session_date=sd, symbol="ES",
+            close=float(b.close), bar_vwap=bar_vwap, bar_volume=vol,
+            session_vwap=sess_vwap, cum_volume=cum_v[sd], source="live_loop",
+        ))
+
+    if not rows:
+        return 0
+    added = 0
+    async with get_session() as session:
+        existing_ts = {
+            r.timestamp_ms for r in (await session.exec(
+                _s(EsVwapPoint).where(EsVwapPoint.symbol == "ES")
+            )).all()
+        }
+        for r in rows:
+            if r.timestamp_ms in existing_ts:
+                continue
+            session.add(r)
+            added += 1
+        if added:
+            try:
+                await session.commit()
+            except IntegrityError:
+                added = 0
+    return added
+
+
+async def es_vwap_loop(state: Any) -> None:
+    """Refresh ES session-anchored VWAP every FEF_ES_VWAP_INTERVAL_SEC (default
+    60s) from IBKR 1-min TRADES bars. Independent best-effort loop — never
+    affects trading. Gated OFF unless FEF_CAPTURE_ENABLED is set, like the
+    other capture paths."""
+    interval = float(os.environ.get("FEF_ES_VWAP_INTERVAL_SEC", "60"))
+    _capture_on = os.environ.get("FEF_CAPTURE_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+    if not _capture_on:
+        logger.info("ES VWAP loop disabled (FEF_CAPTURE_ENABLED is off)")
+        return
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    logger.info("Starting ES VWAP loop (interval=%.0fs)", interval)
+    while True:
+        try:
+            if isinstance(state.ibkr, LiveIBKRProvider):
+                ib = getattr(state.ibkr, "_ib", None)
+                if ib is not None and ib.isConnected():
+                    n = await refresh_es_vwap(ib, duration="1 D")
+                    if n:
+                        logger.debug("ES VWAP: +%d rows", n)
+        except asyncio.CancelledError:
+            logger.info("ES VWAP loop cancelled — exiting")
+            raise
+        except Exception:
+            logger.exception("ES VWAP refresh failed")
+        await asyncio.sleep(interval)
+
+
 def _orders_json(orders: Any) -> list[dict[str, Any]]:
     """Serialise OrderFlowRow list to JSON-safe dicts (top 20 most recent)."""
     out = []
@@ -472,6 +613,21 @@ async def quantdata_poll_loop(state: AppState) -> None:
                     await _persist_rows_idempotent([_agg_row], "aggression-detail")
             except Exception:
                 logger.exception("Failed to persist aggression detail")
+
+            # Persist NEW minutes of the intraday call/put premium-flow series
+            # (net-drift + net-flow). The full day's series comes back every
+            # poll; we insert only minutes past the last-seen for this session.
+            # Independent best-effort block.
+            try:
+                if _capture_on:
+                    _sd = _today_et()
+                    _since = _last_flow_series_ms.get(_sd, 0)
+                    _fs_rows = _build_flow_series_rows(snap, state.active_symbol, _sd, _since)
+                    if _fs_rows:
+                        await _persist_rows_idempotent(_fs_rows, "flow-series")
+                        _last_flow_series_ms[_sd] = max(r.timestamp_ms for r in _fs_rows)
+            except Exception:
+                logger.exception("Failed to persist flow series")
 
             event = SnapshotEvent(
                 timestamp_ms=snap.fetched_at_ms,  # type: ignore[union-attr]

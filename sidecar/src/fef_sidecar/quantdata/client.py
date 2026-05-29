@@ -375,6 +375,7 @@ class QuantDataClient:
         include_vex: bool = True,
         include_expiry_exposure: bool = True,
         include_order_flow: bool = True,
+        include_net_flow: bool = True,
     ) -> MarketSnapshot:
         """Fetch GEX + DEX + drift + max_pain (+ optional extras) concurrently.
 
@@ -406,6 +407,8 @@ class QuantDataClient:
             jobs["oi"] = self.get_oi_by_strike()
         if include_order_flow:
             jobs["order_flow"] = self.get_order_flow()
+        if include_net_flow:
+            jobs["net_flow"] = self.get_net_flow()
 
         settled = await asyncio.gather(*jobs.values(), return_exceptions=True)
         results: dict[str, Any] = {}
@@ -450,4 +453,5 @@ class QuantDataClient:
             gex_by_expiry=results.get("gex_by_expiry"),
             dex_by_expiry=results.get("dex_by_expiry"),
             order_flow=results.get("order_flow"),
+            net_flow=results.get("net_flow"),
         )

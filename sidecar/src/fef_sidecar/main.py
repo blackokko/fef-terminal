@@ -396,6 +396,12 @@ def spawn_data_loops(state: AppState) -> None:
     state.option_chain_capture_task = asyncio.create_task(
         option_chain_capture_loop(state), name="option-chain-capture-loop"
     )
+    # ES session-anchored VWAP capture (direction/trend anchor for the post-FEF
+    # strategy). Independent best-effort task; gated by FEF_CAPTURE_ENABLED.
+    from fef_sidecar.loop import es_vwap_loop
+    state.es_vwap_task = asyncio.create_task(
+        es_vwap_loop(state), name="es-vwap-loop"
+    )
 
 
 async def cancel_data_loops(state: AppState) -> None:
