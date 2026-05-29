@@ -19,14 +19,20 @@ DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.json"
 
 
 class QuantDataConfig(BaseModel):
+    # auth_token now holds the official-API key (qd_...). The legacy
+    # instance_id/page_id/tools fields are no longer used by the client
+    # (kept optional for backward-compat with old config.json files).
     auth_token: str
-    instance_id: str
+    instance_id: str = ""
     page_id: str = ""
     tools: dict[str, str] = Field(default_factory=dict)
 
     @property
     def base_url(self) -> str:
-        return "https://core-lb-prod.quantdata.us/api"
+        # Official public API (Bearer qd_ key). Replaced the old reverse-
+        # engineered dashboard backend (core-lb-prod, JWT + instance_id),
+        # which QuantData revoked. See migration 2026-05-29.
+        return "https://api.quantdata.us/v1"
 
 
 def load_config(path: Path | None = None) -> QuantDataConfig:

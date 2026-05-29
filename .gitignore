@@ -61,6 +61,9 @@ __pycache__/
 *.pyc
 *.cpython-*.pyc
 
+# QuantData API probe output (raw market-data JSON dumps, regenerable)
+sidecar/scripts/maintenance/_qd_probe/
+
 # Throwaway DB-probe scripts + scratch analysis outputs (regenerable)
 scripts/research/_schema_probe*.py
 scripts/research/*_output.txt
