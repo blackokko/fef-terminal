@@ -360,7 +360,7 @@ async def refresh_es_vwap(ib: Any, duration: str = "1 D") -> int:
     from fef_sidecar.ibkr.live import _to_ib_contract
     from fef_sidecar.ibkr.models import Contract
     from fef_sidecar.db.engine import get_session
-    from fef_sidecar.db.models import EsVwapPoint
+    from fef_sidecar.db.models import EsVwapPoint, HistoricalBar
     from sqlmodel import select as _s
     from sqlalchemy.exc import IntegrityError
 
@@ -375,6 +375,10 @@ async def refresh_es_vwap(ib: Any, duration: str = "1 D") -> int:
     cum_pv: dict[str, float] = {}
     cum_v: dict[str, float] = {}
     rows: list[Any] = []
+    # Also store ES RTH OHLCV under a CLEAN key ('ES'/'1 min RTH') so the VWAP
+    # shadow can detect on the right (RTH-anchored) bars. The legacy 'ES'/'1 min'
+    # rows are the OVERNIGHT session and must not be used for RTH VWAP.
+    hist_rows: list[Any] = []
     for b in bars:
         try:
             ts_ms = int(b.date.timestamp() * 1000) if hasattr(b.date, "timestamp") else int(b.date * 1000)
@@ -390,6 +394,11 @@ async def refresh_es_vwap(ib: Any, duration: str = "1 D") -> int:
             timestamp_ms=ts_ms, session_date=sd, symbol="ES",
             close=float(b.close), bar_vwap=bar_vwap, bar_volume=vol,
             session_vwap=sess_vwap, cum_volume=cum_v[sd], source="live_loop",
+        ))
+        hist_rows.append(HistoricalBar(
+            symbol="ES", bar_size="1 min RTH", timestamp_ms=ts_ms,
+            open=float(b.open), high=float(b.high), low=float(b.low),
+            close=float(b.close), volume=vol,
         ))
 
     if not rows:
@@ -411,6 +420,24 @@ async def refresh_es_vwap(ib: Any, duration: str = "1 D") -> int:
                 await session.commit()
             except IntegrityError:
                 added = 0
+    # ES RTH OHLCV — separate best-effort idempotent upsert (unique on
+    # symbol+bar_size+timestamp_ms). Never fail the VWAP path on a bar dup.
+    try:
+        async with get_session() as session:
+            have = {
+                r.timestamp_ms for r in (await session.exec(
+                    _s(HistoricalBar).where(HistoricalBar.symbol == "ES")
+                    .where(HistoricalBar.bar_size == "1 min RTH")
+                )).all()
+            }
+            new_bars = [h for h in hist_rows if h.timestamp_ms not in have]
+            if new_bars:
+                session.add_all(new_bars)
+                await session.commit()
+    except IntegrityError:
+        pass
+    except Exception:
+        logger.exception("ES RTH OHLCV persist failed")
     return added
 
 

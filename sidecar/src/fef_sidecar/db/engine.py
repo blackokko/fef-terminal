@@ -241,6 +241,14 @@ async def init_db() -> None:
                 "ON es_vwap_point "
                 "(timestamp_ms, symbol)",
             ),
+            # shadow_forward_signal: one row per (signal, instant) — dedup
+            # re-scoring across runs.
+            (
+                "idx_shadow_fwd_signal_unique",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_fwd_signal_unique "
+                "ON shadow_forward_signal "
+                "(signal_name, timestamp_ms)",
+            ),
         ]
         for index_name, sql in index_migrations:
             try:

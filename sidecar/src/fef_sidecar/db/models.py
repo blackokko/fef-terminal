@@ -712,6 +712,39 @@ class EsVwapPoint(SQLModel, table=True):
     source: str = Field(default="live_loop", index=True)
 
 
+class ShadowForwardSignal(SQLModel, table=True):
+    """One forward-validation observation of a FROZEN signal candidate.
+
+    Phase 1 shadow (paper, zero capital). Each row is a detected signal + its
+    forward-walked outcome on a frozen definition. `in_sample` flags the
+    selection-era sessions (<= IN_SAMPLE_CUTOFF) vs forward out-of-sample data;
+    the methodology stack is run on the FORWARD-ONLY subset to confirm-or-kill
+    without curve-fitting. First candidate: vwap_loss_short (see
+    engine/signals/shadow_vwap_loss_short.py).
+
+    Idempotency: UNIQUE (signal_name, timestamp_ms) created by init_db.
+    """
+
+    __tablename__ = "shadow_forward_signal"
+
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    signal_name: str = Field(index=True)
+    definition_version: str = Field(index=True)
+    session_date: str = Field(index=True)
+    timestamp_ms: int = Field(index=True)
+    in_sample: bool = Field(default=False, index=True)
+
+    direction: str = "PUTS"
+    entry: float = 0.0
+    stop: float = 0.0
+    target: float = 0.0
+    rr: float = 0.0
+    r_outcome: float = 0.0   # net of friction, in risk units
+    win: float = 0.0
+    friction_pts: float = 0.0
+
+
 # ---------------------------------------------------------------------------
 # Audit log — every config change, override, kill switch
 # ---------------------------------------------------------------------------
