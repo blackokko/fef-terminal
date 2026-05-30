@@ -125,3 +125,82 @@ def score_session(es_rth_1m: list[Bar]) -> list[dict]:
             "friction_pts": FRICTION_PTS,
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Persistence + ledger integration (shared by the nightly chain and the manual
+# runner — single source of truth, no duplicated DB code).
+# ---------------------------------------------------------------------------
+
+VARIANT_ID = f"{SIGNAL_NAME}@{DEFINITION_VERSION}"
+
+
+async def load_es_rth_bars() -> list[Bar]:
+    """ES RTH 1-min bars from historical_bar ('ES'/'1 min RTH')."""
+    from sqlmodel import select
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import HistoricalBar
+    async with get_session() as s:
+        rows = (await s.exec(
+            select(HistoricalBar).where(HistoricalBar.symbol == "ES")
+            .where(HistoricalBar.bar_size == ES_BAR_SIZE)
+            .order_by(HistoricalBar.timestamp_ms)  # type: ignore[arg-type]
+        )).all()
+    return [Bar(ts_ms=r.timestamp_ms, open=r.open, high=r.high, low=r.low,
+                close=r.close, volume=r.volume) for r in rows]
+
+
+async def persist_outcomes(outcomes: list[dict]) -> int:
+    """Idempotent insert into shadow_forward_signal (unique signal+timestamp)."""
+    from sqlalchemy.exc import IntegrityError
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import ShadowForwardSignal
+    added = 0
+    for o in outcomes:
+        try:
+            async with get_session() as s:
+                s.add(ShadowForwardSignal(**o))
+                await s.flush()
+            added += 1
+        except IntegrityError:
+            continue
+    return added
+
+
+async def register_variant() -> None:
+    """Idempotent upsert into variant_ledger so this candidate counts toward the
+    project-wide honest N_trials (rather than a hardcoded number)."""
+    from sqlmodel import select
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import VariantLedger, _utcnow
+    async with get_session() as s:
+        existing = (await s.exec(
+            select(VariantLedger).where(VariantLedger.variant_id == VARIANT_ID)
+        )).first()
+        if existing is not None:
+            existing.last_seen_at = _utcnow()
+            s.add(existing)
+        else:
+            s.add(VariantLedger(
+                variant_id=VARIANT_ID, family="signal_source", sub_family="vwap",
+                description="vwap_loss_short directional-short forward shadow candidate",
+                hypothesis="VWAP loss from above = intraday distribution continuation (short).",
+                tested_in="forward_shadow", sample_window=f"{IN_SAMPLE_CUTOFF}.. (forward)",
+                outcome_summary="pending", still_active=True,
+                variant_params={"definition_hash": definition_hash(), "tf": TF,
+                                "exit": "atr_2to1", "friction_pts": FRICTION_PTS,
+                                "selected_from_cells": 8},
+            ))
+
+
+async def forward_n_trials() -> int:
+    """Honest N_trials = active variants in the ledger, floored at the 8-cell
+    selection penalty for this candidate (per the methodology review)."""
+    from sqlmodel import select
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import VariantLedger
+    async with get_session() as s:
+        n = len((await s.exec(
+            select(VariantLedger).where(VariantLedger.still_active == True)  # noqa: E712
+        )).all())
+    return max(8, n)

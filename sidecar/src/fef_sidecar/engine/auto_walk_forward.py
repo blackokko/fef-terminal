@@ -508,6 +508,20 @@ async def nightly_scheduler(state) -> None:
                 logger.info("Nightly: backfilled %d chain points via QuantData", n)
             except Exception:
                 logger.exception("Nightly: chain backfill failed")
+
+            # 9. vwap_loss_short forward-shadow scoring (Phase 1, paper). Scores
+            # the FROZEN candidate on today's ES RTH bars + persists to
+            # shadow_forward_signal; registers in variant_ledger for honest
+            # N_trials. Read-only on the engine. See engine/signals/
+            # shadow_vwap_loss_short.py.
+            try:
+                from fef_sidecar.engine.signals import shadow_vwap_loss_short as _svls
+                _bars = await _svls.load_es_rth_bars()
+                _added = await _svls.persist_outcomes(_svls.score_session(_bars))
+                await _svls.register_variant()
+                logger.info("Nightly: vwap_loss_short shadow +%d rows", _added)
+            except Exception:
+                logger.exception("Nightly: vwap_loss_short shadow failed")
         except asyncio.CancelledError:
             raise
         except Exception:
