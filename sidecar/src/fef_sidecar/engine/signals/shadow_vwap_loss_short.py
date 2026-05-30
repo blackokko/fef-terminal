@@ -26,6 +26,19 @@ from fef_sidecar.engine.signals import dale, vwap
 from fef_sidecar.engine.signals.dale import Bar
 
 # ---- FROZEN PARAMETERS ----
+# v2 (2026-05-30): tightened per the ChatGPT-5.5 realism review — resolves the
+# four spec ambiguities BEFORE forward data accrues (costless re-baseline):
+#   - ENTRY: next 1-min OPEN after the 5-min signal bar closes (no same-bar-close
+#     optimism; a 5-min close is not an executable fill price).
+#   - OVERLAP: one trade at a time — signals while a position is open are ignored
+#     (an extended move can't masquerade as several independent wins).
+#   - AMBIGUOUS BARS: adverse-first (both target & stop in one bar => STOP), not a
+#     Brownian-bridge proxy — the proxy is for exploration, not a validation gate.
+#   - STOP: max(1xATR, MIN_STOP_PTS) so friction/ATR stays bounded when ATR
+#     compresses (1xATR alone hit 3pt -> 1.5pt friction = 0.5R).
+# Realism re-baseline (in-sample, next-1m-open): n=12, 58.3% win, E[R] +0.49
+# (down from the optimistic +0.62; +0.23 at +60s latency, ~0 by +5min — execution
+# speed is load-bearing, which is why option-dollar validation is the next gate).
 SIGNAL_NAME = "vwap_loss_short"
 TF = 5
 HOLD_BARS = 1
@@ -33,17 +46,26 @@ REJECT_HOLD_BARS = 0
 ATR_PERIOD = 14
 ATR_STOP_MULT = 1.0
 ATR_TARGET_MULT = 2.0
+MIN_STOP_PTS = 4.0                 # floor on the ATR stop (friction-vs-compression guard)
+ENTRY = "next_1m_open"             # NOT same-bar close
+OVERLAP = "one_trade_at_a_time"
+AMBIGUOUS = "adverse_first"
 FRICTION_PTS = 1.5
 IN_SAMPLE_CUTOFF = "2026-05-29"   # sessions <= this are in-sample (selection); > is forward
 ES_BAR_SIZE = "1 min RTH"
 
-DEFINITION_VERSION = "v1-2026-05-29"
+DEFINITION_VERSION = "v2-2026-05-30"
+
+# Pre-registered evaluation checkpoints (avoid optional-stopping: evaluate the
+# frozen strategy ONCE at each, do not promote early on a temporarily good curve).
+CHECKPOINTS = {20: "collect-more-only", 40: "one-contract-pilot-eligible", 80: "scale-eligible"}
 
 
 def definition_hash() -> str:
     payload = "|".join(str(x) for x in (
         SIGNAL_NAME, TF, HOLD_BARS, REJECT_HOLD_BARS, ATR_PERIOD,
-        ATR_STOP_MULT, ATR_TARGET_MULT, FRICTION_PTS, ES_BAR_SIZE, DEFINITION_VERSION,
+        ATR_STOP_MULT, ATR_TARGET_MULT, MIN_STOP_PTS, ENTRY, OVERLAP, AMBIGUOUS,
+        FRICTION_PTS, ES_BAR_SIZE, DEFINITION_VERSION,
     ))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -65,63 +87,70 @@ def _et_date(ts_ms: int) -> str:
     return dt.datetime.fromtimestamp(ts_ms/1000, dt.timezone(dt.timedelta(hours=-4))).strftime("%Y-%m-%d")
 
 
-def _walk_prob(entry, target, stop, is_long, bars1m, close_time, horizon_session):
-    """Order-preserving forward walk -> P(target before stop). t1-prob proxy on
-    ambiguous bars; soft progress on timeout. (Frozen copy.)"""
-    ts = [b.ts_ms for b in bars1m]
-    si = bisect.bisect_left(ts, close_time)
+def _walk_short(entry, target, stop, bars1m, ts1, start_ts, horizon):
+    """Forward-walk a SHORT trade (target<entry<stop) on 1-min bars from start_ts.
+    ADVERSE-FIRST: if a bar touches both, the STOP wins (conservative). Returns
+    (realized_r_in_risk_units, exit_ms). Timeout = mark-to-last-close."""
+    i = bisect.bisect_left(ts1, start_ts)
+    risk = stop - entry
     last = None
-    for k in range(si, len(bars1m)):
+    for k in range(i, len(bars1m)):
         b = bars1m[k]
-        if _et_date(b.ts_ms) > horizon_session:
+        if _et_date(b.ts_ms) > horizon:
             break
         last = b
-        hit_t = (b.high >= target) if is_long else (b.low <= target)
-        hit_s = (b.low <= stop) if is_long else (b.high >= stop)
-        if hit_t and hit_s:
-            ds = abs(b.open - stop); dt_ = abs(b.open - target)
-            return ds / (ds + dt_) if (ds + dt_) > 0 else 0.5
-        if hit_t:
-            return 1.0
-        if hit_s:
-            return 0.0
+        if b.high >= stop:                 # adverse-first
+            return -1.0, b.ts_ms
+        if b.low <= target:
+            return (entry - target) / risk, b.ts_ms
     if last is None:
-        return None
-    prog = ((last.close - entry) if is_long else (entry - last.close)) / abs(target - entry)
-    return max(0.0, min(1.0, 0.5 + 0.5 * prog))
+        return None, None
+    return (entry - last.close) / risk, last.ts_ms
 
 
 def score_session(es_rth_1m: list[Bar]) -> list[dict]:
-    """Detect + score all vwap_loss_short signals present in the given ES RTH
-    1-min bars (may span multiple sessions). Returns one dict per signal."""
+    """Detect + score vwap_loss_short on ES RTH 1-min bars (may span sessions),
+    under the v2 frozen spec: next-1m-OPEN entry, ONE-TRADE-AT-A-TIME, adverse-
+    first, ATR stop floored at MIN_STOP_PTS. One dict per TAKEN signal."""
     es5 = dale.resample(es_rth_1m, TF)
     atr = _atr(es5)
     imap = {b.ts_ms: i for i, b in enumerate(es5)}
-    sigs = [s for s in vwap.detect(es5, timeframe_min=TF, hold_bars=HOLD_BARS,
-                                   reject_hold_bars=REJECT_HOLD_BARS)
-            if s.kind == SIGNAL_NAME]
+    ts1 = [b.ts_ms for b in es_rth_1m]
+    sigs = sorted(
+        (s for s in vwap.detect(es5, timeframe_min=TF, hold_bars=HOLD_BARS,
+                                 reject_hold_bars=REJECT_HOLD_BARS) if s.kind == SIGNAL_NAME),
+        key=lambda s: s.ts_ms,
+    )
     out: list[dict] = []
+    busy_until = 0  # one-trade-at-a-time gate (ms)
     for s in sigs:
         i = imap.get(s.ts_ms)
         a = atr[i] if i is not None else None
         if a is None or a <= 0:
             continue
-        entry = s.price              # short (PUTS)
-        stop = entry + ATR_STOP_MULT * a
+        # realistic entry: open of the first 1-min bar at/after the 5-min close
+        ei = bisect.bisect_left(ts1, s.ts_ms + TF * 60_000)
+        if ei >= len(es_rth_1m):
+            continue
+        entry_ts = ts1[ei]
+        if entry_ts < busy_until:          # position still open -> ignore
+            continue
+        entry = es_rth_1m[ei].open
+        risk = max(ATR_STOP_MULT * a, MIN_STOP_PTS)
+        stop = entry + risk                # short
         target = entry - ATR_TARGET_MULT * a
         sd = _et_date(s.ts_ms)
-        p = _walk_prob(entry, target, stop, False, es_rth_1m, s.ts_ms + TF * 60_000, sd)
-        if p is None:
+        r, exit_ms = _walk_short(entry, target, stop, es_rth_1m, ts1, entry_ts, sd)
+        if r is None:
             continue
-        risk = abs(entry - stop)
-        rr = abs(target - entry) / risk
-        r = p * rr + (1 - p) * (-1.0) - FRICTION_PTS / risk
+        busy_until = exit_ms or busy_until
+        r -= FRICTION_PTS / risk
         out.append({
             "signal_name": SIGNAL_NAME, "definition_version": DEFINITION_VERSION,
             "session_date": sd, "timestamp_ms": s.ts_ms,
             "in_sample": sd <= IN_SAMPLE_CUTOFF,
             "direction": "PUTS", "entry": entry, "stop": stop, "target": target,
-            "rr": rr, "r_outcome": r, "win": 1.0 if r > 0 else 0.0,
+            "rr": (entry - target) / risk, "r_outcome": r, "win": 1.0 if r > 0 else 0.0,
             "friction_pts": FRICTION_PTS,
         })
     return out

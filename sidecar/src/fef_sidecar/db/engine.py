@@ -241,13 +241,18 @@ async def init_db() -> None:
                 "ON es_vwap_point "
                 "(timestamp_ms, symbol)",
             ),
-            # shadow_forward_signal: one row per (signal, instant) — dedup
-            # re-scoring across runs.
+            # shadow_forward_signal: one row per (signal, FROZEN version, instant)
+            # — include definition_version so re-frozen specs (v1, v2, ...) coexist
+            # for audit instead of colliding. Drops the old version-less index.
             (
-                "idx_shadow_fwd_signal_unique",
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_fwd_signal_unique "
+                "drop_old_shadow_fwd_idx",
+                "DROP INDEX IF EXISTS idx_shadow_fwd_signal_unique",
+            ),
+            (
+                "idx_shadow_fwd_signal_uniq2",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_fwd_signal_uniq2 "
                 "ON shadow_forward_signal "
-                "(signal_name, timestamp_ms)",
+                "(signal_name, definition_version, timestamp_ms)",
             ),
         ]
         for index_name, sql in index_migrations:
