@@ -745,6 +745,46 @@ class ShadowForwardSignal(SQLModel, table=True):
     friction_pts: float = 0.0
 
 
+class OptionQuoteHistory(SQLModel, table=True):
+    """Historical option NBBO bid/ask, ingested from ThetaData (Options Standard).
+
+    The MISSING DATA ASSET (2026-06-29): real historical SPXW 0DTE option bid/ask
+    at intraday resolution. This is what lets us validate any signal in OPTION
+    DOLLARS (not just SPX points) and backtest theta-positive credit spreads on
+    years of data instead of waiting months for forward sessions. Pulled from the
+    local Theta Terminal REST API (/v3/option/history/quote) — see
+    scripts/maintenance/ingest_thetadata_quotes.py.
+
+    One row per (symbol, expiry, strike, right, timestamp). `quote_quality` flags
+    crossed/locked/stale quotes (ThetaData has known 0DTE gaps/inconsistencies).
+
+    Idempotency: UNIQUE (symbol, expiry, strike, right, timestamp_ms) via init_db.
+    """
+
+    __tablename__ = "option_quote_history"
+
+    id: int | None = Field(default=None, primary_key=True)
+    ingested_at: datetime = Field(default_factory=_utcnow, index=True)
+    symbol: str = Field(default="SPXW", index=True)      # option root
+    session_date: str = Field(index=True)                # YYYY-MM-DD ET (= expiry for 0DTE)
+    expiry: str = Field(index=True)                       # YYYYMMDD
+    strike: float = Field(index=True)
+    right: str = Field(index=True)                        # "C" / "P"
+    timestamp_ms: int = Field(index=True)                # UTC ms of the quote
+
+    bid: float = 0.0
+    ask: float = 0.0
+    bid_size: int = 0
+    ask_size: int = 0
+    bid_exchange: str | None = None
+    ask_exchange: str | None = None
+
+    # 'ok' / 'crossed' (bid>ask) / 'locked' (bid==ask) / 'zero' / 'wide'
+    quote_quality: str = Field(default="ok", index=True)
+    interval: str = "1s"                                 # ThetaData interval used
+    source: str = Field(default="thetadata", index=True)
+
+
 # ---------------------------------------------------------------------------
 # Audit log — every config change, override, kill switch
 # ---------------------------------------------------------------------------

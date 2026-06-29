@@ -254,6 +254,14 @@ async def init_db() -> None:
                 "ON shadow_forward_signal "
                 "(signal_name, definition_version, timestamp_ms)",
             ),
+            # option_quote_history: one NBBO row per (contract, instant) — dedup
+            # re-ingests of the same ThetaData pull.
+            (
+                "idx_option_quote_hist_unique",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_option_quote_hist_unique "
+                "ON option_quote_history "
+                "(symbol, expiry, strike, right, timestamp_ms)",
+            ),
         ]
         for index_name, sql in index_migrations:
             try:
