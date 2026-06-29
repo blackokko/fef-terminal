@@ -259,11 +259,22 @@ async def probe(date: str) -> None:
 
 
 async def ingest_dates(dates: list[str], interval: str = INTERVAL) -> None:
+    import os
+    import sqlite3
     from fef_sidecar.db.engine import init_db
     await init_db()
+    # resume cheaply: skip sessions already fully ingested (per-day inserts are
+    # atomic, so "has any rows" == "done"). Re-run is then ~free after a crash.
+    dbp = os.path.expanduser("~/.fef-terminal/signal_log.db")
+    _c = sqlite3.connect(dbp)
+    done = {r[0] for r in _c.execute("SELECT DISTINCT session_date FROM option_quote_history")}
+    _c.close()
     total = 0
     async with httpx.AsyncClient() as c:
         for date in dates:
+            sd = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+            if sd in done:
+                continue                       # already ingested
             code, raw = 0, ""
             for attempt in range(3):           # retry transient errors / rate limits
                 try:
