@@ -130,6 +130,10 @@ class FEFVerdict:
     wall_collapse_trigger: bool = False
     nearest_wall_strike: float | None = None
     nearest_wall_distance: float | None = None
+    # Which family the nearest wall came from ('GEX' / 'DEX'). Added with the
+    # 2026-07-02 per-family proximity fix (GEX and DEX magnitudes are on
+    # incomparable scales, so 'dominant' is ranked within-family only).
+    nearest_wall_family: str | None = None
 
     # Secondary 6-factor scorer (informational)
     secondary_scores: dict[str, float] = field(default_factory=dict)
@@ -146,6 +150,7 @@ class FEFVerdict:
             "wall_collapse_trigger": self.wall_collapse_trigger,
             "nearest_wall_strike": self.nearest_wall_strike,
             "nearest_wall_distance": self.nearest_wall_distance,
+            "nearest_wall_family": self.nearest_wall_family,
             "secondary_scores": self.secondary_scores,
             "strike_rec": self.strike_rec,
             "suggested_qty": self.suggested_qty,

@@ -895,6 +895,16 @@ class LiveOrder(SQLModel, table=True):
     spx_target_t1_at_spx: float | None = None  # spot when T1 fired (for retrace)
     spx_target_t2_at_spx: float | None = None  # spot when T2 fired (audit truth)
     spx_target_t3_at_spx: float | None = None  # spot when T3 fired (audit truth)
+    # Dollar P&L targets stored on the PARENT order when exit_strategy='fixed_dollar'.
+    # The watcher fires staged market sells as the position's live open P&L crosses
+    # each target, and a market sell-all when the open loss reaches dollar_target_stop.
+    # Tier quantities + fired flags reuse the spx_target_*_qty / *_fired fields above
+    # (they are generic staged-exit bookkeeping, not SPX-specific). NULL for other
+    # strategies.
+    dollar_target_t1: float | None = None
+    dollar_target_t2: float | None = None
+    dollar_target_t3: float | None = None
+    dollar_target_stop: float | None = None   # negative $ (e.g. -500.0)
     # Spread metadata when exit_strategy='spread_premium'
     spread_kind: str | None = None       # 'PCS' or 'CCS'
     spread_short_strike: float | None = None
@@ -1142,6 +1152,12 @@ class ShadowExitOutcome(SQLModel, table=True):
     # yet computed or position still open.
     actual_realized_pnl: float | None = None
     actual_realized_r: float | None = None
+
+    # Row usability (2026-07-06): 'ok' rows carry a real shadow-$ compute;
+    # 'unusable_premium_gap' / 'unusable_no_entry_premium' rows could not
+    # establish premiums (even via the ±2-min captured-quote rescue) and are
+    # EXPLICITLY excluded from $ aggregates instead of contributing $0.
+    status: str = Field(default="ok", index=True)
 
     __table_args__ = (
         UniqueConstraint("parent_order_id", "variant_label",

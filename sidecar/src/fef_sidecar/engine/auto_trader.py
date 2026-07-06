@@ -52,6 +52,7 @@ class BlockReason:
     NO_STRIKE = "NO_STRIKE"
     PLACE_ERROR = "PLACE_ERROR"
     DUPLICATE_PARENT = "DUPLICATE_PARENT"
+    PHASE_DISAGREE = "PHASE_DISAGREE"
     FIRED = "FIRED"
     # Non-auto-trader codes for other gate paths — used so all block-style
     # audit_log rows carry a structured tag for aggregation.
@@ -66,7 +67,17 @@ class BlockReason:
 
 def _verdict_trigger_type(v: dict) -> str:
     """Map a verdict's boolean flags to a named trigger category.
-    Same logic used by daily_review's by_trigger aggregation."""
+    Same logic used by daily_review's by_trigger aggregation.
+
+    A verdict may carry an EXPLICIT trigger_type (pattern-trigger fires set
+    'flag_bull' / 'flag_bear' / 'pattern_bull' / 'pattern_bear'); that wins.
+    FEF engine verdicts never set the key, so their behavior is unchanged.
+    New trigger types are NOT in the default enabled list — pattern fires
+    stay blocked (TRIGGER_NOT_ENABLED) until the user applies a preset that
+    enables them."""
+    explicit = v.get("trigger_type")
+    if isinstance(explicit, str) and explicit:
+        return explicit
     aligned = bool(v.get("aligned"))
     wall = bool(v.get("wall_collapse_trigger"))
     if wall and aligned: return "confluence"
@@ -83,20 +94,52 @@ class AutoTradeDecision:
     order_result: dict | None = None
 
 
-async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = None) -> AutoTradeDecision:
+async def maybe_auto_trade(
+    state, verdict_dict: dict, *, symbol: str | None = None,
+    source: str = "auto_main",
+) -> AutoTradeDecision:
     """Evaluate gates + maybe place a bracket order.
 
     verdict_dict: the verdict from _run_one_iter (with direction, confidence,
     strike_rec, option_pricing, suggested_qty, t1/t2/t3/stop).
 
     symbol: optional override. When provided (from multi-symbol scanner),
-    counters check both the GLOBAL session cap AND the per-symbol sub-cap."""
+    counters check both the GLOBAL session cap AND the per-symbol sub-cap.
+
+    source: which signal path is asking — 'auto_main' (fef_tick_loop),
+    'auto_scanner' (multi-symbol scanner), 'auto_pattern' (pattern trigger).
+    Passed through to place_bracket for end-to-end trade attribution.
+    NOTE: cool-down + session caps are PER-SYMBOL and shared ACROSS sources —
+    a pattern fire can be cool-down-blocked by a recent scanner fire on the
+    same symbol (and vice versa). That is intentional risk throttling.
+
+    Serialized per symbol via an asyncio.Lock: two near-simultaneous calls
+    (e.g. scanner + tick-loop, or a scanner retry racing itself — the 7/1
+    twin QQQ 720P parents 16ms apart) can no longer both pass the cool-down
+    /cap/duplicate-parent gates before either records its fire."""
 
     sym = (symbol or state.active_symbol).upper()
 
     # Gate 1: toggle
     if not state.auto_trade_enabled:
         return AutoTradeDecision(False, "auto_trade disabled", BlockReason.DISABLED)
+
+    # Per-symbol firing lock (see docstring). Cheap gates run inside it too —
+    # simpler and this path is low-frequency. Locks live on state so all
+    # callers (main loop / scanner / pattern trigger) share them.
+    import asyncio as _asyncio
+    locks = getattr(state, "auto_trade_symbol_locks", None)
+    if locks is None:
+        locks = {}
+        state.auto_trade_symbol_locks = locks  # type: ignore[attr-defined]
+    lock = locks.setdefault(sym, _asyncio.Lock())
+    async with lock:
+        return await _maybe_auto_trade_locked(state, verdict_dict, sym, source)
+
+
+async def _maybe_auto_trade_locked(
+    state, verdict_dict: dict, sym: str, source: str,
+) -> AutoTradeDecision:
 
     # Gate 2: live trading env
     from fef_sidecar.engine.live_trading import is_live_trading_enabled
@@ -107,6 +150,29 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     direction = verdict_dict.get("direction", "WAIT")
     if direction not in ("LONG_CALLS", "LONG_PUTS"):
         return AutoTradeDecision(False, f"verdict is {direction}", BlockReason.VERDICT_WAIT)
+
+    # Gate 3b: phase detector (RIDE/FADE/WAIT direction refiner). SPX-only —
+    # the live detector is fed on SPX in the 15s poll loop (see loop.py). Modes:
+    #   'off'/'advisory' → no gating (advisory just logs its verdict).
+    #   'active'         → VETO when a FRESH, actionable phase verdict DISAGREES
+    #                      with the engine's direction. Stops wrong-way entries
+    #                      (e.g. buying PUTS into an exhausting dump — the losing
+    #                      side per the PUT-T1=1.9% finding). Fail-OPEN when the
+    #                      phase is WAIT/stale/missing so a broken feed can't
+    #                      silently disable auto-trade. Direction *flipping* (to
+    #                      also capture the fade) is a later, validated increment.
+    if getattr(state, "phase_mode", "off") == "active" and sym == "SPX":
+        pv = getattr(state, "phase_last_verdict", None)
+        if pv and pv.get("actionable"):
+            phase_age_ms = int(time.time() * 1000) - int(pv.get("ts_ms", 0) or 0)
+            if 0 <= phase_age_ms <= 90_000:
+                phase_dir = pv.get("direction")
+                if phase_dir and phase_dir != direction:
+                    return AutoTradeDecision(
+                        False,
+                        f"phase {pv.get('state')}/{phase_dir} disagrees with {direction}",
+                        BlockReason.PHASE_DISAGREE,
+                    )
 
     # Gate 3.5: trigger type must be enabled in state.auto_trade_trigger_types.
     # Replaces the confidence_floor as the primary volume knob — today's data
@@ -210,13 +276,13 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     if t1_qty + t2_qty + t3_qty != qty:
         t1_qty = qty - t2_qty - t3_qty
 
-    # Auto-trade picks exit strategy by qty (not the user's panel setting).
-    # fixed_dollar needs enough contracts to make the per-contract $ math
-    # sensible (e.g. $1000/qty/100 has to be a reasonable option-price
-    # delta). Below 15 contracts, fall back to spx_points which doesn't
-    # care about per-contract sizing. The manual Send-to-IBKR button
-    # still honors state.exit_strategy_long for user discretion.
-    strategy = "fixed_dollar" if qty >= 15 else "spx_points"
+    # Honor the operator's chosen exit strategy at ANY size (freeze lifted 2026-06-30).
+    # The old qty>=15 gate silently forced spx_points below 15 contracts, overriding
+    # the panel -> the fixed-dollar profit exits never armed at live size (2-5 ct), so
+    # gains were given back. The fixed_dollar $ targets are position-level and scale
+    # per-contract, so they work fine at small qty (esp. now that strikes are near-ATM
+    # with real delta). Falls back to spx_points only if nothing is set.
+    strategy = getattr(state, "exit_strategy_long", None) or "spx_points"
 
     spx_t1 = verdict_dict.get("t1")
     spx_t2 = verdict_dict.get("t2")
@@ -226,26 +292,68 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
     trade_symbol = sym
 
     if strategy == "fixed_dollar":
-        delta = abs(opt.get("delta") or 0.40)
-        per_contract_dollar = lambda d: d / max(1, qty) / 100.0
-        t1_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t1) / max(abs(delta), 0.05)
-        t2_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t2) / max(abs(delta), 0.05)
-        t3_opt = float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_t3) / max(abs(delta), 0.05)
-        stop_opt = max(0.05, float(opt["entry_limit"]) + per_contract_dollar(state.exit_dollar_stop) / max(abs(delta), 0.05))
+        # WATCHER-MANAGED fixed_dollar (2026-06-30): pass the operator's $ targets
+        # straight through to the watcher, which fires staged market sells as live
+        # open P&L crosses each level. The old code translated $ → option-price
+        # bracket children via `/ max(abs(delta), 0.05)`, which divided by the
+        # option delta and turned a -$500 stop into a ~$1.35 (-$1640) stop. No
+        # translation now — the watcher reads the $ targets directly, so there is
+        # nothing to mis-scale. t1/t2/t3/stop option-limits are unused for this
+        # strategy (parent-only placement) and left at entry as harmless filler.
+        d_t1 = float(state.exit_dollar_t1)
+        d_t2 = float(state.exit_dollar_t2)
+        d_t3 = float(state.exit_dollar_t3)
+        d_stop = float(state.exit_dollar_stop)
+        # PER-SYMBOL $-EXIT SCALING (2026-07-02): the operator's $ targets are
+        # calibrated on SPX-class notional. Applied raw to an ETF-class symbol
+        # they're unreachable — $300 T1 on a 3-lot SPY = +$1.00/ct premium =
+        # +50% on a ~$2 option ≈ 15-20 SPX-equivalent points (live exhibit:
+        # today's SPY 743C — profitable, couldn't bank). Scale all four by the
+        # SAME notional ratio the strike fix uses (_price_scale: spot/7500
+        # below 2000; SPX-class pins to 1.0 → SPX behavior BIT-IDENTICAL).
+        # Whole dollars, $10 minimum magnitude, sign preserved. Hot-read via
+        # UIConfig.etf_dollar_exit_scaling; the entry audit line already
+        # prints the ladder so the scaled numbers are visible per trade.
+        try:
+            from fef_sidecar.config_store import load_config as _load_cfg
+            _etf_scaling = bool(_load_cfg().etf_dollar_exit_scaling)
+        except Exception:
+            logger.exception("etf_dollar_exit_scaling config read failed — defaulting ON")
+            _etf_scaling = True
+        if _etf_scaling:
+            import math as _math_ds
+            from fef_sidecar.engine.strikes import _price_scale
+            _spot_ref = float(opt.get("underlying_price_at_quote") or 0) or float(strike)
+            _scale = _price_scale(_spot_ref)
+            if _scale != 1.0:
+                def _scale_d(x: float) -> float:
+                    return _math_ds.copysign(max(10.0, abs(round(x * _scale))), x)
+                d_t1, d_t2, d_t3, d_stop = (
+                    _scale_d(d_t1), _scale_d(d_t2), _scale_d(d_t3), _scale_d(d_stop)
+                )
+                logger.info(
+                    "fixed_dollar $ targets scaled for %s (ref %.2f, scale %.4f): "
+                    "T1/T2/T3/STOP=%s/%s/%s/%s",
+                    sym, _spot_ref, _scale, d_t1, d_t2, d_t3, d_stop,
+                )
         spec = BracketSpec(
             symbol=trade_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
             expiry=today, qty=qty,
             entry_limit=float(opt["entry_limit"]),
-            t1_limit=round(t1_opt, 2), t2_limit=round(t2_opt, 2),
-            t3_limit=round(t3_opt, 2), stop_limit=round(stop_opt, 2),
+            t1_limit=float(opt["entry_limit"]), t2_limit=float(opt["entry_limit"]),
+            t3_limit=float(opt["entry_limit"]), stop_limit=float(opt["entry_limit"]),
             t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
             exit_strategy="fixed_dollar",
-            dollar_loss_cap=-3000.0,
+            d_t1=d_t1, d_t2=d_t2,
+            d_t3=d_t3, d_stop=d_stop,
+            dollar_loss_cap=-abs(float(os.environ.get("FEF_DOLLAR_LOSS_CAP", "1800"))),
             use_market_entry=True,
         )
     elif strategy == "spx_points":
-        # Auto-trade default: market-order entry + -$3000 dollar loss cap +
+        # Auto-trade default: market-order entry + catastrophic dollar loss cap
+        # (FEF_DOLLAR_LOSS_CAP, default -$1800 per user decision 2026-07-06 —
+        # sits beyond the -10pt ladder stop, binds only on gap disasters) +
         # BE ladder (initialized via entry_spx_price captured from state).
         spec = BracketSpec(
             symbol=trade_symbol, strike=float(strike),
@@ -258,7 +366,7 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
             exit_strategy="spx_points",
             spx_t1=spx_t1, spx_t2=spx_t2, spx_t3=spx_t3, spx_stop=spx_stop,
             entry_spx_price=state.last_spx_price,
-            dollar_loss_cap=-3000.0,
+            dollar_loss_cap=-abs(float(os.environ.get("FEF_DOLLAR_LOSS_CAP", "1800"))),
             use_market_entry=True,
         )
     else:  # 'option_price' (legacy default)
@@ -271,7 +379,7 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
             t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
             t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
             exit_strategy="option_price",
-            dollar_loss_cap=-3000.0,
+            dollar_loss_cap=-abs(float(os.environ.get("FEF_DOLLAR_LOSS_CAP", "1800"))),
             use_market_entry=True,
         )
 
@@ -304,7 +412,8 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
                     f"BLOCKED {direction}: already have active parent at "
                     f"{sym} {strike}{_right_dup} (parent_id={_existing_dup[0].id})"
                 ),
-                details={"block_reason_code": BlockReason.DUPLICATE_PARENT},
+                details={"block_reason_code": BlockReason.DUPLICATE_PARENT,
+                         "source": source},
                 block_reason_code=BlockReason.DUPLICATE_PARENT,
             )
             return AutoTradeDecision(
@@ -321,7 +430,20 @@ async def maybe_auto_trade(state, verdict_dict: dict, *, symbol: str | None = No
         logger.exception("Auto-trade duplicate-parent guard failed; proceeding")
 
     try:
-        result = await place_bracket(state.ibkr, spec, confirm=True)
+        result = await place_bracket(
+            state.ibkr, spec, confirm=True,
+            # Attribution: auto-trader orders must be distinguishable from
+            # manual tickets in the audit log (actor='system' + AUTO-TRADE
+            # prefix + details.source) — see place_bracket docstring.
+            source=source,
+            signal_ref={
+                "direction": direction,
+                "confidence": conf,
+                "trigger_type": trigger_type,
+                "strike_rec": strike,
+                "reasoning": (verdict_dict.get("reasoning") or "")[:200],
+            },
+        )
     except Exception as e:
         logger.exception("Auto-trade place_bracket failed")
         return AutoTradeDecision(False, f"place_bracket error: {e}", BlockReason.PLACE_ERROR)

@@ -280,13 +280,23 @@ class LiveIBKRProvider:
 
         queue: asyncio.Queue[Bar] = asyncio.Queue()
 
-        for b in bars:
+        # Initial load: enqueue COMPLETED bars only. bars[-1] is the
+        # in-progress bar (keepUpToDate) — persisting it now would freeze its
+        # partial OHLC in historical_bar (write_bar no-ops on duplicate
+        # timestamps, so the row would never get the final values).
+        for b in bars[:-1]:
             await queue.put(_bar_from_ib(b))
 
         def _on_update(bar_list, has_new_bar: bool) -> None:
-            if not has_new_bar or not bar_list:
+            # has_new_bar fires when a NEW bar is appended; at that moment
+            # bar_list[-1] is the newborn bar (open == first tick) and
+            # bar_list[-2] is the just-COMPLETED bar in its final state.
+            # Emit the completed one so downstream persistence stores real
+            # OHLC. (Previously this emitted bar_list[-1] — every live-
+            # captured row was a first-tick snapshot of the bar.)
+            if not has_new_bar or len(bar_list) < 2:
                 return
-            queue.put_nowait(_bar_from_ib(bar_list[-1]))
+            queue.put_nowait(_bar_from_ib(bar_list[-2]))
 
         bars.updateEvent += _on_update
 

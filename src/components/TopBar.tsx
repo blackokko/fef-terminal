@@ -95,45 +95,6 @@ function TodayPnLPill({ ibkrDailyPnl }: { ibkrDailyPnl: number | null | undefine
   );
 }
 
-function FreezePill() {
-  const [sessions, setSessions] = useState<number | null>(null);
-  const [target, setTarget] = useState<number>(10);
-  const [lastChange, setLastChange] = useState<string | null>(null);
-
-  useEffect(() => {
-    const refresh = async () => {
-      try {
-        const r = await fetch("http://127.0.0.1:8765/engine/freeze_state");
-        if (!r.ok) return;
-        const data = await r.json();
-        setSessions(data.sessions_since_change ?? 0);
-        setTarget(data.target ?? 10);
-        setLastChange(data.last_change ?? null);
-      } catch {}
-    };
-    void refresh();
-    const id = window.setInterval(refresh, 60000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  if (sessions === null) return null;
-  const reached = sessions >= target;
-  const bg = reached ? "var(--color-green)" : sessions >= target * 0.6 ? "var(--color-amber)"
-                                                                       : "var(--color-red)";
-  return (
-    <span title={`Sessions since last engine change. Reviewer recommends 10+ between changes to avoid curve-fitting. Last change: ${lastChange ?? "—"}`}
-          style={{
-            display: "inline-block", padding: "2px 8px", marginLeft: 6,
-            borderRadius: 3, fontSize: 10, fontWeight: 700,
-            fontFamily: "var(--font-mono)",
-            background: bg,
-            color: reached ? "white" : (sessions >= target * 0.6 ? "var(--color-bg)" : "white"),
-          }}>
-      FREEZE {sessions}/{target}
-    </span>
-  );
-}
-
 type Screen = "trading" | "research" | "settings";
 
 interface TopBarProps {
@@ -226,7 +187,6 @@ export function TopBar({ screen = "trading", onScreenChange }: TopBarProps = {})
             : "—"}
         </span>
         <ModelStatePill />
-        <FreezePill />
       </div>
 
       <div className="topbar-section">

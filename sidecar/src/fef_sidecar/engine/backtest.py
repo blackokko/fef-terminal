@@ -7,7 +7,9 @@ distribution.
 
 Statistical add-ons:
 - Wilson score binomial confidence interval on win rate (95%)
-- Sharpe ratio on per-trade returns (annualized assuming ~252 trading days)
+- Sharpe ratio on per-trade returns (per-trade, NOT annualized — see
+  _sharpe_per_trade; annualizing per-trade $ by √252 is dimensionally wrong,
+  matching the sibling optimization._sharpe convention)
 - Max drawdown on the cumulative P/L curve
 - T-test vs zero (is win rate statistically different from coinflip?)
 """
@@ -51,7 +53,7 @@ class BacktestResult:
     best_trade: float = 0.0
     worst_trade: float = 0.0
     max_drawdown: float = 0.0
-    sharpe_ratio: float | None = None   # annualized, None if insufficient samples
+    sharpe_ratio: float | None = None   # per-trade mean/std, None if insufficient samples
     t_stat_vs_zero: float | None = None  # t-statistic for mean_pnl ≠ 0
 
     # Time series (for chart)
@@ -87,8 +89,13 @@ def _max_drawdown(curve: list[float]) -> float:
     return max_dd
 
 
-def _sharpe_annualized(returns: list[float], periods_per_year: int = 252) -> float | None:
-    """Daily Sharpe annualized. None if insufficient samples or zero stdev."""
+def _sharpe_per_trade(returns: list[float]) -> float | None:
+    """Per-trade Sharpe = mean(return) / std(return). None if insufficient
+    samples or zero stdev.
+
+    NOT annualized: these are per-trade P/L, not daily returns, so the old
+    ×√252 factor was dimensionally wrong (it inflated the ratio ~16×). Ranking
+    is preserved without it, and this matches optimization._sharpe."""
     n = len(returns)
     if n < 5:
         return None
@@ -97,7 +104,7 @@ def _sharpe_annualized(returns: list[float], periods_per_year: int = 252) -> flo
     if variance <= 0:
         return None
     std = math.sqrt(variance)
-    return round((mean / std) * math.sqrt(periods_per_year), 2)
+    return round(mean / std, 2)
 
 
 def _t_stat(returns: list[float]) -> float | None:
@@ -161,7 +168,7 @@ def aggregate_backtest(
         })
     result.cumulative_pnl_curve = curve_points
     result.max_drawdown = round(_max_drawdown([p["cumulative_pnl"] for p in curve_points]), 2)
-    result.sharpe_ratio = _sharpe_annualized(pnls)
+    result.sharpe_ratio = _sharpe_per_trade(pnls)
     result.t_stat_vs_zero = _t_stat(pnls)
 
     return result

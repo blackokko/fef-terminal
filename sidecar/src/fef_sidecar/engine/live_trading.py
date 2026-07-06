@@ -94,6 +94,15 @@ class BracketSpec:
     spx_t2: float | None = None
     spx_t3: float | None = None
     spx_stop: float | None = None
+    # Dollar P&L targets (when exit_strategy='fixed_dollar'). The watcher fires
+    # staged market sells as live open P&L crosses each target, and sells all
+    # remaining when open loss reaches d_stop (negative $). No IBKR option-price
+    # children are placed for fixed_dollar — the watcher manages it in $ terms,
+    # exactly as it does spx_points in point terms.
+    d_t1: float | None = None
+    d_t2: float | None = None
+    d_t3: float | None = None
+    d_stop: float | None = None
     # Spot SPX at the moment auto-trade fired — needed for MFE / R calculations
     # in the spx_target_watcher's BE ladder. None disables the ladder.
     entry_spx_price: float | None = None
@@ -129,11 +138,22 @@ async def place_bracket(
     *,
     confirm: bool = False,
     ticket_id: int | None = None,
+    source: str = "manual_ticket",
+    signal_ref: dict | None = None,
 ) -> dict:
     """Submit a bracket order: parent BUY + 3 limit SELL children + stop SELL.
 
     Returns dict with order IDs + status. If FEF_LIVE_TRADING is false OR
     confirm is false, returns dry-run records without hitting IBKR.
+
+    source: who initiated this order — 'manual_ticket' (UI Send-to-IBKR),
+    'auto_main' (fef_tick_loop), 'auto_scanner' (multi-symbol scanner) or
+    'auto_pattern' (pattern trigger). Drives audit attribution: auto orders
+    log with actor='system' + an 'AUTO-TRADE[<source>]' summary prefix and
+    details.source, and the LiveOrder parent notes carry 'source=<source>;'
+    — so auto-vs-manual AND scanner-vs-pattern are unambiguous from the
+    audit trail (previously everything logged actor='user').
+    signal_ref: optional verdict/trigger context stamped into audit details.
 
     Bracket structure used (IBKR-compatible):
       parent     LMT BUY  qty @ entry_limit
@@ -147,6 +167,13 @@ async def place_bracket(
 
     live = is_live_trading_enabled() and confirm and isinstance(ibkr, LiveIBKRProvider)
     dry_run = not live
+    # Any non-manual source is an auto fire. Known sources: 'manual_ticket',
+    # 'auto_main' (fef_tick_loop), 'auto_scanner' (multi-symbol scanner),
+    # 'auto_pattern' (pattern trigger). The prefix carries the exact source
+    # so per-source P&L attribution is a plain LIKE query on audit/order rows.
+    is_auto = source != "manual_ticket"
+    audit_actor = "system" if is_auto else "user"
+    audit_prefix = f"AUTO-TRADE[{source}] " if is_auto else ""
 
     # SAFETY GATE: when FEF_REQUIRE_PAPER_ACCOUNT=true (default), refuse to
     # submit live orders to a non-paper account. Catches the case where TWS
@@ -177,8 +204,15 @@ async def place_bracket(
     # migration to add proper fields is in DEFERRED_CHANGES.
     _acct_class = getattr(ibkr, "account_class", "unknown") or "unknown"
     _acct_id = getattr(ibkr, "account_id", "") or ""
-    _acct_tag = f"account_class={_acct_class}; account_id={_acct_id};"
+    _acct_tag = f"account_class={_acct_class}; account_id={_acct_id}; source={source};"
 
+    # Watcher-managed strategies (spx_points + fixed_dollar) place ONLY the
+    # parent BUY; the watcher fires staged market sells from the targets stored
+    # on this row (SPX-cross for spx_points, live $ P&L for fixed_dollar). Tier
+    # quantities + fired flags reuse the spx_target_*_qty / *_fired columns for
+    # both. fixed_dollar deliberately stores NO option-price children — that
+    # removes the fragile $→option-price translation (the -$500→$1.35-stop bug).
+    _watcher_managed = spec.exit_strategy in ("spx_points", "fixed_dollar")
     parent = LiveOrder(
         ticket_id=ticket_id, symbol=spec.symbol, strike=spec.strike,
         right=spec.right, expiry=spec.expiry, action="BUY", qty=spec.qty,
@@ -188,31 +222,58 @@ async def place_bracket(
         exit_strategy=spec.exit_strategy,
         spx_target_t1=spec.spx_t1, spx_target_t2=spec.spx_t2,
         spx_target_t3=spec.spx_t3, spx_target_stop=spec.spx_stop,
-        spx_target_t1_qty=spec.t1_qty if spec.exit_strategy == "spx_points" else None,
-        spx_target_t2_qty=spec.t2_qty if spec.exit_strategy == "spx_points" else None,
-        spx_target_t3_qty=spec.t3_qty if spec.exit_strategy == "spx_points" else None,
+        spx_target_t1_qty=spec.t1_qty if _watcher_managed else None,
+        spx_target_t2_qty=spec.t2_qty if _watcher_managed else None,
+        spx_target_t3_qty=spec.t3_qty if _watcher_managed else None,
+        dollar_target_t1=spec.d_t1, dollar_target_t2=spec.d_t2,
+        dollar_target_t3=spec.d_t3, dollar_target_stop=spec.d_stop,
         dollar_loss_cap=spec.dollar_loss_cap,
-        # BE ladder: starts at the original stop, ratchets up as MFE grows
-        dynamic_stop_level=spec.spx_stop,
+        # BE ladder (spx_points only): starts at the original stop, ratchets up
+        # as MFE grows. fixed_dollar manages its stop in $ terms, not via the
+        # SPX-point dynamic_stop_level, so leave it None there.
+        dynamic_stop_level=spec.spx_stop if spec.exit_strategy == "spx_points" else None,
         entry_spx_price=spec.entry_spx_price,
         notes=_acct_tag,
     )
     parent_saved = await SignalIterRepository.write_live_order(parent)
     children_saved = []
-    # SPX-points mode: no option-price children, only the parent.
-    # The spx_target_watcher_loop fires market sells as SPX crosses each level.
-    if spec.exit_strategy == "spx_points":
+    # Watcher-managed: no option-price children, only the parent. The
+    # spx_target_watcher_loop fires market sells (SPX cross or $ P&L cross).
+    if _watcher_managed:
+        # Exit-ladder description shared by the dry-run + live audit lines —
+        # prints the ACTUAL spec targets (post any per-symbol $ scaling) so
+        # the ladder each trade will run under is visible in the audit trail.
+        if spec.exit_strategy == "fixed_dollar":
+            _exits_desc = (f"Watcher fires at $ T1/T2/T3/STOP="
+                           f"{spec.d_t1}/{spec.d_t2}/{spec.d_t3}/{spec.d_stop}")
+        else:
+            _exits_desc = (f"Watcher fires at SPX T1/T2/T3/STOP="
+                           f"{spec.spx_t1}/{spec.spx_t2}/{spec.spx_t3}/{spec.spx_stop}")
         if dry_run:
+            # Audit even in dry-run — attribution parity with the live path.
+            # (Previously this early return skipped the audit entirely, so
+            # dry-run watcher-managed orders left no 'order' trail at all.)
+            entry_desc = "MARKET" if spec.use_market_entry else f"LMT @ ${spec.entry_limit:.2f}"
+            await SignalIterRepository.write_audit_log(
+                category="order", actor="system",
+                summary=f"{audit_prefix}DRY_RUN {spec.exit_strategy} entry: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}. {_exits_desc}",
+                details={"parent_order_id": parent_saved.id,
+                         "exit_strategy": spec.exit_strategy,
+                         "order_type": "MKT" if spec.use_market_entry else "LMT",
+                         "source": source, "signal_ref": signal_ref},
+            )
             return {
                 "ok": True, "dry_run": True,
                 "parent_order_id": parent_saved.id,
                 "children": [],
-                "exit_strategy": "spx_points",
+                "exit_strategy": spec.exit_strategy,
                 "spx_targets": {"t1": spec.spx_t1, "t2": spec.spx_t2,
                                 "t3": spec.spx_t3, "stop": spec.spx_stop},
-                "reason": "DRY_RUN — SPX watcher will simulate exits on cross",
+                "dollar_targets": {"t1": spec.d_t1, "t2": spec.d_t2,
+                                   "t3": spec.d_t3, "stop": spec.d_stop},
+                "reason": f"DRY_RUN — watcher will simulate {spec.exit_strategy} exits",
             }
-        # Live SPX-points: place ONLY the parent buy. Watcher handles exits.
+        # Live watcher-managed: place ONLY the parent buy. Watcher handles exits.
         try:
             from ib_async import LimitOrder, MarketOrder
             ib = ibkr._ib  # type: ignore[attr-defined]
@@ -233,16 +294,18 @@ async def place_bracket(
                 ib_perm_id=parent_trade.order.permId,
             )
             entry_desc = "MARKET" if spec.use_market_entry else f"LMT @ ${spec.entry_limit:.2f}"
+            exits_desc = _exits_desc
             await SignalIterRepository.write_audit_log(
-                category="order", actor="user",
-                summary=f"PLACED spx_points entry: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}. Watcher fires at SPX T1/T2/T3/STOP={spec.spx_t1}/{spec.spx_t2}/{spec.spx_t3}/{spec.spx_stop}",
-                details={"parent_order_id": parent_saved.id, "exit_strategy": "spx_points",
-                         "order_type": "MKT" if spec.use_market_entry else "LMT"},
+                category="order", actor=audit_actor,
+                summary=f"{audit_prefix}PLACED {spec.exit_strategy} entry: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}. {exits_desc}",
+                details={"parent_order_id": parent_saved.id, "exit_strategy": spec.exit_strategy,
+                         "order_type": "MKT" if spec.use_market_entry else "LMT",
+                         "source": source, "signal_ref": signal_ref},
             )
             return {"ok": True, "dry_run": False, "parent_order_id": parent_saved.id,
-                    "exit_strategy": "spx_points"}
+                    "exit_strategy": spec.exit_strategy}
         except Exception as e:
-            logger.exception("spx_points parent submission failed")
+            logger.exception("watcher-managed parent submission failed")
             await SignalIterRepository.update_live_order(parent_saved.id, status="REJECTED", notes=str(e))
             return {"ok": False, "error": str(e)}
 
@@ -265,13 +328,14 @@ async def place_bracket(
 
     entry_desc = "MARKET" if spec.use_market_entry else f"LMT @ ${spec.entry_limit:.2f}"
     await SignalIterRepository.write_audit_log(
-        category="order", actor="user" if confirm else "system",
-        summary=f"{'DRY_RUN' if dry_run else 'PLACED'} bracket: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}",
+        category="order", actor=audit_actor if confirm else "system",
+        summary=f"{audit_prefix}{'DRY_RUN' if dry_run else 'PLACED'} bracket: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}",
         details={
             "parent_order_id": parent_saved.id, "children": [c.id for c in children_saved],
             "spec": {"qty": spec.qty, "t1": spec.t1_limit, "t2": spec.t2_limit,
                      "t3": spec.t3_limit, "stop": spec.stop_limit},
             "order_type": "MKT" if spec.use_market_entry else "LMT",
+            "source": source, "signal_ref": signal_ref,
         },
     )
 

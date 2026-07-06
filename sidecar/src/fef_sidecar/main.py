@@ -98,6 +98,11 @@ async def _seed_defaults_on_first_run() -> None:
                  "HIGH", 300, ["confluence", "aligned_only"], 0, True),
                 ("Aggressive", "MEDIUM floor, 3-min cool-down, all triggers, larger size — trending high-confidence days",
                  "MEDIUM", 180, ["confluence", "aligned_only"], 15, False),
+                ("Pattern signals v1",
+                 "Chart-pattern trigger: flag breakouts + engulfing (per pattern_trade_kinds config), "
+                 "1m/5m confirmed bars, qty 3, 5-min cool-down. Apply to ARM pattern auto-trading; "
+                 "FEF flow triggers are NOT enabled by this preset.",
+                 "LOW", 300, ["flag_bull", "flag_bear", "pattern_bull", "pattern_bear"], 3, True),
             ]
             for name, desc, floor, cool, triggers, qty, runner in defaults:
                 session.add(AutoTradePreset(
@@ -402,6 +407,13 @@ def spawn_data_loops(state: AppState) -> None:
     state.es_vwap_task = asyncio.create_task(
         es_vwap_loop(state), name="es-vwap-loop"
     )
+    # Pattern trigger — confirmed-bar candlestick/flag fires into the
+    # advisory audit surface; auto-trades ONLY when the user arms the
+    # pattern trigger types via a preset (inert by default). Isolated task.
+    from fef_sidecar.engine.pattern_trigger import pattern_trigger_loop
+    state.pattern_trigger_task = asyncio.create_task(
+        pattern_trigger_loop(state), name="pattern-trigger-loop"
+    )
 
 
 async def cancel_data_loops(state: AppState) -> None:
@@ -411,7 +423,7 @@ async def cancel_data_loops(state: AppState) -> None:
         state.loop_task, state.bar_task, state.tick_task,
         state.quantdata_poll_task, state.health_check_task,
         state.vix_task, state.account_task, state.microstructure_task,
-        state.hft_task,
+        state.hft_task, state.pattern_trigger_task,
     ]
     for t in tasks:
         if t is not None:
@@ -426,6 +438,7 @@ async def cancel_data_loops(state: AppState) -> None:
     state.quantdata_poll_task = state.health_check_task = None
     state.vix_task = state.account_task = state.microstructure_task = None
     state.hft_task = None
+    state.pattern_trigger_task = None
 
 
 @asynccontextmanager
@@ -435,6 +448,17 @@ async def lifespan(app: FastAPI):
     await _seed_defaults_on_first_run()
     from fef_sidecar.engine.calendar import seed_calendar_if_empty
     await seed_calendar_if_empty()
+    # Engine-change ledger backfill (idempotent by change name). The
+    # 2026-07-06 EOD flagged the empty engine_change table as a
+    # traceability gap — running the backfill on every boot keeps the
+    # ledger complete without a manual /admin call.
+    try:
+        from fef_sidecar.engine.engine_change_backfill import backfill_engine_changes
+        result = await backfill_engine_changes()
+        if result.get("inserted"):
+            logger.info("EngineChange ledger backfill: %s", result)
+    except Exception:
+        logger.exception("EngineChange ledger startup backfill failed")
 
     state = AppState.build()
     app.state.fef = state
@@ -500,6 +524,7 @@ async def lifespan(app: FastAPI):
             state.microstructure_task,
             state.hft_task,
             state.option_chain_capture_task,
+            state.pattern_trigger_task,
         ):
             if task is not None:
                 task.cancel()  # type: ignore[attr-defined]

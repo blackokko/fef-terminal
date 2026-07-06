@@ -293,6 +293,62 @@ async def test_fifo_pair_off_partial_scaleout_classifies_on_realized() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Scenario (e): orphan SLD (no matching BOT) books $0, NOT -proceeds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fifo_orphan_sell_books_zero_not_negative_proceeds() -> None:
+    """An orphan SLD (shares sold with no open BOT lot to pair against —
+    e.g. the 6/30 75-lot whose buy was recorded under a corrupted contract
+    key) must contribute $0 to realized, NOT -price*shares*100.
+
+    Setup: one clean winner (BOT 5 @ $5 / SLD 5 @ $7 = +$1000) plus an
+    orphan SLD 3 @ $4 on a different contract with no BOT.
+
+    * OLD (buggy) behavior booked the orphan as -$4*3*100 = -$1200, so the
+      session total would have been +1000 - 1200 = -$200 (a spurious loss).
+    * FIXED behavior books the orphan as $0 -> session total = +$1000, and
+      surfaces the 3 unpaired shares in ``unattributed_sell_shares``.
+    """
+    session_date = "2026-05-22"
+    base_ts = datetime(2026, 5, 22, 14, 0, 0, tzinfo=UTC)
+    parent = _make_parent(
+        submitted_at=base_ts, ib_order_id=5000, qty=5,
+        strike=7460.0, status="CLOSED",
+        t1_fired=True, t2_fired=True, t3_fired=True,
+    )
+    await _insert(parent)
+
+    await _insert(
+        # clean winner on 7460C
+        _make_exec(exec_id="e1", timestamp=base_ts, session_date=session_date,
+                   side="BOT", shares=5.0, price=5.0, ib_order_id=5000,
+                   strike=7460.0),
+        _make_exec(exec_id="e2", timestamp=base_ts + timedelta(minutes=5),
+                   session_date=session_date,
+                   side="SLD", shares=5.0, price=7.0, ib_order_id=None,
+                   strike=7460.0),
+        # orphan SLD on 7505C — NO matching BOT lot anywhere this session
+        _make_exec(exec_id="e3", timestamp=base_ts + timedelta(minutes=10),
+                   session_date=session_date,
+                   side="SLD", shares=3.0, price=4.0, ib_order_id=None,
+                   strike=7505.0),
+    )
+
+    summary = await compute_parent_wl_from_fills(session_date)
+    # The orphan does NOT drag the session negative.
+    assert summary.total_realized_dollars == pytest.approx(1000.0)
+    # The orphan contributes nothing to realized $ (old bug added -$1200).
+    assert summary.unattributed_realized == pytest.approx(0.0)
+    # ...but its shares ARE surfaced as a diagnostic.
+    assert summary.unattributed_sell_shares == pytest.approx(3.0)
+    # The clean winner still classifies correctly.
+    assert summary.wins == 1
+    assert summary.losses == 0
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: compute_daily_review uses FIFO, daily_review and daily_session agree
 # ---------------------------------------------------------------------------
 

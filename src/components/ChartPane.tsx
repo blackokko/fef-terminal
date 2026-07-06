@@ -6,12 +6,16 @@ import {
   LineSeries,
   LineStyle,
   createChart,
+  createSeriesMarkers,
   type AutoscaleInfo,
   type CandlestickData,
   type IChartApi,
   type IPriceLine,
   type ISeriesApi,
+  type ISeriesMarkersPluginApi,
   type LineData,
+  type SeriesMarker,
+  type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
 import { useSidecar } from "../context/WebSocketContext";
@@ -122,6 +126,14 @@ const TIMEFRAMES = [
   { label: "1W", value: "1 week" },
 ];
 
+// Tick-count resolutions. SPX has no trade tape, so tick candles are built
+// from the ES futures AllLast stream the sidecar already subscribes to for
+// microstructure — the pane is labeled "ES ticks" when one is active.
+const TICK_TIMEFRAMES = [
+  { label: "1000T", value: "1000T", n: 1000 },
+  { label: "2000T", value: "2000T", n: 2000 },
+];
+
 // Smart default lookback per timeframe. Conservative — picks the largest
 // window that's KNOWN to stay within IBKR's per-request max for ALL symbols
 // (SPX index, ES futures, etc.). Empirically verified:
@@ -161,6 +173,21 @@ const LOOKBACK_OPTIONS = [
 
 const MIN_Y_RANGE_PTS = 50;
 const POLL_INTERVAL_MS = 3000;  // refresh historical bars every 3s
+const TICK_POLL_INTERVAL_MS = 1000;     // tick candles are in-memory — poll fast
+const PATTERN_POLL_INTERVAL_MS = 5000;  // pattern overlay refresh
+
+// Pattern overlay payload (GET /chart/pattern_overlay). Times are epoch SECONDS.
+interface PatternOverlayPayload {
+  markers: {
+    time: number; position: string; shape: string;
+    color: string; text: string; size?: number; kind: string;
+  }[];
+  target_lines: { price: number; from_time: number; label: string; color: string; dir: string }[];
+  flag_zones: { from_time: number; to_time: number; top: number; bottom: number; dir: string }[];
+  trendlines: { kind: string; points: [number, number][]; projected: [number, number] | null }[];
+  bar_count: number;
+  status: string;
+}
 
 interface AggregatedWall {
   strike: number; sources: string[]; dominantColor: string;
@@ -206,6 +233,12 @@ export function ChartPane() {
   }>({ mid: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null });
   const [showEMA, setShowEMA] = useState(true);
   const [showSD, setShowSD] = useState(false);
+  // Pattern overlay (sidecar-detected candlestick patterns / flags / trendlines)
+  const [showPatterns, setShowPatterns] = useState(false);
+  const markersPluginRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const patternLinesRef = useRef<IPriceLine[]>([]);
+  const trendSupportRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const trendResistRef = useRef<ISeriesApi<"Line"> | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const ambientLinesRef = useRef<IPriceLine[]>([]);
   const renderedBarCountRef = useRef(0);
@@ -214,6 +247,11 @@ export function ChartPane() {
   const symbol = activeSymbol ?? "SPX";  // dropdown in TopBar is single source of truth
   const [timeframe, setTimeframe] = useState<string>("2 mins");
   const [bars, setBars] = useState<FetchedBar[]>([]);
+  // Tick-candle mode: "1000T" / "2000T" resolutions chart ES trade prints
+  // instead of time bars for the selected symbol.
+  const tickTf = TICK_TIMEFRAMES.find((t) => t.value === timeframe) ?? null;
+  const isTickTf = tickTf !== null;
+  const [tickFeedNote, setTickFeedNote] = useState<string | null>(null);
   const [hasFittedOnce, setHasFittedOnce] = useState(false);
   // YYYY-MM-DD or "" (today/live)
   const [historicalDate, setHistoricalDate] = useState<string>("");
@@ -269,12 +307,27 @@ export function ChartPane() {
     const dn2 = sdLine("#d29922", 1, LineStyle.Dashed);
     const up3 = sdLine("#f85149", 2, LineStyle.Solid);
     const dn3 = sdLine("#f85149", 2, LineStyle.Solid);
+    // Pattern-overlay auto trendlines — support (green) / resistance (red)
+    // rays through the last two pivot lows/highs, projected to the newest bar.
+    const trendSupport = chart.addSeries(LineSeries, {
+      color: "#3fb950", lineWidth: 2,
+      priceLineVisible: false, lastValueVisible: false,
+    });
+    const trendResist = chart.addSeries(LineSeries, {
+      color: "#f85149", lineWidth: 2,
+      priceLineVisible: false, lastValueVisible: false,
+    });
+    // Series markers plugin (v5 API) — pattern labels live here.
+    const markersPlugin = createSeriesMarkers(series, []);
 
     chartRef.current = chart;
     seriesRef.current = series;
     ema8SeriesRef.current = ema8;
     ema21SeriesRef.current = ema21;
     sdRefs.current = { mid, up1, up2, up3, dn1, dn2, dn3 };
+    trendSupportRef.current = trendSupport;
+    trendResistRef.current = trendResist;
+    markersPluginRef.current = markersPlugin;
 
     const resize = () => {
       if (containerRef.current && chartRef.current) {
@@ -294,6 +347,10 @@ export function ChartPane() {
       ema8SeriesRef.current = null;
       ema21SeriesRef.current = null;
       sdRefs.current = { mid: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null };
+      trendSupportRef.current = null;
+      trendResistRef.current = null;
+      markersPluginRef.current = null;
+      patternLinesRef.current = [];
       priceLinesRef.current = [];
       ambientLinesRef.current = [];
       renderedBarCountRef.current = 0;
@@ -307,6 +364,31 @@ export function ChartPane() {
     let cancelled = false;
     const fetchBars = async () => {
       try {
+        if (tickTf) {
+          // Tick-candle mode — ES trade prints aggregated sidecar-side.
+          // In-memory endpoint; no IBKR request per poll.
+          const r = await fetch(
+            `${API_BASE}/chart/tick_candles?symbol=ES&n=${tickTf.n}`
+          );
+          if (cancelled) return;
+          if (!r.ok) {
+            setFetchError(`HTTP ${r.status}`);
+            return;
+          }
+          const data = (await r.json()) as {
+            candles: FetchedBar[];
+            status: { streaming: boolean; source: string; detail: string };
+          };
+          if (cancelled) return;
+          setBars(data.candles);
+          setFetchError(null);
+          setTickFeedNote(
+            data.status.streaming
+              ? `ES ticks (${data.status.source})`
+              : `no tick feed — ${data.status.detail}`
+          );
+          return;
+        }
         let url: string;
         if (historicalDate) {
           const dayStart = new Date(`${historicalDate}T00:00:00`).getTime();
@@ -338,6 +420,7 @@ export function ChartPane() {
     renderedBarCountRef.current = 0;
     setHasFittedOnce(false);
     setBars([]);
+    setTickFeedNote(null);
     try {
       seriesRef.current?.setData([]);
       ema8SeriesRef.current?.setData([]);
@@ -345,11 +428,18 @@ export function ChartPane() {
       const sd = sdRefs.current;
       sd.mid?.setData([]); sd.up1?.setData([]); sd.up2?.setData([]); sd.up3?.setData([]);
       sd.dn1?.setData([]); sd.dn2?.setData([]); sd.dn3?.setData([]);
+      // Pattern overlay artifacts are stale on any symbol/timeframe/date
+      // change — clear markers, trendlines and flag-target lines.
+      markersPluginRef.current?.setMarkers([]);
+      trendSupportRef.current?.setData([]);
+      trendResistRef.current?.setData([]);
       if (seriesRef.current) {
         for (const line of priceLinesRef.current) seriesRef.current.removePriceLine(line);
         priceLinesRef.current = [];
         for (const line of ambientLinesRef.current) seriesRef.current.removePriceLine(line);
         ambientLinesRef.current = [];
+        for (const line of patternLinesRef.current) seriesRef.current.removePriceLine(line);
+        patternLinesRef.current = [];
       }
       // Re-enable price-axis autoscale. Without this, the Y-axis stays
       // pinned to the previous symbol's range (e.g. SMH ~270) when you
@@ -360,14 +450,17 @@ export function ChartPane() {
       chartRef.current?.priceScale("right").applyOptions({ autoScale: true });
     } catch {}
     void fetchBars();
-    // Historical mode: no polling (the day is closed). Live mode: poll every 3s.
-    if (historicalDate) return () => { cancelled = true; };
-    const id = window.setInterval(fetchBars, POLL_INTERVAL_MS);
+    // Historical mode: no polling (the day is closed). Live mode: poll every
+    // 3s (time bars) / 1s (in-memory tick candles).
+    if (historicalDate && !tickTf) return () => { cancelled = true; };
+    const id = window.setInterval(
+      fetchBars, tickTf ? TICK_POLL_INTERVAL_MS : POLL_INTERVAL_MS,
+    );
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [symbol, timeframe, historicalDate, effectiveLookback]);
+  }, [symbol, timeframe, historicalDate, effectiveLookback]);  // tickTf derives from timeframe
 
   // Refresh available historical dates whenever symbol changes
   useEffect(() => {
@@ -383,6 +476,96 @@ export function ChartPane() {
     })();
     return () => { cancelled = true; };
   }, [symbol, timeframe]);
+
+  // Pattern overlay — poll the sidecar's detector endpoint and render
+  // markers (candles/flags), dashed flag-target price lines, and the two
+  // pivot trendline rays. Live time-bars only: tick candles are ES prints
+  // (different price basis) and historical replay would need a date-window
+  // variant of the endpoint, so both clear the overlay instead.
+  useEffect(() => {
+    const clearOverlay = () => {
+      try {
+        markersPluginRef.current?.setMarkers([]);
+        trendSupportRef.current?.setData([]);
+        trendResistRef.current?.setData([]);
+        if (seriesRef.current) {
+          for (const line of patternLinesRef.current) seriesRef.current.removePriceLine(line);
+        }
+        patternLinesRef.current = [];
+      } catch { /* chart may be tearing down */ }
+    };
+    if (!showPatterns || isTickTf || historicalDate) {
+      clearOverlay();
+      return;
+    }
+    let cancelled = false;
+    const fetchOverlay = async () => {
+      try {
+        const url = `${API_BASE}/chart/pattern_overlay?symbol=${encodeURIComponent(symbol)}&bar_size=${encodeURIComponent(timeframe)}&lookback=400`;
+        const r = await fetch(url);
+        if (!r.ok || cancelled) return;
+        const data = (await r.json()) as PatternOverlayPayload;
+        if (cancelled || !seriesRef.current) return;
+
+        // Markers — payload is already lightweight-charts-shaped (bar-anchored
+        // positions only, so the SeriesMarkerPrice variant never applies).
+        const markers = (data.markers ?? []).map((m) => ({
+          time: m.time as UTCTimestamp,
+          position: m.position,
+          shape: m.shape,
+          color: m.color,
+          text: m.text,
+          size: m.size ?? 1,
+        }) as SeriesMarker<Time>);
+        markersPluginRef.current?.setMarkers(markers);
+
+        // Flag measured-move targets — keep the freshest 2 per direction so
+        // a busy session doesn't wallpaper the pane with stale targets.
+        for (const line of patternLinesRef.current) seriesRef.current.removePriceLine(line);
+        patternLinesRef.current = [];
+        const targets = data.target_lines ?? [];
+        const recent = [
+          ...targets.filter((t) => t.dir === "BULL").slice(-2),
+          ...targets.filter((t) => t.dir === "BEAR").slice(-2),
+        ];
+        for (const t of recent) {
+          patternLinesRef.current.push(seriesRef.current.createPriceLine({
+            price: t.price, color: t.color, lineWidth: 1, lineStyle: LineStyle.Dashed,
+            axisLabelVisible: true, title: t.label,
+          }));
+        }
+
+        // Trendlines — draw from the older pivot to the projection at the
+        // newest bar (the sidecar computes the ray in bar-index space).
+        const applyTrend = (kind: string, series: ISeriesApi<"Line"> | null) => {
+          if (!series) return;
+          const t = (data.trendlines ?? []).find((x) => x.kind === kind);
+          if (!t || !t.projected || t.points.length < 2) {
+            series.setData([]);
+            return;
+          }
+          const pts: LineData[] = [
+            { time: t.points[0][0] as UTCTimestamp, value: t.points[0][1] },
+            { time: t.projected[0] as UTCTimestamp, value: t.projected[1] },
+          ];
+          // Times must be ascending and distinct for setData
+          if ((pts[1].time as number) > (pts[0].time as number)) series.setData(pts);
+          else series.setData([]);
+        };
+        applyTrend("support", trendSupportRef.current);
+        applyTrend("resistance", trendResistRef.current);
+      } catch (e) {
+        console.error("pattern overlay fetch failed:", e);
+      }
+    };
+    void fetchOverlay();
+    const id = window.setInterval(fetchOverlay, PATTERN_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      clearOverlay();
+    };
+  }, [showPatterns, symbol, timeframe, historicalDate, isTickTf]);
 
   // Toggle indicator visibility
   useEffect(() => {
@@ -524,10 +707,11 @@ export function ChartPane() {
   }, [bars, hasFittedOnce]);
 
   // Live tick → extend the last bar's high/low and shift close to tick price.
-  // No new candle is created; just modify the last in place.
+  // No new candle is created; just modify the last in place. Skipped in
+  // tick-candle mode — those candles are ES prints, not SPX index levels.
   useEffect(() => {
     if (!seriesRef.current || !lastTick || bars.length === 0) return;
-    if (symbol !== "SPX") return;
+    if (symbol !== "SPX" || isTickTf) return;
     const last = bars[bars.length - 1];
     const tickPrice = lastTick.spx_price;
     const candle: CandlestickData = {
@@ -538,7 +722,7 @@ export function ChartPane() {
       close: tickPrice,
     };
     try { seriesRef.current.update(candle); } catch {}
-  }, [lastTick, symbol, bars]);
+  }, [lastTick, symbol, bars, isTickTf]);
 
   // Wall overlays. ALWAYS clear stale lines on any change so switching from
   // SPX to ES/SPY/etc. doesn't leave SPX wall labels stuck on the chart.
@@ -550,6 +734,7 @@ export function ChartPane() {
     for (const line of priceLinesRef.current) series.removePriceLine(line);
     priceLinesRef.current = [];
     if (symbol !== "SPX") return;  // walls are SPX-only
+    if (isTickTf) return;  // tick candles are ES prices — SPX strikes would misalign
     const { walls, ntmMaxPain } = aggregateWalls(lastIter);
     for (const w of walls) {
       priceLinesRef.current.push(series.createPriceLine({
@@ -563,7 +748,7 @@ export function ChartPane() {
         axisLabelVisible: true, title: `NTM MP ${ntmMaxPain.toFixed(0)}`,
       }));
     }
-  }, [lastIter, symbol]);
+  }, [lastIter, symbol, isTickTf]);
 
   // Day H/L
   const dayHighLow = useMemo(() => {
@@ -601,13 +786,21 @@ export function ChartPane() {
             <button key={tf.value} className={`chart-toolbar-btn ${timeframe === tf.value ? "active" : ""}`}
               onClick={() => setTimeframe(tf.value)}>{tf.label}</button>
           ))}
+          {TICK_TIMEFRAMES.map((tf) => (
+            <button key={tf.value} className={`chart-toolbar-btn ${timeframe === tf.value ? "active" : ""}`}
+              onClick={() => setTimeframe(tf.value)}
+              title={`${tf.n}-tick candles from the ES futures trade stream (SPX has no tape). Requires the live ES tick feed.`}>
+              {tf.label}
+            </button>
+          ))}
         </div>
         <div className="chart-toolbar-group">
           <select
             value={historicalDate}
             onChange={(e) => setHistoricalDate(e.target.value)}
             className="chart-date-select"
-            title="Pick a past day to replay (from persisted bars). Empty = live."
+            title={isTickTf ? "Tick candles are live-only (in-memory ES trade stream)." : "Pick a past day to replay (from persisted bars). Empty = live."}
+            disabled={isTickTf}
           >
             <option value="">Live ({symbol})</option>
             {availableDates.map((d) => (
@@ -619,7 +812,7 @@ export function ChartPane() {
             onChange={(e) => setLookbackOverride(e.target.value)}
             className="chart-date-select"
             title={`How far back to fetch. Default for ${timeframe}: ${DEFAULT_LOOKBACK_BY_TIMEFRAME[timeframe]}. Larger windows may hit IBKR per-bar-size limits.`}
-            disabled={!!historicalDate}
+            disabled={!!historicalDate || isTickTf}
           >
             <option value="">auto ({DEFAULT_LOOKBACK_BY_TIMEFRAME[timeframe] ?? "1 D"})</option>
             {LOOKBACK_OPTIONS.map((o) => (
@@ -636,10 +829,21 @@ export function ChartPane() {
                   onClick={() => setShowSD(s => !s)} title="StandardDevChannel — TOS-style linear regression across the full chart, ±1σ / 2σ / 3σ. Recomputes on timeframe / lookback change.">
             STD
           </button>
+          <button className={`chart-toolbar-btn ${showPatterns ? "active" : ""}`}
+                  onClick={() => setShowPatterns(s => !s)}
+                  disabled={isTickTf || !!historicalDate}
+                  title="Pattern overlay — engulfing / hammer / 3-soldiers / stars / inside-bar coil markers, measured-move flag breakouts with dashed target lines, and auto pivot trendlines (support green, resistance red). Detected sidecar-side on persisted 1-min bars; live time-bars only.">
+            PAT
+          </button>
         </div>
         <div className="chart-toolbar-info muted small">
-          {bars.length} bar{bars.length === 1 ? "" : "s"}
-          {historicalDate && <span style={{ marginLeft: 8, color: "var(--color-amber)" }}>HISTORICAL</span>}
+          {bars.length} {isTickTf ? "candle" : "bar"}{bars.length === 1 ? "" : "s"}
+          {isTickTf && (
+            <span style={{ marginLeft: 8, color: "var(--color-amber)" }}>
+              {tickFeedNote ?? "ES ticks"}
+            </span>
+          )}
+          {historicalDate && !isTickTf && <span style={{ marginLeft: 8, color: "var(--color-amber)" }}>HISTORICAL</span>}
         </div>
       </div>
       <div ref={containerRef} className="chart-container" />
@@ -651,6 +855,13 @@ export function ChartPane() {
               <p className="chart-placeholder-hint">{fetchError}</p>
               <p className="chart-placeholder-hint">
                 Check the sidecar console + restart the app
+              </p>
+            </>
+          ) : isTickTf ? (
+            <>
+              <p>Waiting for ES tick candles ({timeframe})…</p>
+              <p className="chart-placeholder-hint">
+                {tickFeedNote ?? "Candles form from the live ES trade stream — a 1000T candle needs 1000 prints."}
               </p>
             </>
           ) : (

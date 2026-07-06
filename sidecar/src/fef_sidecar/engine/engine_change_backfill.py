@@ -1,7 +1,10 @@
 """Backfill EngineChange rows for the semantic changes already shipped.
 
-Run once via POST /admin/backfill_engine_changes. Idempotent — skips
-changes whose `name` already exists in the table.
+Runs at sidecar startup (main.lifespan) and via POST
+/admin/backfill_engine_changes. Idempotent — skips changes whose `name`
+already exists in the table, so restarts and manual runs are safe. The
+2026-07-06 EOD flagged the empty ledger as a traceability gap: the startup
+invocation guarantees the ledger is populated on every boot going forward.
 """
 
 from __future__ import annotations
@@ -17,8 +20,10 @@ from fef_sidecar.db.models import EngineChange
 logger = logging.getLogger(__name__)
 
 
-# Each tuple: (applied_iso_date, name, category, description, expected_impact, git_sha_prefix)
-SEMANTIC_CHANGES: list[tuple[str, str, str, str, str, str]] = [
+# Each tuple: (applied_iso_date, name, category, description, expected_impact,
+# git_sha_prefix_or_None — None for changes shipped from the uncommitted
+# working tree, where no commit sha exists yet)
+SEMANTIC_CHANGES: list[tuple[str, str, str, str, str, str | None]] = [
     ("2026-05-18T08:00:00", "wall_collapse_requires_aligned", "gate",
      "Wall-collapse trigger now requires aligned=True confluence",
      "Cut volume on wall_collapse-only fires (15% win) and keep only confluence (42% win)",
@@ -103,6 +108,100 @@ SEMANTIC_CHANGES: list[tuple[str, str, str, str, str, str]] = [
      "_run_one_iter skips when snapshot.spx_price diverges >50% from live tick",
      "Eliminates futures-symbol stale-snapshot signals (today: delta_price=-7341 garbage)",
      "569cbf2"),
+    # ---- 2026-07-02 deploys (ledger backfill 2026-07-06 — the 7/6 EOD
+    # flagged the empty ledger as a traceability gap) ----
+    ("2026-07-02T16:00:00", "chop_gate", "gate",
+     "Scanner CHOP skip-gate: skip actionable fires when trailing 30-min SPX range "
+     "percentile (TOD-matched vs prior 20 sessions) < 33.3; counterfactual signal row "
+     "persisted with extras.skipped_by='chop_gate' + 'chop_gate' audit row; fail-open "
+     "on missing data; hot-read via UIConfig.chop_gate_enabled/_pct_threshold",
+     "22,683-fire sweep: compressed-regime fires lose -$25 to -$48/ct in every config; "
+     "expanded fires ~breakeven-to-positive — cut the harm tercile",
+     None),
+    ("2026-07-02T16:00:00", "bias_veto", "gate",
+     "Scanner bias-disagree veto promoted from tag to SKIP: fires whose reasoning "
+     "carries '(bias-disagrees, demoted)' are skipped (extras.skipped_by='bias_veto', "
+     "'bias_veto' audit row); chop gate wins when both would skip; hot-read via "
+     "UIConfig.bias_veto_enabled",
+     "3 of 5 live losers on 7/2 wore the tag (-$1,710); sweep OOS disagree -$17.00/ct "
+     "vs agree -$1.85/ct",
+     None),
+    ("2026-07-02T16:00:00", "etf_dollar_exit_scaling", "exit",
+     "fixed_dollar $ targets scaled per symbol by the strike fix's notional ratio "
+     "(_price_scale = spot/7500 below 2000; SPX-class bit-identical at 1.0); whole "
+     "dollars, $10 minimum magnitude, sign preserved; hot-read via "
+     "UIConfig.etf_dollar_exit_scaling",
+     "SPX-notional $300 T1 on a 3-lot SPY was ~15-20 SPX-equivalent points away "
+     "(7/2 SPY 743C: profitable, couldn't bank) — scaled ladder makes ETF exits reachable",
+     None),
+    # ---- 2026-07-06 deploys ----
+    ("2026-07-06T12:00:00", "dollar_loss_cap_1800", "safety",
+     "Auto-trade catastrophic dollar-loss cap default set to -$1,800 per position "
+     "(FEF_DOLLAR_LOSS_CAP; watcher polls option premium and market-exits remaining "
+     "qty when open P&L breaches the cap)",
+     "Sits beyond the -10pt ladder stop; binds only on gap disasters (gamma blow-ups) "
+     "so normal exits stay ladder-managed",
+     None),
+    ("2026-07-06T12:00:00", "watcher_oversell_fix", "safety",
+     "Oversell defense-in-depth: per-parent LIFETIME sell cap (cumulative watcher "
+     "sells can never exceed filled qty, independent of broker position snapshots), "
+     "per-(kind,parent) in-flight check latch (no concurrent stop/tier evaluations "
+     "from stale flags), optimistic status/tier latch BEFORE awaited sells with "
+     "revert-on-refusal",
+     "Kills the 7520C double-stop (-3 naked short) and the QQQ 724C post-flatten T3 "
+     "fire — watcher can no longer sell more than the parent owns",
+     None),
+    ("2026-07-06T12:00:00", "scanner_input_glitch_guard", "data",
+     "Per-symbol scanner input sanity guard: incoming spot deviating >20% from the "
+     "engine's last ACCEPTED spot rejects the whole iteration (no engine.push, no "
+     "verdict cache, no trade path) + 'scanner_input_glitch' audit row; QD page-filter "
+     "race closed by loop._qd_scope_lock (atomic set+fetch)",
+     "Stops cross-symbol contamination (GLD scan fetched SPX-priced snapshot -> "
+     "'ALIGNED +7147pts') from polluting engine windows or firing trades",
+     None),
+    # ---- 2026-07-06 overnight batch ----
+    ("2026-07-06T23:00:00", "fomc_morning_gate", "gate",
+     "Scanner FOMC-morning skip-gate: actionable fires on event_calendar FOMC days "
+     "before 14:00 ET are skipped (extras.skipped_by='fomc_gate', 'fomc_gate' audit "
+     "row, FOMC_GATE_SKIP); hot-read via UIConfig.fomc_gate_enabled; gate order "
+     "chop -> bias -> fomc -> tod",
+     "Event study: FOMC pre-statement fires -$61/ct (t=-4.4), 80% of FOMC sessions "
+     "negative; next FOMC 2026-07-29",
+     None),
+    ("2026-07-06T23:00:00", "tod_no_trade_window", "gate",
+     "Scanner time-of-day no-trade window: fires with ET clock in "
+     "[tod_gate_start_et, tod_gate_end_et) (default 14:00-15:30) are skipped "
+     "(extras.skipped_by='tod_gate', 'tod_gate' audit row, TOD_GATE_SKIP); window "
+     "hot-tunable via POST /config",
+     "Entry-filter sweep: worst TOD bucket 14:00-15:30 ET at -$21/ct OOS; "
+     "counterfactual rows grade the window in production",
+     None),
+    ("2026-07-06T23:00:00", "shadow_plumbing_fixes", "data",
+     "Exit-shadow plumbing: entry_spx sourced from the symbol's own CASH spot with "
+     "provenance + 0.5% cross-check (never the active-chart/ES-fed tick); missing "
+     "fill premiums rescued from the nearest captured quote within ±2 min else the "
+     "row is marked unusable via shadow_exit_outcome.status (never $0); close-time "
+     "recompute UPSERTS (replaces) the (parent, variant) row; coverage extended to "
+     "non-SPX watcher parents via _price_scale geometry",
+     "7/6 EOD sec. 2: morning rows recorded ES-priced 7561/7567 vs cash 7511/7508, "
+     "$0-premium rows polluted the A/B, parent 747 froze at entry-time compute",
+     None),
+    ("2026-07-06T23:00:00", "exit_shadow_flip_conditional", "exit",
+     "Shadow variant now conditional on the parent's REAL exit_strategy: "
+     "fixed_dollar parents shadow the BE-ladder (be_ladder_shadow, as before); "
+     "spx_points parents shadow the fixed-$ ladder (fixed_dollar_shadow: 300/500/"
+     "1000/-400 cumulative-realized, ETF-scaled) — supports the 2026-07-07 live "
+     "default flip to spx_points with the A/B still measuring both sides",
+     "Exit A/B keeps producing paired counterfactuals after the live default flips",
+     None),
+    ("2026-07-06T23:00:00", "scanner_reference_pollution_guard", "data",
+     "Input-glitch guard extended: the implied per-iteration delta is validated "
+     "against max(50, 3% of spot) vs every reference in the engine's own history "
+     "window; a violation rejects the iteration AND resets/quarantines the window "
+     "('scanner_input_glitch' audit row, kind='reference_pollution')",
+     "19:07 residual: 6 post-fix rows had VALID current spots against a polluted "
+     "PREVIOUS reference (cross-stream ref in the delta window) producing dP ±6,794",
+     None),
 ]
 
 

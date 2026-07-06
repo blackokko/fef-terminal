@@ -95,6 +95,11 @@ async def init_db() -> None:
             ("live_order", "spread_long_strike", "REAL"),
             ("live_order", "spread_initial_credit", "REAL"),
             ("live_order", "dollar_loss_cap", "REAL"),
+            # fixed_dollar watcher-managed $ targets (2026-06-30)
+            ("live_order", "dollar_target_t1", "REAL"),
+            ("live_order", "dollar_target_t2", "REAL"),
+            ("live_order", "dollar_target_t3", "REAL"),
+            ("live_order", "dollar_target_stop", "REAL"),
             ("live_order", "dynamic_stop_level", "REAL"),
             ("live_order", "be_ladder_max_step_R", "REAL DEFAULT 0.0"),
             ("live_order", "entry_spx_price", "REAL"),
@@ -164,6 +169,10 @@ async def init_db() -> None:
             ("flow_snapshot", "recent_orders", "JSON"),
             ("flow_snapshot", "recent_whale_count_30m", "INTEGER DEFAULT 0"),
             ("flow_snapshot", "recent_golden_sweep_count_30m", "INTEGER DEFAULT 0"),
+            # Shadow-exit row usability (2026-07-06 premium-gap fix): rows
+            # whose premiums couldn't be established are marked unusable
+            # instead of contributing $0 to the A/B aggregate.
+            ("shadow_exit_outcome", "status", "TEXT DEFAULT 'ok'"),
         ]
         for table, column, type_sql in migrations:
             try:

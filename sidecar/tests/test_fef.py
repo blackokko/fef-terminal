@@ -78,13 +78,17 @@ def test_pin_regime_returns_wait_with_no_alignment() -> None:
 
 
 def test_wall_proximity_skip() -> None:
-    engine = FEFEngine(history_window=3, wall_proximity_pts=5.0)
+    # The proximity SKIP is off by default (2026-07-02 validation: the chop
+    # gate owns the harm region); this test opts in to pin the mechanism.
+    engine = FEFEngine(
+        history_window=3, wall_proximity_pts=5.0, wall_proximity_skip_enabled=True,
+    )
 
     walls = [(7400.0, 50000.0)]  # mega call wall at $7,400
     for i, spx in enumerate([7395.0, 7398.0, 7401.0, 7402.0]):
         engine.push(_iter(ts=i, spx=spx, drift_m=i * 3.0, gex_walls=walls))
 
-    # Spot $7,402 is within 5pts of $7,400 — should SKIP regardless
+    # Spot $7,402 is within 5pts of $7,400 — should SKIP when opted in
     last = engine.push(_iter(ts=5, spx=7402.0, drift_m=15.0, gex_walls=walls))
     assert last.direction == FEFDirection.WAIT
     assert last.wall_proximity_skip is True
@@ -107,7 +111,8 @@ def test_absorption_pattern_flags_but_does_not_fire() -> None:
 
 
 def test_aligned_long_calls_fires_high_confidence() -> None:
-    engine = FEFEngine(history_window=3)
+    # logic test: low surge threshold so the small illustrative drift still aligns
+    engine = FEFEngine(history_window=3, flow_surge_min_m=1.0)
 
     walls = [(7460.0, 5000.0)]  # call wall well above
     engine.push(_iter(ts=1, spx=7420.0, drift_m=0.0, gex_walls=walls))
@@ -123,7 +128,7 @@ def test_aligned_long_calls_fires_high_confidence() -> None:
 
 
 def test_aligned_long_puts_fires() -> None:
-    engine = FEFEngine(history_window=3)
+    engine = FEFEngine(history_window=3, flow_surge_min_m=1.0)
 
     walls = [(7380.0, -5000.0)]  # put wall well below, no proximity skip
     engine.push(_iter(ts=1, spx=7420.0, drift_m=0.0, gex_walls=walls, bias="BEARISH"))
@@ -136,10 +141,134 @@ def test_aligned_long_puts_fires() -> None:
     assert last.strike_rec is not None and last.strike_rec <= 7410
 
 
+def test_flow_surge_gate_blocks_below_threshold_fires_above() -> None:
+    """FLOW-SURGE GATE (2026-06-30): with the default ~25M surge threshold, a
+    sub-surge aligned move must WAIT; only a top-decile flow surge fires."""
+    walls = [(7460.0, 5000.0)]
+    # sub-surge: |Δdrift| = 18M over the window, below the 25M default → WAIT
+    sub = FEFEngine(history_window=3, flow_surge_min_m=25.0)
+    sub.push(_iter(ts=1, spx=7420.0, drift_m=0.0, gex_walls=walls))
+    sub.push(_iter(ts=2, spx=7423.0, drift_m=4.0, gex_walls=walls))
+    sub.push(_iter(ts=3, spx=7425.0, drift_m=8.0, gex_walls=walls))
+    last_sub = sub.push(_iter(ts=4, spx=7430.0, drift_m=18.0, gex_walls=walls))
+    assert last_sub.direction == FEFDirection.WAIT
+    assert last_sub.aligned is False
+
+    # surge: |Δdrift| = 45M over the window, above 25M → fires LONG_CALLS
+    surge = FEFEngine(history_window=3, flow_surge_min_m=25.0)
+    surge.push(_iter(ts=1, spx=7420.0, drift_m=0.0, gex_walls=walls))
+    surge.push(_iter(ts=2, spx=7423.0, drift_m=12.0, gex_walls=walls))
+    surge.push(_iter(ts=3, spx=7425.0, drift_m=28.0, gex_walls=walls))
+    last_surge = surge.push(_iter(ts=4, spx=7430.0, drift_m=45.0, gex_walls=walls))
+    assert last_surge.direction == FEFDirection.LONG_CALLS
+    assert last_surge.aligned is True
+
+
+def test_flow_surge_gate_disabled_is_inert() -> None:
+    """RETIRED edge (2026-06-30): with the flow-surge gate disabled (the live
+    default now), an otherwise-aligned surge does NOT fire an actionable verdict —
+    it WAITs, while still reporting the would-be alignment for logging/context."""
+    walls = [(7460.0, 5000.0)]
+    eng = FEFEngine(history_window=3, flow_surge_min_m=1.0, flow_surge_gate_enabled=False)
+    eng.push(_iter(ts=1, spx=7420.0, drift_m=0.0, gex_walls=walls))
+    eng.push(_iter(ts=2, spx=7423.0, drift_m=4.0, gex_walls=walls))
+    eng.push(_iter(ts=3, spx=7425.0, drift_m=8.0, gex_walls=walls))
+    last = eng.push(_iter(ts=4, spx=7430.0, drift_m=18.0, gex_walls=walls))
+    assert last.direction == FEFDirection.WAIT
+    assert last.aligned is True                 # alignment still computed
+    assert "GATE DISABLED" in last.reasoning
+
+
+def test_surge_threshold_warmup_uses_bootstrap() -> None:
+    """ADAPTIVE GATE (2026-06-30): before min_samples readings accumulate, the gate
+    falls back to the absolute warm-up bootstrap (flow_surge_min_m * scale)."""
+    eng = FEFEngine(history_window=3, flow_surge_min_m=25.0, flow_surge_min_samples=20)
+    assert eng._surge_threshold() == 25.0          # empty buffer
+    eng._drift_mag_history.extend([8.0] * 5)        # still < min_samples
+    assert eng._surge_threshold() == 25.0
+
+
+def test_surge_threshold_adapts_below_absolute_floor() -> None:
+    """The whole point of the fix: in a LEAN-flow regime the adaptive p90 sits well
+    below the old fixed 25M, so a real (relative) surge that is < 25M can still fire."""
+    eng = FEFEngine(
+        history_window=3, flow_surge_min_m=25.0, flow_surge_pct=90.0,
+        flow_surge_noise_floor_m=2.0, flow_surge_min_samples=10,
+    )
+    eng._drift_mag_history.extend([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+    thr = eng._surge_threshold()
+    assert 11.0 < thr < 15.0           # p90 of a lean distribution, NOT 25
+    assert thr > 2.0                   # but above the noise floor
+
+
+def test_surge_threshold_respects_noise_floor() -> None:
+    """A dead-flat tape (p90 ≈ 0) must not turn every blip into a surge — the
+    absolute noise floor clamps it."""
+    eng = FEFEngine(
+        history_window=3, flow_surge_noise_floor_m=5.0, flow_surge_min_samples=10,
+    )
+    eng._drift_mag_history.extend([0.1] * 30)
+    assert eng._surge_threshold() == 5.0
+
+
+def test_reset_clears_drift_history() -> None:
+    eng = FEFEngine(history_window=3, flow_surge_min_m=25.0, flow_surge_min_samples=10)
+    eng._drift_mag_history.extend([10.0] * 20)
+    assert eng._surge_threshold() != 25.0
+    eng.reset()
+    assert len(eng._drift_mag_history) == 0
+    assert eng._surge_threshold() == 25.0          # back to warm-up bootstrap
+
+
+def test_drift_glitch_rejected_and_not_recorded() -> None:
+    """A corrupted cumulative drift (the QuantData -2839M kind) must NOT fire and
+    must NOT enter the adaptive surge distribution (else one bad tick poisons p90
+    and fires twice — entering and leaving the 3-iter window)."""
+    walls = [(7460.0, 5000.0)]
+    eng = FEFEngine(history_window=3, drift_sanity_ceiling_m=250.0, flow_surge_min_m=1.0)
+    eng.push(_iter(ts=1, spx=7420.0, drift_m=0.0, gex_walls=walls))
+    eng.push(_iter(ts=2, spx=7423.0, drift_m=4.0, gex_walls=walls))
+    eng.push(_iter(ts=3, spx=7425.0, drift_m=8.0, gex_walls=walls))
+    last = eng.push(_iter(ts=4, spx=7430.0, drift_m=-2839.0, gex_walls=walls))
+    assert last.direction == FEFDirection.WAIT
+    assert "GLITCH" in last.reasoning
+    assert len(eng._drift_mag_history) == 0  # glitch not recorded into the distribution
+
+
+def test_normal_drift_below_ceiling_is_not_rejected() -> None:
+    """A large-but-plausible ΔDrift below the ceiling proceeds normally (fires)."""
+    walls = [(7460.0, 5000.0)]
+    eng = FEFEngine(history_window=3, drift_sanity_ceiling_m=250.0, flow_surge_min_m=1.0)
+    eng.push(_iter(ts=1, spx=7420.0, drift_m=0.0, gex_walls=walls))
+    eng.push(_iter(ts=2, spx=7423.0, drift_m=20.0, gex_walls=walls))
+    eng.push(_iter(ts=3, spx=7425.0, drift_m=50.0, gex_walls=walls))
+    last = eng.push(_iter(ts=4, spx=7430.0, drift_m=90.0, gex_walls=walls))  # ΔDrift=90M < 250
+    assert "GLITCH" not in last.reasoning
+    assert last.direction == FEFDirection.LONG_CALLS
+
+
+def test_adaptive_gate_fires_sub_absolute_surge_in_lean_regime() -> None:
+    """End-to-end: with a lean trailing distribution seeded, a 15M ΔDrift surge
+    (BELOW the 25M absolute floor) fires LONG_CALLS because it clears the adapted
+    p90 (~12M)."""
+    walls = [(7460.0, 5000.0)]
+    eng = FEFEngine(
+        history_window=3, flow_surge_min_m=25.0, flow_surge_pct=90.0,
+        flow_surge_noise_floor_m=2.0, flow_surge_min_samples=10,
+    )
+    eng._drift_mag_history.extend([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+    eng.push(_iter(ts=1, spx=7420.0, drift_m=0.0, gex_walls=walls))
+    eng.push(_iter(ts=2, spx=7421.0, drift_m=5.0, gex_walls=walls))
+    eng.push(_iter(ts=3, spx=7423.0, drift_m=10.0, gex_walls=walls))
+    last = eng.push(_iter(ts=4, spx=7425.0, drift_m=15.0, gex_walls=walls))  # ΔDrift=15M < 25
+    assert last.direction == FEFDirection.LONG_CALLS
+    assert last.aligned is True
+
+
 def test_wall_collapse_special_trigger() -> None:
     """Wall collapse with 2-iter persistence: requires the >20% loss to hold
     across two consecutive iter comparisons (noise filter)."""
-    engine = FEFEngine(history_window=3, wall_collapse_pct=0.20)
+    engine = FEFEngine(history_window=3, wall_collapse_pct=0.20, flow_surge_min_m=1.0)
 
     big = [(7440.0, 50000.0)]      # massive call wall
     mid = [(7440.0, 30000.0)]      # 40% loss vs big (collapse step 1)
@@ -188,7 +317,7 @@ def test_wall_collapse_put_below_fires_long_puts_when_drift_agrees() -> None:
     """Put wall below collapses + bearish drift → LONG_PUTS (floor gone).
     Updated for 2-iter persistence: collapse must hold across two iter
     comparisons, so the wall drops in two steps."""
-    engine = FEFEngine(history_window=3, wall_collapse_pct=0.20)
+    engine = FEFEngine(history_window=3, wall_collapse_pct=0.20, flow_surge_min_m=1.0)
 
     put_wall_big = [(7380.0, -50000.0)]
     put_wall_mid = [(7380.0, -30000.0)]       # 40% loss vs big

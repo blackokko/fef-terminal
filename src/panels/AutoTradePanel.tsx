@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useToast } from "../components/Toast";
+import { NumberSetting } from "../components/NumberSetting";
 
 const API_BASE = "http://127.0.0.1:8765";
 
@@ -342,10 +343,10 @@ export function AutoTradePanel() {
           <tr>
             <td>Cool-down (sec)</td>
             <td>
-              <input type="number" min={60} max={3600} step={30}
+              <NumberSetting min={60} max={3600} step={30}
                      value={status.cool_down_sec}
-                     onChange={(e) => void updateSetting("cool_down_sec", Number(e.target.value))}
-                     disabled={busy} className="settings-input" style={{ width: 80 }} />
+                     onCommit={(n) => void updateSetting("cool_down_sec", n)}
+                     style={{ width: 80 }} />
             </td>
           </tr>
           <tr>
@@ -375,10 +376,10 @@ export function AutoTradePanel() {
           <tr>
             <td>Contracts per fire</td>
             <td>
-              <input type="number" min={0} max={100}
+              <NumberSetting min={0} max={100}
                      value={status.qty_override}
-                     onChange={(e) => void updateSetting("qty_override", Number(e.target.value))}
-                     disabled={busy} className="settings-input" style={{ width: 80 }}
+                     onCommit={(n) => void updateSetting("qty_override", n)}
+                     style={{ width: 80 }}
                      title="Fixed contract size for every auto-trade fire. 0 = use FEF's confidence-tier default (HIGH=15, MEDIUM=10, LOW=5)" />
             </td>
           </tr>

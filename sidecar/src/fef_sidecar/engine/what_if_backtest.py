@@ -24,29 +24,46 @@ logger = logging.getLogger(__name__)
 def _outcome_R(start_ms: int, spx_entry: float, t1: float, t2: float, t3: float,
                stop: float, is_long_calls: bool, bars: list,
                window_min: int = 60) -> float:
-    """Same 50/30/20 weighted-R outcome we use in daily_review."""
-    end_ms = start_ms + window_min * 60_000
-    hit_t1 = hit_t2 = hit_t3 = hit_stop = None
-    for b in bars:
-        if b.timestamp_ms < start_ms: continue
-        if b.timestamp_ms > end_ms: break
-        if is_long_calls:
-            if hit_stop is None and b.low <= stop: hit_stop = True; break
-            if hit_t1 is None and b.high >= t1: hit_t1 = True
-            if hit_t2 is None and b.high >= t2: hit_t2 = True
-            if hit_t3 is None and b.high >= t3: hit_t3 = True
-        else:
-            if hit_stop is None and b.high >= stop: hit_stop = True; break
-            if hit_t1 is None and b.low <= t1: hit_t1 = True
-            if hit_t2 is None and b.low <= t2: hit_t2 = True
-            if hit_t3 is None and b.low <= t3: hit_t3 = True
-    if hit_stop: return -1.0
-    if hit_t1 is None: return 0.0
+    """Partial-aware 50/30/20 weighted-R outcome — identical methodology to
+    daily_review (reuses its BE-ladder-aware ``_trace_outcome``).
+
+    The OLD implementation returned a flat -1.0 on ANY stop, DISCARDING any
+    T1/T2/T3 partials that had already banked before the residual stopped
+    (the pre-2026-05-21 bug that scored +1.5R scale-out winners as -1R
+    losers). This version banks each tier that fired, then settles the
+    unbanked residual at the DYNAMIC (BE-ratcheted) stop — so a trade that
+    took T1+T2 then stopped at breakeven scores positive, matching
+    daily_review + the live auto-trader's scale-out.
+    """
+    from fef_sidecar.engine.daily_review import _trace_outcome
+
+    out = _trace_outcome(start_ms, spx_entry, t1, t2, t3, stop,
+                         is_long_calls, bars, window_min=window_min)
     risk = abs(spx_entry - stop) or 1.0
-    r1 = abs(t1 - spx_entry) / risk
-    r2 = abs(t2 - spx_entry) / risk if hit_t2 else r1
-    r3 = abs(t3 - spx_entry) / risk if hit_t3 else (abs(t2 - spx_entry) / risk if hit_t2 else r1)
-    return 0.50 * r1 + 0.30 * r2 + 0.20 * r3
+    r_t1 = abs(t1 - spx_entry) / risk
+    r_t2 = abs(t2 - spx_entry) / risk
+    r_t3 = abs(t3 - spx_entry) / risk
+    T1_SHARE, T2_SHARE, T3_SHARE = 0.5, 0.3, 0.2
+
+    realized_R = 0.0
+    residual_share = 1.0
+    # Bank each tier's share at its ACTUAL R as it first-touched.
+    if out["t1"] is not None:
+        realized_R += T1_SHARE * r_t1
+        residual_share -= T1_SHARE
+    if out["t2"] is not None:
+        realized_R += T2_SHARE * r_t2
+        residual_share -= T2_SHARE
+    if out["t3"] is not None:
+        realized_R += T3_SHARE * r_t3
+        residual_share -= T3_SHARE
+    # Settle the unbanked residual at the dynamic (BE-ratcheted) stop if it
+    # stopped; a timeout leaves the residual unsettled (0R), like daily_review.
+    if out["stop"] is not None and residual_share > 0.001:
+        dyn = out.get("dyn_stop_at_hit") or stop
+        stop_r = (dyn - spx_entry) / risk if is_long_calls else (spx_entry - dyn) / risk
+        realized_R += residual_share * stop_r
+    return realized_R
 
 
 # Built-in filter functions. Each takes a signal_iter row + its extras

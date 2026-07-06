@@ -530,15 +530,42 @@ def _snapshot_plausible(snap: Any, symbol: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
+def _qd_scope_lock(qd) -> asyncio.Lock:
+    """Lock serializing every set_page_filter → fetch_market_snapshot pair on
+    the shared QuantData client (2026-07-06 hotfix).
+
+    set_page_filter only mutates client._ticker locally (no HTTP) and every
+    sub-fetch reads it at request-build time, so an unlocked set+fetch from
+    one loop could interleave with another loop's set_page_filter and issue
+    some of its concurrent sub-requests for the WRONG SYMBOL — the GLD
+    scanner engine received an SPX-priced snapshot ("ΔPrice +7147.15pts").
+    The lock lives on the client object itself so every loop sharing the
+    client (poll loop, force-fresh iter fetch, multi-symbol scanner) shares
+    one lock."""
+    lock = getattr(qd, "_fef_scope_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        try:
+            qd._fef_scope_lock = lock
+        except Exception:
+            # Client forbids attribute assignment — degrade to unserialized
+            # (pre-hotfix) behavior rather than crashing the loop.
+            return asyncio.Lock()
+    return lock
+
+
 async def quantdata_poll_loop(state: AppState) -> None:
     interval = float(os.environ.get("FEF_QUANTDATA_POLL_INTERVAL_SEC", "15"))
     logger.info("Starting QuantData poll loop (interval=%.1fs, symbol=%s)", interval, state.active_symbol)
 
     while True:
         try:
-            # Ensure QuantData page filter matches active symbol (idempotent)
-            await state.quantdata.set_page_filter(ticker=state.active_symbol)  # type: ignore[attr-defined]
-            snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
+            # Ensure QuantData page filter matches active symbol (idempotent).
+            # Scope lock: set+fetch must be atomic vs the scanner's per-symbol
+            # set+fetch on the same client (see _qd_scope_lock).
+            async with _qd_scope_lock(state.quantdata):
+                await state.quantdata.set_page_filter(ticker=state.active_symbol)  # type: ignore[attr-defined]
+                snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
             ok, reason = _snapshot_plausible(snap, state.active_symbol)
             if not ok:
                 logger.warning(
@@ -585,6 +612,53 @@ async def quantdata_poll_loop(state: AppState) -> None:
                 )
             except Exception:
                 logger.exception("Failed to persist flow snapshot")
+
+            # ---- Phase detector feed (RIDE / FADE / WAIT direction refiner) ----
+            # Velocity/bounce pillars need sub-minute samples, so we feed the
+            # detector HERE on the dense 15s poll — NOT the 120s iter loop.
+            # Advisory: stores the latest verdict on state; maybe_auto_trade
+            # consults it at trade time. SPX-only (the traded underlier) so the
+            # rolling window never mixes symbols. Best-effort — never breaks the
+            # poll cadence. atm_iv=None for now: iv_rank is a different scale;
+            # deriving a true ATM IV from the 0DTE chain is the first refinement.
+            if state.phase_mode in ("advisory", "active") and state.active_symbol == "SPX":
+                try:
+                    from fef_sidecar.engine.phase_detector import PhaseDetector, PhaseSample
+                    if state.phase_detector is None:
+                        state.phase_detector = PhaseDetector(
+                            window_sec=state.phase_window_sec, vel_sec=state.phase_vel_sec,
+                            vel_ignite=state.phase_vel_ignite, vel_stall=state.phase_vel_stall,
+                            min_move=state.phase_min_move, bounce_pt=state.phase_bounce_pt,
+                            iv_delta=state.phase_iv_delta, mp_overshoot=state.phase_mp_overshoot,
+                            fade_min=state.phase_fade_min, ride_min=state.phase_ride_min,
+                        )
+                    _agg = snap.aggression  # type: ignore[union-attr]
+                    _pv = state.phase_detector.update(PhaseSample(  # type: ignore[attr-defined]
+                        ts_ms=int(snap.fetched_at_ms),  # type: ignore[union-attr]
+                        spx=snap.spx_price,  # type: ignore[union-attr]
+                        drift_bias=snap.drift.bias if snap.drift else None,  # type: ignore[union-attr]
+                        call_pct=_agg.call.aggression_pct if _agg and _agg.call else None,
+                        put_pct=_agg.put.aggression_pct if _agg and _agg.put else None,
+                        atm_iv=None,
+                        max_pain=_ntm_max_pain(snap),
+                    ))
+                    state.phase_last_verdict = {
+                        "state": _pv.state, "direction": _pv.direction,
+                        "score": _pv.score, "threshold": _pv.threshold,
+                        "reasons": _pv.reasons, "actionable": _pv.actionable,
+                        "mode": state.phase_mode, "ts_ms": int(snap.fetched_at_ms),  # type: ignore[union-attr]
+                        "spx": snap.spx_price,  # type: ignore[union-attr]
+                    }
+                    if _pv.actionable:
+                        logger.info(
+                            "phase[%s]: %s/%s %d/%d — %s", state.phase_mode,
+                            _pv.state, _pv.direction, _pv.score, _pv.threshold,
+                            "; ".join(_pv.reasons[:3]),
+                        )
+                except Exception:
+                    logger.exception("phase detector feed failed")
+            elif state.phase_mode == "off":
+                state.phase_last_verdict = None
 
             # Full-chain captures below default ON — we need this data for the
             # new exposures-as-regime strategy. The 2026-05-28 hang was the
@@ -771,6 +845,15 @@ async def fef_tick_loop(state: AppState) -> None:
                         current_date,
                     )
                     state.engine.reset()
+                    # Scanner engines carry the SAME per-session drift/wall
+                    # history assumptions — reset them at the boundary too
+                    # (previously only state.engine was reset, so scanner
+                    # engines started each new session with stale deltas).
+                    for _sym, _eng in list(state.scanner_engines.items()):
+                        try:
+                            _eng.reset()
+                        except Exception:
+                            logger.exception("scanner engine reset failed for %s", _sym)
                 state.session_date = current_date
 
             if market_hours_only and not _in_market_hours_et():
@@ -948,8 +1031,10 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     snap = state.last_snapshot
     if snap is None or force_fresh:
         t0 = _time.perf_counter()
-        await state.quantdata.set_page_filter(ticker=state.active_symbol)  # type: ignore[attr-defined]
-        snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
+        # Scope lock: atomic set+fetch vs the scanner (see _qd_scope_lock).
+        async with _qd_scope_lock(state.quantdata):
+            await state.quantdata.set_page_filter(ticker=state.active_symbol)  # type: ignore[attr-defined]
+            snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
         state.last_snapshot = snap
         perf["quantdata_fetch_ms"] = (_time.perf_counter() - t0) * 1000
 
@@ -1291,7 +1376,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     # Defensive: never let an auto-trade exception break the iter pipeline.
     try:
         from fef_sidecar.engine.auto_trader import maybe_auto_trade
-        decision = await maybe_auto_trade(state, event.verdict)
+        decision = await maybe_auto_trade(state, event.verdict, source="auto_main")
         state.auto_trade_last_block_reason = decision.reason
         if decision.fired and decision.order_result:
             logger.info("auto_trade fired: %s", decision.order_result)
@@ -1307,6 +1392,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
                     category="auto_trade_block", actor="system",
                     summary=f"BLOCKED {event.verdict.get('direction')} {event.verdict.get('confidence')}: {decision.reason}",
                     details={
+                        "source": "auto_main",
                         "direction": event.verdict.get("direction"),
                         "confidence": event.verdict.get("confidence"),
                         "strike_rec": event.verdict.get("strike_rec"),
@@ -1540,16 +1626,39 @@ async def _maybe_fetch_option_targets(
         return None
     if verdict.t1 is None or verdict.t2 is None or verdict.t3 is None or verdict.stop is None:
         return None
+    return await fetch_option_targets(
+        state,
+        direction_value=verdict.direction.value,
+        strike_rec=verdict.strike_rec,
+        t1=verdict.t1, t2=verdict.t2, t3=verdict.t3, stop=verdict.stop,
+        spx_price=inputs.spx_price,
+    )
 
+
+async def fetch_option_targets(
+    state: AppState,
+    *,
+    direction_value: str,
+    strike_rec: float,
+    t1: float,
+    t2: float,
+    t3: float,
+    stop: float,
+    spx_price: float,
+) -> OptionTargets | None:
+    """Fetch the 0DTE option quote for a strike and build option-price targets.
+
+    Shared by the FEF iter pipeline (_maybe_fetch_option_targets) and the
+    pattern-trigger loop so both produce identical option_pricing payloads."""
     expiry = _today_et().replace("-", "")  # YYYYMMDD for IBKR
-    right = "C" if verdict.direction.value == "LONG_CALLS" else "P"
+    right = "C" if direction_value == "LONG_CALLS" else "P"
 
     contract = Contract(
         symbol="SPX",
         kind=ContractKind.OPTION,
         exchange="CBOE",  # SPX options are CBOE-listed
         expiry=expiry,
-        strike=verdict.strike_rec,
+        strike=strike_rec,
         right=right,
     )
 
@@ -1572,9 +1681,9 @@ async def _maybe_fetch_option_targets(
                 category="option_quote_fail", actor="system",
                 summary=(
                     f"get_option_quote failed after {len(attempts)} retries: "
-                    f"SPX {expiry} {verdict.strike_rec}{right}: {last_err_type}: {last_err_msg}"
+                    f"SPX {expiry} {strike_rec}{right}: {last_err_type}: {last_err_msg}"
                 ),
-                details={"strike": verdict.strike_rec, "right": right, "expiry": expiry,
+                details={"strike": strike_rec, "right": right, "expiry": expiry,
                          "error_type": last_err_type, "error": last_err_msg,
                          "retry_attempts": len(attempts),
                          "all_errors": [{"type": t, "msg": m} for t, m in attempts]},
@@ -1585,8 +1694,8 @@ async def _maybe_fetch_option_targets(
         return None
 
     targets = build_option_targets(
-        quote=quote, current_spx=inputs.spx_price,
-        spx_t1=verdict.t1, spx_t2=verdict.t2, spx_t3=verdict.t3, spx_stop=verdict.stop,
+        quote=quote, current_spx=spx_price,
+        spx_t1=t1, spx_t2=t2, spx_t3=t3, spx_stop=stop,
     )
     if targets is None:
         try:
@@ -1594,11 +1703,11 @@ async def _maybe_fetch_option_targets(
             await SignalIterRepository.write_audit_log(
                 category="option_quote_fail", actor="system",
                 summary=(
-                    f"option quote unusable for SPX {expiry} {verdict.strike_rec}{right}: "
+                    f"option quote unusable for SPX {expiry} {strike_rec}{right}: "
                     f"last={quote.last} bid={quote.bid} ask={quote.ask} delta={quote.delta} "
                     f"(NaN/0 — IBKR didn't return valid pricing for this contract)"
                 ),
-                details={"strike": verdict.strike_rec, "right": right, "expiry": expiry,
+                details={"strike": strike_rec, "right": right, "expiry": expiry,
                          "last": quote.last, "bid": quote.bid, "ask": quote.ask,
                          "delta": quote.delta,
                          "retry_attempts": len(attempts)},
@@ -1641,7 +1750,16 @@ async def bar_stream_loop(state: AppState) -> None:
     while True:
         try:
             await state.ibkr.connect()
-            async for bar in state.ibkr.stream_bars(Contract.for_symbol(symbol)):
+            # CRITICAL: pass bar_size through. Historically this call used the
+            # provider's default ("2 mins") while the persist below TAGGED rows
+            # with FEF_BAR_SIZE ("1 min") — so live capture wrote 2-minute bars
+            # labeled '1 min' into historical_bar. It went unnoticed while
+            # backfills (/diag/backfill_spx_bars, research pulls) kept filling
+            # true 1-min history; from 2026-07-01 the live stream was the only
+            # writer and the 2-min cadence surfaced. Same subscription cost.
+            async for bar in state.ibkr.stream_bars(
+                Contract.for_symbol(symbol), bar_size=bar_size,
+            ):
                 state.last_spx_price = bar.close
                 # Persist bar for historical chart + backtest replay
                 try:
@@ -2080,14 +2198,6 @@ async def microstructure_loop(state: AppState) -> None:
             _stuff_push_quote(state.stuffing_state, ts_ms)
         state.tick_quote_count_live += 1
 
-    def _on_trade(ts_ms: int, price: float, size: float, aggressor: str) -> None:
-        push_trade(state.microstructure_state, TradePrint(
-            timestamp_ms=ts_ms, price=price, size=size, aggressor=aggressor,  # type: ignore[arg-type]
-        ))
-        if state.stuffing_state is not None:
-            _stuff_push_trade(state.stuffing_state, ts_ms)
-        state.tick_trade_count_live += 1
-
     # Microstructure proxy mapping — futures lead their cash/ETF counterparts.
     # ES is the source of truth for S&P 500 order flow (24h tape, consolidated
     # CME book, professional liquidity); SPY is fragmented retail tape across
@@ -2099,9 +2209,26 @@ async def microstructure_loop(state: AppState) -> None:
         "QQQ": "NQ",
         "IWM": "RTY",
     }
+    micro_symbol = MICRO_PROXY.get(state.active_symbol, state.active_symbol)
+
+    def _on_trade(ts_ms: int, price: float, size: float, aggressor: str) -> None:
+        push_trade(state.microstructure_state, TradePrint(
+            timestamp_ms=ts_ms, price=price, size=size, aggressor=aggressor,  # type: ignore[arg-type]
+        ))
+        if state.stuffing_state is not None:
+            _stuff_push_trade(state.stuffing_state, ts_ms)
+        state.tick_trade_count_live += 1
+        # Feed the SAME trade prints into the tick-candle aggregators
+        # (1000T / 2000T chart resolutions). Piggybacks on this existing
+        # AllLast subscription — no extra IBKR tick-by-tick slot used
+        # (IBKR default cap: 3 simultaneous tick-by-tick subscriptions).
+        try:
+            state.tick_candles.feed(micro_symbol, ts_ms, price, size, source="live")
+        except Exception:
+            pass
+
     cancel_live = None
     if isinstance(state.ibkr, LiveIBKRProvider):
-        micro_symbol = MICRO_PROXY.get(state.active_symbol, state.active_symbol)
         try:
             await state.ibkr.connect()
             cancel_live = await state.ibkr.subscribe_tick_by_tick(
@@ -2135,6 +2262,14 @@ async def microstructure_loop(state: AppState) -> None:
                     push_trade(state.microstructure_state, TradePrint(
                         timestamp_ms=now_ms, price=trade_price, size=trade_size, aggressor=agg,
                     ))
+                    # Mock tick-candle feed under the proxy symbol so the
+                    # 1000T/2000T chart works in dev mode (tagged 'mock').
+                    try:
+                        state.tick_candles.feed(
+                            micro_symbol, now_ms, trade_price, trade_size, source="mock",
+                        )
+                    except Exception:
+                        pass
 
                 now_ms = int(_time.time() * 1000)
                 sig = assess(state.microstructure_state, now_ms)

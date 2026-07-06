@@ -10,8 +10,8 @@ get a FEFVerdict back. Push is synchronous and pure given internal state.
 
 from __future__ import annotations
 
+import math
 from collections import deque
-from collections.abc import Iterable
 from time import time
 
 import time as _time
@@ -20,7 +20,7 @@ from fef_sidecar.db.models import FEFConfidence, FEFDirection
 from fef_sidecar.engine.strikes import build_plan
 from fef_sidecar.engine.types import FEFInputs, FEFVerdict
 from fef_sidecar.quantdata.max_pain import compute_ntm_max_pain
-from fef_sidecar.quantdata.models import ExposureRow, MarketSnapshot
+from fef_sidecar.quantdata.models import MarketSnapshot
 
 
 def snapshot_to_inputs(snap: MarketSnapshot) -> FEFInputs:
@@ -84,9 +84,17 @@ class FEFEngine:
         *,
         history_window: int = 3,
         wall_proximity_pts: float = 5.0,
+        wall_proximity_skip_enabled: bool = False,
         wall_collapse_pct: float = 0.20,
         wall_collapse_floor_m: float = 5.0,
         absorption_fe_ratio_min: float = 5.0,
+        flow_surge_min_m: float = 25.0,
+        flow_surge_pct: float = 90.0,
+        flow_surge_window: int = 120,
+        flow_surge_noise_floor_m: float = 1.0,
+        flow_surge_min_samples: int = 8,
+        drift_sanity_ceiling_m: float = 250.0,
+        flow_surge_gate_enabled: bool = True,
         threshold_scale: float = 1.0,
     ) -> None:
         """
@@ -98,6 +106,29 @@ class FEFEngine:
                 wall collapse to fire — filters noise on minor walls
                 (IMPROVEMENTS #7).
             absorption_fe_ratio_min: minimum FE ratio for absorption flag.
+            flow_surge_min_m: ABSOLUTE warm-up bootstrap floor for the flow-surge
+                gate, in $M — used only until ``flow_surge_min_samples`` |ΔDrift|
+                readings have accumulated this session. After that the gate is the
+                ADAPTIVE rolling percentile below (the fixed absolute value was
+                non-stationary: the flow series grew ~10x over 2022-2026, so an
+                absolute threshold over-fired in recent years).
+            flow_surge_pct: percentile of the trailing |ΔDrift| distribution that
+                defines a "surge" (default 90 = top decile, matching the validated
+                research). The causal analog of the research's per-session p90.
+            flow_surge_window: how many recent |ΔDrift| readings to keep for the
+                adaptive percentile (≈ a session at 2-min cadence).
+            flow_surge_noise_floor_m: small ABSOLUTE minimum (in $M, scaled) the
+                adaptive threshold can never drop below, so a dead-flat tape (where
+                p90≈0) can't make every blip a "surge".
+            flow_surge_min_samples: minimum trailing readings before the adaptive
+                percentile is trusted; below this the warm-up bootstrap is used.
+            drift_sanity_ceiling_m: reject any |ΔDrift| above this (in $M, scaled)
+                as a corrupted-capture GLITCH — QuantData occasionally emits a
+                garbage cumulative drift (e.g. -2839M vs a normal tens-of-M scale).
+                Such a reading would otherwise fire a false surge in a random
+                direction (as it enters AND leaves the 3-iter window) and poison
+                the adaptive percentile buffer. Default 250M is ~15-20x the live
+                p99 (~15M) — far above any real surge on either data scale.
             threshold_scale: scales the magnitude thresholds for ΔPrice/ΔDrift
                 (IMPROVEMENTS #2). If FEF runs at non-default cadence, set this
                 to (interval_sec / 120) so thresholds stay calibrated.
@@ -105,9 +136,35 @@ class FEFEngine:
         self._history: deque[FEFInputs] = deque(maxlen=history_window + 1)
         self._history_window = history_window
         self._wall_proximity_pts = wall_proximity_pts
+        # WALL GATE OFF BY DEFAULT (2026-07-02 validation): the proximity
+        # SKIP fails the harm-reduction bar — near-wall fires (<=2.5pts) are
+        # historically the LEAST bad (-$7.06/ct vs -$19.35 at 5-10pts, which
+        # a 5pt gate KEEPS), a 5pt gate removes 58.6% of all fires, the
+        # toward-barrier class is flat-to-POSITIVE at scale (+$17.42/ct) and
+        # would have skipped +$2,039 of the week's winners, and all real
+        # near-wall harm sits inside the compressed subset the CHOP gate
+        # already skips. The per-family nearest-wall RANKING fix + wall
+        # context on every verdict stay (decision-support); the skip itself
+        # is opt-in policy (FEF_WALL_PROXIMITY_SKIP_ENABLED / this flag).
+        # Revisit only the toward-NON-barrier <=2.5pt cell after
+        # paper-shadow evidence.
+        self._wall_proximity_skip_enabled = wall_proximity_skip_enabled
         self._wall_collapse_pct = wall_collapse_pct
         self._wall_collapse_floor_m = wall_collapse_floor_m
         self._absorption_fe_min = absorption_fe_ratio_min
+        self._flow_surge_min_m = flow_surge_min_m
+        self._flow_surge_pct = flow_surge_pct
+        self._flow_surge_noise_floor_m = flow_surge_noise_floor_m
+        self._flow_surge_min_samples = max(1, flow_surge_min_samples)
+        self._drift_sanity_ceiling_m = drift_sanity_ceiling_m
+        # RETIRED 2026-06-30: the flow-surge directional edge is a spot-reconstruction
+        # artifact (see project-flow-surge-edge). When False, the engine still computes
+        # everything (drift, bias, regime, fe_ratio) for context/logging but does NOT
+        # emit an actionable ALIGNED/wall-collapse directional verdict — the flow-surge
+        # thesis no longer drives trades. Live wiring (state.py) sets this False.
+        self._flow_surge_gate_enabled = flow_surge_gate_enabled
+        # Trailing distribution of |ΔDrift| readings → adaptive surge gate.
+        self._drift_mag_history: deque[float] = deque(maxlen=max(1, flow_surge_window))
         self._threshold_scale = max(0.01, threshold_scale)
 
     # ------------------------------------------------------------------
@@ -134,6 +191,47 @@ class FEFEngine:
     def reset(self) -> None:
         """Clear history (e.g. on new session)."""
         self._history.clear()
+        self._drift_mag_history.clear()
+
+    # ------------------------------------------------------------------
+    # Flow-surge gate (adaptive)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _percentile(values: list[float], pct: float) -> float:
+        """Linear-interpolated percentile (numpy 'linear' method), pure-python so
+        the engine stays dependency-free in the hot path."""
+        if not values:
+            return 0.0
+        s = sorted(values)
+        if len(s) == 1:
+            return s[0]
+        k = (len(s) - 1) * (pct / 100.0)
+        lo = math.floor(k)
+        hi = math.ceil(k)
+        if lo == hi:
+            return s[int(k)]
+        return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+    def _surge_threshold(self) -> float:
+        """The |ΔDrift| (in $M) a reading must exceed to count as a flow surge.
+
+        FIX (2026-06-30): the old fixed-25M absolute floor was non-stationary — the
+        signed-premium flow series grew ~10x over 2022-2026, so an absolute gate
+        over-fired in rich-flow years and under-fired in lean ones. We now use a
+        TRAILING ROLLING PERCENTILE of recent |ΔDrift| (the causal analog of the
+        validated research's per-session p90), bootstrapped by the absolute floor
+        until enough samples accumulate, and clamped to a small absolute noise floor
+        so a dead-flat tape can't turn every blip into a 'surge'. The percentile is
+        computed from already-measured ΔDrift magnitudes, which embed the live
+        cadence — so it is NOT re-scaled by threshold_scale (only the absolute
+        bootstrap/noise floors are).
+        """
+        scale = self._threshold_scale
+        if len(self._drift_mag_history) >= self._flow_surge_min_samples:
+            adaptive = self._percentile(list(self._drift_mag_history), self._flow_surge_pct)
+            return max(adaptive, self._flow_surge_noise_floor_m * scale)
+        return self._flow_surge_min_m * scale  # warm-up bootstrap
 
     @property
     def history_size(self) -> int:
@@ -149,6 +247,26 @@ class FEFEngine:
 
         delta_price = current.spx_price - oldest.spx_price
         delta_drift_m = current.drift_cum_net_m - oldest.drift_cum_net_m
+
+        # GLITCH GUARD (2026-06-30): reject a corrupted-capture ΔDrift before it can
+        # fire a false surge OR poison the adaptive-percentile buffer. A garbage
+        # cumulative drift (e.g. QuantData's -2839M on 2026-06-30) produces a huge
+        # ΔDrift as it enters AND again as it leaves the 3-iter window — two
+        # wrong-direction fires from one bad tick. Bail out without firing and
+        # WITHOUT recording it into the surge distribution.
+        drift_ceiling = self._drift_sanity_ceiling_m * self._threshold_scale
+        if abs(delta_drift_m) > drift_ceiling:
+            return FEFVerdict(
+                direction=FEFDirection.WAIT,
+                confidence=FEFConfidence.NONE,
+                reasoning=(
+                    f"DRIFT GLITCH REJECTED — ΔDrift {delta_drift_m:+.1f}M exceeds the "
+                    f"sanity ceiling {drift_ceiling:.0f}M (corrupted capture). "
+                    "Not firing; not recorded in the surge distribution."
+                ),
+                delta_price=delta_price,
+                delta_drift_m=delta_drift_m,
+            )
 
         # v2 fix (bug #1): the old `max(abs(delta_price), 0.1)` floor inflated
         # fe_ratio whenever price barely moved — e.g. dp=0.05, dDrift=1M gave
@@ -167,7 +285,17 @@ class FEFEngine:
         # so non-default cadences (e.g. 60s at scale=0.5) don't require the
         # same magnitude as 120s. The 1.0pt baseline applies at scale=1.0.
         align_thresh_pts = 1.0 * self._threshold_scale
-        align_thresh_drift_m = 1.0 * self._threshold_scale
+        # FLOW-SURGE GATE (validated 2026-06-30, made ADAPTIVE 2026-06-30). The old
+        # 1.0M floor fired on the majority of all readings and diluted the edge to
+        # breakeven; the directional edge lives ONLY in the top-decile surge. The
+        # first fix used a fixed 25M absolute floor, but that is non-stationary (the
+        # flow series grew ~10x over 2022-2026). Now the gate is a TRAILING ROLLING
+        # PERCENTILE of recent |ΔDrift| (see _surge_threshold): the causal analog of
+        # the research's per-session p90. The 25M absolute value survives only as the
+        # warm-up bootstrap + a small noise floor. Compute the threshold from PRIOR
+        # readings, THEN record this reading's magnitude (keeps the gate causal).
+        align_thresh_drift_m = self._surge_threshold()
+        self._drift_mag_history.append(abs(delta_drift_m))
         aligned = (
             same_sign
             and abs(delta_price) >= align_thresh_pts
@@ -187,16 +315,23 @@ class FEFEngine:
             or (fe_ratio_raw >= 10.0 and abs(delta_drift_m) >= 5.0)
         )
 
-        nearest_strike, nearest_dist = self._nearest_dominant_wall(current)
-        wall_proximity_skip = (
+        nearest_strike, nearest_dist, nearest_family, nearest_net_m = (
+            self._nearest_dominant_wall_detail(current)
+        )
+        # Nearness is always computed (context on every verdict); the SKIP
+        # itself is opt-in policy — OFF by default per the 2026-07-02
+        # validation (chop gate owns the harm region; see __init__ note).
+        wall_proximity_near = (
             nearest_dist is not None and nearest_dist <= self._wall_proximity_pts
         )
+        wall_proximity_skip = wall_proximity_near and self._wall_proximity_skip_enabled
         wall_collapse, collapse_dir = self._detect_wall_collapse()
 
         # Wall collapse REQUIRES aligned confluence. Today's data shows
         # wall_collapse-alone at 15% win, wall_collapse + aligned at 42%.
         # Without aligned drift agreement, the collapse signal is noise.
-        if wall_collapse and collapse_dir is not None and aligned:
+        if (wall_collapse and collapse_dir is not None and aligned
+                and self._flow_surge_gate_enabled):
             aligned_dir = (
                 FEFDirection.LONG_CALLS if delta_price > 0 else FEFDirection.LONG_PUTS
             )
@@ -219,6 +354,7 @@ class FEFEngine:
                     wall_collapse_trigger=True,
                     nearest_wall_strike=nearest_strike,
                     nearest_wall_distance=nearest_dist,
+                    nearest_wall_family=nearest_family,
                 )
 
         if wall_proximity_skip:
@@ -227,8 +363,9 @@ class FEFEngine:
                 confidence=FEFConfidence.NONE,
                 reasoning=(
                     f"WALL PROXIMITY SKIP — spot ${current.spx_price:.2f} within "
-                    f"{nearest_dist:.1f}pts of dominant wall at ${nearest_strike:.0f}. "
-                    "Wait for clear break or rejection."
+                    f"{self._wall_proximity_pts:.1f}pts of {nearest_family} "
+                    f"{nearest_strike:.0f} ({nearest_net_m:+,.0f}M) "
+                    f"{nearest_dist:.1f}pts away. Wait for clear break or rejection."
                 ),
                 delta_price=delta_price,
                 delta_drift_m=delta_drift_m,
@@ -238,6 +375,30 @@ class FEFEngine:
                 wall_proximity_skip=True,
                 nearest_wall_strike=nearest_strike,
                 nearest_wall_distance=nearest_dist,
+                nearest_wall_family=nearest_family,
+                secondary_scores=self._secondary_scores(current),
+            )
+
+        if aligned and not self._flow_surge_gate_enabled:
+            # Edge retired — log the would-be fire but do NOT act on it.
+            would_be = "LONG_CALLS" if delta_price > 0 else "LONG_PUTS"
+            return FEFVerdict(
+                direction=FEFDirection.WAIT,
+                confidence=FEFConfidence.NONE,
+                reasoning=(
+                    f"FLOW-SURGE GATE DISABLED — would be ALIGNED {would_be} "
+                    f"(ΔPrice {delta_price:+.2f}pts, ΔDrift {delta_drift_m:+.2f}M) but the "
+                    "flow-surge directional edge was RETIRED 2026-06-30 (spot-reconstruction "
+                    "artifact). Not firing."
+                ),
+                delta_price=delta_price,
+                delta_drift_m=delta_drift_m,
+                fe_ratio=fe_ratio,
+                aligned=True,
+                absorption=False,
+                nearest_wall_strike=nearest_strike,
+                nearest_wall_distance=nearest_dist,
+                nearest_wall_family=nearest_family,
                 secondary_scores=self._secondary_scores(current),
             )
 
@@ -284,6 +445,7 @@ class FEFEngine:
                 wall_collapse_trigger=False,
                 nearest_wall_strike=nearest_strike,
                 nearest_wall_distance=nearest_dist,
+                nearest_wall_family=nearest_family,
             )
 
         # Absorption flagged but we don't fire yet — wait for confirmation
@@ -306,6 +468,7 @@ class FEFEngine:
                 absorption=True,
                 nearest_wall_strike=nearest_strike,
                 nearest_wall_distance=nearest_dist,
+                nearest_wall_family=nearest_family,
                 secondary_scores=self._secondary_scores(current),
             )
 
@@ -323,6 +486,7 @@ class FEFEngine:
             absorption=False,
             nearest_wall_strike=nearest_strike,
             nearest_wall_distance=nearest_dist,
+            nearest_wall_family=nearest_family,
             secondary_scores=self._secondary_scores(current),
         )
 
@@ -330,19 +494,48 @@ class FEFEngine:
     # Sub-rules
     # ------------------------------------------------------------------
 
+    def _nearest_dominant_wall_detail(
+        self, inputs: FEFInputs
+    ) -> tuple[float | None, float | None, str | None, float | None]:
+        """Return (strike, distance, family, net_m) of the nearest significant wall.
+
+        BUG FIX 2026-07-02 — the wall-proximity gate had NEVER functioned:
+        the old code ranked GEX top-5 + DEX top-5 TOGETHER by abs(net_m),
+        but the families live on incomparable scales (GEX ~1e4 M vs DEX
+        ~1e7 M), so ranked[0] was ALWAYS a far-OTM DEX monster (e.g. strike
+        8000, 558pts from spot) and wall_proximity_skip could never trigger.
+        Live proof 2026-07-02 19:06Z: fired 7440P at spot 7441.7 with GEX
+        walls 7430 (-10,016M) / 7440 (-9,800M) / 7435 (-7,653M) in its own
+        inputs — 1.7pts from the 7440 wall — and the gate passed because
+        'nearest dominant' was DEX 8000.
+
+        Intent per the docstring ('most dominant wall NEAR SPOT'): dominance
+        ranking only means anything WITHIN a family's own units — and the
+        top_gex_walls / top_dex_walls inputs are already each family's top-5
+        by magnitude. So proximity = the wall NEAREST to spot among the
+        top-5 GEX walls, likewise among the top-5 DEX walls, and the closer
+        of those two wins. (Equivalently: nearest-by-distance across both
+        per-family top-5 lists, with the family tracked for logging.)
+        """
+        best_strike: float | None = None
+        best_dist: float | None = None
+        best_family: str | None = None
+        best_net_m: float | None = None
+        for family, walls in (("GEX", inputs.top_gex_walls), ("DEX", inputs.top_dex_walls)):
+            for w in walls:
+                dist = abs(inputs.spx_price - w.strike)
+                if best_dist is None or dist < best_dist:
+                    best_strike, best_dist = w.strike, dist
+                    best_family, best_net_m = family, w.net_m
+        return best_strike, best_dist, best_family, best_net_m
+
     def _nearest_dominant_wall(
         self, inputs: FEFInputs
     ) -> tuple[float | None, float | None]:
-        """Return (strike, distance) for the most dominant wall near spot.
-
-        Dominance = abs(net_m). Considers GEX top-5 + DEX top-5.
-        """
-        candidates: Iterable[ExposureRow] = list(inputs.top_gex_walls) + list(inputs.top_dex_walls)
-        ranked = sorted(candidates, key=lambda w: abs(w.net_m), reverse=True)
-        if not ranked:
-            return None, None
-        top = ranked[0]
-        return top.strike, abs(inputs.spx_price - top.strike)
+        """(strike, distance) of the nearest significant wall — thin wrapper
+        kept for the original signature; see _nearest_dominant_wall_detail."""
+        strike, dist, _family, _net_m = self._nearest_dominant_wall_detail(inputs)
+        return strike, dist
 
     def _detect_wall_collapse(self) -> tuple[bool, FEFDirection | None]:
         """Detect whether the dominant wall lost >threshold exposure since last iter.
@@ -546,6 +739,7 @@ class FEFEngine:
         wall_collapse_trigger: bool,
         nearest_wall_strike: float | None,
         nearest_wall_distance: float | None,
+        nearest_wall_family: str | None = None,
     ) -> FEFVerdict:
         plan = build_plan(
             spot=current.spx_price,
@@ -573,5 +767,6 @@ class FEFEngine:
             wall_collapse_trigger=wall_collapse_trigger,
             nearest_wall_strike=nearest_wall_strike,
             nearest_wall_distance=nearest_wall_distance,
+            nearest_wall_family=nearest_wall_family,
             secondary_scores=self._secondary_scores(current),
         )

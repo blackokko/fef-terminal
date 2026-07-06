@@ -47,6 +47,9 @@ class TournamentRunner:
         for v in variants:
             engine = FEFEngine(
                 wall_proximity_pts=v.wall_proximity_pts,
+                # Variants explicitly parametrize the proximity knob -> the
+                # gate is opt-in here (live default is OFF, 2026-07-02).
+                wall_proximity_skip_enabled=True,
                 wall_collapse_pct=v.wall_collapse_pct,
                 wall_collapse_floor_m=v.wall_collapse_floor_m,
                 absorption_fe_ratio_min=v.absorption_fe_ratio_min,

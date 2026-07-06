@@ -190,9 +190,15 @@ async def compute_parent_wl_from_fills(
                         if lot[1] <= 1e-9:
                             lots.popleft()
                     if remaining > 0:
-                        # No open lots to pair against — orphan sell (shouldn't
-                        # happen in normal long-only operation, but record it)
-                        unattributed_realized += -price * remaining * 100.0
+                        # No open lots to pair against — an orphan SLD whose BOT
+                        # lot is missing/corrupted (e.g. the 6/30 75-lot recorded
+                        # under a malformed contract key, or a genuine prior-
+                        # session carry-in whose buy is outside this session's
+                        # execs). The cost basis is UNKNOWN, so the old
+                        # `-price*shares*100` fabricated a spurious full-notional
+                        # "loss" (-$5,820 on 6/30, -$480 on 5/22) that poisoned
+                        # the trusted session $. Book $0 to realized and surface
+                        # the shares as a diagnostic instead of guessing a basis.
                         unattributed_sell_shares += remaining
 
         # Build per-parent summaries.

@@ -168,6 +168,24 @@ async def set_regime_lookback(request: Request, body: dict[str, Any] = Body(...)
     }
 
 
+@router.get("/regime/live")
+async def regime_live(request: Request) -> dict[str, Any]:
+    """VALIDATED live regime tiles — the Market Regime panel's data source.
+
+    Replaces the retired 'vibe' classifier display (RegimeDetector's
+    PIN_DAY/TREND_DAY/... labels — unvalidated, mislabeled 5/27, consumed by
+    nothing in the trading path). Tiles: range_regime (chop gate r30 TOD
+    percentile + live gate effect), expected_move (VIX tercile + 30m rvol
+    percentile + post-capitulation flag), flow_bias (drift bias + veto armed),
+    events (FOMC/CPI/NFP/OPEX/EOM calendar), dealer_gamma (exposure snapshot).
+    Fail-open: every tile degrades to n/a on missing data; never 500s.
+
+    The old /regime/lookback + /regime/debug endpoints stay functional for
+    back-compat but the panel no longer uses them."""
+    from fef_sidecar.engine.regime_live import build_regime_live
+    return await build_regime_live(_state(request))
+
+
 @router.get("/regime/debug")
 async def regime_debug(request: Request) -> dict[str, Any]:
     """Inspect the regime detector's rolling window + last assessment.
@@ -530,6 +548,18 @@ async def auto_trade_status(request: Request) -> dict[str, Any]:
         "qty_override": s.auto_trade_qty_override,
         "trigger_types": s.auto_trade_trigger_types,
         "runner_protect_enabled": s.runner_protect_enabled,
+        # STATUS TRUTH (2026-07-02): the scanner fires trades in parallel with
+        # the main loop — surface its per-symbol activity here so the UI can
+        # never again show 'verdict is WAIT' while scanner engines trade.
+        "scanner": {
+            "enabled_symbols": [
+                sym for sym, on in s.scan_enabled_symbols.items() if on
+            ],
+            "max_per_symbol": s.auto_trade_max_per_symbol,
+            "count_by_symbol": dict(s.auto_trade_count_by_symbol),
+            "last_fire_at_ms_by_symbol": dict(s.auto_trade_last_at_ms_by_symbol),
+            "last_verdict_by_symbol": dict(s.last_scanner_verdict_by_symbol),
+        },
     }
 
 
@@ -543,6 +573,7 @@ async def get_exit_strategy(request: Request) -> dict[str, Any]:
             "dollar_t2": s.exit_dollar_t2,
             "dollar_t3": s.exit_dollar_t3,
             "dollar_stop": s.exit_dollar_stop,
+            "dollar_semantics": s.exit_dollar_semantics,
         },
         "spread": {
             "stop_multiplier": s.spread_stop_multiplier,
@@ -562,9 +593,94 @@ async def set_exit_strategy(request: Request, body: dict[str, Any] = Body(...)) 
     if "dollar_t2" in body: s.exit_dollar_t2 = float(body["dollar_t2"])
     if "dollar_t3" in body: s.exit_dollar_t3 = float(body["dollar_t3"])
     if "dollar_stop" in body: s.exit_dollar_stop = float(body["dollar_stop"])
+    if "dollar_semantics" in body:
+        v = str(body["dollar_semantics"])
+        if v in ("cumulative_realized", "whole_unrealized"):
+            s.exit_dollar_semantics = v
     if "spread_stop_multiplier" in body: s.spread_stop_multiplier = float(body["spread_stop_multiplier"])
     if "spread_tp_close_debit" in body: s.spread_tp_close_debit = float(body["spread_tp_close_debit"])
     return {"ok": True}
+
+
+# Phase-detector threshold profiles, calibrated by the 2026-07-01 backtest (866
+# sessions, independent IBKR ruler). Both are FADE-only (ride_min=7 > 6-pillar
+# max disables the losing max-thrust RIDE). "big_move" = high conviction (~6% of
+# days, +8pt fav); "balanced" = more signals (min_move=12, ~0.4/session, +2.3pt,
+# positive all 4 years). Small/"scalp" moves showed no edge and are not offered.
+PHASE_PRESETS: dict[str, dict[str, float]] = {
+    "big_move": {
+        "window_sec": 300, "vel_sec": 75, "vel_ignite": 16.0, "vel_stall": 3.0,
+        "min_move": 18.0, "bounce_pt": 3.0, "iv_delta": 0.006, "mp_overshoot": 8.0,
+        "fade_min": 5, "ride_min": 7,
+    },
+    "balanced": {
+        "window_sec": 300, "vel_sec": 75, "vel_ignite": 16.0, "vel_stall": 3.0,
+        "min_move": 12.0, "bounce_pt": 3.0, "iv_delta": 0.006, "mp_overshoot": 8.0,
+        "fade_min": 5, "ride_min": 7,
+    },
+}
+
+_PHASE_KNOBS_F = ("vel_ignite", "vel_stall", "min_move", "bounce_pt", "iv_delta", "mp_overshoot")
+_PHASE_KNOBS_I = ("window_sec", "vel_sec", "fade_min", "ride_min")
+
+
+def _phase_config(s: Any) -> dict[str, Any]:
+    return {
+        "mode": s.phase_mode,
+        "window_sec": s.phase_window_sec, "vel_sec": s.phase_vel_sec,
+        "vel_ignite": s.phase_vel_ignite, "vel_stall": s.phase_vel_stall,
+        "min_move": s.phase_min_move, "bounce_pt": s.phase_bounce_pt,
+        "iv_delta": s.phase_iv_delta, "mp_overshoot": s.phase_mp_overshoot,
+        "fade_min": s.phase_fade_min, "ride_min": s.phase_ride_min,
+    }
+
+
+@router.get("/phase_detector")
+async def get_phase_detector(request: Request) -> dict[str, Any]:
+    """Phase-detector config + latest live verdict. Feeds the settings panel."""
+    s = _state(request)
+    return {
+        "config": _phase_config(s),
+        "last_verdict": getattr(s, "phase_last_verdict", None),
+        "presets": PHASE_PRESETS,
+    }
+
+
+@router.post("/phase_detector")
+async def set_phase_detector(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Update phase-detector mode / thresholds, or apply a named preset. Nulls
+    the live detector so it rebuilds with the new thresholds on the next poll."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    s = _state(request)
+
+    # Apply a named preset first (explicit knobs in the same body still win).
+    preset_name = body.get("preset")
+    if preset_name in PHASE_PRESETS:
+        for k, v in PHASE_PRESETS[preset_name].items():
+            setattr(s, f"phase_{k}", v)
+
+    if "mode" in body:
+        v = str(body["mode"]).lower()
+        if v in ("off", "advisory", "active"):
+            s.phase_mode = v
+    for k in _PHASE_KNOBS_F:
+        if k in body:
+            setattr(s, f"phase_{k}", float(body[k]))
+    for k in _PHASE_KNOBS_I:
+        if k in body:
+            setattr(s, f"phase_{k}", int(body[k]))
+
+    # Force a rebuild with the new thresholds on the next poll-loop feed.
+    s.phase_detector = None
+    await SignalIterRepository.write_audit_log(
+        category="phase_detector_config", actor="user",
+        summary=(
+            f"Phase detector mode={s.phase_mode}"
+            + (f" preset={preset_name}" if preset_name in PHASE_PRESETS else "")
+            + f" (min_move={s.phase_min_move}, fade_min={s.phase_fade_min}, ride_min={s.phase_ride_min})"
+        ),
+    )
+    return {"ok": True, "config": _phase_config(s)}
 
 
 @router.post("/auto_trade/runner_protect")
@@ -614,7 +730,8 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
     if "qty_override" in body:
         s.auto_trade_qty_override = max(0, min(100, int(body["qty_override"])))
     if "trigger_types" in body:
-        valid = {"confluence", "aligned_only", "wall_only"}
+        valid = {"confluence", "aligned_only", "wall_only",
+                 "flag_bull", "flag_bear", "pattern_bull", "pattern_bear"}
         types = [t for t in body["trigger_types"] if t in valid]
         if not types:
             types = ["confluence"]  # never allow empty — would block all fires silently
@@ -673,6 +790,24 @@ _AUTO_TRADE_DEFAULT_PRESETS = [
         "trigger_types": ["confluence", "aligned_only"],
         "qty_override": 15,
         "runner_protect_enabled": False,
+    },
+    {
+        # Pattern auto-trade — INERT until the user applies this preset (or
+        # manually enables the pattern trigger types). Fires come from the
+        # confirmed-bar pattern trigger loop (flags always; candle patterns
+        # filtered by UIConfig.pattern_trade_kinds, default engulfing only)
+        # and pass through every existing auto-trader guardrail.
+        "name": "Pattern signals v1",
+        "description": (
+            "Chart-pattern trigger: flag breakouts + engulfing (per pattern_trade_kinds config), "
+            "1m/5m confirmed bars, qty 3, 5-min cool-down. Apply to ARM pattern auto-trading; "
+            "FEF flow triggers are NOT enabled by this preset."
+        ),
+        "confidence_floor": "LOW",
+        "cool_down_sec": 300,
+        "trigger_types": ["flag_bull", "flag_bear", "pattern_bull", "pattern_bear"],
+        "qty_override": 3,
+        "runner_protect_enabled": True,
     },
 ]
 
@@ -799,7 +934,8 @@ async def apply_auto_trade_preset(preset_id: int, request: Request) -> dict[str,
         s.auto_trade_confidence_floor = preset.confidence_floor
         s.auto_trade_cool_down_sec = max(60, preset.cool_down_sec)
         s.auto_trade_qty_override = max(0, min(100, preset.qty_override))
-        valid_triggers = {"confluence", "aligned_only", "wall_only"}
+        valid_triggers = {"confluence", "aligned_only", "wall_only",
+                          "flag_bull", "flag_bear", "pattern_bull", "pattern_bear"}
         types = [t for t in preset.trigger_types if t in valid_triggers]
         s.auto_trade_trigger_types = types if types else ["confluence"]
         s.runner_protect_enabled = bool(preset.runner_protect_enabled)
@@ -868,6 +1004,8 @@ async def scanner_symbols_set(request: Request, body: dict[str, Any] = Body(...)
       max_per_symbol: int (1..50)
     """
     s = _state(request)
+    before_enabled = dict(s.scan_enabled_symbols)
+    before_cap = s.auto_trade_max_per_symbol
     if "enabled" in body and isinstance(body["enabled"], dict):
         for sym, on in body["enabled"].items():
             sym_u = str(sym).upper()
@@ -875,6 +1013,34 @@ async def scanner_symbols_set(request: Request, body: dict[str, Any] = Body(...)
                 s.scan_enabled_symbols[sym_u] = bool(on)
     if "max_per_symbol" in body:
         s.auto_trade_max_per_symbol = max(1, min(100, int(body["max_per_symbol"])))
+    # Audit scanner-enablement / cap changes. A max_per_symbol=50 change was
+    # made invisibly on 7/1 (default is 2) — risk-relevant config edits must
+    # leave a trail.
+    changed_syms = {
+        sym: on for sym, on in s.scan_enabled_symbols.items()
+        if before_enabled.get(sym) != on
+    }
+    if changed_syms or before_cap != s.auto_trade_max_per_symbol:
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="config", actor="user",
+                summary=(
+                    "Scanner config changed: "
+                    + (f"enabled {changed_syms} " if changed_syms else "")
+                    + (
+                        f"max_per_symbol {before_cap} -> {s.auto_trade_max_per_symbol}"
+                        if before_cap != s.auto_trade_max_per_symbol else ""
+                    )
+                ).strip(),
+                details={
+                    "enabled_before": before_enabled,
+                    "enabled_after": dict(s.scan_enabled_symbols),
+                    "max_per_symbol_before": before_cap,
+                    "max_per_symbol_after": s.auto_trade_max_per_symbol,
+                },
+            )
+        except Exception:
+            pass
     return {
         "ok": True,
         "enabled": dict(s.scan_enabled_symbols),
@@ -2372,6 +2538,134 @@ async def backtest_full_pipeline(
         }
 
 
+# BE ladder rungs — shared with spx_target_watcher / daily_review. Each
+# tuple is (MFE trigger R, LOCKED stop R). When MFE reaches the trigger the
+# stop RATCHETS up to the locked level. A stop that fires after ratcheting
+# therefore banks the LOCKED R (0.0/0.5/1.0), NOT the trigger (0.5/1.0/1.5).
+_BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+# 50/30/20 scale-out shares — same split daily_review + the auto-trader use.
+_T1_SHARE, _T2_SHARE, _T3_SHARE = 0.5, 0.3, 0.2
+
+
+def _walk_be_ladder_exit(*, entry_spx, t1, t2, t3, stop, is_long,
+                         path_items, apply_be_ladder):
+    """Walk a forward SPX path with a BE-ratcheting dynamic stop + 50/30/20
+    partial scale-out and return the partial-aware realized R.
+
+    ``path_items``: iterable of (ts_ms, open, high, low, close) tuples.
+
+    Scoring mirrors ``daily_review._trace_outcome`` + its partial banking:
+
+      * Each tier (T1/T2/T3) first-touched banks its share at that tier's
+        ACTUAL R (``|target - entry| / risk``) — NOT a hardcoded 1.5/2.5/5.0
+        magnitude. A full T3 run books ``0.5·r_t1 + 0.3·r_t2 + 0.2·r_t3``,
+        so the booked R tracks the verdict's real target distances.
+      * A stop settles the UNBANKED residual share at the dynamic stop's
+        LOCKED R. A breakeven ratchet (locked 0.0R) therefore scores 0.0R on
+        the residual, NOT the +0.5R ladder TRIGGER that used to leak in as a
+        phantom win and silently flip tournament boards toward
+        ``apply_be_ladder=true``.
+      * A timeout leaves the residual unsettled (0R on that share), matching
+        ``daily_review``.
+
+    Returns ``dict(outcome, realized_R, be_step, be_lock_R, exit_spx)``.
+    """
+    risk_spx = abs(entry_spx - stop)
+    risk_r = risk_spx or 1.0
+    r_t1 = abs(t1 - entry_spx) / risk_r
+    r_t2 = abs(t2 - entry_spx) / risk_r
+    r_t3 = abs(t3 - entry_spx) / risk_r
+
+    dyn_stop = stop
+    be_step = 0.0      # highest ladder TRIGGER reached (0.5/1.0/1.5)
+    be_lock_R = 0.0    # LOCKED stop level in R (0.0/0.5/1.0)
+    t1_fired = t2_fired = t3_fired = False
+    stop_hit_flag = False
+    dyn_stop_at_hit = None
+    exit_spx = path_items[-1][4] if path_items else entry_spx
+
+    for _ts_ms, _p_open, p_high, p_low, p_close in path_items:
+        favor_extreme = p_high if is_long else p_low
+        adverse_extreme = p_low if is_long else p_high
+        if apply_be_ladder and risk_spx > 0:
+            mfe_R = ((favor_extreme - entry_spx) / risk_spx if is_long
+                     else (entry_spx - favor_extreme) / risk_spx)
+            for trig_R, locked_R in _BE_LADDER:
+                if mfe_R >= trig_R and be_step < trig_R:
+                    be_step = trig_R
+                    be_lock_R = locked_R
+                    if is_long:
+                        new_stop = entry_spx + locked_R * risk_spx
+                        if new_stop > dyn_stop:
+                            dyn_stop = new_stop
+                    else:
+                        new_stop = entry_spx - locked_R * risk_spx
+                        if new_stop < dyn_stop:
+                            dyn_stop = new_stop
+        # Conservative intra-bar ordering: check the stop BEFORE targets, using
+        # the adverse extreme so a wick through the stop counts as a hit.
+        stop_hit = ((is_long and adverse_extreme <= dyn_stop)
+                    or (not is_long and adverse_extreme >= dyn_stop))
+        if stop_hit:
+            stop_hit_flag = True
+            dyn_stop_at_hit = dyn_stop
+            exit_spx = dyn_stop
+            break
+        # First-touch tiers (favorable extreme). Partials scale out while the
+        # residual keeps running, so we do NOT break on T1/T2.
+        if (is_long and favor_extreme >= t1) or (not is_long and favor_extreme <= t1):
+            t1_fired = True
+        if (is_long and favor_extreme >= t2) or (not is_long and favor_extreme <= t2):
+            t2_fired = True
+        if (is_long and favor_extreme >= t3) or (not is_long and favor_extreme <= t3):
+            t3_fired = True
+        if t3_fired:
+            # 50/30/20 → all three tiers scale the whole position out.
+            exit_spx = t3
+            break
+
+    # Partial-aware realized R (daily_review methodology).
+    realized_R = 0.0
+    residual_share = 1.0
+    if t1_fired:
+        realized_R += _T1_SHARE * r_t1
+        residual_share -= _T1_SHARE
+    if t2_fired:
+        realized_R += _T2_SHARE * r_t2
+        residual_share -= _T2_SHARE
+    if t3_fired:
+        realized_R += _T3_SHARE * r_t3
+        residual_share -= _T3_SHARE
+    if stop_hit_flag and residual_share > 0.001:
+        dyn = dyn_stop_at_hit if dyn_stop_at_hit is not None else stop
+        stop_r = ((dyn - entry_spx) / risk_r if is_long
+                  else (entry_spx - dyn) / risk_r)
+        realized_R += residual_share * stop_r
+
+    # Outcome label: highest tier reached, else BE_STOP/STOP/TIMEOUT. The
+    # BE_STOP label carries the LOCKED R so it reads honestly in trade logs.
+    if t3_fired:
+        outcome = "T3"
+    elif t2_fired:
+        outcome = "T2"
+    elif t1_fired:
+        outcome = "T1"
+    elif stop_hit_flag:
+        ratcheted = (apply_be_ladder and dyn_stop_at_hit is not None
+                     and dyn_stop_at_hit != stop)
+        outcome = f"BE_STOP_{be_lock_R:.1f}R" if ratcheted else "STOP"
+    else:
+        outcome = "TIMEOUT"
+
+    return {
+        "outcome": outcome,
+        "realized_R": realized_R,
+        "be_step": be_step,
+        "be_lock_R": be_lock_R,
+        "exit_spx": exit_spx,
+    }
+
+
 def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
                       apply_be_ladder, commission_per_contract,
                       avg_entry_slip_pct, avg_exit_slip_pct,
@@ -2399,6 +2693,11 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
             from fef_sidecar.engine.types import FEFInputs
             engine = FEFEngine(
                 wall_proximity_pts=float(preset_row.wall_proximity_pts),
+                # Preset replays EXPLICITLY parametrize wall_proximity_pts as
+                # a strategy knob, so the proximity gate is opt-in here by
+                # construction — unlike the LIVE default, which is OFF per
+                # the 2026-07-02 validation (chop gate owns the harm region).
+                wall_proximity_skip_enabled=True,
                 wall_collapse_pct=float(preset_row.wall_collapse_pct),
                 wall_collapse_floor_m=float(preset_row.wall_collapse_floor_m),
                 absorption_fe_ratio_min=float(preset_row.absorption_fe_ratio_min),
@@ -2583,84 +2882,31 @@ def _backtest_compute(*, sigs, fills, spx_bars=None, session_date_from, to_date,
                           for t, p in iter_slice]
             path_mode = "iter_snapshot"
 
-        # BE ladder simulation — same logic as spx_target_watcher
-        BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
-        risk_spx = abs(entry_spx - stop)
-        dyn_stop = stop
-        be_step = 0.0
-        outcome = "TIMEOUT"
-        exit_spx = path_items[-1][4]  # last close
-        partial_R = 0.0
+        # BE-ratcheting dynamic stop + 50/30/20 partial scale-out, scored
+        # with the partial-aware LOCKED-R methodology (see
+        # _walk_be_ladder_exit). This is the fix for the BE-stop scoring bug:
+        # a breakeven ratchet now banks the LOCKED 0.0R on the residual
+        # instead of the +0.5R ladder TRIGGER — the leak that used to flip
+        # tournament boards positive purely from apply_be_ladder=true. Full
+        # T3 runs book the verdict's ACTUAL per-tier R (not a hardcoded 2.95).
+        _walk = _walk_be_ladder_exit(
+            entry_spx=entry_spx, t1=t1, t2=t2, t3=t3, stop=stop,
+            is_long=is_long, path_items=path_items,
+            apply_be_ladder=apply_be_ladder,
+        )
+        outcome = _walk["outcome"]
+        realized_R = _walk["realized_R"]
+        be_step = _walk["be_step"]
+        exit_spx = _walk["exit_spx"]
 
-        for ts_ms, p_open, p_high, p_low, p_close in path_items:
-            # Update BE ladder using favorable extreme reached within bar
-            favor_extreme = p_high if is_long else p_low
-            adverse_extreme = p_low if is_long else p_high
-            if apply_be_ladder and risk_spx > 0:
-                mfe_R = (
-                    (favor_extreme - entry_spx) / risk_spx if is_long
-                    else (entry_spx - favor_extreme) / risk_spx
-                )
-                for trig_R, new_stop_R in BE_LADDER:
-                    if mfe_R >= trig_R and be_step < trig_R:
-                        be_step = trig_R
-                        if is_long:
-                            new_stop = entry_spx + new_stop_R * risk_spx
-                            if new_stop > dyn_stop: dyn_stop = new_stop
-                        else:
-                            new_stop = entry_spx - new_stop_R * risk_spx
-                            if new_stop < dyn_stop: dyn_stop = new_stop
-
-            # Conservative intra-bar ordering: check stop BEFORE targets.
-            # Use adverse extreme so a wick through the stop counts as a hit
-            # even if the bar's close recovered.
-            stop_hit = (
-                (is_long and adverse_extreme <= dyn_stop)
-                or (not is_long and adverse_extreme >= dyn_stop)
-            )
-            if stop_hit:
-                outcome = "STOP" if dyn_stop == stop else f"BE_STOP_{be_step:.1f}R"
-                exit_spx = dyn_stop
-                break
-            # Check tiers using favorable extreme — wick to target counts
-            t1_hit = (is_long and favor_extreme >= t1) or (not is_long and favor_extreme <= t1)
-            t2_hit = (is_long and favor_extreme >= t2) or (not is_long and favor_extreme <= t2)
-            t3_hit = (is_long and favor_extreme >= t3) or (not is_long and favor_extreme <= t3)
-            if t3_hit:
-                outcome = "T3"
-                exit_spx = t3
-                break
-            elif t2_hit and "T2" not in str(partial_R):
-                partial_R += 0.4 * 2.5
-                outcome = "T2_in_progress"
-            elif t1_hit and partial_R < 0.1:
-                partial_R += 0.3 * 1.5
-
-        # Compute R based on outcome (using SPX-points R)
-        if outcome == "T3":
-            realized_R = 0.3 * 1.5 + 0.4 * 2.5 + 0.3 * 5.0  # 30/40/30 split full run
-        elif outcome.startswith("BE_STOP"):
-            realized_R = float(outcome.split("_")[-1].replace("R", ""))
-        elif outcome == "STOP":
-            realized_R = -1.0
-        elif outcome == "T2_in_progress":
-            # T1+T2 hit, runner stopped at BE or further
-            realized_R = 0.3 * 1.5 + 0.4 * 2.5 + 0.3 * max(0, be_step)
-        else:  # TIMEOUT or T1-only
-            if is_long:
-                mfe_R = (max(p[2] for p in path_items) - entry_spx) / risk_spx if risk_spx > 0 else 0
-            else:
-                mfe_R = (entry_spx - min(p[3] for p in path_items)) / risk_spx if risk_spx > 0 else 0
-            if mfe_R >= 1.5:
-                realized_R = 0.3 * 1.5 + 0.7 * be_step
-            else:
-                realized_R = be_step  # whatever's locked
-
-        # Apply slippage + commission
+        # Apply slippage + commission. All three are per-contract R fractions:
+        # commission_R must NOT multiply by qty (the qty in the numerator's
+        # total commission and the denominator's total premium cancel) —
+        # multiplying made it ~qty× (≈5×) too large.
         qty = 5  # default
         slip_R_entry = -avg_entry_slip_pct / 100 * 0.5  # rough cost in R
         slip_R_exit = -avg_exit_slip_pct / 100 * 0.5
-        commission_R = -(commission_per_contract * 2) / (entry_limit * 100) * qty  # roundtrip / per dollar
+        commission_R = -(commission_per_contract * 2) / (entry_limit * 100)  # roundtrip / per-contract premium
         realized_R_net = realized_R + slip_R_entry + slip_R_exit + commission_R
 
         trades.append({
@@ -3657,16 +3903,30 @@ async def shadow_enable(request: Request, body: dict[str, Any] = Body(...)) -> d
     """Enable shadow engine with overridden parameters.
     Body: {label: 'tighter_collapse', wall_proximity_pts?, wall_collapse_pct?,
            wall_collapse_floor_m?, absorption_fe_ratio_min?}
+
+    Built via the CANONICAL engine factory (state._make_engine) so the shadow
+    honors FEF_FLOW_SURGE_GATE_ENABLED + surge tuning + drift-sanity ceiling
+    exactly like the production engine — previously a bare FEFEngine() left
+    flow_surge_gate_enabled at its constructor default (True), so shadows
+    silently ran the retired flow-surge path. The 4 body params overlay the
+    env-derived config (same private-attr hot-reload style as POST /config).
     """
-    from fef_sidecar.engine import FEFEngine
+    from fef_sidecar.state import _make_engine
     s = _state(request)
     s.shadow_label = body.get("label", "shadow")
-    s.shadow_engine = FEFEngine(
-        wall_proximity_pts=float(body.get("wall_proximity_pts", 5.0)),
-        wall_collapse_pct=float(body.get("wall_collapse_pct", 0.20)),
-        wall_collapse_floor_m=float(body.get("wall_collapse_floor_m", 5.0)),
-        absorption_fe_ratio_min=float(body.get("absorption_fe_ratio_min", 5.0)),
-    )
+    engine = _make_engine()
+    if "wall_proximity_pts" in body:
+        engine._wall_proximity_pts = float(body["wall_proximity_pts"])  # type: ignore[attr-defined]
+        # Explicitly shadowing the proximity knob = opting into the gate
+        # (the live default is OFF per the 2026-07-02 wall validation).
+        engine._wall_proximity_skip_enabled = True  # type: ignore[attr-defined]
+    if "wall_collapse_pct" in body:
+        engine._wall_collapse_pct = float(body["wall_collapse_pct"])  # type: ignore[attr-defined]
+    if "wall_collapse_floor_m" in body:
+        engine._wall_collapse_floor_m = float(body["wall_collapse_floor_m"])  # type: ignore[attr-defined]
+    if "absorption_fe_ratio_min" in body:
+        engine._absorption_fe_min = float(body["absorption_fe_ratio_min"])  # type: ignore[attr-defined]
+    s.shadow_engine = engine
     return {"ok": True, "label": s.shadow_label}
 
 
@@ -4896,6 +5156,120 @@ async def get_bars(
                 "volume": float(b.volume or 0),
             })
     return bars
+
+
+# Chart pattern overlay — markers / measured-move targets / trendlines for
+# ChartPane. Computed from PERSISTED bars (historical_bar, read-only) rather
+# than a fresh IBKR fetch so polling this endpoint adds zero IBKR load on
+# top of the chart's own /bars polling. Live capture persists 1-min bars for
+# the active symbol; other timeframes are resampled server-side from those,
+# aligned to the same wall-clock boundaries IBKR uses for intraday bars.
+_PATTERN_BAR_MINUTES = {
+    "1 min": 1, "2 mins": 2, "5 mins": 5, "15 mins": 15, "30 mins": 30, "1 hour": 60,
+}
+
+
+@router.get("/chart/pattern_overlay")
+async def chart_pattern_overlay(
+    request: Request,
+    symbol: str = "SPX",
+    bar_size: str = "1 min",
+    lookback: int = 400,
+    doji: bool = False,
+) -> dict[str, Any]:
+    """Pattern overlay payload for the chart.
+
+    Returns {markers, target_lines, flag_zones, trendlines, bar_count, status}.
+    Marker/line times are epoch SECONDS (lightweight-charts native).
+    Thresholds come from UIConfig pattern_* fields — the same source of
+    truth the live pattern trigger uses. `doji=true` adds doji markers
+    (off by default, noisy)."""
+    from fef_sidecar.engine.pattern_overlay import build_overlay, resample_bars
+    from fef_sidecar.engine.pattern_trigger import overlay_config_from_ui
+
+    s = _state(request)
+    sym = symbol.upper()
+    lookback = max(50, min(int(lookback), 2000))
+    minutes = _PATTERN_BAR_MINUTES.get(bar_size)
+    empty = {"markers": [], "target_lines": [], "flag_zones": [], "trendlines": []}
+    if minutes is None:
+        return {**empty, "bar_count": 0,
+                "status": f"pattern overlay unsupported for bar_size {bar_size!r}"}
+
+    if type(s.ibkr).__name__ == "MockIBKRProvider":
+        # Mirror /bars' mock branch — coherent PriceTrack so markers line up
+        # with the candles the chart is showing in dev mode.
+        from fef_sidecar.mock import get_track
+        track = get_track()
+        bars = track.build_bars(bar_size_minutes=minutes)
+        if sym == "QQQ":
+            tf = lambda v: round(v / 14.5, 2)
+        elif sym == "IWM":
+            tf = lambda v: round(v / 33.0, 2)
+        elif sym == "SPY":
+            tf = lambda v: round(v / 10.0, 2)
+        elif sym == "ES":
+            tf = lambda v: round(v - 5.0, 2)
+        else:
+            tf = lambda v: v
+        window = [
+            {"timestamp_ms": b["timestamp_ms"], "open": tf(b["open"]), "high": tf(b["high"]),
+             "low": tf(b["low"]), "close": tf(b["close"]), "volume": b["volume"]}
+            for b in bars
+        ][-lookback:]
+        source = "mock_track"
+    else:
+        rows = await SignalIterRepository.query_recent_bars(
+            sym, "1 min", limit=lookback * minutes,
+        )
+        base = [
+            {"timestamp_ms": r.timestamp_ms, "open": r.open, "high": r.high,
+             "low": r.low, "close": r.close, "volume": r.volume}
+            for r in rows
+        ]
+        if not base and minutes > 1:
+            # No live-captured 1-min rows (e.g. non-active symbol) — try bars
+            # persisted directly at the requested size (backfills).
+            rows = await SignalIterRepository.query_recent_bars(sym, bar_size, limit=lookback)
+            base = [
+                {"timestamp_ms": r.timestamp_ms, "open": r.open, "high": r.high,
+                 "low": r.low, "close": r.close, "volume": r.volume}
+                for r in rows
+            ]
+            window = base[-lookback:]
+        else:
+            window = resample_bars(base, minutes)[-lookback:]
+        source = "historical_bar"
+        if not window:
+            return {**empty, "bar_count": 0,
+                    "status": f"no persisted bars for {sym} — pattern overlay needs "
+                              f"live 1-min capture (active symbol) or a backfill"}
+
+    cfg = overlay_config_from_ui(load_config(), include_doji=doji)
+    payload = build_overlay(window, cfg)
+    return {**payload, "bar_count": len(window), "status": "ok", "source": source}
+
+
+@router.get("/chart/tick_candles")
+async def chart_tick_candles(
+    request: Request,
+    symbol: str = "ES",
+    n: int = 1000,
+) -> dict[str, Any]:
+    """N-tick candles (default ES 1000T) aggregated from the tick-by-tick
+    AllLast trade stream the microstructure loop already holds. Returns
+    {candles, status, n}; candles carry timestamp_ms like /bars. When no
+    trade stream is live for the symbol, candles=[] and status.detail says
+    why (chart shows 'no tick feed')."""
+    s = _state(request)
+    svc = s.tick_candles
+    if int(n) not in svc.tick_sizes:
+        raise HTTPException(400, f"n must be one of {list(svc.tick_sizes)}")
+    return {
+        "candles": svc.get_candles(symbol, int(n)),
+        "status": svc.status(symbol),
+        "n": int(n),
+    }
 
 
 def _aggregate_scripted_bars(symbol: str, bar_size: str, max_frame: int | None = None) -> list[dict[str, Any]]:

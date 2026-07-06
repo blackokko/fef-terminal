@@ -21,6 +21,31 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+# --- $/R conversion (delta-aware) -------------------------------------------
+# 1R == POINTS_PER_R SPX points. An option's $ move per 1 SPX point is
+# delta × DOLLARS_PER_POINT (the $100 SPX multiplier), so:
+#     $ per 1R per contract = delta × DOLLARS_PER_POINT × POINTS_PER_R
+#                           = delta × 1000
+# ATM (delta 0.5) → $500/R/contract (the legacy hardcoded value). A 35-OTM
+# 0DTE contract is ≈0.09 delta → ≈$90/R/contract, so the old $500 constant
+# overstated displayed $ by ~6× for the strikes this engine actually trades.
+DOLLARS_PER_POINT = 100.0          # SPX option multiplier ($/pt)
+POINTS_PER_R = 10.0                # 1R == 10 SPX points
+DEFAULT_STRIKE_DELTA = 0.09        # 35-OTM 0DTE ≈ 0.09Δ (realistic default)
+# Minimum fired trades for a walk-forward window to be treated as trustworthy.
+# Below this the "optimal" params are noise; results are flagged low_confidence.
+MIN_CONFIDENT_TRADES = 20
+
+
+def _dollars_per_r_per_contract(strike_delta: float | None) -> float:
+    """$ moved per 1R (POINTS_PER_R SPX pts) for one contract, delta-aware.
+
+    Falls back to DEFAULT_STRIKE_DELTA when the signal's strike delta isn't
+    available. Ranking is scale-invariant to this factor, but the DISPLAYED
+    dollars must stop being ~6× inflated from the ATM-delta-0.5 assumption."""
+    delta = strike_delta if (strike_delta is not None and strike_delta > 0) else DEFAULT_STRIKE_DELTA
+    return delta * DOLLARS_PER_POINT * POINTS_PER_R
+
 
 @dataclass
 class SweepConfig:
@@ -47,11 +72,15 @@ class SweepResult:
     test_total_pnl: float
     sharpe_ci_lo: float | None = None
     sharpe_ci_hi: float | None = None
+    # True when either split fired < MIN_CONFIDENT_TRADES trades — the
+    # "optimal" params for such a window are noise and must not be trusted.
+    low_confidence: bool = False
 
 
 def _proxy_pnl(direction: str, spx_now: float, spx_walk: list[float],
                qty: int = 15, symbol: str = "SPX",
-               apply_friction: bool = True) -> float:
+               apply_friction: bool = True,
+               strike_delta: float | None = None) -> float:
     """Bar-walk proxy P/L with 50/30/20 partial scale-out + -1R stop.
 
     P2 (2026-05-21): replaces the prior linear endpoint estimate
@@ -73,8 +102,12 @@ def _proxy_pnl(direction: str, spx_now: float, spx_walk: list[float],
             — this is coarser than 1-min bars but matches the iter
             granularity available at this layer. Use spx_walk = [endpoint]
             for legacy single-endpoint behavior.
-        qty: contract count for $ conversion ($50/pt/contract × 0.5 delta).
+        qty: contract count for $ conversion.
         apply_friction: subtract slippage + commission.
+        strike_delta: option delta of the traded strike. Drives the
+            delta-aware $/R (delta × $100 × 10pt). None → DEFAULT_STRIKE_DELTA
+            (35-OTM 0DTE ≈ 0.09), NOT the ATM-0.5 assumption that inflated
+            displayed $ ~6× for the OTM strikes this engine actually trades.
 
     Returns $ P/L. With apply_friction=True, walk-forward edges are no
     longer overstated by 20-50% from 0DTE bid-ask slippage.
@@ -114,9 +147,12 @@ def _proxy_pnl(direction: str, spx_now: float, spx_walk: list[float],
         final_r = direction_sign * (final_close - spx_now) / 10.0
         realized_r += remaining_share * final_r
 
-    # Convert R to $: 1R = 10pt × 0.5 delta × $100/pt × qty / 100  ≡  10pt × $50/pt × qty
-    # Matches the legacy convention: 10pt SPX move × 50 × qty.
-    gross_pnl = realized_r * 10 * 50 * qty
+    # Convert R to $ with a DELTA-AWARE per-contract factor (see
+    # _dollars_per_r_per_contract). Old code hardcoded 10·50·qty == $500/R/ct,
+    # i.e. an ATM delta-0.5 assumption that overstated $ ~6× for the OTM 0DTE
+    # strikes actually traded. Ranking is unchanged (scale-invariant); the
+    # displayed dollars are now realistic.
+    gross_pnl = realized_r * _dollars_per_r_per_contract(strike_delta) * qty
 
     if not apply_friction:
         return round(gross_pnl, 2)
@@ -126,6 +162,23 @@ def _proxy_pnl(direction: str, spx_now: float, spx_walk: list[float],
     spread_cost = entry_premium_estimate * cfg["bid_ask_pct_of_mid"] * qty * 100
     commission = cfg["commission_per_contract"] * qty * 2  # round-trip
     return round(gross_pnl - spread_cost - commission, 2)
+
+
+def _forward_walk_within_session(slice_iters: list[dict], i: int,
+                                 future_idx: int) -> list[float]:
+    """Forward SPX prices for iters (i+1 .. future_idx) that share iter i's
+    session_date. Purges the walk at the overnight boundary — a 0DTE trade
+    can't be held into the next session, so scoring it against the next day's
+    open is invalid. When session_date isn't present on the iters the walk is
+    unpurged (legacy behavior)."""
+    entry_session = slice_iters[i].get("session_date")
+    walk: list[float] = []
+    for j in range(i + 1, future_idx + 1):
+        fwd = slice_iters[j]
+        if entry_session is not None and fwd.get("session_date") != entry_session:
+            break
+        walk.append(fwd["spx_price"])
+    return walk
 
 
 def _sharpe(returns: list[float]) -> float | None:
@@ -234,10 +287,14 @@ def run_sweep(
             future_idx = i + cfg.lookahead_iters
             if future_idx >= len(slice_iters):
                 continue
-            spx_walk = [
-                slice_iters[j]["spx_price"]
-                for j in range(i + 1, future_idx + 1)
-            ]
+            # PURGE the forward-walk at the overnight session boundary: a 0DTE
+            # trade cannot be held past its own session, so the walk must stay
+            # within the entry's session_date. Without this the walk hopped
+            # across days and scored a trade against the NEXT session's open —
+            # invalid for 0DTE.
+            spx_walk = _forward_walk_within_session(slice_iters, i, future_idx)
+            if not spx_walk:
+                continue
             pnl = _proxy_pnl(verdict.direction.value, it["spx_price"], spx_walk)
             returns.append(pnl)
             trades += 1
@@ -254,6 +311,9 @@ def run_sweep(
                 for afe in cfg.absorption_fe_values:
                     engine = FEFEngine(
                         wall_proximity_pts=prox,
+                        # The sweep explicitly varies the proximity knob ->
+                        # gate opt-in here (live default OFF, 2026-07-02).
+                        wall_proximity_skip_enabled=True,
                         wall_collapse_pct=cpct,
                         wall_collapse_floor_m=cfloor,
                         absorption_fe_ratio_min=afe,
@@ -261,6 +321,8 @@ def run_sweep(
                     train_returns, train_trades, train_wins, train_total = _eval(train_iters, engine)
                     test_returns, test_trades, test_wins, test_total = _eval(test_iters, engine)
                     ci_lo, ci_hi = _bootstrap_sharpe_ci(test_returns)
+                    low_conf = (train_trades < MIN_CONFIDENT_TRADES
+                                or test_trades < MIN_CONFIDENT_TRADES)
                     results.append(SweepResult(
                         wall_proximity_pts=prox,
                         wall_collapse_pct=cpct,
@@ -276,6 +338,7 @@ def run_sweep(
                         test_total_pnl=round(test_total, 2),
                         sharpe_ci_lo=ci_lo,
                         sharpe_ci_hi=ci_hi,
+                        low_confidence=low_conf,
                     ))
     results.sort(key=lambda r: (r.test_sharpe or -999, r.test_total_pnl), reverse=True)
     return results

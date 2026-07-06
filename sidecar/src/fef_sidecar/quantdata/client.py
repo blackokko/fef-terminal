@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, timezone
@@ -276,7 +277,19 @@ class QuantDataClient:
         return parse_exposure(raw, greek)
 
     async def get_net_drift(self) -> DriftSummary:
-        body = {"sessionDate": self._sd(), "filter": self._filter()}
+        # 0DTE-SCOPE the drift (2026-06-30). The validated flow edge is on SPXW 0DTE
+        # aggressive flow. WITHOUT expirationDate, net-drift returns ALL-EXPIRY net
+        # premium (dominated by longer-dated hedging) which is ANTI-correlated with
+        # the 0DTE signal — measured Spearman −0.32 / 25.5% direction agreement vs
+        # the ThetaData 0DTE flow, i.e. the live engine was firing roughly the WRONG
+        # way (a likely cause of the "fires a whole losing direction" history).
+        # Scoping to the session's 0DTE flips it to +0.40 / 73%. Mirrors get_max_pain.
+        # Escape hatch: FEF_DRIFT_EXPIRY_SCOPE=ALL restores the old all-expiry drift.
+        if os.environ.get("FEF_DRIFT_EXPIRY_SCOPE", "0DTE").upper() == "ALL":
+            filt = self._filter()
+        else:
+            filt = self._filter(expirationDate=self._exp())
+        body = {"sessionDate": self._sd(), "filter": filt}
         raw = await self._post_tool(ENDPOINTS["net_drift"], body)
         return parse_net_drift(raw)
 

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { NumberSetting } from "../components/NumberSetting";
 
 const API_BASE = "http://127.0.0.1:8765";
 
@@ -9,6 +10,7 @@ interface ExitConfig {
     dollar_t2: number;
     dollar_t3: number;
     dollar_stop: number;
+    dollar_semantics: "cumulative_realized" | "whole_unrealized";
   };
   spread: {
     stop_multiplier: number;
@@ -79,34 +81,48 @@ export function ExitStrategyPanel() {
       </div>
 
       {cfg.long.strategy === "fixed_dollar" && (
+        <>
+        <div style={{ margin: "6px 0 4px" }}>
+          <select
+            value={cfg.long.dollar_semantics}
+            disabled={busy}
+            onChange={(e) => void update({ dollar_semantics: e.target.value })}
+            style={{ fontSize: 11, width: "100%" }}
+          >
+            <option value="cumulative_realized">Targets = cumulative banked ($1000 TP ≈ $1000 booked)</option>
+            <option value="whole_unrealized">Targets = full-position unrealized (legacy)</option>
+          </select>
+          <div className="muted small" style={{ marginTop: 2 }}>
+            {cfg.long.dollar_semantics === "cumulative_realized"
+              ? "Each tier's slice earns the increment between targets, so hitting all 3 banks ≈ the top number. Tiers fire later."
+              : "Tier fires when the whole position's unrealized P&L crosses the target; each sells only its slice, so 3 TPs bank far less than the top number (the 7510C case)."}
+          </div>
+        </div>
         <table className="exit-strat-table">
           <tbody>
             <tr>
               <td>T1 target</td>
-              <td>$ <input type="number" step="100" value={cfg.long.dollar_t1}
-                          onChange={(e) => void update({ dollar_t1: Number(e.target.value) })}
-                          className="settings-input" disabled={busy} /></td>
+              <td>$ <NumberSetting step="100" value={cfg.long.dollar_t1}
+                          onCommit={(n) => void update({ dollar_t1: n })} /></td>
             </tr>
             <tr>
               <td>T2 target</td>
-              <td>$ <input type="number" step="100" value={cfg.long.dollar_t2}
-                          onChange={(e) => void update({ dollar_t2: Number(e.target.value) })}
-                          className="settings-input" disabled={busy} /></td>
+              <td>$ <NumberSetting step="100" value={cfg.long.dollar_t2}
+                          onCommit={(n) => void update({ dollar_t2: n })} /></td>
             </tr>
             <tr>
               <td>T3 target</td>
-              <td>$ <input type="number" step="100" value={cfg.long.dollar_t3}
-                          onChange={(e) => void update({ dollar_t3: Number(e.target.value) })}
-                          className="settings-input" disabled={busy} /></td>
+              <td>$ <NumberSetting step="100" value={cfg.long.dollar_t3}
+                          onCommit={(n) => void update({ dollar_t3: n })} /></td>
             </tr>
             <tr>
               <td>Stop (loss)</td>
-              <td>$ <input type="number" step="100" value={cfg.long.dollar_stop}
-                          onChange={(e) => void update({ dollar_stop: Number(e.target.value) })}
-                          className="settings-input" disabled={busy} /></td>
+              <td>$ <NumberSetting step="100" value={cfg.long.dollar_stop}
+                          onCommit={(n) => void update({ dollar_stop: n })} /></td>
             </tr>
           </tbody>
         </table>
+        </>
       )}
 
       <div className="muted small" style={{ marginTop: 10, marginBottom: 4, fontWeight: 600, color: "var(--color-text)" }}>
@@ -116,15 +132,13 @@ export function ExitStrategyPanel() {
         <tbody>
           <tr>
             <td>TP close debit</td>
-            <td>$ <input type="number" step="0.01" value={cfg.spread.tp_close_debit}
-                        onChange={(e) => void update({ spread_tp_close_debit: Number(e.target.value) })}
-                        className="settings-input" disabled={busy} /></td>
+            <td>$ <NumberSetting step="0.01" value={cfg.spread.tp_close_debit}
+                        onCommit={(n) => void update({ spread_tp_close_debit: n })} /></td>
           </tr>
           <tr>
             <td>Stop multiplier</td>
-            <td><input type="number" step="0.5" value={cfg.spread.stop_multiplier}
-                       onChange={(e) => void update({ spread_stop_multiplier: Number(e.target.value) })}
-                       className="settings-input" disabled={busy} />× initial credit</td>
+            <td><NumberSetting step="0.5" value={cfg.spread.stop_multiplier}
+                       onCommit={(n) => void update({ spread_stop_multiplier: n })} />× initial credit</td>
           </tr>
         </tbody>
       </table>

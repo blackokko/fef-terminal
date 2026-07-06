@@ -365,6 +365,24 @@ class SignalIterRepository:
             return list((await session.exec(stmt)).all())
 
     @staticmethod
+    async def query_recent_bars(symbol: str, bar_size: str, *,
+                                limit: int = 400) -> list[HistoricalBar]:
+        """Most recent `limit` bars for symbol+bar_size, returned OLDEST-first
+        (chronological). Used by the pattern trigger loop + overlay endpoint,
+        which want 'the last N bars' rather than a time window."""
+        async with get_session() as session:
+            stmt = (
+                select(HistoricalBar)
+                .where(HistoricalBar.symbol == symbol)
+                .where(HistoricalBar.bar_size == bar_size)
+                .order_by(HistoricalBar.timestamp_ms.desc())  # type: ignore[attr-defined]
+                .limit(limit)
+            )
+            rows = list((await session.exec(stmt)).all())
+        rows.reverse()
+        return rows
+
+    @staticmethod
     async def write_flow_snapshot(
         symbol: str, session_date: str, timestamp_ms: int, spx_price: float,
         top_gex_walls: list, top_dex_walls: list,
@@ -496,7 +514,9 @@ class SignalIterRepository:
     @staticmethod
     async def query_audit_log(*, category: str | None = None, limit: int = 200) -> list[AuditLog]:
         async with get_session() as session:
-            stmt = select(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit)  # type: ignore[attr-defined]
+            # id tie-break: rows written within one timestamp tick (Windows
+            # datetime resolution ~15ms) otherwise return in unstable order.
+            stmt = select(AuditLog).order_by(AuditLog.timestamp.desc(), AuditLog.id.desc()).limit(limit)  # type: ignore[attr-defined]
             if category is not None:
                 stmt = stmt.where(AuditLog.category == category)
             return list((await session.exec(stmt)).all())

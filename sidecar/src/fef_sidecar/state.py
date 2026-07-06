@@ -14,6 +14,7 @@ from fef_sidecar.engine import FEFEngine
 from fef_sidecar.engine.microstructure import MicrostructureState
 from fef_sidecar.engine.mock_autotrader import MockAutoTraderState
 from fef_sidecar.engine.regime import RegimeAssessment, RegimeDetector
+from fef_sidecar.engine.tick_candles import TickCandleService
 from fef_sidecar.engine.tournament import DEFAULT_VARIANTS, TournamentRunner
 from fef_sidecar.events import EventBroadcaster
 from fef_sidecar.ibkr import IBKRProvider, LiveIBKRProvider, MockIBKRProvider
@@ -154,7 +155,42 @@ class AppState:
     exit_dollar_t2: float = 2500.0
     exit_dollar_t3: float = 5000.0
     exit_dollar_stop: float = -1000.0
+    # How the fixed_dollar tier targets are interpreted:
+    #   'cumulative_realized' (default) — d_targets are CUMULATIVE banked totals;
+    #     each tier's slice must earn the increment between targets, so hitting
+    #     all 3 banks ≈ the top number. Intuitive ("$1000 TP" ≈ $1000 booked).
+    #   'whole_unrealized' — legacy: tier fires on full-position unrealized P&L
+    #     crossing the target (the 7510C behaviour where 3 TPs banked ~$650).
+    exit_dollar_semantics: str = "cumulative_realized"
     spx_target_task: object | None = None
+
+    # ---- Phase detector (RIDE / FADE / WAIT direction refiner) ----
+    # Reads WHERE in a move we are (ignition vs exhaustion) from 6 mechanical
+    # pillars and emits a direction — fixes the 2026-07-01 failure where the
+    # engine followed a dump into PUTS at the capitulation low instead of
+    # fading the exhaustion (the +$25k 7470C play). See engine/phase_detector.py.
+    #   mode: 'off'      — not evaluated.
+    #         'advisory' — evaluated + logged every iter, ZERO trade impact.
+    #         'active'   — overrides the auto-trade entry direction.
+    # Default 'advisory' (zero trade impact — computes + logs + shows in the panel
+    # so it can be watched/validated). Promote to 'active' only after the backtest
+    # + advisory-session validation clear the pivot kill-gate (human decision).
+    phase_mode: str = "advisory"
+    phase_window_sec: int = 300
+    phase_vel_sec: int = 75
+    phase_vel_ignite: float = 16.0
+    phase_vel_stall: float = 3.0
+    phase_min_move: float = 18.0
+    phase_bounce_pt: float = 3.0
+    phase_iv_delta: float = 0.006
+    phase_mp_overshoot: float = 8.0
+    phase_fade_min: int = 5       # backtest: only >=5 is sane + positive
+    phase_ride_min: int = 7       # >6-pillar max => RIDE off (chasing thrust loses)
+    # Runtime holders (not config): the live detector + its latest verdict dict.
+    # POST /phase_detector nulls phase_detector to force a rebuild with new
+    # thresholds on the next iter.
+    phase_detector: object | None = None
+    phase_last_verdict: dict | None = None
 
     # Spread exit rule (always premium_pct for now):
     #   TP  = close for $0.05 debit (basically expire worthless)
@@ -264,6 +300,38 @@ class AppState:
     # ES VWAP capture loop task handle.
     es_vwap_task: object | None = None
 
+    # N-tick candle aggregation (1000T / 2000T chart resolutions). Fed by
+    # microstructure_loop's trade callback — same ES AllLast stream, zero
+    # extra IBKR tick-by-tick subscriptions. Served by /chart/tick_candles.
+    tick_candles: TickCandleService = field(default_factory=TickCandleService)
+
+    # Pattern trigger loop task handle (confirmed-bar pattern fires ->
+    # advisory audit rows + opt-in auto-trade). Restarted on symbol switch.
+    pattern_trigger_task: object | None = None
+
+    # Per-symbol auto-trade firing locks. maybe_auto_trade serializes the
+    # whole gate+place sequence per symbol so near-simultaneous calls from
+    # different signal sources (scanner / main loop / pattern trigger) can't
+    # both pass cool-down/cap/duplicate-parent gates before either records
+    # its fire (7/1: twin QQQ 720P parents 16ms apart).
+    auto_trade_symbol_locks: dict[str, object] = field(default_factory=dict)
+
+    # CHOP skip-gate — per-(bar_symbol, session_date) cached time-of-day r30
+    # distribution (built once per session from the prior ~20 sessions of
+    # 1-min bars; see engine/chop_gate.py). Values are chop_gate._DistCacheEntry.
+    chop_tod_dist_cache: dict[tuple, object] = field(default_factory=dict)
+
+    # Impulse attention flag — per-(symbol, direction) last-fire epoch ms for
+    # the advisory flag's own cooldown (UIConfig.impulse_flag_cooldown_sec).
+    # Advisory only; never gates or places trades.
+    impulse_flag_last_at_ms: dict[tuple, int] = field(default_factory=dict)
+
+    # BE-ladder exit shadow — per-parent simulated SPX-point BE-ladder exit
+    # state (see spx_target_watcher._shadow_be_ladder_cycle). Keyed by
+    # LiveOrder parent id; in-memory only (lost on restart — acceptable for
+    # an A/B exit shadow). NEVER places orders.
+    shadow_be_ladder: dict[int, dict] = field(default_factory=dict)
+
     @classmethod
     def build(cls) -> AppState:
         return cls(
@@ -279,15 +347,75 @@ class AppState:
         )
 
 
-def _make_engine() -> FEFEngine:
-    """Engine factory honoring env-var thresholds (IMPROVEMENTS #2 + #7)."""
-    interval = float(os.environ.get("FEF_LOOP_INTERVAL_SEC", "120"))
+def _make_engine(
+    *,
+    interval_sec: float | None = None,
+    flow_surge_gate: bool | None = None,
+) -> FEFEngine:
+    """Engine factory honoring env-var thresholds (IMPROVEMENTS #2 + #7).
+
+    THE canonical FEFEngine constructor — every engine in the app (main
+    loop, multi-symbol scanner, shadow) must come through here so env-tuned
+    behavior applies uniformly. The scanner previously used a local 5-param
+    factory: flow_surge_gate_enabled fell back to the CONSTRUCTOR default
+    (True), so the flow-surge path kept firing live auto-trades from the
+    scanner while the main engine had it disabled (the 7/1-7/2 fires).
+
+    interval_sec: evaluation cadence for magnitude-threshold scaling.
+    Default = FEF_LOOP_INTERVAL_SEC (main loop, 120s).
+
+    flow_surge_gate: explicit gate override. None (main loop + shadow) =
+    FEF_FLOW_SURGE_GATE_ENABLED env, default FALSE — the main engine's
+    flow-surge path stays RETIRED and only logs the advisory
+    'FLOW-SURGE GATE DISABLED — would be ALIGNED...' WAIT rows. The
+    SCANNER passes its own explicit value (see multi_symbol_scanner.
+    _make_engine_for): per the 2026-07-02 config decision, the STRICT
+    scanner configuration is the ONE canonical flow-surge signaler; the
+    global env flag must NOT be used to wake the main engine's actionable
+    path alongside it (two engines with different effective thresholds
+    firing into one account = uninterpretable mixed signal population)."""
+    interval = (
+        float(interval_sec) if interval_sec is not None
+        else float(os.environ.get("FEF_LOOP_INTERVAL_SEC", "120"))
+    )
     # Auto-scale magnitude thresholds by interval (default 120s = scale 1.0)
     threshold_scale = max(0.1, interval / 120.0)
     return FEFEngine(
         wall_proximity_pts=float(os.environ.get("FEF_WALL_PROXIMITY_PTS", "5.0")),
+        # WALL GATE OFF BY DEFAULT (2026-07-02 validation): the proximity
+        # skip fails the harm-reduction bar (near-wall fires are the least
+        # bad; a 5pt gate removes 58.6% of fires and keeps the worse 5-10pt
+        # band; the chop gate already owns the real harm region). The
+        # per-family ranking fix + wall context logging remain; the SKIP is
+        # explicit opt-in via this env.
+        wall_proximity_skip_enabled=(
+            os.environ.get("FEF_WALL_PROXIMITY_SKIP_ENABLED", "false").lower()
+            in ("true", "1", "yes", "on")
+        ),
         wall_collapse_pct=float(os.environ.get("FEF_WALL_COLLAPSE_PCT", "0.20")),
         wall_collapse_floor_m=float(os.environ.get("FEF_WALL_COLLAPSE_FLOOR_M", "5.0")),
         absorption_fe_ratio_min=float(os.environ.get("FEF_ABSORPTION_FE_MIN", "5.0")),
+        # Flow-surge gate: adaptive rolling percentile of recent |ΔDrift|, with the
+        # absolute value as a warm-up bootstrap (non-stationarity fix 2026-06-30).
+        flow_surge_min_m=float(os.environ.get("FEF_FLOW_SURGE_MIN_M", "25.0")),
+        flow_surge_pct=float(os.environ.get("FEF_FLOW_SURGE_PCT", "90.0")),
+        flow_surge_window=int(os.environ.get("FEF_FLOW_SURGE_WINDOW", "120")),
+        flow_surge_noise_floor_m=float(os.environ.get("FEF_FLOW_SURGE_NOISE_FLOOR_M", "1.0")),
+        flow_surge_min_samples=int(os.environ.get("FEF_FLOW_SURGE_MIN_SAMPLES", "8")),
+        # Reject corrupted-capture drift glitches (e.g. QuantData -2839M) before
+        # they fire a false surge or poison the adaptive percentile.
+        drift_sanity_ceiling_m=float(os.environ.get("FEF_DRIFT_SANITY_CEILING_M", "250.0")),
+        # INERT by default (2026-06-30): the flow-surge directional edge was retired
+        # as a spot-reconstruction artifact. The drift input still feeds bias/regime,
+        # but flow-surge alignment no longer fires actionable trades from the MAIN
+        # engine. Flow-surge signaling lives EXCLUSIVELY in the strict scanner
+        # (FEF_SCANNER_FLOW_SURGE_ENABLED, default on) — do NOT flip this global
+        # flag to trade flow-surge from the main loop as well (mixed-threshold
+        # signal population; see the 2026-07-02 config decision).
+        flow_surge_gate_enabled=(
+            flow_surge_gate if flow_surge_gate is not None
+            else os.environ.get("FEF_FLOW_SURGE_GATE_ENABLED", "false").lower()
+            in ("true", "1", "yes", "on")
+        ),
         threshold_scale=threshold_scale,
     )

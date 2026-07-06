@@ -74,6 +74,9 @@ export function Sidebar() {
             <Safe name="CrossSymbol"><CrossSymbolPanel /></Safe>
             <Safe name="OrderTicket"><OrderTicketPanel /></Safe>
             <Safe name="ExitStrategy"><ExitStrategyPanel /></Safe>
+            {/* PhaseDetectorPanel retired from the sidebar 2026-07-06 — its
+                post-capitulation logic now lives in the Market Regime panel's
+                Expected-move tile. Code kept at panels/PhaseDetectorPanel.tsx. */}
             <Safe name="AutoTrade"><AutoTradePanel /></Safe>
             <Safe name="Scanner"><ScannerPanel /></Safe>
             <Safe name="LiveExecution"><LiveExecutionPanel /></Safe>

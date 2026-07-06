@@ -26,6 +26,7 @@ import os
 import time as _time
 from typing import Any
 
+from fef_sidecar.config_store import load_config
 from fef_sidecar.db.repository import SignalIterRepository
 from fef_sidecar.engine import FEFEngine
 from fef_sidecar.engine.fef import snapshot_to_inputs
@@ -35,18 +36,224 @@ logger = logging.getLogger(__name__)
 
 OPTION_SYMBOLS = {"SPX", "SPY", "QQQ", "IWM", "GLD", "SMH", "TLT"}
 
+# Per-symbol input sanity guard (2026-07-06): reject an incoming spot that
+# deviates more than this fraction from the engine's last ACCEPTED spot.
+# Cross-symbol contamination is orders of magnitude beyond it (SPX 7526.8 on
+# a GLD ~380 engine = +1882%); no legitimate 60s move approaches 20%.
+SCANNER_SPOT_MAX_DEVIATION = 0.20
+
+# Reference-pollution guard (2026-07-06 19:07 residual): even with a VALID
+# current spot, the engine's own delta window can still hold a cross-stream
+# reference accepted before the band guard deployed (6 post-fix rows carried
+# dP ±6,794 off a polluted PREVIOUS reference). The implied per-iteration
+# delta is validated against max(SCANNER_DELTA_ABS_MAX_PTS,
+# SCANNER_DELTA_MAX_FRAC × spot); a violation rejects the iteration AND
+# resets (quarantines) the engine's history window so the pollution cannot
+# survive into the next delta computation.
+SCANNER_DELTA_ABS_MAX_PTS = 50.0
+SCANNER_DELTA_MAX_FRAC = 0.03
+
+
+def _reference_delta_threshold(spot: float) -> float:
+    return max(SCANNER_DELTA_ABS_MAX_PTS, SCANNER_DELTA_MAX_FRAC * abs(spot))
+
+
+def _polluted_window_refs(engine, spot: float) -> list[float]:
+    """Prices in the engine's history window whose implied delta vs `spot`
+    violates the reference-pollution threshold. Empty list = window clean
+    (or engine exposes no window — nothing to validate)."""
+    history = getattr(engine, "_history", None) if engine is not None else None
+    if not history:
+        return []
+    thresh = _reference_delta_threshold(spot)
+    out: list[float] = []
+    for entry in history:
+        try:
+            ref = float(getattr(entry, "spx_price", 0.0) or 0.0)
+        except Exception:
+            continue
+        if ref > 0 and abs(spot - ref) > thresh:
+            out.append(ref)
+    return out
+
+
+def _quarantine_engine_window(engine) -> bool:
+    """Reset the engine's history/delta window (public reset() when
+    available). Returns True when a reset actually happened."""
+    if engine is None:
+        return False
+    try:
+        if hasattr(engine, "reset"):
+            engine.reset()
+            return True
+        history = getattr(engine, "_history", None)
+        if history is not None:
+            history.clear()
+            return True
+    except Exception:
+        logger.exception("scanner: engine window quarantine failed")
+    return False
+
+
+async def _reject_scanner_input_glitch(state, symbol: str, spot, engine=None) -> bool:
+    """Input-boundary price sanity guard for one scanner engine (2026-07-06).
+
+    A race on the shared QuantData page filter (set_page_filter mutates
+    client._ticker; every sub-fetch reads it at request time) let the GLD
+    scan fetch an SPX-priced snapshot → "[SCANNER GLD] ALIGNED — ΔPrice
+    +7147.15pts". The race itself is closed by loop._qd_scope_lock; this
+    guard is the boundary backstop, in TWO phases:
+
+    Phase 1 — current-spot band (original guard): if the incoming spot
+    deviates >20% from this engine's last ACCEPTED spot, REJECT the whole
+    iteration — no engine.push (drift/delta windows stay unpolluted), no
+    verdict cache, no trade path — and write a category='scanner_input_glitch'
+    audit row (kind='spot_band') with both values. A rejected spot is NOT
+    recorded as the new baseline; the first-ever spot for a symbol is
+    accepted (no baseline to judge against). On rejection the engine's
+    history window is ALSO validated against the accepted baseline and
+    quarantined if it holds a cross-stream reference.
+
+    Phase 2 — reference pollution (2026-07-06 19:07 residual): a VALID
+    current spot judged against a POLLUTED previous reference still produced
+    dP ±6,794 in 6 post-fix rows (cross-stream reference already inside the
+    engine's delta window, e.g. accepted pre-deploy or after a baseline
+    reset). If any window reference implies |Δprice| > max(50, 3% of spot),
+    REJECT the iteration and RESET/quarantine the engine's history window
+    (engine.reset() → clean re-warmup), audit row kind='reference_pollution'.
+
+    Returns True → caller must skip the iteration."""
+    if not hasattr(state, "_scanner_last_spot"):
+        state._scanner_last_spot = {}  # type: ignore[attr-defined]
+    last = state._scanner_last_spot.get(symbol)  # type: ignore[attr-defined]
+    spot_f = float(spot or 0.0)
+    if (last is not None and last > 0
+            and abs(spot_f - last) > last * SCANNER_SPOT_MAX_DEVIATION):
+        dev_pct = abs(spot_f - last) / last * 100.0
+        # The window must never retain a reference that is itself outside
+        # the accepted band (cross-symbol pollution) — validate + quarantine
+        # while we're rejecting anyway, so the next accepted tick can't be
+        # judged against a foreign previous price.
+        window_bad = bool(_polluted_window_refs(engine, last))
+        quarantined = _quarantine_engine_window(engine) if window_bad else False
+        logger.warning(
+            "scanner: %s REJECTED snapshot spot %.2f — deviates %.1f%% from "
+            "last accepted %.2f (cross-symbol contamination guard%s)",
+            symbol, spot_f, dev_pct, last,
+            "; polluted window quarantined" if quarantined else "",
+        )
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="scanner_input_glitch", actor="system",
+                summary=(
+                    f"SCANNER {symbol}: REJECTED snapshot spot {spot_f:.2f} — "
+                    f"deviates {dev_pct:.1f}% from last accepted {last:.2f} "
+                    f"(>{SCANNER_SPOT_MAX_DEVIATION:.0%} cross-symbol contamination "
+                    f"guard); iteration skipped, engine state untouched"
+                ),
+                details={
+                    "kind": "spot_band",
+                    "symbol": symbol,
+                    "incoming_spot": spot_f,
+                    "last_accepted_spot": last,
+                    "deviation_pct": round(dev_pct, 2),
+                    "threshold_pct": SCANNER_SPOT_MAX_DEVIATION * 100.0,
+                    "window_quarantined": quarantined,
+                },
+            )
+        except Exception:
+            logger.exception("scanner: input-glitch audit write failed for %s", symbol)
+        return True
+
+    # Phase 2 — the current spot is acceptable; validate the DELTA it would
+    # produce against every reference in the engine's own history window.
+    if spot_f > 0:
+        polluted = _polluted_window_refs(engine, spot_f)
+        if polluted:
+            worst = max(polluted, key=lambda r: abs(spot_f - r))
+            delta = spot_f - worst
+            thresh = _reference_delta_threshold(spot_f)
+            quarantined = _quarantine_engine_window(engine)
+            logger.warning(
+                "scanner: %s REJECTED iteration — valid spot %.2f against "
+                "polluted window reference %.2f (dPrice %+.2f exceeds "
+                "max(50, 3%%·spot)=%.2f); reference window %s",
+                symbol, spot_f, worst, delta, thresh,
+                "quarantined" if quarantined else "NOT quarantined",
+            )
+            try:
+                await SignalIterRepository.write_audit_log(
+                    category="scanner_input_glitch", actor="system",
+                    summary=(
+                        f"SCANNER {symbol}: REJECTED iteration — valid spot "
+                        f"{spot_f:.2f} vs polluted window reference {worst:.2f} "
+                        f"(dPrice {delta:+.2f} > {thresh:.2f} = max(50, 3% of "
+                        f"spot)); engine history window "
+                        f"{'quarantined' if quarantined else 'not quarantined'}"
+                    ),
+                    details={
+                        "kind": "reference_pollution",
+                        "symbol": symbol,
+                        "incoming_spot": spot_f,
+                        "polluted_reference": worst,
+                        "delta_price": round(delta, 2),
+                        "threshold_pts": round(thresh, 2),
+                        "polluted_refs": [round(r, 2) for r in polluted[:8]],
+                        "window_quarantined": quarantined,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "scanner: reference-pollution audit write failed for %s", symbol,
+                )
+            # The spot itself validated against the band — record it as the
+            # baseline so the band guard stays current while the engine
+            # re-warms from a clean window.
+            state._scanner_last_spot[symbol] = spot_f  # type: ignore[attr-defined]
+            return True
+        state._scanner_last_spot[symbol] = spot_f  # type: ignore[attr-defined]
+    return False
+
 
 def _make_engine_for(symbol: str) -> FEFEngine:
-    """Build a FEFEngine with the standard thresholds. One per symbol."""
-    interval = float(os.environ.get("FEF_LOOP_INTERVAL_SEC", "120"))
-    threshold_scale = max(0.1, interval / 120.0)
-    return FEFEngine(
-        wall_proximity_pts=float(os.environ.get("FEF_WALL_PROXIMITY_PTS", "5.0")),
-        wall_collapse_pct=float(os.environ.get("FEF_WALL_COLLAPSE_PCT", "0.20")),
-        wall_collapse_floor_m=float(os.environ.get("FEF_WALL_COLLAPSE_FLOOR_M", "5.0")),
-        absorption_fe_ratio_min=float(os.environ.get("FEF_ABSORPTION_FE_MIN", "5.0")),
-        threshold_scale=threshold_scale,
-    )
+    """Build a per-symbol FEFEngine via the CANONICAL factory — configured
+    as THE one canonical flow-surge signaler.
+
+    CONFIG DECISION (2026-07-02, final): the STRICT scanner configuration
+    ("whatever fired today") is the ONE canonical flow-surge signaler. The
+    MAIN engine's flow-surge path stays RETIRED (advisory WAIT rows only).
+    Two engines with different effective thresholds firing into one account
+    would produce an uninterpretable mixed signal population — so the
+    scanner gate is controlled by its OWN env, independent of the global
+    FEF_FLOW_SURGE_GATE_ENABLED (which governs main + shadow and stays
+    false at deploy):
+
+        FEF_SCANNER_FLOW_SURGE_ENABLED  (default true = today's behavior)
+
+    History: this used to be a local 5-param FEFEngine() call, so
+    flow_surge_gate_enabled silently fell back to the CONSTRUCTOR default
+    True — which is HOW the scanner kept firing after the 6/30 retirement
+    flipped only state._make_engine's env default. Now the same behavior
+    is explicit, named, and switchable.
+
+    threshold_scale — CANONICAL STRICT CONFIGURATION (not a legacy quirk):
+    scanner engines deliberately use the FEF_LOOP_INTERVAL_SEC-derived
+    scale (120s -> 1.0) while evaluating every FEF_SCAN_INTERVAL_SEC (60s),
+    i.e. a 60s delta window judged against 120s-calibrated magnitude
+    thresholds — ~2x stricter per window. That selectivity (~1 fire/day)
+    IS the configuration being forward-tested; do not "fix" it to
+    cadence-matched scaling. Cadence-matched scaling remains available as
+    an explicit opt-in via FEF_SCAN_THRESHOLD_SCALE_SEC (e.g. 60).
+    """
+    from fef_sidecar.state import _make_engine
+    scanner_gate = os.environ.get(
+        "FEF_SCANNER_FLOW_SURGE_ENABLED", "true"
+    ).lower() in ("true", "1", "yes", "on")
+    raw = os.environ.get("FEF_SCAN_THRESHOLD_SCALE_SEC", "").strip()
+    if raw:
+        return _make_engine(interval_sec=float(raw), flow_surge_gate=scanner_gate)
+    # Default: FEF_LOOP_INTERVAL_SEC scale = the canonical strict config.
+    return _make_engine(flow_surge_gate=scanner_gate)
 
 
 async def _scan_one_symbol(state, symbol: str) -> None:
@@ -59,10 +266,16 @@ async def _scan_one_symbol(state, symbol: str) -> None:
     engine = state.scanner_engines[symbol]
 
     # Fetch QuantData snapshot for this symbol. Temporarily flip the page
-    # filter; the global poll will reset it next cycle.
+    # filter; the global poll will reset it next cycle. HOLD THE SCOPE LOCK
+    # across set+fetch (2026-07-06): set_page_filter mutates the shared
+    # client's _ticker and every sub-fetch reads it at request time, so an
+    # unlocked pair interleaved with the main poll's set_page_filter fetched
+    # SPX-priced data into this symbol's snapshot (the GLD +7147pt glitch).
     try:
-        await state.quantdata.set_page_filter(ticker=symbol)
-        snap = await state.quantdata.fetch_market_snapshot()
+        from fef_sidecar.loop import _qd_scope_lock
+        async with _qd_scope_lock(state.quantdata):
+            await state.quantdata.set_page_filter(ticker=symbol)
+            snap = await state.quantdata.fetch_market_snapshot()
     except Exception as e:
         logger.warning("scanner: QuantData fetch failed for %s: %s", symbol, e)
         return
@@ -70,6 +283,17 @@ async def _scan_one_symbol(state, symbol: str) -> None:
         return
 
     inputs = snapshot_to_inputs(snap)
+
+    # PER-SYMBOL PRICE SANITY GUARD (2026-07-06): reject cross-symbol
+    # contamination at the input boundary BEFORE any consumption — no
+    # engine.push, no verdict cache, no impulse flag, no trade path. The
+    # engine is passed so the guard can also validate/quarantine its
+    # history window (reference-pollution extension, 19:07 residual).
+    if await _reject_scanner_input_glitch(
+        state, symbol, inputs.spx_price, engine=engine,
+    ):
+        return
+
     verdict = engine.push(inputs)
 
     # Cache the verdict for the FE Scanner panel (it polls /scanner/symbols).
@@ -85,6 +309,19 @@ async def _scan_one_symbol(state, symbol: str) -> None:
         "strike_rec": verdict.strike_rec,
         "timestamp_ms": int(_time.time() * 1000),
     }
+
+    # IMPULSE ATTENTION FLAG — advisory only (validated 2026-07-02 as
+    # decision-support; whipsaws as an auto-trigger). Evaluated on EVERY
+    # scan, WAIT verdicts included — the verdict carries delta_price /
+    # delta_drift_m regardless of direction. Never trades.
+    try:
+        await maybe_impulse_flag(
+            state, symbol, spot=inputs.spx_price,
+            delta_price=verdict.delta_price,
+            delta_drift_m=verdict.delta_drift_m,
+        )
+    except Exception:
+        logger.exception("scanner: impulse flag evaluation failed for %s", symbol)
 
     # Build a verdict dict for the auto-trader (not broadcast — local only).
     verdict_dict = {
@@ -103,6 +340,7 @@ async def _scan_one_symbol(state, symbol: str) -> None:
         "wall_collapse_trigger": verdict.wall_collapse_trigger,
         "nearest_wall_strike": verdict.nearest_wall_strike,
         "nearest_wall_distance": verdict.nearest_wall_distance,
+        "nearest_wall_family": verdict.nearest_wall_family,
         "secondary_scores": verdict.secondary_scores,
         "scanner_symbol": symbol,
     }
@@ -144,13 +382,680 @@ async def _scan_one_symbol(state, symbol: str) -> None:
             logger.exception("scanner: option quote fetch failed for %s", symbol)
 
     if symbol in OPTION_SYMBOLS:
+        await handle_actionable_scanner_verdict(
+            state, symbol, spot=inputs.spx_price, verdict_dict=verdict_dict,
+            inputs=inputs,
+        )
+
+
+# Structured block code for bias-veto skips (same rationale as
+# chop_gate.CHOP_GATE_BLOCK_CODE: the veto lives outside the frozen
+# auto-trader; block_reason_code is a free-form column).
+BIAS_VETO_BLOCK_CODE = "BIAS_VETO_SKIP"
+# FOMC-morning gate (2026-07-06 event study: FOMC pre-14:00 fires -$61/ct,
+# t=-4.4, 80% of FOMC sessions negative).
+FOMC_GATE_BLOCK_CODE = "FOMC_GATE_SKIP"
+FOMC_STATEMENT_MINUTE_ET = 14 * 60  # statement drops 14:00 ET
+# Time-of-day no-trade window (entry-filter sweep: worst TOD bucket
+# 14:00-15:30 ET at -$21/ct OOS; user decision 2026-07-06).
+TOD_GATE_BLOCK_CODE = "TOD_GATE_SKIP"
+
+
+def _parse_hhmm(raw: Any) -> int | None:
+    """'14:00' -> 840 (minute of day). None on anything unparseable —
+    callers treat that as a misconfigured (disabled) window."""
+    try:
+        s = str(raw).strip()
+        hh, mm = s.split(":")
+        h, m = int(hh), int(mm)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_minute_et(minute_of_day: int) -> str:
+    return f"{minute_of_day // 60:02d}:{minute_of_day % 60:02d}"
+
+
+def _now_et_parts(now_ms: int | None = None) -> tuple[str, int]:
+    """(session_date 'YYYY-MM-DD', minute_of_day) under the app's fixed-offset
+    ET convention (same as _today_et / chop_gate). Monkeypatchable in tests."""
+    from datetime import datetime, timedelta, timezone
+    et = timezone(timedelta(hours=-4))
+    if now_ms is None:
+        now_ms = int(_time.time() * 1000)
+    dt = datetime.fromtimestamp(now_ms / 1000, et)
+    return dt.strftime("%Y-%m-%d"), dt.hour * 60 + dt.minute
+
+
+class _EntryGatesConfig:
+    """Hot-read snapshot of the scanner entry-gate config (one read per
+    actionable evaluation). Plain attributes — trivially fake-able."""
+
+    __slots__ = (
+        "chop_enabled", "chop_threshold", "bias_veto_enabled",
+        "fomc_gate_enabled", "tod_gate_enabled",
+        "tod_start_min", "tod_end_min", "tod_window_label",
+    )
+
+    def __init__(self) -> None:
+        # Mirror UIConfig defaults (user decisions 2026-07-02 + 2026-07-06)
+        self.chop_enabled = True
+        self.chop_threshold = 33.3
+        self.bias_veto_enabled = True
+        self.fomc_gate_enabled = True
+        self.tod_gate_enabled = True
+        self.tod_start_min: int | None = 14 * 60
+        self.tod_end_min: int | None = 15 * 60 + 30
+        self.tod_window_label = "14:00-15:30"
+
+
+async def _chop_gate_context(state) -> tuple[Any | None, _EntryGatesConfig]:
+    """Hot-read the entry-gate config + evaluate the CHOP assessment for 'now'.
+
+    Returns (chop_assessment, gates_config).
+
+    Config is re-read on EVERY actionable evaluation (load_config is a
+    module-level import so tests can monkeypatch it), which makes every gate
+    knob (chop_gate_enabled / chop_gate_pct_threshold / bias_veto_enabled /
+    fomc_gate_enabled / tod_gate_enabled + the TOD window edges) tunable via
+    POST /config without a restart. Both steps are exception-guarded; a
+    failed assessment returns None which the caller treats as gate-open (the
+    filters are harm-reduction — they must never block on their own failure).
+    An unparseable or inverted TOD window disables the TOD gate (fail-open)
+    and logs the misconfiguration."""
+    gates = _EntryGatesConfig()
+    try:
+        cfg = load_config()
+        gates.chop_enabled = bool(cfg.chop_gate_enabled)
+        gates.chop_threshold = float(cfg.chop_gate_pct_threshold)
+        gates.bias_veto_enabled = bool(cfg.bias_veto_enabled)
+        gates.fomc_gate_enabled = bool(cfg.fomc_gate_enabled)
+        gates.tod_gate_enabled = bool(cfg.tod_gate_enabled)
+        start = _parse_hhmm(cfg.tod_gate_start_et)
+        end = _parse_hhmm(cfg.tod_gate_end_et)
+        if start is None or end is None or start >= end:
+            if gates.tod_gate_enabled:
+                logger.warning(
+                    "scanner: TOD gate window misconfigured (start=%r end=%r) "
+                    "— gate fails open", cfg.tod_gate_start_et, cfg.tod_gate_end_et,
+                )
+            gates.tod_gate_enabled = False
+            gates.tod_start_min = gates.tod_end_min = None
+            gates.tod_window_label = f"{cfg.tod_gate_start_et}-{cfg.tod_gate_end_et}"
+        else:
+            gates.tod_start_min, gates.tod_end_min = start, end
+            gates.tod_window_label = (
+                f"{_fmt_minute_et(start)}-{_fmt_minute_et(end)}"
+            )
+    except Exception:
+        logger.exception("scanner: gate config read failed — using defaults")
+    assessment = None
+    try:
+        from fef_sidecar.engine import chop_gate as _cg
+        assessment = await _cg.assess_chop(state)
+    except Exception:
+        logger.exception("scanner: chop_gate assessment failed — gate passes open")
+    return assessment, gates
+
+
+async def maybe_impulse_flag(
+    state, symbol: str, *, spot: float,
+    delta_price: float | None, delta_drift_m: float | None,
+) -> bool:
+    """IMPULSE ATTENTION FLAG — advisory only, NEVER trades.
+
+    Validated 2026-07-02: this exact combination works as a real-time
+    attention flag (caught both of the day's missed moves, one 4 minutes
+    before the scanner's late fire) but WHIPSAWS as an auto-trigger — so it
+    ships as decision-support. Fires when ALL of:
+
+      1. |delta_price| >= UIConfig.impulse_flag_min_pts — SPX-calibrated
+         points, moneyness-scaled by spot/7500 for ETF-class symbols (the
+         same _price_scale as the strike fix; SPX-class spot>=2000 = 1.0),
+      2. sign(delta_drift) == sign(delta_price) when
+         impulse_flag_require_agree (default true). The disagree-VETO is the
+         validated core — 7/2 17:58's disagreeing impulse was a session-low
+         puts trap,
+      3. the chop regime is NOT confirmed-compressed (reuses the chop-gate
+         percentile — flag fires only when the regime has room; an unknown
+         percentile passes, consistent with the gate's fail-open design).
+
+    Per-(symbol, direction) cooldown (impulse_flag_cooldown_sec, default
+    600s) so a trending tape doesn't re-flag every 60s scan.
+
+    Effects when it fires: one audit_log row (category='impulse_flag') +
+    one ADVISORY signal_iter row — direction stays WAIT with confidence
+    NONE and extras.source='impulse_flag'/advisory=true, so it is
+    structurally invisible to maybe_auto_trade (gate 3 rejects WAIT) and
+    to every actionable-signal analytic. Returns True when flagged."""
+    # Hot-read config each scan (module-level load_config — test-patchable).
+    enabled, min_pts, require_agree, cooldown_sec, chop_threshold = (
+        True, 6.0, True, 600, 33.3
+    )
+    try:
+        cfg = load_config()
+        enabled = bool(cfg.impulse_flag_enabled)
+        min_pts = float(cfg.impulse_flag_min_pts)
+        require_agree = bool(cfg.impulse_flag_require_agree)
+        cooldown_sec = int(cfg.impulse_flag_cooldown_sec)
+        chop_threshold = float(cfg.chop_gate_pct_threshold)
+    except Exception:
+        logger.exception("scanner: impulse flag config read failed — using defaults")
+    if not enabled:
+        return False
+    if delta_price is None or not spot or spot <= 0:
+        return False
+
+    # 1. Impulse magnitude — SPX-calibrated, moneyness-scaled per symbol.
+    from fef_sidecar.engine.strikes import _price_scale
+    eff_min_pts = min_pts * _price_scale(spot)
+    if abs(delta_price) < eff_min_pts:
+        return False
+    direction = "UP" if delta_price > 0 else "DOWN"
+
+    # 2. Flow agreement (the validated veto).
+    agree = bool(
+        delta_drift_m is not None
+        and ((delta_price > 0 and delta_drift_m > 0)
+             or (delta_price < 0 and delta_drift_m < 0))
+    )
+    if require_agree and not agree:
+        return False
+
+    # Per-(symbol, direction) cooldown — checked before any DB work.
+    now_ms = int(_time.time() * 1000)
+    last_map = getattr(state, "impulse_flag_last_at_ms", None)
+    if last_map is None:
+        last_map = {}
         try:
-            from fef_sidecar.engine.auto_trader import maybe_auto_trade
-            decision = await maybe_auto_trade(state, verdict_dict, symbol=symbol)
-            if decision.fired and decision.order_result:
-                logger.info("scanner: %s auto-trade fired: %s", symbol, decision.order_result)
+            state.impulse_flag_last_at_ms = last_map
         except Exception:
-            logger.exception("scanner: auto-trade evaluation failed for %s", symbol)
+            pass
+    key = (symbol, direction)
+    last = last_map.get(key, 0)
+    if last and (now_ms - last) < cooldown_sec * 1000:
+        return False
+
+    # 3. Regime room — only a CONFIRMED compressed regime suppresses.
+    chop = None
+    try:
+        from fef_sidecar.engine import chop_gate as _cg
+        chop = await _cg.assess_chop(state)
+    except Exception:
+        logger.exception("scanner: impulse flag chop assessment failed — treating as unknown")
+    if chop is not None and chop.is_compressed(chop_threshold):
+        return False
+
+    # Stamp the cooldown BEFORE the writes so a failing write can't turn
+    # into a 60s-cadence retry spam.
+    last_map[key] = now_ms
+
+    pct = chop.percentile if chop is not None else None
+    pct_str = f"{pct:.0f}" if pct is not None else "n/a"
+    dd_str = (
+        f"{delta_drift_m:+.1f}M {'agree' if agree else 'disagree'}"
+        if delta_drift_m is not None else "n/a"
+    )
+    body = (
+        f"{symbol} @ {spot:.1f} (dP {delta_price:+.1f}pts, "
+        f"dDrift {dd_str}, r30 pct {pct_str})"
+    )
+    summary = f"IMPULSE {direction} {body}"
+    logger.info("scanner: %s", summary)
+
+    signal_id = None
+    try:
+        from fef_sidecar.db import FEFConfidence, FEFDirection
+        from fef_sidecar.loop import _current_account_class, _current_provider_mode
+        signal = await SignalIterRepository.write_iter(
+            spx_price=spot,
+            direction=FEFDirection.WAIT,       # advisory — untradeable by construction
+            confidence=FEFConfidence.NONE,
+            reasoning=(
+                f"[IMPULSE {direction}] {body}. "
+                "Advisory attention flag — decision-support only, no trade."
+            ),
+            drift_cum_net_m=0.0, drift_bias="NEUTRAL",
+            ntm_max_pain=0.0, raw_max_pain=0.0,
+            top_gex_walls=[], top_dex_walls=[],
+            extras={
+                "source": "impulse_flag",
+                "advisory": True,
+                "scanner_symbol": symbol,
+                "impulse_direction": direction,
+                "delta_price": delta_price,
+                "delta_drift_m": delta_drift_m,
+                "flow_agree": agree,
+                "threshold_pts_effective": round(eff_min_pts, 4),
+                "r30_pct": round(pct, 2) if pct is not None else None,
+                "tod_bucket": chop.tod_bucket if chop is not None else None,
+                "account_class": _current_account_class(state),
+                "account_id": getattr(state.ibkr, "account_id", "") or "",
+            },
+            session_date=_today_et(),
+            provider_mode=_current_provider_mode(state),
+        )
+        signal_id = signal.id
+    except Exception:
+        logger.exception("scanner: impulse flag signal persist failed for %s", symbol)
+
+    try:
+        await SignalIterRepository.write_audit_log(
+            category="impulse_flag", actor="system",
+            summary=summary,
+            details={
+                "source": "impulse_flag",
+                "symbol": symbol,
+                "direction": direction,
+                "spot": spot,
+                "delta_price": delta_price,
+                "delta_drift_m": delta_drift_m,
+                "flow_agree": agree,
+                "threshold_pts_effective": round(eff_min_pts, 4),
+                "r30_pct": round(pct, 2) if pct is not None else None,
+                "tod_bucket": chop.tod_bucket if chop is not None else None,
+                "cooldown_sec": cooldown_sec,
+                "signal_iter_id": signal_id,
+            },
+        )
+    except Exception:
+        logger.exception("scanner: impulse flag audit write failed for %s", symbol)
+    return True
+
+
+async def handle_actionable_scanner_verdict(
+    state, symbol: str, *, spot: float, verdict_dict: dict[str, Any],
+    inputs: Any | None = None,
+) -> None:
+    """Persist + (maybe) trade one scanner verdict.
+
+    VISIBILITY FIX (2026-07-02): the scanner used to call maybe_auto_trade
+    directly and persist NOTHING — its fires never appeared in signal
+    history and blocks never updated auto_trade_last_block_reason, so the
+    UI showed 'verdict is WAIT' while the scanner traded in parallel. Now
+    every ACTIONABLE scanner verdict:
+      1. writes a signal_iter row (reasoning '[SCANNER <sym>] ...',
+         extras.source='scanner' + scanner_symbol + trigger/option data +
+         tag-only chop/TOD/bias context for future filters),
+      2. passes the CHOP SKIP-GATE (engine/chop_gate.py — 2026-07-02
+         22,683-fire sweep): if the trailing 30-min SPX range percentile
+         vs the same time-of-day over the prior 20 sessions is below
+         UIConfig.chop_gate_pct_threshold (default 33.3, compressed
+         tercile), the fire is SKIPPED — no maybe_auto_trade call; the
+         signal row stays in history tagged extras.skipped_by='chop_gate'
+         and a category='chop_gate' audit row records the counterfactual.
+         Missing data (percentile None) NEVER skips — gate passes open,
+      2b. passes the BIAS-DISAGREE VETO (2026-07-02, promoted from tag):
+         a fire whose reasoning carries the '(bias-disagrees, demoted)'
+         stamp is skipped when UIConfig.bias_veto_enabled — signal row
+         tagged extras.skipped_by='bias_veto', category='bias_veto' audit
+         row. Chop gate wins when both would skip (first gate wins),
+      2c. passes the FOMC-MORNING GATE (2026-07-06 event study: FOMC
+         pre-14:00 fires -$61/ct t=-4.4, 80% of FOMC sessions negative):
+         on an event_calendar FOMC day before 14:00 ET the fire is SKIPPED —
+         extras.skipped_by='fomc_gate', category='fomc_gate' audit row,
+         block_reason_code=FOMC_GATE_SKIP. UIConfig.fomc_gate_enabled
+         (default true, hot-read),
+      2d. passes the TOD NO-TRADE WINDOW (user request 2026-07-06; sweep's
+         worst OOS bucket 14:00-15:30 ET at -$21/ct): a fire whose ET clock
+         time falls in [tod_gate_start_et, tod_gate_end_et) is SKIPPED —
+         extras.skipped_by='tod_gate', category='tod_gate' audit row,
+         block_reason_code=TOD_GATE_SKIP. UIConfig.tod_gate_enabled +
+         window edges hot-read. Gate order: chop -> bias -> fomc -> tod
+         (first gate to skip wins; distinct audit categories),
+      3. flows through maybe_auto_trade with source='auto_scanner'
+         (per-symbol lock + all gates; cool-downs/caps are shared with the
+         pattern trigger and main loop on the same symbol),
+      4. surfaces its outcome in state.auto_trade_last_block_reason and —
+         when blocked while auto-trade is ON — an auto_trade_block audit
+         row carrying the source.
+    WAIT verdicts stay unpersisted (the scanner panel + /auto_trade/status
+    show them live; persisting every 60s WAIT scan would flood analytics).
+    """
+    direction = verdict_dict.get("direction", "WAIT")
+    if direction not in ("LONG_CALLS", "LONG_PUTS"):
+        return
+
+    # ---- Entry skip-gates + tag-only annotations (2026-07-02/06 sweeps) ----
+    # Gate ORDER (first gate wins, each skip logged distinctly so the
+    # counterfactual populations never blur):
+    #   1. chop gate (compressed-regime skip)
+    #   2. bias veto (drift-bias disagreement skip)
+    #   3. FOMC-morning gate (FOMC day, pre-14:00 ET statement skip)
+    #   4. TOD no-trade window (default 14:00-15:30 ET skip)
+    #   5. wall proximity — engine-internal, already produced a WAIT verdict
+    #      upstream, so it never reaches this function.
+    chop, gates = await _chop_gate_context(state)
+    gate_enabled, gate_threshold = gates.chop_enabled, gates.chop_threshold
+    bias_veto_enabled = gates.bias_veto_enabled
+    reasoning_txt = verdict_dict.get("reasoning", "") or ""
+    # The engine stamps ' (bias-disagrees, demoted)' into ALIGNED reasoning
+    # when drift_bias opposes the fire direction — parse it out.
+    bias_disagree = "bias-disagrees" in reasoning_txt
+    chop_skip = bool(
+        gate_enabled and chop is not None and chop.is_compressed(gate_threshold)
+    )
+    # Bias veto (2026-07-02): 3 of the day's 5 live losers wore the tag
+    # (-$1,710); sweep OOS disagree -$17.00/ct vs agree -$1.85/ct. Applies
+    # only when the chop gate did not already skip (first gate wins).
+    bias_skip = bool(bias_veto_enabled and bias_disagree and not chop_skip)
+    # FOMC-morning gate (2026-07-06 event study: FOMC pre-statement fires
+    # -$61/ct t=-4.4, 80% of FOMC sessions negative). Skips actionable fires
+    # on an event_calendar FOMC day while the ET clock is before the 14:00
+    # statement. Evaluated only when no earlier gate already skipped.
+    session_date_now, minute_now = _now_et_parts()
+    try:
+        from fef_sidecar.engine.event_calendar import is_fomc_day
+        fomc_day = is_fomc_day(session_date_now)
+    except Exception:
+        logger.exception("scanner: FOMC calendar lookup failed — gate passes open")
+        fomc_day = False
+    fomc_pre_statement = bool(fomc_day and minute_now < FOMC_STATEMENT_MINUTE_ET)
+    fomc_skip = bool(
+        gates.fomc_gate_enabled and fomc_pre_statement
+        and not (chop_skip or bias_skip)
+    )
+    # TOD no-trade window (user request 2026-07-06; sweep's worst OOS bucket
+    # 14:00-15:30 ET at -$21/ct). start inclusive, end exclusive.
+    tod_in_window = bool(
+        gates.tod_start_min is not None and gates.tod_end_min is not None
+        and gates.tod_start_min <= minute_now < gates.tod_end_min
+    )
+    tod_skip = bool(
+        gates.tod_gate_enabled and tod_in_window
+        and not (chop_skip or bias_skip or fomc_skip)
+    )
+    skipped_by = (
+        "chop_gate" if chop_skip
+        else "bias_veto" if bias_skip
+        else "fomc_gate" if fomc_skip
+        else "tod_gate" if tod_skip
+        else None
+    )
+    chop_extras: dict[str, Any] = (
+        chop.to_extras() if chop is not None
+        else {"r30": None, "r30_pct": None, "tod_bucket": None,
+              "data_gap": "chop assessment unavailable"}
+    )
+    chop_extras.update({
+        "enabled": gate_enabled,
+        "threshold_pct": gate_threshold,
+        "skipped": chop_skip,
+    })
+    fomc_extras: dict[str, Any] = {
+        "enabled": gates.fomc_gate_enabled,
+        "fomc_day": fomc_day,
+        "pre_statement": fomc_pre_statement,
+        "minute_et": minute_now,
+        "statement_minute_et": FOMC_STATEMENT_MINUTE_ET,
+        "skipped": fomc_skip,
+    }
+    tod_extras: dict[str, Any] = {
+        "enabled": gates.tod_gate_enabled,
+        "window_et": gates.tod_window_label,
+        "in_window": tod_in_window,
+        "minute_et": minute_now,
+        "skipped": tod_skip,
+    }
+    if chop_skip:
+        skip_note = (
+            f" [CHOP-GATE SKIPPED: r30 pct {chop.percentile:.1f} < {gate_threshold:.1f}]"
+        )
+    elif bias_skip:
+        skip_note = " [BIAS-VETO SKIPPED]"
+    elif fomc_skip:
+        skip_note = " [FOMC-GATE SKIPPED: pre-statement]"
+    elif tod_skip:
+        skip_note = (
+            f" [TOD-GATE SKIPPED: {_fmt_minute_et(minute_now)} in "
+            f"{gates.tod_window_label} ET]"
+        )
+    else:
+        skip_note = ""
+    # Barrier class of the nearest wall (decision-support tag, never gates):
+    # True = the wall lies in the fire's direction of travel (today's 7440P
+    # pattern = toward-barrier — flat-to-POSITIVE at scale per the wall
+    # validation), False = wall behind the trade, None = no wall data.
+    _nw_strike = verdict_dict.get("nearest_wall_strike")
+    nearest_wall_toward: bool | None = None
+    if _nw_strike is not None:
+        nearest_wall_toward = (
+            _nw_strike >= spot if direction == "LONG_CALLS" else _nw_strike <= spot
+        )
+
+    signal_id = None
+    try:
+        from fef_sidecar.db import FEFConfidence, FEFDirection
+        from fef_sidecar.loop import (
+            _current_account_class,
+            _current_provider_mode,
+            _walls_json,
+        )
+        conf_value = verdict_dict.get("confidence", "LOW")
+        signal = await SignalIterRepository.write_iter(
+            spx_price=spot,
+            direction=FEFDirection(direction),
+            confidence=FEFConfidence(conf_value) if conf_value in FEFConfidence._value2member_map_ else FEFConfidence.LOW,
+            reasoning=f"[SCANNER {symbol}] {verdict_dict.get('reasoning', '')}{skip_note}",
+            drift_cum_net_m=(inputs.drift_cum_net_m if inputs is not None else 0.0),
+            drift_bias=(inputs.drift_bias if inputs is not None else "NEUTRAL"),
+            ntm_max_pain=(inputs.ntm_max_pain if inputs is not None else 0.0),
+            raw_max_pain=(inputs.raw_max_pain if inputs is not None else 0.0),
+            top_gex_walls=_walls_json(inputs.top_gex_walls) if inputs is not None else [],
+            top_dex_walls=_walls_json(inputs.top_dex_walls) if inputs is not None else [],
+            extras={
+                "source": "scanner",
+                "scanner_symbol": symbol,
+                "trigger_type": verdict_dict.get("trigger_type"),
+                "aligned": verdict_dict.get("aligned"),
+                "wall_collapse_trigger": verdict_dict.get("wall_collapse_trigger"),
+                "strike_rec": verdict_dict.get("strike_rec"),
+                "option_pricing": verdict_dict.get("option_pricing"),
+                "account_class": _current_account_class(state),
+                "account_id": getattr(state.ibkr, "account_id", "") or "",
+                # TAG-ONLY context on every scanner fire (live data for
+                # future filters): drift-bias disagreement, 30-min ET time
+                # bucket, the TOD-relative 30-min range percentile, and the
+                # nearest per-family wall (strike/distance/family — was
+                # dropped from extras until the 2026-07-02 proximity fix).
+                "bias_disagree": bias_disagree,
+                "tod_bucket": chop_extras.get("tod_bucket"),
+                "r30_pct": chop_extras.get("r30_pct"),
+                "nearest_wall_strike": verdict_dict.get("nearest_wall_strike"),
+                "nearest_wall_distance": verdict_dict.get("nearest_wall_distance"),
+                "nearest_wall_family": verdict_dict.get("nearest_wall_family"),
+                "nearest_wall_toward": nearest_wall_toward,
+                "chop_gate": chop_extras,
+                "bias_veto_enabled": bias_veto_enabled,
+                "fomc_gate": fomc_extras,
+                "tod_gate": tod_extras,
+                # Counterfactual marker — row persisted, trade withheld.
+                # 'chop_gate' / 'bias_veto' / 'fomc_gate' / 'tod_gate'
+                # (first gate wins); absent on fires.
+                **({"skipped_by": skipped_by} if skipped_by else {}),
+            },
+            session_date=_today_et(),
+            provider_mode=_current_provider_mode(state),
+        )
+        signal_id = signal.id
+    except Exception:
+        logger.exception("scanner: signal persist failed for %s (still evaluating trade)", symbol)
+
+    if chop_skip:
+        # Compressed-regime skip: the signal row above keeps the full
+        # counterfactual visible in signal history (option_pricing included,
+        # lookahead worker scores it like any other row); the audit row makes
+        # the skip itself first-class. maybe_auto_trade is NOT called — no
+        # cool-down consumed, no per-symbol budget spent.
+        assert chop is not None  # chop_skip => assessed percentile exists
+        msg = (
+            f"CHOP-GATE SKIPPED SCANNER {direction} {symbol}: "
+            f"r30 pct {chop.percentile:.1f} < {gate_threshold:.1f}"
+        )
+        state.auto_trade_last_block_reason = f"[scanner {symbol}] {msg}"
+        logger.info("scanner: %s", msg)
+        try:
+            from fef_sidecar.engine.chop_gate import CHOP_GATE_BLOCK_CODE
+            await SignalIterRepository.write_audit_log(
+                category="chop_gate", actor="system",
+                summary=msg,
+                details={
+                    "source": "auto_scanner",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "confidence": verdict_dict.get("confidence"),
+                    "strike_rec": verdict_dict.get("strike_rec"),
+                    "r30": chop.r30,
+                    "r30_pct": round(chop.percentile, 2) if chop.percentile is not None else None,
+                    "threshold_pct": gate_threshold,
+                    "tod_bucket": chop.tod_bucket,
+                    "n_samples": chop.n_samples,
+                    "n_sessions": chop.n_sessions,
+                    "signal_iter_id": signal_id,
+                },
+                block_reason_code=CHOP_GATE_BLOCK_CODE,
+            )
+        except Exception:
+            logger.exception("scanner: chop_gate audit write failed for %s", symbol)
+        return
+
+    if bias_skip:
+        # Bias-disagree veto: same counterfactual mechanics as the chop gate
+        # (signal row persisted above with option_pricing + skipped_by, the
+        # lookahead worker scores it), distinct category so the two filters'
+        # saves/costs are separately measurable. No maybe_auto_trade call —
+        # no cool-down consumed, no per-symbol budget spent.
+        msg = (
+            f"BIAS-VETO SKIPPED SCANNER {direction} {symbol}: "
+            f"drift bias disagrees with fire direction"
+        )
+        state.auto_trade_last_block_reason = f"[scanner {symbol}] {msg}"
+        logger.info("scanner: %s", msg)
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="bias_veto", actor="system",
+                summary=msg,
+                details={
+                    "source": "auto_scanner",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "confidence": verdict_dict.get("confidence"),
+                    "strike_rec": verdict_dict.get("strike_rec"),
+                    "drift_bias": (inputs.drift_bias if inputs is not None else None),
+                    "r30_pct": chop_extras.get("r30_pct"),
+                    "tod_bucket": chop_extras.get("tod_bucket"),
+                    "signal_iter_id": signal_id,
+                },
+                block_reason_code=BIAS_VETO_BLOCK_CODE,
+            )
+        except Exception:
+            logger.exception("scanner: bias_veto audit write failed for %s", symbol)
+        return
+
+    if fomc_skip:
+        # FOMC-morning skip: same counterfactual mechanics as the chop gate
+        # (signal row persisted above with option_pricing + skipped_by, the
+        # lookahead worker scores it), distinct category so this gate's
+        # saves/costs are separately measurable. No maybe_auto_trade call —
+        # no cool-down consumed, no per-symbol budget spent.
+        msg = (
+            f"FOMC-GATE SKIPPED SCANNER {direction} {symbol}: "
+            f"pre-statement ({_fmt_minute_et(minute_now)} ET < 14:00 on "
+            f"FOMC day {session_date_now})"
+        )
+        state.auto_trade_last_block_reason = f"[scanner {symbol}] {msg}"
+        logger.info("scanner: %s", msg)
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="fomc_gate", actor="system",
+                summary=msg,
+                details={
+                    "source": "auto_scanner",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "confidence": verdict_dict.get("confidence"),
+                    "strike_rec": verdict_dict.get("strike_rec"),
+                    "session_date": session_date_now,
+                    "minute_et": minute_now,
+                    "statement_minute_et": FOMC_STATEMENT_MINUTE_ET,
+                    "r30_pct": chop_extras.get("r30_pct"),
+                    "tod_bucket": chop_extras.get("tod_bucket"),
+                    "signal_iter_id": signal_id,
+                },
+                block_reason_code=FOMC_GATE_BLOCK_CODE,
+            )
+        except Exception:
+            logger.exception("scanner: fomc_gate audit write failed for %s", symbol)
+        return
+
+    if tod_skip:
+        # TOD no-trade window skip: counterfactual mechanics identical to the
+        # other gates, its own audit category. The window ships hot-tunable
+        # (tod_gate_start_et / tod_gate_end_et) and the persisted skips let
+        # the counterfactual logs grade the window like the other gates.
+        msg = (
+            f"TOD-GATE SKIPPED SCANNER {direction} {symbol}: "
+            f"{_fmt_minute_et(minute_now)} ET inside no-trade window "
+            f"{gates.tod_window_label}"
+        )
+        state.auto_trade_last_block_reason = f"[scanner {symbol}] {msg}"
+        logger.info("scanner: %s", msg)
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="tod_gate", actor="system",
+                summary=msg,
+                details={
+                    "source": "auto_scanner",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "confidence": verdict_dict.get("confidence"),
+                    "strike_rec": verdict_dict.get("strike_rec"),
+                    "window_et": gates.tod_window_label,
+                    "minute_et": minute_now,
+                    "r30_pct": chop_extras.get("r30_pct"),
+                    "tod_bucket": chop_extras.get("tod_bucket"),
+                    "signal_iter_id": signal_id,
+                },
+                block_reason_code=TOD_GATE_BLOCK_CODE,
+            )
+        except Exception:
+            logger.exception("scanner: tod_gate audit write failed for %s", symbol)
+        return
+
+    try:
+        from fef_sidecar.engine.auto_trader import maybe_auto_trade
+        decision = await maybe_auto_trade(
+            state, verdict_dict, symbol=symbol, source="auto_scanner",
+        )
+        state.auto_trade_last_block_reason = f"[scanner {symbol}] {decision.reason}"
+        if decision.fired and decision.order_result:
+            logger.info("scanner: %s auto-trade fired: %s", symbol, decision.order_result)
+        elif state.auto_trade_enabled and decision.reason != "auto_trade disabled":
+            try:
+                await SignalIterRepository.write_audit_log(
+                    category="auto_trade_block", actor="system",
+                    summary=(
+                        f"BLOCKED SCANNER {direction} {symbol}: {decision.reason}"
+                    ),
+                    details={
+                        "source": "auto_scanner",
+                        "symbol": symbol,
+                        "direction": direction,
+                        "confidence": verdict_dict.get("confidence"),
+                        "strike_rec": verdict_dict.get("strike_rec"),
+                        "reason": decision.reason,
+                        "reason_code": decision.reason_code,
+                        "signal_iter_id": signal_id,
+                    },
+                    block_reason_code=decision.reason_code,
+                )
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("scanner: auto-trade evaluation failed for %s", symbol)
 
 
 def _today_et() -> str:

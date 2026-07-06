@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 
 async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
     """Run an optimization sweep + compare to current engine config."""
-    from fef_sidecar.engine.optimization import SweepConfig, run_sweep
+    from fef_sidecar.engine.optimization import (
+        MIN_CONFIDENT_TRADES,
+        SweepConfig,
+        run_sweep,
+    )
 
     cfg = SweepConfig(
         proximity_values=[3.0, 5.0, 8.0],
@@ -48,6 +52,9 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
         {"spx_price": r.spx_price, "drift_cum_net_m": r.drift_cum_net_m,
          "drift_bias": r.drift_bias, "ntm_max_pain": r.ntm_max_pain,
          "raw_max_pain": r.raw_max_pain,
+         # session_date lets run_sweep purge the forward-walk at the overnight
+         # boundary (0DTE trades can't be held across sessions).
+         "session_date": r.session_date,
          "top_gex_walls": r.top_gex_walls or [],
          "top_dex_walls": r.top_dex_walls or [],
          "top_cex_walls": getattr(r, "top_cex_walls", None) or [],
@@ -118,6 +125,17 @@ async def run_auto_walk_forward(state, days: int = 7) -> WalkForwardRun:
     notes_parts = []
     if ci_overlap_warning:
         notes_parts.append(ci_overlap_warning)
+    if getattr(best, "low_confidence", False):
+        notes_parts.append(
+            f"LOW CONFIDENCE: best window fired < {MIN_CONFIDENT_TRADES} trades "
+            f"(train={best.train_trades}, test={best.test_trades}) — treat "
+            f"'optimal' params as noise, do NOT retune on this window."
+        )
+        logger.warning(
+            "Auto walk-forward: best result is low-confidence "
+            "(train_trades=%d, test_trades=%d)",
+            best.train_trades, best.test_trades,
+        )
 
     run = WalkForwardRun(
         window_days=days,
