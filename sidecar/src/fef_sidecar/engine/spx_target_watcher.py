@@ -1626,6 +1626,12 @@ async def _safe_persist_execs(state) -> None:
 #       ETF-scaled for non-SPX via the same _price_scale/rounding the real
 #       auto-trader applies. Driven by throttled option-quote mids exactly
 #       like the real _check_fixed_dollar (triggers evaluate at quote mid).
+#   real == 'spx_points' on a LO-VIX day -> ALSO the LO-VIX SHRINK ladder
+#       (variant_label='lowvix_shrink_shadow', 2026-07-07 registered
+#       backtest, shadow-first): the parent's own stored plan with all four
+#       offsets scaled by m=0.6 via the exact backtest transformation
+#       (_lowvix_scaled_plan), walked with be_ladder-shadow semantics — a
+#       SECOND row for the same parent (see _lowvix_shadow_cycle_one).
 #
 # 2026-07-06 plumbing fixes (7/6 EOD sec. 2):
 #   (a) entry_spx is sourced from the SYMBOL'S OWN CASH spot (the same spot
@@ -1665,6 +1671,17 @@ _FD_SHADOW_SEMANTICS = "cumulative_realized"
 _FD_SHADOW_QUOTE_INTERVAL_MS = int(
     float(os.environ.get("FEF_FIXED_DOLLAR_CHECK_SEC", "3.0")) * 1000
 )
+
+# Lo-VIX ladder-shrink shadow (2026-07-07 registered backtest — scratchpad
+# lowvix_score.py over the strict-replay fire set: m=0.6 on lo-VIX days,
+# ADOPT on both fill conventions; the operator's standing rule = SHADOW-
+# FIRST). spx_points parents on lo-VIX days (engine/lo_vix_day.py) carry
+# this SECOND shadow: the same entry walked on the parent's own stored plan
+# with ALL FOUR offsets scaled by m=0.6 via the exact backtest plan
+# transformation (_lowvix_scaled_plan). Non-lo/unknown days: no extra row.
+_LOWVIX_SHADOW_VARIANT_LABEL = "lowvix_shrink_shadow"
+_LOWVIX_SHRINK_M = 0.6
+_LOWVIX_EPS = 1e-6  # backtest scaled_plan's EPS — default-offset detection
 
 # Shadow row usability (persisted to shadow_exit_outcome.status):
 _SHADOW_STATUS_OK = "ok"
@@ -1766,6 +1783,79 @@ async def _shadow_cash_spot(
     return result
 
 
+def _resolve_shadow_entry_spx(
+    state, p, spot: float | None, spot_source: str | None,
+) -> tuple[float, str, float | None] | None:
+    """(entry_spx, entry_spx_source, parent_entry_spx_price) for a shadow —
+    the 7/6 pollution guard shared by every shadow init: the parent's
+    recorded entry_spx_price is used only when it agrees with the cash
+    reference within _SHADOW_ENTRY_SPX_MAX_DEV; beyond that the cash
+    reference wins (active-chart pollution signature, ES-priced 7561 vs
+    cash 7511), with both values persisted for audit. None => DEFER init
+    (no cash reference to validate against, or no usable spot at all)."""
+    cash = float(spot) if spot and spot > 0 else None
+    parent_entry = float(p.entry_spx_price) if (p.entry_spx_price or 0) > 0 else None
+    if parent_entry is not None and cash is not None:
+        if abs(parent_entry - cash) / cash > _SHADOW_ENTRY_SPX_MAX_DEV:
+            logger.warning(
+                "exit shadow: parent %s entry_spx_price %.2f deviates >%.1f%% "
+                "from %s cash %.2f — using cash (active-chart pollution guard)",
+                p.id, parent_entry, _SHADOW_ENTRY_SPX_MAX_DEV * 100,
+                p.symbol, cash,
+            )
+            return cash, f"cash_spot_override({spot_source})", parent_entry
+        return parent_entry, "parent_entry_spx_price", parent_entry
+    if parent_entry is not None:
+        # No cash reference this cycle — defer rather than trust a value we
+        # cannot validate (the 7/6 rows were exactly unvalidated entries).
+        return None
+    if cash is None:
+        return None
+    return cash, f"cash_spot({spot_source})", None
+
+
+def _shadow_tier_qtys(p) -> list[int]:
+    """The parent's own tier split when it accounts for the full qty, else
+    the canonical 50/30/20 shadow split."""
+    parent_tier_qtys = [
+        int(getattr(p, "spx_target_t1_qty", 0) or 0),
+        int(getattr(p, "spx_target_t2_qty", 0) or 0),
+        int(getattr(p, "spx_target_t3_qty", 0) or 0),
+    ]
+    if sum(parent_tier_qtys) == int(p.qty):
+        return parent_tier_qtys
+    return _shadow_split_qty(int(p.qty))
+
+
+def _shadow_base(
+    p, variant: str, entry_spx: float, entry_spx_source: str,
+    parent_entry: float | None, spot_source: str | None,
+) -> dict:
+    """Common shadow state-machine fields — every variant layers its own
+    levels/ladder config on top (see _shadow_init / _lowvix_shadow_init)."""
+    return {
+        "variant": variant,
+        "parent_id": p.id,
+        "symbol": p.symbol, "strike": float(p.strike), "right": p.right,
+        "expiry": p.expiry,
+        "qty": int(p.qty),
+        "is_long": p.right == "C",
+        "entry_spx": float(entry_spx),
+        "entry_spx_source": entry_spx_source,
+        "parent_entry_spx_price": parent_entry,
+        "spot_source": spot_source,
+        "entry_premium": float(p.avg_fill_price or p.limit_price or 0) or None,
+        "tier_qtys": _shadow_tier_qtys(p),
+        "tier_fired": [False, False, False],
+        "peak_mfe_R": 0.0,
+        "fills": [],           # {tier, spx, qty, ts_ms, premium, premium_src}
+        "premium_tasks": [],   # spawned quote captures, gathered at finalize
+        "done": False,
+        "exit_reason": None,
+        "settled_mtm_at_real_close": False,
+    }
+
+
 def _shadow_init(state, p, spot: float | None, spot_source: str | None = None) -> dict | None:
     """Build the shadow state machine for one parent — the VARIANT is
     conditional on the parent's real exit_strategy (2026-07-06 flip):
@@ -1779,31 +1869,10 @@ def _shadow_init(state, p, spot: float | None, spot_source: str | None = None) -
     the cash reference wins, with both values persisted for audit."""
     if not p.qty:
         return None
-    cash = float(spot) if spot and spot > 0 else None
-    parent_entry = float(p.entry_spx_price) if (p.entry_spx_price or 0) > 0 else None
-    entry_spx: float | None
-    if parent_entry is not None and cash is not None:
-        if abs(parent_entry - cash) / cash > _SHADOW_ENTRY_SPX_MAX_DEV:
-            entry_spx = cash
-            entry_spx_source = f"cash_spot_override({spot_source})"
-            logger.warning(
-                "exit shadow: parent %s entry_spx_price %.2f deviates >%.1f%% "
-                "from %s cash %.2f — using cash (active-chart pollution guard)",
-                p.id, parent_entry, _SHADOW_ENTRY_SPX_MAX_DEV * 100,
-                p.symbol, cash,
-            )
-        else:
-            entry_spx = parent_entry
-            entry_spx_source = "parent_entry_spx_price"
-    elif parent_entry is not None:
-        # No cash reference this cycle — defer rather than trust a value we
-        # cannot validate (the 7/6 rows were exactly unvalidated entries).
+    resolved = _resolve_shadow_entry_spx(state, p, spot, spot_source)
+    if resolved is None:
         return None
-    else:
-        entry_spx = cash
-        entry_spx_source = f"cash_spot({spot_source})" if cash is not None else None
-    if not entry_spx or entry_spx <= 0:
-        return None
+    entry_spx, entry_spx_source, parent_entry = resolved
     is_long = p.right == "C"
 
     variant = (
@@ -1811,38 +1880,8 @@ def _shadow_init(state, p, spot: float | None, spot_source: str | None = None) -
         if getattr(p, "exit_strategy", None) == "spx_points"
         else _SHADOW_VARIANT_LABEL
     )
-
-    parent_tier_qtys = [
-        int(getattr(p, "spx_target_t1_qty", 0) or 0),
-        int(getattr(p, "spx_target_t2_qty", 0) or 0),
-        int(getattr(p, "spx_target_t3_qty", 0) or 0),
-    ]
-    tier_qtys = (
-        parent_tier_qtys if sum(parent_tier_qtys) == int(p.qty)
-        else _shadow_split_qty(int(p.qty))
-    )
-
-    sh: dict = {
-        "variant": variant,
-        "parent_id": p.id,
-        "symbol": p.symbol, "strike": float(p.strike), "right": p.right,
-        "expiry": p.expiry,
-        "qty": int(p.qty),
-        "is_long": is_long,
-        "entry_spx": float(entry_spx),
-        "entry_spx_source": entry_spx_source,
-        "parent_entry_spx_price": parent_entry,
-        "spot_source": spot_source,
-        "entry_premium": float(p.avg_fill_price or p.limit_price or 0) or None,
-        "tier_qtys": tier_qtys,
-        "tier_fired": [False, False, False],
-        "peak_mfe_R": 0.0,
-        "fills": [],           # {tier, spx, qty, ts_ms, premium, premium_src}
-        "premium_tasks": [],   # spawned quote captures, gathered at finalize
-        "done": False,
-        "exit_reason": None,
-        "settled_mtm_at_real_close": False,
-    }
+    sh = _shadow_base(p, variant, entry_spx, entry_spx_source, parent_entry,
+                      spot_source)
 
     if variant == _FD_SHADOW_VARIANT_LABEL:
         # Fixed-dollar ladder — ETF-scaled at init from the symbol's own
@@ -1859,7 +1898,7 @@ def _shadow_init(state, p, spot: float | None, spot_source: str | None = None) -
             "last_mid_ms": 0,
             "last_quote_ms": 0,
             "peak_gain_per_ct": 0.0,
-            "last_spot": cash,
+            "last_spot": float(spot) if spot and spot > 0 else None,
         })
         return sh
 
@@ -1896,6 +1935,191 @@ def _shadow_init(state, p, spot: float | None, spot_source: str | None = None) -
         "be_step": 0.0, "be_lock_R": 0.0,
     })
     return sh
+
+
+def _plan_anchor_from_stop(stop: float, is_long: bool) -> float | None:
+    """Recover the spot a parent's plan was anchored on from its stored stop.
+
+    build_plan NEVER wall-anchors the stop — it is always
+    spot -/+ 10*_price_scale(spot) — so the inversion is exact:
+    SPX-class (scale pinned to 1.0): anchor = stop +/- 10; ETF-class:
+    solve spot*(1 -/+ 10/7500) = stop. The class is decided by the
+    recovered value itself; both branches are exact within their class and
+    nothing trades near the 2000 boundary where they could disagree.
+    Callers must cross-check the anchor against the validated entry spot —
+    a hand-set or non-default stop yields a bogus anchor."""
+    from fef_sidecar.engine.strikes import _SPX_REF_LEVEL
+    sgn = 1.0 if is_long else -1.0
+    cand = stop + sgn * 10.0
+    if cand >= 2000.0:
+        return cand
+    denom = 1.0 - sgn * (10.0 / _SPX_REF_LEVEL)
+    if denom <= 0:
+        return None
+    cand = stop / denom
+    if 0.0 < cand < 2000.0:
+        return cand
+    return None
+
+
+def _lowvix_scaled_plan(
+    spx_sig: float, t1: float, t2: float, t3: float, stop: float,
+    is_long: bool, m: float, price_scale: float = 1.0,
+) -> tuple[float, float, float, float]:
+    """EXACT mirror of the registered backtest's plan transformation
+    (scratchpad regime_exit_score.scaled_plan, reused verbatim by
+    lowvix_score.py): scale the DEFAULT offsets by m around the plan's own
+    reference spot; KEEP a wall-anchored tier only while it passes
+    build_plan's live sanity band re-evaluated at the scaled stop distance
+    R' (T1 in [0.5R', 2R']; T2 in [2R', 3R'] and >3pts beyond the new T1 —
+    the raw 3-pt separation matches both build_plan and the backtest; T3
+    beyond the new T2); a wall failing its band falls back to the scaled
+    default. The stop is ALWAYS the scaled default — build_plan never
+    wall-anchors it. At m=1.0 this reproduces the stored plan exactly.
+    price_scale generalizes the backtest's SPX defaults (15/25/50/-10 x
+    _price_scale; 1.0 for SPX -> bit-identical to the backtest arm)."""
+    sgn = 1.0 if is_long else -1.0
+    d1, d2, d3 = 15.0 * price_scale, 25.0 * price_scale, 50.0 * price_scale
+    off1 = sgn * (t1 - spx_sig)
+    off2 = sgn * (t2 - spx_sig)
+    off3 = sgn * (t3 - spx_sig)
+    R = 10.0 * price_scale * m
+    ns = spx_sig - sgn * R
+    # T1
+    if abs(off1 - d1) < _LOWVIX_EPS:
+        n1 = spx_sig + sgn * d1 * m
+    elif 0.5 * R - _LOWVIX_EPS <= off1 <= 2.0 * R + _LOWVIX_EPS:
+        n1 = t1
+    else:
+        n1 = spx_sig + sgn * d1 * m
+    # T2
+    if abs(off2 - d2) < _LOWVIX_EPS:
+        n2 = spx_sig + sgn * d2 * m
+    elif (2.0 * R - _LOWVIX_EPS <= off2 <= 3.0 * R + _LOWVIX_EPS) and abs(t2 - n1) > 3.0:
+        n2 = t2
+    else:
+        n2 = spx_sig + sgn * d2 * m
+    # T3 (anchor = wall or NTM max pain; keep iff still beyond the new T2)
+    if abs(off3 - d3) < _LOWVIX_EPS:
+        n3 = spx_sig + sgn * d3 * m
+    elif sgn * (t3 - n2) > 0:
+        n3 = t3
+    else:
+        n3 = spx_sig + sgn * d3 * m
+    return n1, n2, n3, ns
+
+
+def _lowvix_shadow_init(
+    state, p, spot: float | None, spot_source: str | None = None,
+) -> dict | str | None:
+    """SECOND shadow for an spx_points parent on a lo-VIX day (the caller
+    has already established is_lo_vix_day(state) is True): the SAME entry
+    walked on the parent's own stored plan with all four offsets scaled by
+    m=_LOWVIX_SHRINK_M via the exact backtest transformation
+    (_lowvix_scaled_plan). Walks with the same conventions as the
+    be_ladder shadow (_shadow_step: BE ratchet, stop-before-targets,
+    first-touch tiers; fills at quote prices; finalize-on-close upsert;
+    unusable_* statuses never $0).
+
+    Requires the parent's stored spx_target_* plan — the registered
+    variant transforms the STORED ladder, never a synthesized one — and a
+    recoverable plan anchor: build_plan's stop is always its default
+    offset from the plan reference spot, so the anchor is inverted from
+    the stored stop and cross-checked against the validated entry. A stop
+    that was hand-set (anchor >0.5% off entry) makes the transformation
+    undefined -> no lo-VIX row for this parent.
+
+    Returns the shadow dict; None to DEFER (no validated entry spot this
+    cycle — retry); or a string reason to DECLINE permanently (memoized by
+    the caller so the 0.1s loop logs once, not per tick)."""
+    if not p.qty:
+        return "parent has no qty"
+    levels = (p.spx_target_t1, p.spx_target_t2, p.spx_target_t3,
+              p.spx_target_stop)
+    if any(v is None for v in levels):
+        return "parent has no stored spx_target_* plan"
+    resolved = _resolve_shadow_entry_spx(state, p, spot, spot_source)
+    if resolved is None:
+        return None
+    entry_spx, entry_spx_source, parent_entry = resolved
+    is_long = p.right == "C"
+    t1, t2, t3, stop = (float(v) for v in levels)
+    anchor = _plan_anchor_from_stop(stop, is_long)
+    if anchor is None or abs(anchor - entry_spx) / entry_spx > _SHADOW_ENTRY_SPX_MAX_DEV:
+        return (
+            f"plan anchor unrecoverable from stop {stop:.2f} "
+            f"(anchor {f'{anchor:.2f}' if anchor is not None else 'n/a'} "
+            f"vs entry {entry_spx:.2f})"
+        )
+    from fef_sidecar.engine.strikes import _price_scale
+    ps = _price_scale(anchor)
+    n1, n2, n3, ns = _lowvix_scaled_plan(
+        anchor, t1, t2, t3, stop, is_long, _LOWVIX_SHRINK_M, ps,
+    )
+    risk = abs(float(entry_spx) - ns)
+    if risk <= 0:
+        return f"scaled stop {ns:.2f} coincides with entry {entry_spx:.2f}"
+    sh = _shadow_base(p, _LOWVIX_SHADOW_VARIANT_LABEL, entry_spx,
+                      entry_spx_source, parent_entry, spot_source)
+    sh.update({
+        "t1": n1, "t2": n2, "t3": n3, "stop": ns,
+        "levels_source": "lowvix_scaled_plan(parent_spx_targets)",
+        "dyn_stop": ns,
+        "be_step": 0.0, "be_lock_R": 0.0,
+        # Provenance merged into variant_params at finalize.
+        "variant_extra": {
+            "m_scale": _LOWVIX_SHRINK_M,
+            "plan_anchor": anchor,
+            "price_scale": ps,
+            "original_levels": {"t1": t1, "t2": t2, "t3": t3, "stop": stop},
+        },
+    })
+    return sh
+
+
+async def _lowvix_shadow_cycle_one(
+    state, p, shadows: dict | None, sym_spot: float | None,
+    sym_src: str | None,
+) -> None:
+    """Init/advance one parent's lo-VIX shrink shadow. No-op unless the
+    parent is spx_points on a lo-VIX day (None/unknown => NOT lo — the
+    classifier is fail-open to normal behavior). Kept apart from the
+    primary shadow's init/step branching so neither variant's deferral
+    stalls the other. NEVER places orders."""
+    if shadows is None or p.id is None:
+        return
+    if getattr(p, "exit_strategy", None) != "spx_points":
+        return
+    sh = shadows.get(p.id)
+    if sh is None:
+        declined = getattr(state, "_lowvix_shadow_declined", None)
+        if declined is not None and p.id in declined:
+            return
+        from fef_sidecar.engine.lo_vix_day import is_lo_vix_day
+        if await is_lo_vix_day(state) is not True:  # session-cached
+            return
+        made = _lowvix_shadow_init(state, p, sym_spot, spot_source=sym_src)
+        if isinstance(made, dict):
+            shadows[p.id] = made
+        elif isinstance(made, str):
+            # Permanent decline — memoize so the 0.1s loop logs ONCE.
+            if declined is None:
+                declined = set()
+                try:
+                    state._lowvix_shadow_declined = declined  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            declined.add(p.id)
+            logger.warning(
+                "lowvix shadow: parent %s gets no lo-VIX shrink row — %s",
+                p.id, made,
+            )
+        return
+    # Keep entry premium current once the real fill syncs in.
+    if not sh.get("entry_premium") and (p.avg_fill_price or 0) > 0:
+        sh["entry_premium"] = float(p.avg_fill_price)
+    if not sh["done"] and sym_spot:
+        _shadow_step(state, sh, sym_spot)
 
 
 async def _shadow_capture_premium(state, sh: dict, fill: dict) -> None:
@@ -2293,6 +2517,9 @@ async def _shadow_finalize(state, sh: dict, spot: float) -> None:
                 "be_step": sh["be_step"], "be_lock_R": sh["be_lock_R"],
                 **common,
             }
+        # Variant-specific provenance stamped at init (lo-VIX shrink: m,
+        # recovered plan anchor, price scale, the unscaled stored plan).
+        variant_params.update(sh.get("variant_extra") or {})
 
         # UPSERT the outcome row (7/6 EOD sec. 2c): the close-time recompute
         # must REPLACE an earlier row for (parent, variant) — parent 747's
@@ -2335,7 +2562,11 @@ async def _shadow_finalize(state, sh: dict, spot: float) -> None:
 
         shadow_str = _fmt_money(shadow_dollars) if shadow_dollars is not None else "n/a"
         real_str = _fmt_money(real_dollars) if real_dollars is not None else "n/a"
-        label = "fixed-$ ladder" if is_fd else "BE-ladder"
+        label = (
+            "fixed-$ ladder" if is_fd
+            else "lo-VIX m=0.6 ladder" if variant == _LOWVIX_SHADOW_VARIANT_LABEL
+            else "BE-ladder"
+        )
         status_note = "" if status == _SHADOW_STATUS_OK else f" [{status}]"
         await SignalIterRepository.write_audit_log(
             category="shadow_exit", actor="system",
@@ -2365,10 +2596,13 @@ async def _shadow_finalize(state, sh: dict, spot: float) -> None:
 
 
 async def _shadow_be_ladder_cycle(state, parents, spot: float) -> None:
-    """One watcher-poll advance of every parent's exit shadow (both variants;
-    the name is historical — state.shadow_be_ladder keys all shadows). Called
-    from spx_target_watcher_loop with the parents + polled spot it already
-    has; per-symbol CASH spots are resolved via _shadow_cash_spot (cached per
+    """One watcher-poll advance of every parent's exit shadow (all variants;
+    the name is historical — state.shadow_be_ladder keys the primary
+    shadows, state.shadow_lowvix the lo-VIX shrink ones, so an spx_points
+    parent on a lo-VIX day carries TWO (parent, variant) rows — the DB
+    upsert key ux_shadow_exit_parent_variant supports that). Called from
+    spx_target_watcher_loop with the parents + polled spot it already has;
+    per-symbol CASH spots are resolved via _shadow_cash_spot (cached per
     cycle) so non-SPX parents step on their own price and an off-SPX active
     chart can't pollute entries. No order placement anywhere below."""
     shadows = getattr(state, "shadow_be_ladder", None)
@@ -2378,6 +2612,13 @@ async def _shadow_be_ladder_cycle(state, parents, spot: float) -> None:
             state.shadow_be_ladder = shadows
         except Exception:
             return
+    lowvix_shadows = getattr(state, "shadow_lowvix", None)
+    if lowvix_shadows is None:
+        lowvix_shadows = {}
+        try:
+            state.shadow_lowvix = lowvix_shadows
+        except Exception:
+            lowvix_shadows = None  # attr-frozen state: no lo-VIX shadows
     spot_cache: dict[str, tuple[float | None, str | None]] = {}
     live_ids = set()
     for p in parents:
@@ -2386,6 +2627,10 @@ async def _shadow_be_ladder_cycle(state, parents, spot: float) -> None:
         live_ids.add(p.id)
         sh = shadows.get(p.id)
         sym_spot, sym_src = await _shadow_cash_spot(state, p.symbol, spot, spot_cache)
+        # LO-VIX SHRINK SHADOW (2026-07-07 registered backtest, shadow-
+        # first): spx_points parents on lo-VIX days get a SECOND shadow —
+        # same plan, all four offsets scaled by m=0.6.
+        await _lowvix_shadow_cycle_one(state, p, lowvix_shadows, sym_spot, sym_src)
         if sh is None:
             sh = _shadow_init(state, p, sym_spot, spot_source=sym_src)
             if sh is not None:
@@ -2406,6 +2651,11 @@ async def _shadow_be_ladder_cycle(state, parents, spot: float) -> None:
         sh = shadows.pop(pid)
         f_spot, _f_src = await _shadow_cash_spot(state, sh["symbol"], spot, spot_cache)
         await _shadow_finalize(state, sh, f_spot or 0.0)
+    if lowvix_shadows:
+        for pid in [pid for pid in list(lowvix_shadows) if pid not in live_ids]:
+            lsh = lowvix_shadows.pop(pid)
+            f_spot, _f_src = await _shadow_cash_spot(state, lsh["symbol"], spot, spot_cache)
+            await _shadow_finalize(state, lsh, f_spot or 0.0)
 
 
 # Default BE ladder. Configurable per-deployment via env if needed.
