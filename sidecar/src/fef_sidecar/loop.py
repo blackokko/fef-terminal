@@ -555,10 +555,12 @@ def _qd_scope_lock(qd) -> asyncio.Lock:
 
 
 async def quantdata_poll_loop(state: AppState) -> None:
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
     interval = float(os.environ.get("FEF_QUANTDATA_POLL_INTERVAL_SEC", "15"))
     logger.info("Starting QuantData poll loop (interval=%.1fs, symbol=%s)", interval, state.active_symbol)
 
     while True:
+        _wd_beat(state, "quantdata-poll")
         try:
             # Ensure QuantData page filter matches active symbol (idempotent).
             # Scope lock: set+fetch must be atomic vs the scanner's per-symbol
@@ -1744,10 +1746,34 @@ def _option_pricing_dict(targets: OptionTargets | None) -> dict[str, Any] | None
 
 
 async def bar_stream_loop(state: AppState) -> None:
-    symbol = state.active_symbol
+    """Stream + persist completed bars for the ACTIVE symbol.
+
+    2026-07-07 incident hardening: the session wrote ZERO SPX bars after the
+    ES->SPX chart switch and the bar writer died silently at ~13:31Z. Two
+    holes fixed here:
+      (a) the subscription was keyed to the SPAWN-time symbol — if the
+          /config/symbol cancel+respawn misses (or a future caller forgets),
+          the loop streamed the old symbol forever. It now re-reads
+          state.active_symbol per (re)subscribe AND per bar, and resubscribes
+          itself on a switch — respawn or no respawn.
+      (b) `async for` on a wedged keepUpToDate subscription blocks forever
+          with no exception (an IBKR reconnect silently drops the update
+          feed). The wait is now bounded (poll timeout) so the loop stamps
+          its watchdog heartbeat every wakeup, and a no-bar gap beyond
+          FEF_BAR_STALL_THRESHOLD_SEC during RTH forces a resubscribe.
+    """
+    import time as _t
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
     bar_size = os.environ.get("FEF_BAR_SIZE", "1 min")
-    logger.info("Starting bar stream loop for %s (%s)", symbol, bar_size)
+    stall_threshold = float(os.environ.get("FEF_BAR_STALL_THRESHOLD_SEC", "180"))
+    poll_timeout = float(os.environ.get("FEF_BAR_POLL_TIMEOUT_SEC", "15"))
+    logger.info(
+        "Starting bar stream loop for %s (%s, stall watchdog=%.0fs)",
+        state.active_symbol, bar_size, stall_threshold,
+    )
     while True:
+        symbol = state.active_symbol
+        resub_delay = 0.0
         try:
             await state.ibkr.connect()
             # CRITICAL: pass bar_size through. Historically this call used the
@@ -1757,40 +1783,158 @@ async def bar_stream_loop(state: AppState) -> None:
             # backfills (/diag/backfill_spx_bars, research pulls) kept filling
             # true 1-min history; from 2026-07-01 the live stream was the only
             # writer and the 2-min cadence surfaced. Same subscription cost.
-            async for bar in state.ibkr.stream_bars(
+            agen = state.ibkr.stream_bars(
                 Contract.for_symbol(symbol), bar_size=bar_size,
-            ):
-                state.last_spx_price = bar.close
-                # Persist bar for historical chart + backtest replay
-                try:
-                    await SignalIterRepository.write_bar(
-                        symbol=symbol, bar_size=bar_size, timestamp_ms=bar.epoch_ms,
-                        open_=bar.open, high=bar.high, low=bar.low, close=bar.close,
-                        volume=bar.volume,
+            )
+            last_bar_mono = _t.monotonic()
+            # The next-bar wait is a PERSISTENT task polled with asyncio.wait
+            # — wait_for would CANCEL __anext__ on every poll timeout, which
+            # closes the generator (its finally unsubscribes) between 1-min
+            # bars. asyncio.wait leaves the pending task running.
+            pending: asyncio.Task | None = None
+            try:
+                while True:
+                    _wd_beat(state, "bar-stream")
+                    if state.active_symbol != symbol:
+                        logger.info(
+                            "Bar stream: active symbol %s -> %s — resubscribing",
+                            symbol, state.active_symbol,
+                        )
+                        break
+                    if pending is None:
+                        pending = asyncio.ensure_future(agen.__anext__())
+                    done, _p = await asyncio.wait({pending}, timeout=poll_timeout)
+                    if not done:
+                        # No completed bar this wakeup — normal off-cadence /
+                        # closed market. Only a gap beyond the stall threshold
+                        # DURING RTH means the subscription is wedged.
+                        if (_t.monotonic() - last_bar_mono > stall_threshold
+                                and _in_market_hours_et()):
+                            logger.warning(
+                                "Bar stream stalled >%.0fs on %s during RTH — resubscribing",
+                                stall_threshold, symbol,
+                            )
+                            resub_delay = 1.0
+                            break
+                        continue
+                    try:
+                        bar = pending.result()
+                    except StopAsyncIteration:
+                        pending = None
+                        logger.info("Bar stream generator ended — resubscribing")
+                        resub_delay = 5.0
+                        break
+                    pending = None
+                    last_bar_mono = _t.monotonic()
+                    state.last_spx_price = bar.close
+                    # Persist bar for historical chart + backtest replay
+                    try:
+                        await SignalIterRepository.write_bar(
+                            symbol=symbol, bar_size=bar_size, timestamp_ms=bar.epoch_ms,
+                            open_=bar.open, high=bar.high, low=bar.low, close=bar.close,
+                            volume=bar.volume,
+                        )
+                    except Exception:
+                        logger.exception("Failed to persist bar")
+                    event = TickEvent(
+                        timestamp_ms=bar.epoch_ms,
+                        spx_price=bar.close,
+                        bar={
+                            "open": bar.open,
+                            "high": bar.high,
+                            "low": bar.low,
+                            "close": bar.close,
+                            "volume": bar.volume,
+                        },
+                        prior_close=state.prior_close_by_symbol.get(symbol),
                     )
+                    await state.broadcaster.publish(event)
+            finally:
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                try:
+                    await agen.aclose()
                 except Exception:
-                    logger.exception("Failed to persist bar")
-                event = TickEvent(
-                    timestamp_ms=bar.epoch_ms,
-                    spx_price=bar.close,
-                    bar={
-                        "open": bar.open,
-                        "high": bar.high,
-                        "low": bar.low,
-                        "close": bar.close,
-                        "volume": bar.volume,
-                    },
-                    prior_close=state.prior_close_by_symbol.get(symbol),
-                )
-                await state.broadcaster.publish(event)
-            logger.info("Bar stream completed — sleeping 60s before reconnect")
-            await asyncio.sleep(60)
+                    pass
+            if resub_delay:
+                await asyncio.sleep(resub_delay)
         except asyncio.CancelledError:
             logger.info("Bar stream cancelled — exiting")
             raise
         except Exception:
             logger.exception("Bar stream failed — reconnecting in 5s")
             await asyncio.sleep(5)
+
+
+async def _bar_capture_health_report(state: AppState, *, tag: str) -> str:
+    """Compute + audit one capture-health line: historical_bar rows written
+    per (symbol, bar_size) over the trailing 60 minutes. A dead/wedged bar
+    writer (2026-07-07: zero SPX rows all session, writer died 13:31Z) shows
+    up as active-symbol=0 within the hour instead of at the EOD audit.
+    Returns the summary for tests/callers."""
+    from sqlalchemy import func
+    from sqlmodel import select
+    from fef_sidecar.db.engine import get_session
+    from fef_sidecar.db.models import HistoricalBar
+    import time as _t
+
+    cutoff_ms = int(_t.time() * 1000) - 3600_000
+    async with get_session() as session:
+        rows = list((await session.exec(
+            select(HistoricalBar.symbol, HistoricalBar.bar_size, func.count())
+            .where(HistoricalBar.timestamp_ms >= cutoff_ms)
+            .group_by(HistoricalBar.symbol, HistoricalBar.bar_size)
+        )).all())
+    counts = {f"{sym} ({bs})": int(n) for sym, bs, n in rows}
+    active = state.active_symbol
+    active_rows = sum(
+        n for (sym, bs, n) in rows
+        if sym == active and bs == os.environ.get("FEF_BAR_SIZE", "1 min")
+    )
+    body = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"
+    warn = (
+        "WARNING: 0 rows for the active symbol in the last hour — bar capture is dead. "
+        if active_rows == 0 else ""
+    )
+    summary = (
+        f"BAR CAPTURE health [{tag}]: {warn}last 60min: {body} (active={active})"
+    )
+    await SignalIterRepository.write_audit_log(
+        category="capture_health", actor="system", summary=summary,
+        details={"tag": tag, "counts": counts, "active_symbol": active,
+                 "active_rows_last_hour": active_rows},
+    )
+    return summary
+
+
+async def bar_capture_health_loop(state: AppState) -> None:
+    """Capture-health reporter: one audit line at the open (~09:31 ET) and at
+    each top-of-hour during RTH (see _bar_capture_health_report). Checks
+    every 60s; dedupes by (session, slot)."""
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
+    et = timezone(timedelta(hours=-4))
+    fired: set[str] = set()
+    logger.info("Starting bar-capture health loop (open + hourly during RTH)")
+    while True:
+        try:
+            _wd_beat(state, "bar-capture-health")
+            if _in_market_hours_et():
+                now = datetime.now(et)
+                slot = None
+                if now.hour == 9 and now.minute in (31, 32):
+                    slot = "open"
+                elif now.minute in (0, 1) and now.hour > 9:
+                    slot = f"h{now.hour:02d}"
+                if slot is not None:
+                    key = f"{now.strftime('%Y-%m-%d')}:{slot}"
+                    if key not in fired:
+                        fired.add(key)
+                        await _bar_capture_health_report(state, tag=slot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("bar-capture health iteration failed")
+        await asyncio.sleep(60)
 
 
 # ---------------------------------------------------------------------------
@@ -1813,11 +1957,13 @@ async def vix_poll_loop(state: AppState) -> None:
     stays at its prior reading.
     """
     from fef_sidecar.events import StatusEvent
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
     import time as _time
 
     interval = float(os.environ.get("FEF_VIX_POLL_INTERVAL_SEC", "30"))
     logger.info("Starting VIX poll loop (interval=%.1fs)", interval)
     while True:
+        _wd_beat(state, "vix-poll")
         try:
             vix_value: float | None = None
             vix_ts_ms: int | None = None
@@ -2335,10 +2481,17 @@ async def tick_stream_loop(state: AppState) -> None:
     panel frozen until manual app restart.
     """
     import time as _t
-    symbol = state.active_symbol
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
     stall_threshold = int(os.environ.get("FEF_TICK_STALL_THRESHOLD_SEC", "30"))
-    logger.info("Starting tick stream loop for %s (stall watchdog=%ds)", symbol, stall_threshold)
+    logger.info(
+        "Starting tick stream loop for %s (stall watchdog=%ds)",
+        state.active_symbol, stall_threshold,
+    )
     while True:
+        # Re-read the active symbol per (re)subscribe and follow switches
+        # below — the subscription must never stay keyed to the spawn-time
+        # symbol (2026-07-07: bar/tick capture lost the ES->SPX switch).
+        symbol = state.active_symbol
         try:
             await state.ibkr.connect()
             async def _stream():
@@ -2347,6 +2500,13 @@ async def tick_stream_loop(state: AppState) -> None:
             agen = _stream()
             try:
                 while True:
+                    _wd_beat(state, "tick-stream")
+                    if state.active_symbol != symbol:
+                        logger.info(
+                            "Tick stream: active symbol %s -> %s — resubscribing",
+                            symbol, state.active_symbol,
+                        )
+                        break
                     try:
                         quote = await asyncio.wait_for(
                             agen.__anext__(), timeout=stall_threshold,

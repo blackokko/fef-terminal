@@ -470,23 +470,414 @@ def _try_spawn_exit_check(state, kind: str, parent_id, make_coro) -> bool:
     return True
 
 
-async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str) -> bool:
+# Sell-attempt outcomes that must NOT keep an optimistic terminal latch:
+# no order was placed AND the refusal clears once the entry fill propagates
+# to ib.positions() (the 2026-07-07 eviction: "0 available after reservation"
+# ~40s after entry, STOPPED persisted before the sell, refusal path returned
+# without reverting -> parent dropped from the watcher scan with contracts
+# still open, no alert). "refused_cap" is deliberately EXCLUDED — a lifetime-
+# cap refusal means the watcher already sold the parent's full filled qty,
+# so the terminal status is true and reverting it would reopen a ghost.
+# "dry" is excluded to preserve DRY-mode resolved-marker semantics.
+_RETRYABLE_SELL_OUTCOMES = ("refused_guard", "error")
+
+# Back-off between retryable refused sell attempts per parent — bounds the
+# audit volume of the retry loop (0.1s poll + tick path would otherwise spam
+# a SKIPPED + refusal row pair per tick until the fill propagates).
+_REFUSAL_BACKOFF_SEC = float(os.environ.get("FEF_WATCHER_REFUSAL_BACKOFF_SEC", "2.0"))
+
+
+def _refusal_backoff_active(state, p) -> bool:
+    until = getattr(state, "_watcher_refusal_backoff_ms", {}).get(p.id, 0)
+    return int(_time.time() * 1000) < until
+
+
+def _set_refusal_backoff(state, p) -> None:
+    if not hasattr(state, "_watcher_refusal_backoff_ms"):
+        state._watcher_refusal_backoff_ms = {}  # type: ignore[attr-defined]
+    state._watcher_refusal_backoff_ms[p.id] = (  # type: ignore[attr-defined]
+        int(_time.time() * 1000) + int(_REFUSAL_BACKOFF_SEC * 1000)
+    )
+
+
+async def _rollback_refused_terminal_latch(
+    state, p, *, latched_status: str, prior_status: str,
+    tier_label: str, outcome_kind: str | None, ref_desc: str,
+) -> None:
+    """REFUSAL ROLLBACK (2026-07-07 eviction incident): a terminal status may
+    only survive a sell that actually PLACED an order. Reverts the optimistic
+    status (in memory + persisted) so the parent stays inside the watcher's
+    SUBMITTED/FILLED/PARTIAL scan filter and the sell is retried, and writes
+    the loud watcher_refusal_retry row. Best-effort — never raises into the
+    caller's finally."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    try:
+        p.status = prior_status
+        await SignalIterRepository.update_live_order(p.id, status=prior_status)
+        _set_refusal_backoff(state, p)
+        await SignalIterRepository.write_audit_log(
+            category="watcher_refusal_retry", actor="system",
+            summary=(
+                f"{tier_label} sell REFUSED ({outcome_kind or 'unknown'}) for parent {p.id} "
+                f"{p.symbol} {p.strike}{p.right} at {ref_desc} — status reverted "
+                f"{latched_status}->{prior_status}; parent stays managed, retry in "
+                f"{_REFUSAL_BACKOFF_SEC:.0f}s"
+            ),
+            details={
+                "parent_id": p.id, "tier": tier_label,
+                "outcome": outcome_kind, "latched_status": latched_status,
+                "reverted_to": prior_status, "ref": ref_desc,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "refusal rollback failed for parent %s (%s)", p.id, tier_label,
+        )
+
+
+async def _audit_tier_refusal_retry(
+    state, p, tier_label: str, outcome_kind: str | None, ref_desc: str,
+) -> None:
+    """watcher_refusal_retry row for a tier whose optimistic fired-flag was
+    reverted after a retryable refusal (the flag revert itself is done by the
+    caller — it predates this incident and stays as-is)."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    try:
+        _set_refusal_backoff(state, p)
+        await SignalIterRepository.write_audit_log(
+            category="watcher_refusal_retry", actor="system",
+            summary=(
+                f"{tier_label} sell REFUSED ({outcome_kind or 'unknown'}) for parent {p.id} "
+                f"{p.symbol} {p.strike}{p.right} at {ref_desc} — fired-flag reverted; "
+                f"tier stays armed, retry in {_REFUSAL_BACKOFF_SEC:.0f}s"
+            ),
+            details={
+                "parent_id": p.id, "tier": tier_label,
+                "outcome": outcome_kind, "ref": ref_desc,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "tier refusal audit failed for parent %s (%s)", p.id, tier_label,
+        )
+
+
+# --- Entry-fill grace (2026-07-07) -----------------------------------------
+# Stop/tier triggers must not be CONSUMED before the entry fill is confirmed:
+# both incident parents crossed their (corrupt) stops ~40s after entry while
+# ib.positions() had not yet reflected the buy — every sell was refused by
+# the anti-short guard, and the optimistic latch then evicted the parents.
+# Evaluation is skipped until filled_qty/avg_fill_price sync in or the broker
+# position is visible; after FEF_ENTRY_FILL_GRACE_SEC (default 120s) it
+# proceeds regardless (fail-open, audited once) so a broken fill-sync can
+# never silently disable exit management.
+_ENTRY_FILL_GRACE_SEC = float(os.environ.get("FEF_ENTRY_FILL_GRACE_SEC", "120"))
+
+
+def _entry_fill_confirmed(state, p) -> bool:
+    if int(getattr(p, "filled_qty", 0) or 0) > 0:
+        return True
+    if (p.avg_fill_price or 0) > 0:
+        return True
+    try:
+        from fef_sidecar.ibkr.live import LiveIBKRProvider
+        if isinstance(state.ibkr, LiveIBKRProvider):
+            ib = state.ibkr._ib  # type: ignore[attr-defined]
+            for pos in ib.positions():
+                c = pos.contract
+                if (getattr(c, "secType", "") == "OPT"
+                        and getattr(c, "symbol", "") == p.symbol
+                        and abs(float(getattr(c, "strike", 0)) - p.strike) < 0.01
+                        and getattr(c, "right", "") == p.right
+                        and getattr(c, "lastTradeDateOrContractMonth", "") == p.expiry
+                        and pos.position > 0):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+async def _entry_fill_grace_pending(state, p) -> bool:
+    """True while stop/tier evaluation must be SKIPPED for this parent (entry
+    fill unconfirmed and grace window still open). See block comment above."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    if p.id is None or _entry_fill_confirmed(state, p):
+        return False
+    now_ms = int(_time.time() * 1000)
+    start_ms = None
+    sub = getattr(p, "submitted_at", None)
+    if sub is not None:
+        try:
+            from datetime import UTC
+            if sub.tzinfo is None:
+                sub = sub.replace(tzinfo=UTC)  # DB round-trips drop tzinfo; stored UTC
+            start_ms = int(sub.timestamp() * 1000)
+        except Exception:
+            start_ms = None
+    if start_ms is None:
+        # No usable submit time — anchor on first sight (process-local).
+        if not hasattr(state, "_watcher_fill_grace_seen_ms"):
+            state._watcher_fill_grace_seen_ms = {}  # type: ignore[attr-defined]
+        start_ms = state._watcher_fill_grace_seen_ms.setdefault(p.id, now_ms)  # type: ignore[attr-defined]
+    if (now_ms - start_ms) / 1000.0 < _ENTRY_FILL_GRACE_SEC:
+        return True
+    # Fail-open: grace expired without a confirmed fill — manage anyway
+    # (the guards downstream still refuse to short) and say so once.
+    if not hasattr(state, "_watcher_fill_grace_expired"):
+        state._watcher_fill_grace_expired = set()  # type: ignore[attr-defined]
+    if p.id not in state._watcher_fill_grace_expired:  # type: ignore[attr-defined]
+        state._watcher_fill_grace_expired.add(p.id)  # type: ignore[attr-defined]
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="spx_watcher", actor="system",
+                summary=(
+                    f"ENTRY_FILL_GRACE expired ({_ENTRY_FILL_GRACE_SEC:.0f}s) for parent "
+                    f"{p.id} {p.symbol} {p.strike}{p.right} — no confirmed fill; "
+                    f"evaluating stop/tiers anyway (fail-open)"
+                ),
+            )
+        except Exception:
+            pass
+    return False
+
+
+# --- Arm-time plan sanity / re-anchor (2026-07-07) --------------------------
+# build_plan geometry at scale 1.0: stop 10pt, T1 15pt (1.5R), T2 25pt (2.5R),
+# T3 50pt (5R). Non-SPX symbols scale by _price_scale (strikes.py).
+_PLAN_EXPECTED_STOP_PTS = 10.0
+_PLAN_EXPECTED_T_PTS = (15.0, 25.0, 50.0)
+_PLAN_MAX_REL_DEV = 0.40
+# entry ref / symbol spot disagreeing by more than this RATIO is the
+# cross-symbol capture signature (SPX 7530.28 recorded on a SPY parent).
+_PLAN_UNITS_RATIO = 3.0
+
+
+async def _maybe_reanchor_plan(state, p, sym_spot: float | None) -> None:
+    """ARM-TIME PLAN SANITY (2026-07-07 incident): the scanner builds
+    T1/T2/T3/STOP from its own per-symbol QD spot while entry_spx_price is
+    captured from the active-chart tick (auto_trader) — two price sources.
+    Parent 751: plan ref 7520.66 vs entry 7530.28 -> |stop-entry| = 0.38pt,
+    R collapsed 10 -> 0.38, the BE ladder insta-stepped to 1.5R inside 200ms
+    and the ratcheted stop crossed ~40s later.
+
+    Rule: |spx_stop - entry_spx_price| must be within _PLAN_MAX_REL_DEV of
+    the expected 10 x _price_scale(sym_spot) points, on the LOSS side. On
+    violation, ALL four levels are re-anchored as offsets from
+    entry_spx_price (stop -/+10, T1 +/-15, T2 +/-25, T3 +/-50, scaled); a
+    target is preserved only when its own offset passes the same test
+    (wall-anchored levels that agree with the entry survive).
+    dynamic_stop_level + be_ladder_max_step_R reset alongside. An
+    entry_spx_price in the wrong UNITS entirely (ratio > 3x vs the symbol's
+    own spot — cross-symbol capture) is first repaired to sym_spot; the
+    caller's units guard (spot-vs-stop) has already vouched for sym_spot.
+
+    Checked once per parent (memoized). Re-anchored values are re-applied
+    to stale in-memory copies (the tick loop's 500ms parent cache).
+    Persists + audits category="plan_reanchored" with before/after."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    from fef_sidecar.engine.strikes import _price_scale
+    if p.id is None:
+        return
+    if not hasattr(state, "_watcher_plan_sanity"):
+        state._watcher_plan_sanity = {}  # type: ignore[attr-defined]
+    memo = state._watcher_plan_sanity  # type: ignore[attr-defined]
+    if p.id in memo:
+        fixed = memo[p.id]
+        if fixed:
+            # Re-apply the STATIC plan fields to a stale copy (tick cache).
+            # Ladder state (dynamic_stop_level / be_ladder_max_step_R) is
+            # NOT memoized — it legitimately ratchets after the re-anchor
+            # and must never be rewound to its reset value.
+            for k, v in fixed.items():
+                setattr(p, k, v)
+        return
+    entry = float(p.entry_spx_price) if (p.entry_spx_price or 0) > 0 else None
+    stop = float(p.spx_target_stop) if p.spx_target_stop is not None else None
+    if entry is None or stop is None or not sym_spot or sym_spot <= 0:
+        return  # nothing to validate yet — retry next cycle (no memo)
+    before = {
+        "entry_spx_price": entry, "spx_target_t1": p.spx_target_t1,
+        "spx_target_t2": p.spx_target_t2, "spx_target_t3": p.spx_target_t3,
+        "spx_target_stop": stop, "dynamic_stop_level": p.dynamic_stop_level,
+        "be_ladder_max_step_R": p.be_ladder_max_step_R,
+    }
+    updates: dict = {}
+    ratio = entry / float(sym_spot)
+    entry_repaired = ratio > _PLAN_UNITS_RATIO or ratio < 1.0 / _PLAN_UNITS_RATIO
+    if entry_repaired:
+        entry = float(sym_spot)
+        updates["entry_spx_price"] = entry
+    scale = _price_scale(float(sym_spot))
+    expected_stop = _PLAN_EXPECTED_STOP_PTS * scale
+    sign = 1.0 if p.right == "C" else -1.0
+    stop_off = sign * (entry - stop)  # >0 iff stop is on the loss side
+    stop_ok = (
+        stop_off > 0
+        and abs(stop_off - expected_stop) / expected_stop <= _PLAN_MAX_REL_DEV
+    )
+    if stop_ok and not entry_repaired:
+        memo[p.id] = None
+        return
+    if not stop_ok:
+        new_stop = entry - sign * expected_stop
+        updates["spx_target_stop"] = new_stop
+        for fld, pts in zip(
+            ("spx_target_t1", "spx_target_t2", "spx_target_t3"),
+            _PLAN_EXPECTED_T_PTS,
+        ):
+            cur = getattr(p, fld)
+            exp_off = pts * scale
+            keep = False
+            if cur is not None:
+                off = sign * (float(cur) - entry)  # >0 iff on the profit side
+                keep = off > 0 and abs(off - exp_off) / exp_off <= _PLAN_MAX_REL_DEV
+            if not keep:
+                updates[fld] = entry + sign * exp_off
+    # Ladder state derived from a bad entry/stop is garbage — reset it to
+    # the (possibly new) plan stop in both violation modes.
+    updates["dynamic_stop_level"] = updates.get("spx_target_stop", stop)
+    updates["be_ladder_max_step_R"] = 0.0
+    await SignalIterRepository.update_live_order(p.id, **updates)
+    for k, v in updates.items():
+        setattr(p, k, v)
+    memo[p.id] = {
+        k: v for k, v in updates.items()
+        if k not in ("dynamic_stop_level", "be_ladder_max_step_R")
+    }
+    await SignalIterRepository.write_audit_log(
+        category="plan_reanchored", actor="system",
+        summary=(
+            f"PLAN RE-ANCHORED for parent {p.id} {p.symbol} {p.strike}{p.right}: "
+            f"stop {before['spx_target_stop']} -> {p.spx_target_stop}, "
+            f"T1 {before['spx_target_t1']} -> {p.spx_target_t1}, "
+            f"T2 {before['spx_target_t2']} -> {p.spx_target_t2}, "
+            f"T3 {before['spx_target_t3']} -> {p.spx_target_t3} "
+            f"(entry ref {entry:.2f}{' repaired' if entry_repaired else ''}, "
+            f"expected R {expected_stop:.2f}, seen {stop_off:.2f})"
+        ),
+        details={
+            "parent_id": p.id, "before": before,
+            "after": {k: getattr(p, k) for k in before},
+            "entry_repaired": entry_repaired, "scale": scale,
+            "expected_stop_pts": expected_stop, "seen_stop_offset": stop_off,
+            "spot_ref": float(sym_spot),
+        },
+    )
+
+
+# --- Per-symbol spot resolution + units guard (2026-07-07) -------------------
+_WATCHER_SPOT_AUDIT_INTERVAL_MS = 300_000  # no-spot / units-mismatch: 1 row / 5 min
+_WATCHER_UNITS_RATIO = 3.0
+
+
+def _throttled(state, attr: str, key, now_ms: int,
+               interval_ms: int = _WATCHER_SPOT_AUDIT_INTERVAL_MS) -> bool:
+    """True iff the (attr, key) audit slot is open; claims it when open."""
+    if not hasattr(state, attr):
+        setattr(state, attr, {})
+    slots = getattr(state, attr)
+    if now_ms - slots.get(key, 0) < interval_ms:
+        return False
+    slots[key] = now_ms
+    return True
+
+
+async def _watcher_symbol_spot(state, p, poll_spot: float, spot_cache: dict) -> float | None:
+    """Resolve parent p's OWN symbol spot for spx_points stop/tier evaluation
+    (2026-07-07 incident #2: the SPY 749P plan stop 751.16 was compared
+    against the ACTIVE-CHART SPX tick 7533 -> dist=-6781pt -> instant stop).
+    Reuses _shadow_cash_spot resolution: active tick only when active_symbol
+    == p.symbol, else scanner per-symbol snapshot <=180s, else latest 1-min
+    bar <=10min. No symbol-correct spot -> SKIP evaluation for this parent
+    (category="watcher_no_spot", once per 5 min per parent)."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    spot, _src = await _shadow_cash_spot(state, p.symbol, poll_spot, spot_cache)
+    if spot is not None and spot > 0:
+        return float(spot)
+    now_ms = int(_time.time() * 1000)
+    if _throttled(state, "_watcher_no_spot_log_ms", p.id, now_ms):
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="watcher_no_spot", actor="system",
+                summary=(
+                    f"NO SYMBOL-CORRECT SPOT for parent {p.id} {p.symbol} "
+                    f"{p.strike}{p.right} (active={getattr(state, 'active_symbol', '?')}) "
+                    f"— stop/tier evaluation SKIPPED until a {p.symbol} spot resolves"
+                ),
+            )
+        except Exception:
+            pass
+    return None
+
+
+async def _units_guard_ok(state, p, spot: float) -> bool:
+    """Cross-unit comparison guard: never evaluate a stop whose price scale
+    disagrees with the spot by more than 3x in either direction (an SPX-scale
+    number against an ETF-scale one is ~10x). Audits
+    category="watcher_units_mismatch" once per 5 min per parent."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    stop_ref = (
+        p.dynamic_stop_level if p.dynamic_stop_level is not None
+        else p.spx_target_stop
+    )
+    if stop_ref is None or stop_ref <= 0 or spot <= 0:
+        return True  # nothing comparable — no stop can fire anyway
+    ratio = spot / float(stop_ref)
+    if 1.0 / _WATCHER_UNITS_RATIO <= ratio <= _WATCHER_UNITS_RATIO:
+        return True
+    now_ms = int(_time.time() * 1000)
+    if _throttled(state, "_watcher_units_log_ms", p.id, now_ms):
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="watcher_units_mismatch", actor="system",
+                summary=(
+                    f"UNITS MISMATCH for parent {p.id} {p.symbol} {p.strike}{p.right}: "
+                    f"spot={spot:.2f} vs stop={float(stop_ref):.2f} (ratio {ratio:.2f}) "
+                    f"— refusing to evaluate a cross-unit comparison"
+                ),
+            )
+        except Exception:
+            pass
+    return False
+
+
+async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str,
+                             outcome: dict | None = None) -> bool:
     """Safe market-sell-to-close `qty` of parent p's contract — the single shared
     exit path for BOTH spx_points and fixed_dollar watchers. Mirrors the long-qty
     guard + contract-level pending reservation + child-row write. `ref_desc` is a
     human string for the audit (e.g. 'SPX 6712.50' or 'prem 5.40 / +$520').
     Returns True iff an order was actually placed.
+
+    When `outcome` is provided, outcome["kind"] records how the attempt
+    resolved so callers can decide whether an optimistic latch must roll back:
+      "placed"        — order placed.
+      "dry"           — non-live provider ([DRY] row written).
+      "refused_guard" — anti-short reservation or safe-sell
+                        no_position/short_blocked; clears once the entry fill
+                        propagates -> RETRYABLE.
+      "refused_cap"   — lifetime sell cap; the watcher already sold the full
+                        filled qty -> NOT retryable.
+      "error"         — exception before placement -> RETRYABLE.
+      "noop"          — qty <= 0.
     """
     from fef_sidecar.db.repository import SignalIterRepository
     from fef_sidecar.ibkr.live import LiveIBKRProvider
 
+    def _resolve(kind: str) -> None:
+        if outcome is not None:
+            outcome["kind"] = kind
+
+    _resolve("error")  # pessimistic default — overwritten on a decisive path
     if qty <= 0:
+        _resolve("noop")
         return False
     if not isinstance(state.ibkr, LiveIBKRProvider):
         await SignalIterRepository.write_audit_log(
             category="spx_watcher", actor="system",
             summary=f"[DRY] {tier_label} crossed: would market-sell-to-close {qty}× {p.symbol} {p.strike}{p.right} at {ref_desc}",
         )
+        _resolve("dry")
         return False
     try:
         from fef_sidecar.ibkr.safe_sell import safe_market_sell
@@ -519,6 +910,7 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str)
                     f"for {p.symbol} {p.strike}{p.right} — refusing to short"
                 ),
             )
+            _resolve("refused_guard")
             return False
         if sell_qty < qty:
             await SignalIterRepository.write_audit_log(
@@ -544,6 +936,7 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str)
                     f"— refusing to oversell"
                 ),
             )
+            _resolve("refused_cap")
             return False
         if sell_qty < requested_after_guards:
             sold, cap = _lifetime_cap_state(state, p)
@@ -572,7 +965,16 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str)
         )
         if not result.placed:
             _lifetime_cap_release(state, p, sell_qty)
+            # no_position/short_blocked = the same fill-lag class as the
+            # reservation skip; placement_error = no order placed either.
+            _resolve(
+                "refused_guard"
+                if result.reason in ("no_position", "short_blocked")
+                else "error"
+            )
             return False
+        _resolve("placed")  # set BEFORE the audit/child writes — an exception
+        # past this point must never classify a placed order as retryable.
         if int(result.sell_qty) < sell_qty:
             # safe_market_sell clamped further — release the unplaced slice.
             _lifetime_cap_release(state, p, sell_qty - int(result.sell_qty))
@@ -598,6 +1000,7 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str)
             logger.exception(
                 "spx_watcher: write_watcher_sell_child failed for parent %s", p.id,
             )
+        _resolve("placed")
         return True
     except Exception:
         logger.exception("watcher market sell failed")
@@ -713,12 +1116,23 @@ async def _check_fixed_dollar(state, p) -> None:
             try:
                 # OPTIMISTIC LATCH (2026-07-06 oversell hotfix): resolve the
                 # parent BEFORE the awaited sell so a re-entrant/stale check
-                # can never re-fire into the placement window. Same terminal
-                # status the old post-sell write produced (it was written
-                # unconditionally after the sell anyway — refused included).
+                # can never re-fire into the placement window. REFUSAL
+                # ROLLBACK (2026-07-07): the terminal status only survives a
+                # sell that actually placed — a guard-refused/errored attempt
+                # reverts it so the parent stays managed and retries.
+                prior_status = p.status
                 p.status = "CLOSED"
                 await SignalIterRepository.update_live_order(p.id, status="CLOSED")
-                await _watcher_safe_sell(state, p, remaining_qty, "RUNNER_PROTECT", ref)
+                outcome: dict = {}
+                placed = await _watcher_safe_sell(
+                    state, p, remaining_qty, "RUNNER_PROTECT", ref, outcome=outcome,
+                )
+                if not placed and outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
+                    await _rollback_refused_terminal_latch(
+                        state, p, latched_status="CLOSED", prior_status=prior_status,
+                        tier_label="RUNNER_PROTECT", outcome_kind=outcome.get("kind"),
+                        ref_desc=ref,
+                    )
             finally:
                 state.firing_parent_ids.discard(p.id)
             return
@@ -726,10 +1140,20 @@ async def _check_fixed_dollar(state, p) -> None:
         if stop_qty > 0:
             state.firing_parent_ids.add(p.id)
             try:
-                # OPTIMISTIC LATCH — see RUNNER_PROTECT rationale above.
+                # OPTIMISTIC LATCH + REFUSAL ROLLBACK — see RUNNER_PROTECT above.
+                prior_status = p.status
                 p.status = "STOPPED"
                 await SignalIterRepository.update_live_order(p.id, status="STOPPED")
-                await _watcher_safe_sell(state, p, stop_qty, "STOP", ref)
+                outcome = {}
+                placed = await _watcher_safe_sell(
+                    state, p, stop_qty, "STOP", ref, outcome=outcome,
+                )
+                if not placed and outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
+                    await _rollback_refused_terminal_latch(
+                        state, p, latched_status="STOPPED", prior_status=prior_status,
+                        tier_label="STOP", outcome_kind=outcome.get("kind"),
+                        ref_desc=ref,
+                    )
             finally:
                 state.firing_parent_ids.discard(p.id)
             return
@@ -750,10 +1174,15 @@ async def _check_fixed_dollar(state, p) -> None:
             # → CLOSED → open runner orphaned from every watcher).
             setattr(p, field, True)
             await SignalIterRepository.update_live_order(p.id, **{field: True})
-            placed = await _watcher_safe_sell(state, p, qty, label, ref)
+            outcome = {}
+            placed = await _watcher_safe_sell(state, p, qty, label, ref, outcome=outcome)
             if not placed:
                 setattr(p, field, False)
                 await SignalIterRepository.update_live_order(p.id, **{field: False})
+                if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
+                    await _audit_tier_refusal_retry(
+                        state, p, label, outcome.get("kind"), ref,
+                    )
                 continue
             await SignalIterRepository.update_live_order(p.id, status="PARTIAL")
             any_fired = True
@@ -1577,11 +2006,332 @@ async def _shadow_be_ladder_cycle(state, parents, spot: float) -> None:
         await _shadow_finalize(state, sh, f_spot or 0.0)
 
 
-async def spx_target_watcher_loop(state) -> None:
-    from fef_sidecar.db.models import LiveOrder
+# Default BE ladder. Configurable per-deployment via env if needed.
+# Each tuple: (trigger_R, new_stop_at_R_from_entry)
+# 0.5R reached -> stop to entry (BE)
+# 1.0R reached -> stop to +0.5R (locks half)
+# 1.5R reached -> stop to +1.0R (locks 1R)
+_BE_LADDER_STEPS = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+
+# Tick-age threshold for stale-data warnings (audit-logged). If the cached
+# tick hasn't refreshed in this long, the IBKR tick stream is likely stalled
+# and stop detection may be acting on stale data.
+_STALE_TICK_WARN_MS = int(os.environ.get("SPX_WATCHER_STALE_TICK_MS", "1500"))
+# Per-parent throttle so the "spot near stop" diagnostic doesn't flood the
+# audit_log when iterating at 0.1s.
+_NEAR_STOP_LOG_INTERVAL_MS = 5000
+
+
+async def _eval_spx_points_parent(
+    state, p, spot: float, last_near_stop_log_ms: dict | None = None,
+) -> None:
+    """One poll-cycle evaluation of a single spx_points parent against ITS
+    OWN symbol spot (extracted from spx_target_watcher_loop 2026-07-07 so the
+    stop/tier/rollback state machine is unit-testable). `spot` must already
+    be symbol-correct (_watcher_symbol_spot). Guard order: units guard ->
+    arm-time plan sanity -> refusal backoff -> entry-fill grace -> BE ladder
+    -> stop -> T1/T2/T3 -> runner protect -> CLOSED sync."""
     from fef_sidecar.db.repository import SignalIterRepository
-    from fef_sidecar.ibkr.live import LiveIBKRProvider
-    from fef_sidecar.ibkr.models import Contract, ContractKind
+
+    if last_near_stop_log_ms is None:
+        last_near_stop_log_ms = {}
+
+    # UNITS GUARD (2026-07-07): never compare a stop against a spot in a
+    # different price scale. Runs BEFORE re-anchor — the plan stop was built
+    # from the scanner's per-symbol spot, so spot-vs-stop agreement is what
+    # vouches for `spot` before it may repair a polluted entry ref.
+    if not await _units_guard_ok(state, p, spot):
+        return
+
+    # ARM-TIME PLAN SANITY (2026-07-07): two-price-sources kill switch —
+    # re-anchors corrupt levels as offsets from entry_spx_price (parent 751:
+    # R collapsed 10 -> 0.38 and the BE ladder insta-stepped).
+    await _maybe_reanchor_plan(state, p, spot)
+
+    # Retryable-refusal backoff: a just-refused sell retries on a 2s clock,
+    # not per 0.1s tick (bounds audit volume while positions() catches up).
+    if _refusal_backoff_active(state, p):
+        return
+
+    # ENTRY-FILL GRACE (2026-07-07): don't consume stop/tier triggers before
+    # the entry fill is confirmed (fail-open after the grace window).
+    if await _entry_fill_grace_pending(state, p):
+        return
+
+    is_long_calls = p.right == "C"
+
+    # BE ladder: check current MFE in R, ratchet stop level up.
+    # Pure state change — no IBKR call, no order placement, fast.
+    if (p.entry_spx_price is not None and p.spx_target_stop is not None
+        and p.dynamic_stop_level is not None):
+        risk = abs(p.entry_spx_price - p.spx_target_stop)
+        if risk > 0:
+            if is_long_calls:
+                mfe_R = (spot - p.entry_spx_price) / risk
+            else:
+                mfe_R = (p.entry_spx_price - spot) / risk
+            for trig_R, new_stop_R in _BE_LADDER_STEPS:
+                if mfe_R >= trig_R and p.be_ladder_max_step_R < trig_R:
+                    # Ratchet stop. For longs: stop moves UP. For puts: DOWN.
+                    if is_long_calls:
+                        new_stop = p.entry_spx_price + new_stop_R * risk
+                        if new_stop > (p.dynamic_stop_level or -1e9):
+                            await SignalIterRepository.update_live_order(
+                                p.id, dynamic_stop_level=new_stop,
+                                be_ladder_max_step_R=trig_R,
+                            )
+                            p.dynamic_stop_level = new_stop
+                            p.be_ladder_max_step_R = trig_R
+                            await SignalIterRepository.write_audit_log(
+                                category="spx_watcher", actor="system",
+                                summary=f"BE LADDER step {trig_R}R: stop moved to {new_stop:.2f} (locks {new_stop_R}R) on {p.symbol} {p.strike}{p.right}",
+                            )
+                    else:
+                        new_stop = p.entry_spx_price - new_stop_R * risk
+                        if new_stop < (p.dynamic_stop_level or 1e9):
+                            await SignalIterRepository.update_live_order(
+                                p.id, dynamic_stop_level=new_stop,
+                                be_ladder_max_step_R=trig_R,
+                            )
+                            p.dynamic_stop_level = new_stop
+                            p.be_ladder_max_step_R = trig_R
+                            await SignalIterRepository.write_audit_log(
+                                category="spx_watcher", actor="system",
+                                summary=f"BE LADDER step {trig_R}R: stop moved to {new_stop:.2f} (locks {new_stop_R}R) on {p.symbol} {p.strike}{p.right}",
+                            )
+
+    async def _market_sell(qty: int, tier_label: str, outcome: dict | None = None) -> bool:
+        # spx_points exits delegate to the shared safe-sell helper
+        # (the same path fixed_dollar uses). ref = the symbol's spot at fire.
+        # Returns True iff an order actually PLACED — callers MUST gate
+        # their tier fired-flag on this, else a refused sell phantom-
+        # banks the tier and can orphan an open runner (the 7520C bug).
+        return await _watcher_safe_sell(
+            state, p, qty, tier_label, f"{p.symbol} {spot:.2f}", outcome=outcome,
+        )
+
+    # Stop check uses the dynamic level (BE ladder ratchets it).
+    # If the tick-driven fast path is already firing this parent's
+    # stop, skip — avoids double-fire.
+    if p.id in state.firing_parent_ids:
+        return
+    effective_stop = p.dynamic_stop_level if p.dynamic_stop_level is not None else p.spx_target_stop
+    if effective_stop is not None:
+        # Distance to stop (signed by direction — positive = safe,
+        # negative = breached). Used for the near-stop diagnostic
+        # below + for stale-tick warnings if a fire ever lags.
+        dist_to_stop = (
+            (spot - effective_stop) if is_long_calls
+            else (effective_stop - spot)
+        )
+        # Diagnostic: if the spot is within 2pt of the stop, audit-log
+        # once every 5s per parent with the live-tick freshness so
+        # we can prove watcher latency from the log timeline. Only
+        # written when actually close to firing — won't spam.
+        if dist_to_stop <= 2.0 and p.id is not None:
+            try:
+                last_log = last_near_stop_log_ms.get(p.id, 0)
+                now_ms = int(asyncio.get_running_loop().time() * 1000)
+                if now_ms - last_log >= _NEAR_STOP_LOG_INTERVAL_MS:
+                    last_near_stop_log_ms[p.id] = now_ms
+                    tick_age_ms = (
+                        int(_time.time() * 1000) - state.last_live_tick_ms
+                        if state.last_live_tick_ms > 0 else -1
+                    )
+                    stale = " STALE" if tick_age_ms > _STALE_TICK_WARN_MS else ""
+                    await SignalIterRepository.write_audit_log(
+                        category="spx_watcher", actor="system",
+                        summary=(f"NEAR_STOP{stale}: {p.symbol} {p.strike}{p.right} "
+                                f"spot={spot:.2f} stop={effective_stop:.2f} "
+                                f"dist={dist_to_stop:+.2f}pt tick_age={tick_age_ms}ms"),
+                    )
+            except Exception:
+                pass
+        stop_hit = dist_to_stop <= 0
+        if stop_hit:
+            # Compute remaining qty across all tiers
+            unfired_qty = 0
+            if not p.spx_target_t1_fired and p.spx_target_t1_qty:
+                unfired_qty += p.spx_target_t1_qty
+            if not p.spx_target_t2_fired and p.spx_target_t2_qty:
+                unfired_qty += p.spx_target_t2_qty
+            if not p.spx_target_t3_fired and p.spx_target_t3_qty:
+                unfired_qty += p.spx_target_t3_qty
+            if unfired_qty > 0:
+                state.firing_parent_ids.add(p.id)
+                try:
+                    # OPTIMISTIC LATCH (2026-07-06): status=STOPPED
+                    # BEFORE the awaited sell so no other path can
+                    # re-fire this parent mid-placement.
+                    # IMPORTANT: only set status=STOPPED. Do NOT
+                    # overwrite spx_target_t{1,2,3}_fired to True
+                    # as cleanup — those flags record whether each
+                    # tier was actually banked as a partial during
+                    # the trade. Polluting them on stop misleads
+                    # every downstream consumer (research_dump,
+                    # ablation, _estimate_parent_r, BE-kill stats).
+                    # status=STOPPED is the sole resolved-marker.
+                    # REFUSAL ROLLBACK (2026-07-07): the terminal
+                    # status only survives an actually-placed order —
+                    # a guard-refused/errored sell reverts it so the
+                    # parent stays managed (the eviction hole).
+                    prior_status = p.status
+                    p.status = "STOPPED"
+                    await SignalIterRepository.update_live_order(
+                        p.id, status="STOPPED",
+                    )
+                    outcome: dict = {}
+                    placed = await _market_sell(unfired_qty, "STOP", outcome)
+                    if not placed and outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
+                        await _rollback_refused_terminal_latch(
+                            state, p, latched_status="STOPPED",
+                            prior_status=prior_status, tier_label="STOP",
+                            outcome_kind=outcome.get("kind"),
+                            ref_desc=f"{p.symbol} {spot:.2f}",
+                        )
+                finally:
+                    state.firing_parent_ids.discard(p.id)
+            return  # nothing else to do on this parent
+
+    # T1
+    if not p.spx_target_t1_fired and p.spx_target_t1 is not None and p.spx_target_t1_qty:
+        t1_hit = (
+            (is_long_calls and spot >= p.spx_target_t1)
+            or (not is_long_calls and spot <= p.spx_target_t1)
+        )
+        if t1_hit:
+            # OPTIMISTIC LATCH (2026-07-06): flag BEFORE the awaited
+            # sell; revert ONLY on definitive refusal (placed=False)
+            # so a refused sell never phantom-banks the tier.
+            p.spx_target_t1_fired = True; p.spx_target_t1_at_spx = spot
+            await SignalIterRepository.update_live_order(
+                p.id, spx_target_t1_fired=True, spx_target_t1_at_spx=spot,
+            )
+            outcome = {}
+            if await _market_sell(p.spx_target_t1_qty, "T1", outcome):
+                await SignalIterRepository.update_live_order(
+                    p.id, status="PARTIAL",
+                )
+            else:
+                p.spx_target_t1_fired = False; p.spx_target_t1_at_spx = None
+                await SignalIterRepository.update_live_order(
+                    p.id, spx_target_t1_fired=False, spx_target_t1_at_spx=None,
+                )
+                if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
+                    await _audit_tier_refusal_retry(
+                        state, p, "T1", outcome.get("kind"), f"{p.symbol} {spot:.2f}",
+                    )
+
+    # T2
+    if not p.spx_target_t2_fired and p.spx_target_t2 is not None and p.spx_target_t2_qty:
+        t2_hit = (
+            (is_long_calls and spot >= p.spx_target_t2)
+            or (not is_long_calls and spot <= p.spx_target_t2)
+        )
+        if t2_hit:
+            # OPTIMISTIC LATCH — see T1.
+            p.spx_target_t2_fired = True; p.spx_target_t2_at_spx = spot
+            await SignalIterRepository.update_live_order(
+                p.id, spx_target_t2_fired=True, spx_target_t2_at_spx=spot,
+            )
+            outcome = {}
+            if await _market_sell(p.spx_target_t2_qty, "T2", outcome):
+                await SignalIterRepository.update_live_order(
+                    p.id, status="PARTIAL",
+                )
+            else:
+                p.spx_target_t2_fired = False; p.spx_target_t2_at_spx = None
+                await SignalIterRepository.update_live_order(
+                    p.id, spx_target_t2_fired=False, spx_target_t2_at_spx=None,
+                )
+                if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
+                    await _audit_tier_refusal_retry(
+                        state, p, "T2", outcome.get("kind"), f"{p.symbol} {spot:.2f}",
+                    )
+
+    # T3
+    if not p.spx_target_t3_fired and p.spx_target_t3 is not None and p.spx_target_t3_qty:
+        t3_hit = (
+            (is_long_calls and spot >= p.spx_target_t3)
+            or (not is_long_calls and spot <= p.spx_target_t3)
+        )
+        if t3_hit:
+            # OPTIMISTIC LATCH — see T1.
+            p.spx_target_t3_fired = True; p.spx_target_t3_at_spx = spot
+            await SignalIterRepository.update_live_order(
+                p.id, spx_target_t3_fired=True, spx_target_t3_at_spx=spot,
+            )
+            outcome = {}
+            if await _market_sell(p.spx_target_t3_qty, "T3", outcome):
+                await SignalIterRepository.update_live_order(
+                    p.id, status="PARTIAL",
+                )
+            else:
+                p.spx_target_t3_fired = False; p.spx_target_t3_at_spx = None
+                await SignalIterRepository.update_live_order(
+                    p.id, spx_target_t3_fired=False, spx_target_t3_at_spx=None,
+                )
+                if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
+                    await _audit_tier_refusal_retry(
+                        state, p, "T3", outcome.get("kind"), f"{p.symbol} {spot:.2f}",
+                    )
+
+    # Runner protect: if T1 has fired but T2/T3 are still open
+    # and the spot retraces back to where T1 fired → exit runners
+    if (state.runner_protect_enabled and p.spx_target_t1_fired
+        and p.spx_target_t1_at_spx is not None
+        and (not p.spx_target_t2_fired or not p.spx_target_t3_fired)):
+        retrace_hit = (
+            (is_long_calls and spot <= p.spx_target_t1_at_spx)
+            or (not is_long_calls and spot >= p.spx_target_t1_at_spx)
+        )
+        if retrace_hit:
+            runner_qty = 0
+            if not p.spx_target_t2_fired and p.spx_target_t2_qty:
+                runner_qty += p.spx_target_t2_qty
+            if not p.spx_target_t3_fired and p.spx_target_t3_qty:
+                runner_qty += p.spx_target_t3_qty
+            if runner_qty > 0:
+                # OPTIMISTIC LATCH — flag the runner tiers BEFORE
+                # the awaited sell; revert to their prior values on
+                # definitive refusal (a tier genuinely banked
+                # earlier must never be un-flagged).
+                prev_t2 = p.spx_target_t2_fired
+                prev_t3 = p.spx_target_t3_fired
+                p.spx_target_t2_fired = True; p.spx_target_t3_fired = True
+                await SignalIterRepository.update_live_order(
+                    p.id, spx_target_t2_fired=True, spx_target_t3_fired=True,
+                )
+                outcome = {}
+                if not await _market_sell(runner_qty, "RUNNER_PROTECT", outcome):
+                    p.spx_target_t2_fired = prev_t2
+                    p.spx_target_t3_fired = prev_t3
+                    await SignalIterRepository.update_live_order(
+                        p.id, spx_target_t2_fired=prev_t2,
+                        spx_target_t3_fired=prev_t3,
+                    )
+                    if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
+                        await _audit_tier_refusal_retry(
+                            state, p, "RUNNER_PROTECT", outcome.get("kind"),
+                            f"{p.symbol} {spot:.2f}",
+                        )
+
+    # Sync parent status to CLOSED once the banked tiers cover the full
+    # position (real remaining == 0) — not on the flags alone, so a
+    # tier flagged without a completed sell can't orphan an open runner.
+    if (p.spx_target_t1_fired and p.spx_target_t2_fired
+        and p.spx_target_t3_fired and p.status not in ("STOPPED", "CLOSED")
+        and _all_tiers_banked(
+            [p.spx_target_t1_qty or 0, p.spx_target_t2_qty or 0, p.spx_target_t3_qty or 0],
+            [p.spx_target_t1_fired, p.spx_target_t2_fired, p.spx_target_t3_fired],
+            p.qty,
+        )):
+        await SignalIterRepository.update_live_order(p.id, status="CLOSED")
+
+
+async def spx_target_watcher_loop(state) -> None:
+    from fef_sidecar.db.repository import SignalIterRepository
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
 
     interval = float(os.environ.get("SPX_WATCHER_INTERVAL_SEC", "0.1"))
     logger.info("SPX target watcher loop starting (interval=%.2fs)", interval)
@@ -1590,17 +2340,13 @@ async def spx_target_watcher_loop(state) -> None:
     fixed_dollar_check_ms = int(
         float(os.environ.get("FEF_FIXED_DOLLAR_CHECK_SEC", "3.0")) * 1000
     )
-    # Tick-age threshold for stale-data warnings (audit-logged). If the
-    # cached SPX hasn't refreshed in this long, the IBKR tick stream is
-    # likely stalled and stop detection may be acting on stale data.
-    stale_tick_warn_ms = int(os.environ.get("SPX_WATCHER_STALE_TICK_MS", "1500"))
     # Per-parent log throttle so the "spot near stop" diagnostic doesn't
-    # flood the audit_log when iterating at 0.1s.
+    # flood the audit_log when iterating at 0.1s (see _NEAR_STOP_LOG_INTERVAL_MS).
     last_near_stop_log_ms: dict[int, int] = {}
-    NEAR_STOP_LOG_INTERVAL_MS = 5000  # 5s between near-stop diagnostics per parent
 
     while True:
         try:
+            _wd_beat(state, "spx-target-watcher")
             spot = state.last_live_tick_spx or state.last_spx_price
             if spot <= 0:
                 await asyncio.sleep(interval)
@@ -1660,12 +2406,10 @@ async def spx_target_watcher_loop(state) -> None:
                         ):
                             state._dollar_cap_last_check_ms[p.id] = now_ms  # type: ignore[attr-defined]
 
-            # Default BE ladder. Configurable per-deployment via env if needed.
-            # Each tuple: (trigger_R, new_stop_at_R_from_entry)
-            # 0.5R reached -> stop to entry (BE)
-            # 1.0R reached -> stop to +0.5R (locks half)
-            # 1.5R reached -> stop to +1.0R (locks 1R)
-            BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+            # Per-cycle cache for per-symbol spot resolution (2026-07-07):
+            # each spx_points parent is evaluated against ITS OWN symbol's
+            # spot, never the active-chart price of a different symbol.
+            spot_cache: dict[str, tuple[float | None, str | None]] = {}
 
             for p in parents:
                 # Keep the parent's avg_fill_price + status current from the live
@@ -1691,240 +2435,16 @@ async def spx_target_watcher_loop(state) -> None:
                             state._fixed_dollar_last_check_ms[p.id] = now_ms  # type: ignore[attr-defined]
                     continue
 
-                is_long_calls = p.right == "C"
-
-                # BE ladder: check current MFE in R, ratchet stop level up.
-                # Pure state change — no IBKR call, no order placement, fast.
-                if (p.entry_spx_price is not None and p.spx_target_stop is not None
-                    and p.dynamic_stop_level is not None):
-                    risk = abs(p.entry_spx_price - p.spx_target_stop)
-                    if risk > 0:
-                        if is_long_calls:
-                            mfe_R = (spot - p.entry_spx_price) / risk
-                        else:
-                            mfe_R = (p.entry_spx_price - spot) / risk
-                        for trig_R, new_stop_R in BE_LADDER:
-                            if mfe_R >= trig_R and p.be_ladder_max_step_R < trig_R:
-                                # Ratchet stop. For longs: stop moves UP. For puts: DOWN.
-                                if is_long_calls:
-                                    new_stop = p.entry_spx_price + new_stop_R * risk
-                                    if new_stop > (p.dynamic_stop_level or -1e9):
-                                        await SignalIterRepository.update_live_order(
-                                            p.id, dynamic_stop_level=new_stop,
-                                            be_ladder_max_step_R=trig_R,
-                                        )
-                                        p.dynamic_stop_level = new_stop
-                                        p.be_ladder_max_step_R = trig_R
-                                        await SignalIterRepository.write_audit_log(
-                                            category="spx_watcher", actor="system",
-                                            summary=f"BE LADDER step {trig_R}R: stop moved to {new_stop:.2f} (locks {new_stop_R}R) on {p.symbol} {p.strike}{p.right}",
-                                        )
-                                else:
-                                    new_stop = p.entry_spx_price - new_stop_R * risk
-                                    if new_stop < (p.dynamic_stop_level or 1e9):
-                                        await SignalIterRepository.update_live_order(
-                                            p.id, dynamic_stop_level=new_stop,
-                                            be_ladder_max_step_R=trig_R,
-                                        )
-                                        p.dynamic_stop_level = new_stop
-                                        p.be_ladder_max_step_R = trig_R
-                                        await SignalIterRepository.write_audit_log(
-                                            category="spx_watcher", actor="system",
-                                            summary=f"BE LADDER step {trig_R}R: stop moved to {new_stop:.2f} (locks {new_stop_R}R) on {p.symbol} {p.strike}{p.right}",
-                                        )
-
-                async def _market_sell(qty: int, tier_label: str) -> bool:
-                    # spx_points exits delegate to the shared safe-sell helper
-                    # (the same path fixed_dollar uses). ref = SPX spot at fire.
-                    # Returns True iff an order actually PLACED — callers MUST gate
-                    # their tier fired-flag on this, else a refused sell phantom-
-                    # banks the tier and can orphan an open runner (the 7520C bug).
-                    return await _watcher_safe_sell(state, p, qty, tier_label, f"SPX {spot:.2f}")
-
-                # Stop check uses the dynamic level (BE ladder ratchets it).
-                # If the tick-driven fast path is already firing this parent's
-                # stop, skip — avoids double-fire.
-                if p.id in state.firing_parent_ids:
+                # PER-SYMBOL SPOT (2026-07-07): resolve the parent's OWN
+                # symbol spot (active tick only when active_symbol matches,
+                # else scanner snapshot <=180s, else 1-min bar <=10min). No
+                # symbol-correct spot -> SKIP this parent (audited 1/5min).
+                sym_spot = await _watcher_symbol_spot(state, p, spot, spot_cache)
+                if sym_spot is None:
                     continue
-                effective_stop = p.dynamic_stop_level if p.dynamic_stop_level is not None else p.spx_target_stop
-                if effective_stop is not None:
-                    # Distance to stop (signed by direction — positive = safe,
-                    # negative = breached). Used for the near-stop diagnostic
-                    # below + for stale-tick warnings if a fire ever lags.
-                    dist_to_stop = (
-                        (spot - effective_stop) if is_long_calls
-                        else (effective_stop - spot)
-                    )
-                    # Diagnostic: if SPX is within 2pt of the stop, audit-log
-                    # once every 5s per parent with the live-tick freshness so
-                    # we can prove watcher latency from the log timeline. Only
-                    # written when actually close to firing — won't spam.
-                    if dist_to_stop <= 2.0 and p.id is not None:
-                        try:
-                            last_log = last_near_stop_log_ms.get(p.id, 0)
-                            now_ms = int(asyncio.get_running_loop().time() * 1000)
-                            if now_ms - last_log >= NEAR_STOP_LOG_INTERVAL_MS:
-                                last_near_stop_log_ms[p.id] = now_ms
-                                tick_age_ms = (
-                                    int(_time.time() * 1000) - state.last_live_tick_ms
-                                    if state.last_live_tick_ms > 0 else -1
-                                )
-                                stale = " STALE" if tick_age_ms > stale_tick_warn_ms else ""
-                                await SignalIterRepository.write_audit_log(
-                                    category="spx_watcher", actor="system",
-                                    summary=(f"NEAR_STOP{stale}: {p.symbol} {p.strike}{p.right} "
-                                            f"spot={spot:.2f} stop={effective_stop:.2f} "
-                                            f"dist={dist_to_stop:+.2f}pt tick_age={tick_age_ms}ms"),
-                                )
-                        except Exception:
-                            pass
-                    stop_hit = dist_to_stop <= 0
-                    if stop_hit:
-                        # Compute remaining qty across all tiers
-                        unfired_qty = 0
-                        if not p.spx_target_t1_fired and p.spx_target_t1_qty:
-                            unfired_qty += p.spx_target_t1_qty
-                        if not p.spx_target_t2_fired and p.spx_target_t2_qty:
-                            unfired_qty += p.spx_target_t2_qty
-                        if not p.spx_target_t3_fired and p.spx_target_t3_qty:
-                            unfired_qty += p.spx_target_t3_qty
-                        if unfired_qty > 0:
-                            state.firing_parent_ids.add(p.id)
-                            try:
-                                # OPTIMISTIC LATCH (2026-07-06): status=STOPPED
-                                # BEFORE the awaited sell (it was already written
-                                # unconditionally after it) so no other path can
-                                # re-fire this parent mid-placement.
-                                # IMPORTANT: only set status=STOPPED. Do NOT
-                                # overwrite spx_target_t{1,2,3}_fired to True
-                                # as cleanup — those flags record whether each
-                                # tier was actually banked as a partial during
-                                # the trade. Polluting them on stop misleads
-                                # every downstream consumer (research_dump,
-                                # ablation, _estimate_parent_r, BE-kill stats).
-                                # status=STOPPED is the sole resolved-marker.
-                                p.status = "STOPPED"
-                                await SignalIterRepository.update_live_order(
-                                    p.id, status="STOPPED",
-                                )
-                                await _market_sell(unfired_qty, "STOP")
-                            finally:
-                                state.firing_parent_ids.discard(p.id)
-                        continue  # nothing else to do on this parent
-
-                # T1
-                if not p.spx_target_t1_fired and p.spx_target_t1 is not None and p.spx_target_t1_qty:
-                    t1_hit = (
-                        (is_long_calls and spot >= p.spx_target_t1)
-                        or (not is_long_calls and spot <= p.spx_target_t1)
-                    )
-                    if t1_hit:
-                        # OPTIMISTIC LATCH (2026-07-06): flag BEFORE the awaited
-                        # sell; revert ONLY on definitive refusal (placed=False)
-                        # so a refused sell never phantom-banks the tier.
-                        p.spx_target_t1_fired = True; p.spx_target_t1_at_spx = spot
-                        await SignalIterRepository.update_live_order(
-                            p.id, spx_target_t1_fired=True, spx_target_t1_at_spx=spot,
-                        )
-                        if await _market_sell(p.spx_target_t1_qty, "T1"):
-                            await SignalIterRepository.update_live_order(
-                                p.id, status="PARTIAL",
-                            )
-                        else:
-                            p.spx_target_t1_fired = False; p.spx_target_t1_at_spx = None
-                            await SignalIterRepository.update_live_order(
-                                p.id, spx_target_t1_fired=False, spx_target_t1_at_spx=None,
-                            )
-
-                # T2
-                if not p.spx_target_t2_fired and p.spx_target_t2 is not None and p.spx_target_t2_qty:
-                    t2_hit = (
-                        (is_long_calls and spot >= p.spx_target_t2)
-                        or (not is_long_calls and spot <= p.spx_target_t2)
-                    )
-                    if t2_hit:
-                        # OPTIMISTIC LATCH — see T1.
-                        p.spx_target_t2_fired = True; p.spx_target_t2_at_spx = spot
-                        await SignalIterRepository.update_live_order(
-                            p.id, spx_target_t2_fired=True, spx_target_t2_at_spx=spot,
-                        )
-                        if await _market_sell(p.spx_target_t2_qty, "T2"):
-                            await SignalIterRepository.update_live_order(
-                                p.id, status="PARTIAL",
-                            )
-                        else:
-                            p.spx_target_t2_fired = False; p.spx_target_t2_at_spx = None
-                            await SignalIterRepository.update_live_order(
-                                p.id, spx_target_t2_fired=False, spx_target_t2_at_spx=None,
-                            )
-
-                # T3
-                if not p.spx_target_t3_fired and p.spx_target_t3 is not None and p.spx_target_t3_qty:
-                    t3_hit = (
-                        (is_long_calls and spot >= p.spx_target_t3)
-                        or (not is_long_calls and spot <= p.spx_target_t3)
-                    )
-                    if t3_hit:
-                        # OPTIMISTIC LATCH — see T1.
-                        p.spx_target_t3_fired = True; p.spx_target_t3_at_spx = spot
-                        await SignalIterRepository.update_live_order(
-                            p.id, spx_target_t3_fired=True, spx_target_t3_at_spx=spot,
-                        )
-                        if await _market_sell(p.spx_target_t3_qty, "T3"):
-                            await SignalIterRepository.update_live_order(
-                                p.id, status="PARTIAL",
-                            )
-                        else:
-                            p.spx_target_t3_fired = False; p.spx_target_t3_at_spx = None
-                            await SignalIterRepository.update_live_order(
-                                p.id, spx_target_t3_fired=False, spx_target_t3_at_spx=None,
-                            )
-
-                # Runner protect: if T1 has fired but T2/T3 are still open
-                # and SPX retraces back to where T1 fired → exit runners
-                if (state.runner_protect_enabled and p.spx_target_t1_fired
-                    and p.spx_target_t1_at_spx is not None
-                    and (not p.spx_target_t2_fired or not p.spx_target_t3_fired)):
-                    retrace_hit = (
-                        (is_long_calls and spot <= p.spx_target_t1_at_spx)
-                        or (not is_long_calls and spot >= p.spx_target_t1_at_spx)
-                    )
-                    if retrace_hit:
-                        runner_qty = 0
-                        if not p.spx_target_t2_fired and p.spx_target_t2_qty:
-                            runner_qty += p.spx_target_t2_qty
-                        if not p.spx_target_t3_fired and p.spx_target_t3_qty:
-                            runner_qty += p.spx_target_t3_qty
-                        if runner_qty > 0:
-                            # OPTIMISTIC LATCH — flag the runner tiers BEFORE
-                            # the awaited sell; revert to their prior values on
-                            # definitive refusal (a tier genuinely banked
-                            # earlier must never be un-flagged).
-                            prev_t2 = p.spx_target_t2_fired
-                            prev_t3 = p.spx_target_t3_fired
-                            p.spx_target_t2_fired = True; p.spx_target_t3_fired = True
-                            await SignalIterRepository.update_live_order(
-                                p.id, spx_target_t2_fired=True, spx_target_t3_fired=True,
-                            )
-                            if not await _market_sell(runner_qty, "RUNNER_PROTECT"):
-                                p.spx_target_t2_fired = prev_t2
-                                p.spx_target_t3_fired = prev_t3
-                                await SignalIterRepository.update_live_order(
-                                    p.id, spx_target_t2_fired=prev_t2,
-                                    spx_target_t3_fired=prev_t3,
-                                )
-
-                # Sync parent status to CLOSED once the banked tiers cover the full
-                # position (real remaining == 0) — not on the flags alone, so a
-                # tier flagged without a completed sell can't orphan an open runner.
-                if (p.spx_target_t1_fired and p.spx_target_t2_fired
-                    and p.spx_target_t3_fired and p.status not in ("STOPPED", "CLOSED")
-                    and _all_tiers_banked(
-                        [p.spx_target_t1_qty or 0, p.spx_target_t2_qty or 0, p.spx_target_t3_qty or 0],
-                        [p.spx_target_t1_fired, p.spx_target_t2_fired, p.spx_target_t3_fired],
-                        p.qty,
-                    )):
-                    await SignalIterRepository.update_live_order(p.id, status="CLOSED")
+                await _eval_spx_points_parent(
+                    state, p, sym_spot, last_near_stop_log_ms,
+                )
 
         except asyncio.CancelledError:
             raise
@@ -1954,9 +2474,8 @@ async def spx_stop_tick_watcher_loop(state) -> None:
     If the tick stream stalls or this task crashes, the poll loop
     continues to fire stops at its own cadence — defense in depth.
     """
-    from fef_sidecar.db.models import LiveOrder
     from fef_sidecar.db.repository import SignalIterRepository
-    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
 
     logger.info("SPX stop tick-watcher starting (tick-driven fast path)")
     # Cache open parents for short windows so we don't re-query DB on
@@ -1968,7 +2487,13 @@ async def spx_stop_tick_watcher_loop(state) -> None:
     async with state.broadcaster.subscribe() as queue:
         while True:
             try:
-                event = await queue.get()
+                _wd_beat(state, "spx-stop-tick-watcher")
+                try:
+                    # Bounded wait so the watchdog heartbeat keeps stamping
+                    # even when no ticks arrive (closed market / stalled feed).
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except (asyncio.TimeoutError, TimeoutError):
+                    continue
                 # Only tick events drive stop detection. Skip everything else.
                 if getattr(event, "type", None) != "tick":
                     continue
@@ -1993,181 +2518,240 @@ async def spx_stop_tick_watcher_loop(state) -> None:
                     ]
                     parents_cache_at_ms = now_ms
 
-                for p in parents_cache:
-                    if p.id in state.firing_parent_ids:
-                        continue
-                    is_long_calls = p.right == "C"
-                    effective_stop = (
-                        p.dynamic_stop_level
-                        if p.dynamic_stop_level is not None
-                        else p.spx_target_stop
-                    )
-                    if effective_stop is None:
-                        continue
-                    stop_hit = (
-                        (is_long_calls and spot <= effective_stop)
-                        or (not is_long_calls and spot >= effective_stop)
-                    )
-                    if not stop_hit:
-                        continue
-                    # Compute unfired qty from the cached snapshot. The
-                    # long_qty position guard in the IBKR sell call will
-                    # clip if the cache is stale (e.g., T1 fired between
-                    # cache refreshes).
-                    unfired_qty = 0
-                    if not p.spx_target_t1_fired and p.spx_target_t1_qty:
-                        unfired_qty += p.spx_target_t1_qty
-                    if not p.spx_target_t2_fired and p.spx_target_t2_qty:
-                        unfired_qty += p.spx_target_t2_qty
-                    if not p.spx_target_t3_fired and p.spx_target_t3_qty:
-                        unfired_qty += p.spx_target_t3_qty
-                    if unfired_qty <= 0:
-                        continue
-                    # Acquire the firing lock — only one path may fire this
-                    # parent at a time.
-                    state.firing_parent_ids.add(p.id)
-                    try:
-                        # OPTIMISTIC LATCH (2026-07-06): status=STOPPED BEFORE
-                        # the awaited sell (previously written unconditionally
-                        # after it — DRY/refused included) so the poll loop /
-                        # a stale spawned check can't re-fire this parent
-                        # mid-placement. Same as the polling-loop stop branch:
-                        # status=STOPPED is the resolved-marker; don't overwrite
-                        # the per-tier fired flags as cleanup — that pollutes
-                        # partial-tracking for every downstream analytic.
-                        p.status = "STOPPED"
-                        await SignalIterRepository.update_live_order(
-                            p.id, status="STOPPED",
-                        )
-                        if not isinstance(state.ibkr, LiveIBKRProvider):
-                            await SignalIterRepository.write_audit_log(
-                                category="spx_watcher", actor="system",
-                                summary=(
-                                    f"[DRY/TICK] STOP crossed: would market-sell-to-close "
-                                    f"{unfired_qty}x {p.symbol} {p.strike}{p.right} at SPX {spot:.2f}"
-                                ),
-                            )
-                        else:
-                            from fef_sidecar.ibkr.safe_sell import safe_market_sell
-                            ib = state.ibkr._ib  # type: ignore[attr-defined]
-                            try:
-                                ic = await _qualified_ib_contract(state, p)
-                                positions = ib.positions()
-                                long_qty = sum(
-                                    int(pos.position) for pos in positions
-                                    if (getattr(pos.contract, "secType", "") == "OPT"
-                                        and getattr(pos.contract, "symbol", "") == p.symbol
-                                        and abs(float(getattr(pos.contract, "strike", 0)) - p.strike) < 0.01
-                                        and getattr(pos.contract, "right", "") == p.right
-                                        and getattr(pos.contract, "lastTradeDateOrContractMonth", "") == p.expiry
-                                        and pos.position > 0)
-                                )
-                                # Contract-level pending-sell reservation.
-                                # Prevents cross-parent races on same contract —
-                                # the 7-parent SPX 7520C race that placed a
-                                # naked short occurred here. safe_market_sell
-                                # is the structural backstop if this reservation
-                                # misses.
-                                contract_key = (p.symbol, float(p.strike), p.right, p.expiry)
-                                pending = state.firing_contracts.get(contract_key, 0)
-                                available = max(0, long_qty - pending)
-                                sell_qty = min(unfired_qty, available)
-                                # LIFETIME SELL CAP (2026-07-06) — absolute
-                                # oversell backstop, independent of the (stale-
-                                # window-prone) broker position snapshot. See
-                                # _lifetime_cap_reserve.
-                                cap_qty = (
-                                    _lifetime_cap_reserve(state, p, sell_qty)
-                                    if sell_qty > 0 else 0
-                                )
-                                if sell_qty <= 0:
-                                    await SignalIterRepository.write_audit_log(
-                                        category="spx_watcher", actor="system",
-                                        summary=(
-                                            f"STOP/TICK SKIPPED: 0 available after reservation "
-                                            f"(long={long_qty}, pending={pending}, requested={unfired_qty}) "
-                                            f"for {p.symbol} {p.strike}{p.right} — refusing to short"
-                                        ),
-                                    )
-                                elif cap_qty <= 0:
-                                    sold, cap = _lifetime_cap_state(state, p)
-                                    await SignalIterRepository.write_audit_log(
-                                        category="spx_watcher", actor="system",
-                                        summary=(
-                                            f"STOP/TICK REFUSED by lifetime sell cap: watcher "
-                                            f"already sold {sold}/{cap} for parent {p.id} "
-                                            f"({p.symbol} {p.strike}{p.right}, requested={sell_qty}) "
-                                            f"— refusing to oversell"
-                                        ),
-                                    )
-                                else:
-                                    sell_qty = cap_qty
-                                    # Reserve before placing. Spawn a 2s-delayed
-                                    # decrement (see _market_sell rationale).
-                                    state.firing_contracts[contract_key] = pending + sell_qty
-
-                                    async def _release_reservation(key, amount):
-                                        try:
-                                            await asyncio.sleep(2.0)
-                                            cur = state.firing_contracts.get(key, 0)
-                                            state.firing_contracts[key] = max(0, cur - amount)
-                                        except Exception:
-                                            pass
-
-                                    asyncio.create_task(_release_reservation(contract_key, sell_qty))
-
-                                    result = await safe_market_sell(
-                                        ib, ic, sell_qty, purpose="watcher_close",
-                                        state=state, parent_id=p.id,
-                                    )
-                                    if result.placed:
-                                        tick_age_ms = (
-                                            now_ms - state.last_live_tick_ms
-                                            if state.last_live_tick_ms > 0 else -1
-                                        )
-                                        # Banked-$ audit line (spawned — see
-                                        # _write_tier_fill_audit).
-                                        asyncio.create_task(_write_tier_fill_audit(
-                                            state, p, "STOP/TICK", result, f"SPX {spot:.2f}",
-                                            extra_summary=(
-                                                f"stop={effective_stop:.2f}, "
-                                                f"tick_age={tick_age_ms}ms"
-                                            ),
-                                            extra_details={
-                                                "stop_level": effective_stop,
-                                                "tick_age_ms": tick_age_ms,
-                                            },
-                                        ))
-                                        try:
-                                            await SignalIterRepository.write_watcher_sell_child(
-                                                parent=p, bracket_role="stop",
-                                                qty=int(result.sell_qty),
-                                                ib_order_id=int(result.trade.order.orderId),
-                                                ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
-                                                notes=f"stop_tick@SPX={spot:.2f},age={tick_age_ms}ms",
-                                            )
-                                        except Exception:
-                                            logger.exception(
-                                                "stop_tick: write_watcher_sell_child failed for parent %s",
-                                                p.id,
-                                            )
-                                        if int(result.sell_qty) < sell_qty:
-                                            _lifetime_cap_release(
-                                                state, p, sell_qty - int(result.sell_qty),
-                                            )
-                                    else:
-                                        # safe_market_sell already wrote an
-                                        # audit_log (HARD-BLOCK / no_position).
-                                        _lifetime_cap_release(state, p, sell_qty)
-                            except Exception:
-                                logger.exception("spx_stop_tick_watcher market sell failed")
-                        # (status=STOPPED already latched above, before the sell.)
+                for p in list(parents_cache):
+                    resolved = await _tick_check_parent_stop(state, p, spot, symbol)
+                    if resolved:
                         # Refresh cache so the next ticks don't re-evaluate
-                        # this just-stopped parent.
+                        # this just-stopped parent. A rolled-back refusal
+                        # stays cached so the retry clock applies to it.
                         parents_cache = [c for c in parents_cache if c.id != p.id]
-                    finally:
-                        state.firing_parent_ids.discard(p.id)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("spx_stop_tick_watcher iteration failed")
+
+
+async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
+    """Tick fast-path stop check for ONE cached spx_points parent. Returns
+    True iff the parent resolved terminally (caller drops it from the tick
+    cache); False = keep managing (no trigger, guard skip, or a refusal that
+    rolled the optimistic latch back).
+
+    Guards (2026-07-07 incident): the tick is only comparable to parents of
+    ITS OWN symbol — the SPY 749P stop 751.16 was evaluated against the SPX
+    tick 7533 (dist=-6781pt) and instantly "triggered". Cross-symbol parents
+    are skipped here entirely; the poll loop manages them on their own
+    resolved spot. Units guard + arm-time plan sanity + entry-fill grace
+    mirror the poll path.
+    """
+    from fef_sidecar.db.repository import SignalIterRepository
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+
+    if p.symbol != symbol:
+        return False
+    if p.id in state.firing_parent_ids:
+        return False
+    if not await _units_guard_ok(state, p, spot):
+        return False
+    await _maybe_reanchor_plan(state, p, spot)
+    if _refusal_backoff_active(state, p):
+        return False
+    if await _entry_fill_grace_pending(state, p):
+        return False
+    is_long_calls = p.right == "C"
+    effective_stop = (
+        p.dynamic_stop_level
+        if p.dynamic_stop_level is not None
+        else p.spx_target_stop
+    )
+    if effective_stop is None:
+        return False
+    stop_hit = (
+        (is_long_calls and spot <= effective_stop)
+        or (not is_long_calls and spot >= effective_stop)
+    )
+    if not stop_hit:
+        return False
+    # Compute unfired qty from the cached snapshot. The long_qty position
+    # guard in the IBKR sell call will clip if the cache is stale (e.g., T1
+    # fired between cache refreshes).
+    unfired_qty = 0
+    if not p.spx_target_t1_fired and p.spx_target_t1_qty:
+        unfired_qty += p.spx_target_t1_qty
+    if not p.spx_target_t2_fired and p.spx_target_t2_qty:
+        unfired_qty += p.spx_target_t2_qty
+    if not p.spx_target_t3_fired and p.spx_target_t3_qty:
+        unfired_qty += p.spx_target_t3_qty
+    if unfired_qty <= 0:
+        return False
+    now_ms = int(_time.time() * 1000)
+    # Acquire the firing lock — only one path may fire this parent at a time.
+    state.firing_parent_ids.add(p.id)
+    resolved = True
+    try:
+        # OPTIMISTIC LATCH (2026-07-06): status=STOPPED BEFORE the awaited
+        # sell so the poll loop / a stale spawned check can't re-fire this
+        # parent mid-placement. status=STOPPED is the resolved-marker; don't
+        # overwrite the per-tier fired flags as cleanup — that pollutes
+        # partial-tracking for every downstream analytic.
+        # REFUSAL ROLLBACK (2026-07-07): the terminal status only survives an
+        # actually-placed order — a guard-refused/errored sell reverts it so
+        # the parent stays managed (the eviction hole: "STOP/TICK SKIPPED: 0
+        # available after reservation" returned with STOPPED persisted).
+        prior_status = p.status
+        p.status = "STOPPED"
+        await SignalIterRepository.update_live_order(
+            p.id, status="STOPPED",
+        )
+        if not isinstance(state.ibkr, LiveIBKRProvider):
+            await SignalIterRepository.write_audit_log(
+                category="spx_watcher", actor="system",
+                summary=(
+                    f"[DRY/TICK] STOP crossed: would market-sell-to-close "
+                    f"{unfired_qty}x {p.symbol} {p.strike}{p.right} at {symbol} {spot:.2f}"
+                ),
+            )
+        else:
+            from fef_sidecar.ibkr.safe_sell import safe_market_sell
+            ib = state.ibkr._ib  # type: ignore[attr-defined]
+            try:
+                ic = await _qualified_ib_contract(state, p)
+                positions = ib.positions()
+                long_qty = sum(
+                    int(pos.position) for pos in positions
+                    if (getattr(pos.contract, "secType", "") == "OPT"
+                        and getattr(pos.contract, "symbol", "") == p.symbol
+                        and abs(float(getattr(pos.contract, "strike", 0)) - p.strike) < 0.01
+                        and getattr(pos.contract, "right", "") == p.right
+                        and getattr(pos.contract, "lastTradeDateOrContractMonth", "") == p.expiry
+                        and pos.position > 0)
+                )
+                # Contract-level pending-sell reservation. Prevents
+                # cross-parent races on same contract — the 7-parent SPX
+                # 7520C race that placed a naked short occurred here.
+                # safe_market_sell is the structural backstop if this
+                # reservation misses.
+                contract_key = (p.symbol, float(p.strike), p.right, p.expiry)
+                pending = state.firing_contracts.get(contract_key, 0)
+                available = max(0, long_qty - pending)
+                sell_qty = min(unfired_qty, available)
+                # LIFETIME SELL CAP (2026-07-06) — absolute oversell backstop,
+                # independent of the (stale-window-prone) broker position
+                # snapshot. See _lifetime_cap_reserve.
+                cap_qty = (
+                    _lifetime_cap_reserve(state, p, sell_qty)
+                    if sell_qty > 0 else 0
+                )
+                if sell_qty <= 0:
+                    await SignalIterRepository.write_audit_log(
+                        category="spx_watcher", actor="system",
+                        summary=(
+                            f"STOP/TICK SKIPPED: 0 available after reservation "
+                            f"(long={long_qty}, pending={pending}, requested={unfired_qty}) "
+                            f"for {p.symbol} {p.strike}{p.right} — refusing to short"
+                        ),
+                    )
+                    await _rollback_refused_terminal_latch(
+                        state, p, latched_status="STOPPED",
+                        prior_status=prior_status, tier_label="STOP/TICK",
+                        outcome_kind="refused_guard",
+                        ref_desc=f"{symbol} {spot:.2f}",
+                    )
+                    resolved = False
+                elif cap_qty <= 0:
+                    # Lifetime cap = the watcher already sold the full filled
+                    # qty; the terminal status is TRUE — no rollback.
+                    sold, cap = _lifetime_cap_state(state, p)
+                    await SignalIterRepository.write_audit_log(
+                        category="spx_watcher", actor="system",
+                        summary=(
+                            f"STOP/TICK REFUSED by lifetime sell cap: watcher "
+                            f"already sold {sold}/{cap} for parent {p.id} "
+                            f"({p.symbol} {p.strike}{p.right}, requested={sell_qty}) "
+                            f"— refusing to oversell"
+                        ),
+                    )
+                else:
+                    sell_qty = cap_qty
+                    # Reserve before placing. Spawn a 2s-delayed
+                    # decrement (see _market_sell rationale).
+                    state.firing_contracts[contract_key] = pending + sell_qty
+
+                    async def _release_reservation(key, amount):
+                        try:
+                            await asyncio.sleep(2.0)
+                            cur = state.firing_contracts.get(key, 0)
+                            state.firing_contracts[key] = max(0, cur - amount)
+                        except Exception:
+                            pass
+
+                    asyncio.create_task(_release_reservation(contract_key, sell_qty))
+
+                    result = await safe_market_sell(
+                        ib, ic, sell_qty, purpose="watcher_close",
+                        state=state, parent_id=p.id,
+                    )
+                    if result.placed:
+                        tick_age_ms = (
+                            now_ms - state.last_live_tick_ms
+                            if state.last_live_tick_ms > 0 else -1
+                        )
+                        # Banked-$ audit line (spawned — see
+                        # _write_tier_fill_audit).
+                        asyncio.create_task(_write_tier_fill_audit(
+                            state, p, "STOP/TICK", result, f"{symbol} {spot:.2f}",
+                            extra_summary=(
+                                f"stop={effective_stop:.2f}, "
+                                f"tick_age={tick_age_ms}ms"
+                            ),
+                            extra_details={
+                                "stop_level": effective_stop,
+                                "tick_age_ms": tick_age_ms,
+                            },
+                        ))
+                        try:
+                            await SignalIterRepository.write_watcher_sell_child(
+                                parent=p, bracket_role="stop",
+                                qty=int(result.sell_qty),
+                                ib_order_id=int(result.trade.order.orderId),
+                                ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
+                                notes=f"stop_tick@{symbol}={spot:.2f},age={tick_age_ms}ms",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "stop_tick: write_watcher_sell_child failed for parent %s",
+                                p.id,
+                            )
+                        if int(result.sell_qty) < sell_qty:
+                            _lifetime_cap_release(
+                                state, p, sell_qty - int(result.sell_qty),
+                            )
+                    else:
+                        # safe_market_sell already wrote an audit_log
+                        # (HARD-BLOCK / no_position / placement_error) —
+                        # no order placed, so the latch must roll back.
+                        _lifetime_cap_release(state, p, sell_qty)
+                        await _rollback_refused_terminal_latch(
+                            state, p, latched_status="STOPPED",
+                            prior_status=prior_status, tier_label="STOP/TICK",
+                            outcome_kind=(
+                                "refused_guard"
+                                if result.reason in ("no_position", "short_blocked")
+                                else "error"
+                            ),
+                            ref_desc=f"{symbol} {spot:.2f}",
+                        )
+                        resolved = False
+            except Exception:
+                logger.exception("spx_stop_tick_watcher market sell failed")
+                # Exception before placement (qualify/positions/reserve) —
+                # revert the latch so the parent stays managed and retries.
+                await _rollback_refused_terminal_latch(
+                    state, p, latched_status="STOPPED",
+                    prior_status=prior_status, tier_label="STOP/TICK",
+                    outcome_kind="error", ref_desc=f"{symbol} {spot:.2f}",
+                )
+                resolved = False
+    finally:
+        state.firing_parent_ids.discard(p.id)
+    return resolved

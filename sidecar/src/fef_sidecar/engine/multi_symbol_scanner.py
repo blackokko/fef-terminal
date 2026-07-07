@@ -1069,6 +1069,7 @@ async def multi_symbol_scanner_loop(state) -> None:
     enabled symbols and runs a scan for each. Skips disabled symbols
     and never touches the active chart symbol's primary loop.
     """
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
     interval = float(os.environ.get("FEF_SCAN_INTERVAL_SEC", "60"))
     logger.info("multi-symbol scanner loop starting (interval=%.1fs)", interval)
 
@@ -1076,6 +1077,7 @@ async def multi_symbol_scanner_loop(state) -> None:
     await asyncio.sleep(15)
 
     while True:
+        _wd_beat(state, "multi-symbol-scanner")
         try:
             enabled = [
                 s for s, on in state.scan_enabled_symbols.items() if on

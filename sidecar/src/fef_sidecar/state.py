@@ -332,6 +332,16 @@ class AppState:
     # an A/B exit shadow). NEVER places orders.
     shadow_be_ladder: dict[int, dict] = field(default_factory=dict)
 
+    # Loop watchdog (2026-07-07): heartbeat map (loop name -> monotonic
+    # seconds, stamped every healthy cycle), supervised-loop registry, and
+    # the supervisor task handle. The week's failure class is "async task
+    # dies or wedges silently" (bar writer + live_position snapshot writer
+    # both stopped ~13:31Z with nothing surfaced) — the watchdog audits and
+    # respawns. See engine/loop_watchdog.py.
+    loop_heartbeats: dict[str, float] = field(default_factory=dict)
+    watchdog_loops: dict[str, object] = field(default_factory=dict)
+    watchdog_task: object | None = None
+
     @classmethod
     def build(cls) -> AppState:
         return cls(

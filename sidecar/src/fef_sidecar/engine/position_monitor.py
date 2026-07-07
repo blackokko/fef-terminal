@@ -19,10 +19,12 @@ logger = logging.getLogger(__name__)
 
 
 async def position_monitor_loop(state: AppState) -> None:
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
     interval = float(os.environ.get("FEF_POSITION_POLL_INTERVAL_SEC", "5"))
     logger.info("Starting position monitor loop (interval=%.1fs)", interval)
 
     while True:
+        _wd_beat(state, "position-monitor")
         try:
             if not isinstance(state.ibkr, LiveIBKRProvider):
                 # Mock mode: skip — no real positions

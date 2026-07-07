@@ -344,68 +344,108 @@ async def daily_prior_close_refresher(state: AppState) -> None:
             await asyncio.sleep(60)  # back off a minute before retrying
 
 
+def _task_alive(task: object | None) -> bool:
+    return task is not None and not task.done()  # type: ignore[attr-defined]
+
+
 def spawn_data_loops(state: AppState) -> None:
     """(Re-)spawn the per-symbol data loops. Called on startup and whenever
     the active symbol is changed via /config/symbol so the loops pick up
-    the new symbol immediately."""
-    state.quantdata_poll_task = asyncio.create_task(
-        quantdata_poll_loop(state), name="quantdata-poll-loop"
+    the new symbol immediately.
+
+    2026-07-07: critical loops (tick/bar streams, QD poll, VIX poll,
+    position snapshots, watcher loops, scanner) are spawned SUPERVISED —
+    heartbeat + traceback-on-death + auto-respawn (engine/loop_watchdog.py).
+    spawn_supervised also cancels a live same-name task first, which closes
+    the old /config/symbol duplicate-task leak (this function used to
+    re-create watcher/scanner/position tasks that cancel_data_loops never
+    cancelled). The remaining symbol-agnostic singletons are guarded with
+    _task_alive for the same reason."""
+    from fef_sidecar.engine.loop_watchdog import spawn_supervised
+
+    state.quantdata_poll_task = spawn_supervised(
+        state, "quantdata-poll", lambda: quantdata_poll_loop(state),
+        cadence_sec=15, stale_after_sec=120,
     )
     state.loop_task = asyncio.create_task(fef_tick_loop(state), name="fef-tick-loop")
-    state.bar_task = asyncio.create_task(bar_stream_loop(state), name="bar-stream-loop")
-    state.tick_task = asyncio.create_task(tick_stream_loop(state), name="tick-stream-loop")
+    state.bar_task = spawn_supervised(
+        state, "bar-stream", lambda: bar_stream_loop(state),
+        cadence_sec=15, stale_after_sec=120,
+    )
+    state.tick_task = spawn_supervised(
+        state, "tick-stream", lambda: tick_stream_loop(state),
+        cadence_sec=30, stale_after_sec=120,
+    )
     state.health_check_task = asyncio.create_task(
         ibkr_health_check_loop(state), name="ibkr-health-check-loop"
     )
-    state.vix_task = asyncio.create_task(vix_poll_loop(state), name="vix-poll-loop")
+    state.vix_task = spawn_supervised(
+        state, "vix-poll", lambda: vix_poll_loop(state),
+        cadence_sec=30, stale_after_sec=180,
+    )
     state.account_task = asyncio.create_task(account_poll_loop(state), name="account-poll-loop")
     state.microstructure_task = asyncio.create_task(
         microstructure_loop(state), name="microstructure-loop"
     )
     state.hft_task = asyncio.create_task(hft_loop(state), name="hft-loop")
     from fef_sidecar.engine.position_monitor import position_monitor_loop
-    state.position_task = asyncio.create_task(
-        position_monitor_loop(state), name="position-monitor-loop"
+    state.position_task = spawn_supervised(
+        state, "position-monitor", lambda: position_monitor_loop(state),
+        cadence_sec=5, stale_after_sec=120,
     )
     from fef_sidecar.engine.auto_walk_forward import nightly_scheduler
-    state.auto_wf_task = asyncio.create_task(
-        nightly_scheduler(state), name="auto-walk-forward-scheduler"
-    )
+    if not _task_alive(state.auto_wf_task):
+        state.auto_wf_task = asyncio.create_task(
+            nightly_scheduler(state), name="auto-walk-forward-scheduler"
+        )
     from fef_sidecar.engine.runner_protector import runner_protector_loop
-    state.runner_protect_task = asyncio.create_task(
-        runner_protector_loop(state), name="runner-protector-loop"
-    )
+    if not _task_alive(state.runner_protect_task):
+        state.runner_protect_task = asyncio.create_task(
+            runner_protector_loop(state), name="runner-protector-loop"
+        )
     from fef_sidecar.engine.spx_target_watcher import (
         spx_stop_tick_watcher_loop,
         spx_target_watcher_loop,
     )
-    state.spx_target_task = asyncio.create_task(
-        spx_target_watcher_loop(state), name="spx-target-watcher-loop"
+    state.spx_target_task = spawn_supervised(
+        state, "spx-target-watcher", lambda: spx_target_watcher_loop(state),
+        cadence_sec=1, stale_after_sec=30,
     )
-    state.spx_stop_tick_task = asyncio.create_task(
-        spx_stop_tick_watcher_loop(state), name="spx-stop-tick-watcher"
+    state.spx_stop_tick_task = spawn_supervised(
+        state, "spx-stop-tick-watcher", lambda: spx_stop_tick_watcher_loop(state),
+        cadence_sec=30, stale_after_sec=120,
     )
     from fef_sidecar.engine.spread_exit_watcher import spread_exit_watcher_loop
-    state.spread_exit_task = asyncio.create_task(
-        spread_exit_watcher_loop(state), name="spread-exit-watcher-loop"
-    )
+    if not _task_alive(state.spread_exit_task):
+        state.spread_exit_task = asyncio.create_task(
+            spread_exit_watcher_loop(state), name="spread-exit-watcher-loop"
+        )
     from fef_sidecar.engine.multi_symbol_scanner import multi_symbol_scanner_loop
-    state.scanner_task = asyncio.create_task(
-        multi_symbol_scanner_loop(state), name="multi-symbol-scanner-loop"
+    state.scanner_task = spawn_supervised(
+        state, "multi-symbol-scanner", lambda: multi_symbol_scanner_loop(state),
+        cadence_sec=60, stale_after_sec=300,
     )
     # Option chain capture — snapshots ATM±25pt × {C,P} via IBKR every 2 min
     # so shadow variants can replay alternate-strike outcomes. Isolated task:
     # failure won't affect signal/auto-trade loops. Disable via
     # FEF_CHAIN_CAPTURE_ENABLED=false.
     from fef_sidecar.engine.option_chain_capture import option_chain_capture_loop
-    state.option_chain_capture_task = asyncio.create_task(
-        option_chain_capture_loop(state), name="option-chain-capture-loop"
-    )
+    if not _task_alive(state.option_chain_capture_task):
+        state.option_chain_capture_task = asyncio.create_task(
+            option_chain_capture_loop(state), name="option-chain-capture-loop"
+        )
     # ES session-anchored VWAP capture (direction/trend anchor for the post-FEF
     # strategy). Independent best-effort task; gated by FEF_CAPTURE_ENABLED.
-    from fef_sidecar.loop import es_vwap_loop
-    state.es_vwap_task = asyncio.create_task(
-        es_vwap_loop(state), name="es-vwap-loop"
+    from fef_sidecar.loop import bar_capture_health_loop, es_vwap_loop
+    if not _task_alive(state.es_vwap_task):
+        state.es_vwap_task = asyncio.create_task(
+            es_vwap_loop(state), name="es-vwap-loop"
+        )
+    # Capture-health reporter — audits historical_bar rows/hour per symbol at
+    # the open + hourly so a dead bar writer is visible the same session.
+    spawn_supervised(
+        state, "bar-capture-health", lambda: bar_capture_health_loop(state),
+        cadence_sec=60, stale_after_sec=300,
     )
     # Pattern trigger — confirmed-bar candlestick/flag fires into the
     # advisory audit surface; auto-trades ONLY when the user arms the
@@ -480,6 +520,12 @@ async def lifespan(app: FastAPI):
     )
     if auto_loops:
         spawn_data_loops(state)
+        # Loop watchdog supervisor — audits + respawns dead/stalled
+        # supervised loops (2026-07-07 silent-death incident).
+        from fef_sidecar.engine.loop_watchdog import loop_watchdog_loop
+        state.watchdog_task = asyncio.create_task(
+            loop_watchdog_loop(state), name="loop-watchdog"
+        )
         asyncio.create_task(refresh_prior_close(state), name="refresh-prior-close")
         asyncio.create_task(daily_prior_close_refresher(state), name="daily-prior-close-refresher")
         asyncio.create_task(backfill_regime_from_db(state), name="backfill-regime")
@@ -514,6 +560,8 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("fef-sidecar shutting down")
         for task in (
+            # Watchdog first — it must not respawn loops mid-teardown.
+            state.watchdog_task,
             state.loop_task,
             state.bar_task,
             state.tick_task,
