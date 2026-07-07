@@ -95,10 +95,28 @@ async def _write_watchdog_audit(summary: str, details: dict | None = None,
         logger.exception("loop_watchdog: audit write failed (%s)", summary)
 
 
-async def _supervised_body(state: Any, spec: SupervisedLoop) -> None:
+async def _supervised_body(
+    state: Any, spec: SupervisedLoop, wait_for_prev: Any | None = None,
+) -> None:
     """Run one supervised loop to completion. An escaping exception lands a
     traceback in the audit log BEFORE the task exits — the supervisor then
-    respawns from the heartbeat/done check."""
+    respawns from the heartbeat/done check.
+
+    wait_for_prev: the cancelled predecessor task. Awaited (bounded) before
+    this instance starts — two live instances of one loop must never overlap
+    (2026-07-07 review: overlapping poll-loop instances each held their own
+    ORM parent copies and could both sell the same tier)."""
+    if wait_for_prev is not None:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(wait_for_prev, return_exceptions=True),
+                timeout=10.0,
+            )
+        except Exception:
+            logger.warning(
+                "supervised loop %s: predecessor did not finish within 10s — starting anyway",
+                spec.name,
+            )
     heartbeat(state, spec.name)
     try:
         await spec.factory()
@@ -138,11 +156,14 @@ def spawn_supervised(
     """
     reg = _registry(state)
     prev = reg.get(name)
+    prev_task = None
     if prev is not None and prev.task is not None and not prev.task.done():
         # Replacing a live loop (symbol-switch respawn / re-registration) —
-        # cancel the old task so two copies never run side by side.
+        # cancel the old task; the new instance AWAITS it before starting
+        # (see _supervised_body) so two copies never run side by side.
         prev.cancelled = True
         prev.task.cancel()
+        prev_task = prev.task
     spec = SupervisedLoop(
         name=name, factory=factory, cadence_sec=float(cadence_sec),
         stale_after_sec=(
@@ -150,7 +171,9 @@ def spawn_supervised(
             else 3.0 * float(cadence_sec)
         ),
     )
-    spec.task = asyncio.create_task(_supervised_body(state, spec), name=name)
+    spec.task = asyncio.create_task(
+        _supervised_body(state, spec, wait_for_prev=prev_task), name=name,
+    )
     heartbeat(state, name)
     reg[name] = spec
     return spec.task
@@ -165,6 +188,11 @@ async def _watchdog_check_once(state: Any, *, now: float | None = None) -> list[
     hbs = getattr(state, "loop_heartbeats", {}) or {}
     if now is None:
         now = time.monotonic()
+    # BLOCKER-1 (2026-07-07 review): never cancel/respawn tasks while an exit
+    # fire is in flight — cancellation mid-sell is exactly how an optimistic
+    # latch gets stranded. Fires are short; re-check next pass.
+    if getattr(state, "firing_parent_ids", None):
+        return actions
     for spec in list(reg.values()):
         if spec.cancelled or spec.completed:
             continue
@@ -200,9 +228,15 @@ async def _watchdog_check_once(state: Any, *, now: float | None = None) -> list[
                      "stale_after_sec": spec.stale_after_sec},
         )
         try:
-            if spec.task is not None and not spec.task.done():
-                spec.task.cancel()  # wedged, not dead — replace it
-            spec.task = asyncio.create_task(_supervised_body(state, spec), name=spec.name)
+            old_task = spec.task
+            if old_task is not None and not old_task.done():
+                old_task.cancel()  # wedged, not dead — replace it
+            # The replacement awaits the cancelled predecessor before it
+            # starts (never two live instances of one loop side by side).
+            spec.task = asyncio.create_task(
+                _supervised_body(state, spec, wait_for_prev=old_task),
+                name=spec.name,
+            )
             spec.respawn_ts.append(now)
             heartbeat(state, spec.name)
             actions.append(f"respawned:{spec.name}")

@@ -390,10 +390,11 @@ async def test_spy_parent_uses_own_spot_not_spx_active_tick() -> None:
         spx_target_stop=751.16, dynamic_stop_level=751.16,
     )
 
-    sym_spot = await _watcher_symbol_spot(state, p, 7533.0, {})
+    sym_spot, sym_src = await _watcher_symbol_spot(state, p, 7533.0, {})
     assert sym_spot == pytest.approx(750.20)         # scanner snapshot, not SPX
+    assert sym_src == "scanner_snapshot"
 
-    await _eval_spx_points_parent(state, p, sym_spot)
+    await _eval_spx_points_parent(state, p, sym_spot, spot_src=sym_src)
     assert fake.placed == []                          # no cross-symbol trigger
     assert p.status == "FILLED"
     assert p.entry_spx_price == pytest.approx(750.20)  # polluted entry repaired
@@ -440,8 +441,8 @@ async def test_no_symbol_spot_skips_with_single_audit() -> None:
         symbol="SPY", strike=749.0, entry_spx_price=750.30,
         spx_target_stop=751.16, dynamic_stop_level=751.16,
     )
-    assert await _watcher_symbol_spot(state, p, 7533.0, {}) is None
-    assert await _watcher_symbol_spot(state, p, 7533.0, {}) is None
+    assert await _watcher_symbol_spot(state, p, 7533.0, {}) == (None, None)
+    assert await _watcher_symbol_spot(state, p, 7533.0, {}) == (None, None)
     rows = await SignalIterRepository.query_audit_log(category="watcher_no_spot")
     assert len(rows) == 1
     await _drain()

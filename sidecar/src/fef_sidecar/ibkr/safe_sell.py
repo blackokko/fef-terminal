@@ -198,35 +198,15 @@ async def safe_market_sell(
             reason="no_position" if net_long == 0 else "short_blocked",
         )
 
-    # Place the clamped sell
+    # Place the clamped sell. ONLY the placeOrder call may yield
+    # placement_error — once the order is transmitted the success result is
+    # constructed IMMEDIATELY, and no awaited write below may flip it
+    # (2026-07-07 review: a raised clamped-audit write AFTER placeOrder
+    # returned placed=False, so callers rolled back their latch and re-sold
+    # an already-transmitted order).
     try:
         mkt = MarketOrder("SELL", sell_qty)
         trade = ib.placeOrder(contract, mkt)
-        logger.info(
-            "safe_market_sell: %s %s%s sell_qty=%d (requested=%d, net_long=%d, purpose=%s)",
-            contract.symbol, contract.strike, contract.right,
-            sell_qty, qty, net_long, purpose,
-        )
-        if sell_qty < qty:
-            from fef_sidecar.engine.auto_trader import BlockReason as _BR
-            await SignalIterRepository.write_audit_log(
-                category="safe_sell_clamped", actor="system",
-                summary=(
-                    f"CLAMPED: {contract.symbol} {contract.strike}{contract.right} — "
-                    f"requested {qty}, sold {sell_qty} (net_long was {net_long}). "
-                    f"purpose={purpose}"
-                ),
-                details={
-                    "purpose": purpose, "requested_qty": qty,
-                    "sell_qty": sell_qty, "net_long": net_long,
-                    "parent_id": parent_id,
-                },
-                block_reason_code=_BR.SAFE_SELL_CLAMPED,
-            )
-        return SafeSellResult(
-            placed=True, sell_qty=sell_qty, requested_qty=qty, net_long=net_long,
-            reason="ok" if sell_qty == qty else "clamped_to_long", trade=trade,
-        )
     except Exception as e:
         from fef_sidecar.engine.auto_trader import BlockReason as _BR
         await SignalIterRepository.write_audit_log(
@@ -242,3 +222,34 @@ async def safe_market_sell(
             placed=False, sell_qty=0, requested_qty=qty, net_long=net_long,
             reason="placement_error",
         )
+    result = SafeSellResult(
+        placed=True, sell_qty=sell_qty, requested_qty=qty, net_long=net_long,
+        reason="ok" if sell_qty == qty else "clamped_to_long", trade=trade,
+    )
+    logger.info(
+        "safe_market_sell: %s %s%s sell_qty=%d (requested=%d, net_long=%d, purpose=%s)",
+        contract.symbol, contract.strike, contract.right,
+        sell_qty, qty, net_long, purpose,
+    )
+    if sell_qty < qty:
+        try:
+            from fef_sidecar.engine.auto_trader import BlockReason as _BR
+            await SignalIterRepository.write_audit_log(
+                category="safe_sell_clamped", actor="system",
+                summary=(
+                    f"CLAMPED: {contract.symbol} {contract.strike}{contract.right} — "
+                    f"requested {qty}, sold {sell_qty} (net_long was {net_long}). "
+                    f"purpose={purpose}"
+                ),
+                details={
+                    "purpose": purpose, "requested_qty": qty,
+                    "sell_qty": sell_qty, "net_long": net_long,
+                    "parent_id": parent_id,
+                },
+                block_reason_code=_BR.SAFE_SELL_CLAMPED,
+            )
+        except Exception:
+            logger.exception(
+                "safe_market_sell: clamped-audit write failed (order already placed)",
+            )
+    return result

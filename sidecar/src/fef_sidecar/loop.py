@@ -1851,7 +1851,15 @@ async def bar_stream_loop(state: AppState) -> None:
                     await state.broadcaster.publish(event)
             finally:
                 if pending is not None and not pending.done():
+                    # Await the cancelled waiter BEFORE closing the generator
+                    # — aclose() on a generator with a running __anext__
+                    # raises RuntimeError and can leak the IBKR subscription
+                    # slot (review MINOR-9).
                     pending.cancel()
+                    try:
+                        await pending
+                    except (Exception, asyncio.CancelledError):
+                        pass
                 try:
                     await agen.aclose()
                 except Exception:
@@ -1912,7 +1920,11 @@ async def bar_capture_health_loop(state: AppState) -> None:
     each top-of-hour during RTH (see _bar_capture_health_report). Checks
     every 60s; dedupes by (session, slot)."""
     from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
-    et = timezone(timedelta(hours=-4))
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")  # DST-correct (review MINOR-10)
+    except Exception:
+        et = timezone(timedelta(hours=-4))
     fired: set[str] = set()
     logger.info("Starting bar-capture health loop (open + hourly during RTH)")
     while True:

@@ -270,52 +270,58 @@ async def _check_dollar_loss(state, p) -> None:
             )
             return
 
-        # Reserve before placing. Spawn a 2s-delayed decrement.
-        state.firing_contracts[contract_key] = pending + sell_qty
-
-        async def _release_reservation(key, amount):
-            try:
-                await asyncio.sleep(2.0)
-                cur = state.firing_contracts.get(key, 0)
-                state.firing_contracts[key] = max(0, cur - amount)
-            except Exception:
-                pass
-
-        asyncio.create_task(_release_reservation(contract_key, sell_qty))
-
-        result = await safe_market_sell(
-            ib, ic, sell_qty, purpose="dollar_cap", state=state, parent_id=p.id,
-        )
-        if not result.placed:
-            # safe_market_sell already wrote an audit_log explaining why.
-            _lifetime_cap_release(state, p, sell_qty)
-            return
-        if int(result.sell_qty) < sell_qty:
-            _lifetime_cap_release(state, p, sell_qty - int(result.sell_qty))
-        # status=STOPPED is the resolved-marker. Don't overwrite the per-tier
-        # fired flags as cleanup — they record whether each tier was banked
-        # as a partial, not whether the trade resolved. (See poll-loop branch
-        # for the full rationale.)
-        await SignalIterRepository.update_live_order(
-            p.id, status="STOPPED",
-        )
-        await SignalIterRepository.write_audit_log(
-            category="spx_watcher", actor="system",
-            summary=f"DOLLAR_STOP(${pnl:.0f}): market-sold-to-close {result.sell_qty}× {p.symbol} {p.strike}{p.right} (ib_order_id={result.trade.order.orderId})",
-        )
+        placed_qty = 0
         try:
-            await SignalIterRepository.write_watcher_sell_child(
-                parent=p, bracket_role="dollar_cap",
-                qty=int(result.sell_qty),
-                ib_order_id=int(result.trade.order.orderId),
-                ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
-                notes=f"dollar_cap pnl=${pnl:.0f}",
+            # Reserve before placing. Spawn a 2s-delayed decrement.
+            state.firing_contracts[contract_key] = pending + sell_qty
+
+            async def _release_reservation(key, amount):
+                try:
+                    await asyncio.sleep(2.0)
+                    cur = state.firing_contracts.get(key, 0)
+                    state.firing_contracts[key] = max(0, cur - amount)
+                except Exception:
+                    pass
+
+            asyncio.create_task(_release_reservation(contract_key, sell_qty))
+
+            result = await safe_market_sell(
+                ib, ic, sell_qty, purpose="dollar_cap", state=state, parent_id=p.id,
             )
-        except Exception:
-            logger.exception(
-                "dollar_cap: write_watcher_sell_child failed for parent %s",
-                p.id,
+            if not result.placed:
+                # safe_market_sell already wrote an audit_log explaining why.
+                return
+            placed_qty = int(result.sell_qty)
+            # status=STOPPED is the resolved-marker. Don't overwrite the per-tier
+            # fired flags as cleanup — they record whether each tier was banked
+            # as a partial, not whether the trade resolved. (See poll-loop branch
+            # for the full rationale.)
+            await SignalIterRepository.update_live_order(
+                p.id, status="STOPPED",
             )
+            await SignalIterRepository.write_audit_log(
+                category="spx_watcher", actor="system",
+                summary=f"DOLLAR_STOP(${pnl:.0f}): market-sold-to-close {result.sell_qty}× {p.symbol} {p.strike}{p.right} (ib_order_id={result.trade.order.orderId})",
+            )
+            try:
+                await SignalIterRepository.write_watcher_sell_child(
+                    parent=p, bracket_role="dollar_cap",
+                    qty=int(result.sell_qty),
+                    ib_order_id=int(result.trade.order.orderId),
+                    ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
+                    notes=f"dollar_cap pnl=${pnl:.0f}",
+                )
+            except Exception:
+                logger.exception(
+                    "dollar_cap: write_watcher_sell_child failed for parent %s",
+                    p.id,
+                )
+        finally:
+            # CAP-LEAK GUARD (2026-07-07 review BLOCKER-2): release whatever
+            # was reserved but not confirmed placed — refusal, exception, or
+            # cancellation alike.
+            if placed_qty < sell_qty:
+                _lifetime_cap_release(state, p, sell_qty - placed_qty)
     except Exception:
         logger.exception("dollar-loss check failed for parent %s", p.id)
 
@@ -471,20 +477,37 @@ def _try_spawn_exit_check(state, kind: str, parent_id, make_coro) -> bool:
 
 
 # Sell-attempt outcomes that must NOT keep an optimistic terminal latch:
-# no order was placed AND the refusal clears once the entry fill propagates
-# to ib.positions() (the 2026-07-07 eviction: "0 available after reservation"
-# ~40s after entry, STOPPED persisted before the sell, refusal path returned
-# without reverting -> parent dropped from the watcher scan with contracts
-# still open, no alert). "refused_cap" is deliberately EXCLUDED — a lifetime-
-# cap refusal means the watcher already sold the parent's full filled qty,
-# so the terminal status is true and reverting it would reopen a ghost.
-# "dry" is excluded to preserve DRY-mode resolved-marker semantics.
-_RETRYABLE_SELL_OUTCOMES = ("refused_guard", "error")
+# no order was placed AND the refusal is expected to clear (fill propagation)
+# or demands escalation (cap-vs-broker divergence) — the 2026-07-07 eviction:
+# "0 available after reservation" ~40s after entry, STOPPED persisted before
+# the sell, refusal path returned without reverting -> parent dropped from
+# the watcher scan with contracts still open, no alert.
+#   "refused_guard"          — anti-short reservation / no_position; clears
+#                              once ib.positions() reflects the entry fill.
+#   "refused_cap_divergence" — lifetime cap says fully sold but the broker
+#                              still shows the position (a leaked reservation
+#                              or counter drift); keep managed + escalate,
+#                              bounded by the refusal streak -> park.
+#   "error"                  — no order placed (exception before placement).
+# Plain "refused_cap" (cap sold-out AND broker flat/pending-covered) stays
+# terminal — reverting it would reopen a ghost. "dry" keeps DRY-mode
+# resolved-marker semantics.
+_RETRYABLE_SELL_OUTCOMES = ("refused_guard", "refused_cap_divergence", "error")
 
 # Back-off between retryable refused sell attempts per parent — bounds the
 # audit volume of the retry loop (0.1s poll + tick path would otherwise spam
 # a SKIPPED + refusal row pair per tick until the fill propagates).
 _REFUSAL_BACKOFF_SEC = float(os.environ.get("FEF_WATCHER_REFUSAL_BACKOFF_SEC", "2.0"))
+
+# Refused-sell streak budget (2026-07-07 review MAJOR-5): a parent whose
+# sells are refused indefinitely (e.g. the user manually flattened a shared
+# strike) must not flap FILLED<->STOPPED at the backoff cadence forever
+# (~5-7k DB writes/hour). Past the budget the parent is PARKED: broker
+# net-flat -> CLOSED_EXTERNAL, else STUCK — both leave the watcher scan
+# filter — with ONE loud category="watcher_stuck" row. A >60s gap between
+# refusals starts a fresh streak; any placed order clears it.
+_REFUSAL_MAX_ATTEMPTS = int(os.environ.get("FEF_WATCHER_REFUSAL_MAX_ATTEMPTS", "20"))
+_REFUSAL_WINDOW_SEC = float(os.environ.get("FEF_WATCHER_REFUSAL_WINDOW_SEC", "90"))
 
 
 def _refusal_backoff_active(state, p) -> bool:
@@ -500,6 +523,113 @@ def _set_refusal_backoff(state, p) -> None:
     )
 
 
+def _note_refusal_over_limit(state, p) -> bool:
+    """Bump the per-parent refused-sell streak; True when the streak exceeds
+    _REFUSAL_MAX_ATTEMPTS or spans _REFUSAL_WINDOW_SEC and the parent must be
+    parked instead of retried again."""
+    if p.id is None:
+        return False
+    if not hasattr(state, "_watcher_refusal_streak"):
+        state._watcher_refusal_streak = {}  # type: ignore[attr-defined]
+    now_ms = int(_time.time() * 1000)
+    entry = state._watcher_refusal_streak.get(p.id)  # type: ignore[attr-defined]
+    if entry is None or now_ms - entry[2] > 60_000:
+        entry = (0, now_ms, now_ms)  # (count, first_ms, last_ms) — new streak
+    count = entry[0] + 1
+    state._watcher_refusal_streak[p.id] = (count, entry[1], now_ms)  # type: ignore[attr-defined]
+    return (count >= _REFUSAL_MAX_ATTEMPTS
+            or (now_ms - entry[1]) / 1000.0 >= _REFUSAL_WINDOW_SEC)
+
+
+def _clear_refusal_streak(state, p) -> None:
+    getattr(state, "_watcher_refusal_streak", {}).pop(p.id, None)
+
+
+def _broker_long_qty(state, p) -> int:
+    """Net long at the broker for p's contract; -1 when unknown (non-live
+    provider or positions() error)."""
+    try:
+        from fef_sidecar.ibkr.live import LiveIBKRProvider
+        if not isinstance(state.ibkr, LiveIBKRProvider):
+            return -1
+        ib = state.ibkr._ib  # type: ignore[attr-defined]
+        long_qty = 0
+        for pos in ib.positions():
+            c = pos.contract
+            if (getattr(c, "secType", "") == "OPT"
+                    and getattr(c, "symbol", "") == p.symbol
+                    and abs(float(getattr(c, "strike", 0)) - p.strike) < 0.01
+                    and getattr(c, "right", "") == p.right
+                    and getattr(c, "lastTradeDateOrContractMonth", "") == p.expiry
+                    and pos.position > 0):
+                long_qty += int(pos.position)
+        return long_qty
+    except Exception:
+        return -1
+
+
+async def _park_stuck_parent(
+    state, p, tier_label: str, outcome_kind: str | None, ref_desc: str,
+) -> None:
+    """Refused-sell streak exceeded the retry budget — stop flapping. Broker
+    net-flat means the position was closed outside the watcher (manual
+    flatten of a shared strike) -> CLOSED_EXTERNAL; still long or unknown ->
+    STUCK for manual intervention. Both statuses leave the watcher scan
+    filter; the single watcher_stuck row is the loud alert."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    long_qty = _broker_long_qty(state, p)
+    new_status = "CLOSED_EXTERNAL" if long_qty == 0 else "STUCK"
+    try:
+        p.status = new_status
+        await SignalIterRepository.update_live_order(p.id, status=new_status)
+    except Exception:
+        logger.exception("park: status write failed for parent %s", p.id)
+    try:
+        await SignalIterRepository.write_audit_log(
+            category="watcher_stuck", actor="system",
+            summary=(
+                f"PARKED {new_status}: parent {p.id} {p.symbol} {p.strike}{p.right} — "
+                f"refused-{tier_label}-sell streak exhausted the retry budget "
+                f"({_REFUSAL_MAX_ATTEMPTS} attempts / {_REFUSAL_WINDOW_SEC:.0f}s; "
+                f"last outcome {outcome_kind or 'unknown'} at {ref_desc}); "
+                f"broker long={'unknown' if long_qty < 0 else long_qty}"
+                + (" — position closed outside the watcher" if long_qty == 0
+                   else " — MANUAL INTERVENTION REQUIRED")
+            ),
+            details={
+                "parent_id": p.id, "status": new_status,
+                "broker_long": long_qty, "tier": tier_label,
+                "outcome": outcome_kind, "ref": ref_desc,
+            },
+        )
+    except Exception:
+        logger.exception("park: audit write failed for parent %s", p.id)
+    _clear_refusal_streak(state, p)
+
+
+async def _run_exit_fire_shielded(state, fire_factory):
+    """BLOCKER-1 (2026-07-07 review): the watcher task can be CANCELLED
+    mid-sell (watchdog stale-respawn, /config/symbol respawn, shutdown) and
+    CancelledError bypasses every except-Exception rollback — an optimistic
+    latch would strand the parent exactly like the original eviction. Each
+    latch->sell->rollback critical section runs as its OWN task behind
+    asyncio.shield: outer cancellation propagates to the caller immediately
+    while the fire keeps running detached to completion — its rollback and
+    firing_parent_ids release included. Detached fires are strongly
+    referenced on state (asyncio holds tasks weakly)."""
+    task = asyncio.ensure_future(fire_factory())
+    fires = getattr(state, "_watcher_detached_fires", None)
+    if fires is None:
+        fires = set()
+        try:
+            state._watcher_detached_fires = fires  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    fires.add(task)
+    task.add_done_callback(fires.discard)
+    return await asyncio.shield(task)
+
+
 async def _rollback_refused_terminal_latch(
     state, p, *, latched_status: str, prior_status: str,
     tier_label: str, outcome_kind: str | None, ref_desc: str,
@@ -508,13 +638,46 @@ async def _rollback_refused_terminal_latch(
     only survive a sell that actually PLACED an order. Reverts the optimistic
     status (in memory + persisted) so the parent stays inside the watcher's
     SUBMITTED/FILLED/PARTIAL scan filter and the sell is retried, and writes
-    the loud watcher_refusal_retry row. Best-effort — never raises into the
-    caller's finally."""
+    the loud watcher_refusal_retry row.
+
+    Ordering (review MINOR-7): the backoff is set FIRST (sync — it must hold
+    even when the writes below fail); a streak past the retry budget PARKS
+    the parent instead of reverting (MAJOR-5); the status revert retries once
+    — a failed revert IS the eviction hole, so the fallback is a loud
+    watcher_stuck row. Best-effort — never raises into the caller's finally."""
     from fef_sidecar.db.repository import SignalIterRepository
     try:
-        p.status = prior_status
-        await SignalIterRepository.update_live_order(p.id, status=prior_status)
         _set_refusal_backoff(state, p)
+        if _note_refusal_over_limit(state, p):
+            await _park_stuck_parent(state, p, tier_label, outcome_kind, ref_desc)
+            return
+        p.status = prior_status
+        reverted = False
+        for _attempt in (1, 2):
+            try:
+                await SignalIterRepository.update_live_order(p.id, status=prior_status)
+                reverted = True
+                break
+            except Exception:
+                logger.exception(
+                    "refusal rollback write failed (attempt %d) for parent %s",
+                    _attempt, p.id,
+                )
+        if not reverted:
+            try:
+                await SignalIterRepository.write_audit_log(
+                    category="watcher_stuck", actor="system",
+                    summary=(
+                        f"ROLLBACK WRITE FAILED for parent {p.id} {p.symbol} "
+                        f"{p.strike}{p.right} — DB may still show {latched_status} "
+                        f"with contracts open; MANUAL CHECK REQUIRED"
+                    ),
+                    details={"parent_id": p.id, "latched_status": latched_status,
+                             "intended_status": prior_status},
+                )
+            except Exception:
+                logger.exception("rollback-failure audit failed for parent %s", p.id)
+            return
         await SignalIterRepository.write_audit_log(
             category="watcher_refusal_retry", actor="system",
             summary=(
@@ -540,10 +703,14 @@ async def _audit_tier_refusal_retry(
 ) -> None:
     """watcher_refusal_retry row for a tier whose optimistic fired-flag was
     reverted after a retryable refusal (the flag revert itself is done by the
-    caller — it predates this incident and stays as-is)."""
+    caller — it predates this incident and stays as-is). Shares the backoff +
+    streak budget with the status rollback path (MAJOR-5)."""
     from fef_sidecar.db.repository import SignalIterRepository
     try:
         _set_refusal_backoff(state, p)
+        if _note_refusal_over_limit(state, p):
+            await _park_stuck_parent(state, p, tier_label, outcome_kind, ref_desc)
+            return
         await SignalIterRepository.write_audit_log(
             category="watcher_refusal_retry", actor="system",
             summary=(
@@ -647,12 +814,22 @@ async def _entry_fill_grace_pending(state, p) -> bool:
 _PLAN_EXPECTED_STOP_PTS = 10.0
 _PLAN_EXPECTED_T_PTS = (15.0, 25.0, 50.0)
 _PLAN_MAX_REL_DEV = 0.40
+# Re-anchor TRIGGER is one-sided (review MAJOR-4): only a COLLAPSED or
+# wrong-side R is corrupt (the incident's 0.38pt). A wider-than-expected R
+# is routine on fast tape (verdict->fill latency moves the entry ref beyond
+# the scanner spot) and legitimately wall-anchored plans must survive it.
+_PLAN_MIN_STOP_RATIO = 0.60
 # entry ref / symbol spot disagreeing by more than this RATIO is the
 # cross-symbol capture signature (SPX 7530.28 recorded on a SPY parent).
 _PLAN_UNITS_RATIO = 3.0
+# Spot sources trustworthy enough to REPAIR a cross-unit entry ref (review
+# MINOR-8): a 1-min bar can be up to 10 minutes old — never anchor to it.
+_PLAN_REPAIR_SPOT_SOURCES = ("active_tick", "scanner_snapshot", "tick_stream")
 
 
-async def _maybe_reanchor_plan(state, p, sym_spot: float | None) -> None:
+async def _maybe_reanchor_plan(
+    state, p, sym_spot: float | None, spot_src: str | None = "active_tick",
+) -> bool:
     """ARM-TIME PLAN SANITY (2026-07-07 incident): the scanner builds
     T1/T2/T3/STOP from its own per-symbol QD spot while entry_spx_price is
     captured from the active-chart tick (auto_trader) — two price sources.
@@ -660,24 +837,30 @@ async def _maybe_reanchor_plan(state, p, sym_spot: float | None) -> None:
     R collapsed 10 -> 0.38, the BE ladder insta-stepped to 1.5R inside 200ms
     and the ratcheted stop crossed ~40s later.
 
-    Rule: |spx_stop - entry_spx_price| must be within _PLAN_MAX_REL_DEV of
-    the expected 10 x _price_scale(sym_spot) points, on the LOSS side. On
-    violation, ALL four levels are re-anchored as offsets from
-    entry_spx_price (stop -/+10, T1 +/-15, T2 +/-25, T3 +/-50, scaled); a
-    target is preserved only when its own offset passes the same test
-    (wall-anchored levels that agree with the entry survive).
-    dynamic_stop_level + be_ladder_max_step_R reset alongside. An
-    entry_spx_price in the wrong UNITS entirely (ratio > 3x vs the symbol's
-    own spot — cross-symbol capture) is first repaired to sym_spot; the
-    caller's units guard (spot-vs-stop) has already vouched for sym_spot.
+    Trigger (one-sided, review MAJOR-4): re-anchor only when the stop sits on
+    the WRONG SIDE of entry or the offset COLLAPSED below
+    _PLAN_MIN_STOP_RATIO x the expected 10 x _price_scale points — a
+    wider-than-expected R (fast tape) is left alone. On violation, all four
+    levels are re-anchored as offsets from entry_spx_price (stop -/+10,
+    T1 +/-15, T2 +/-25, T3 +/-50, scaled); a target is preserved only when
+    its own offset is within _PLAN_MAX_REL_DEV of expected on the profit
+    side (wall-anchored levels that agree with the entry survive).
+    dynamic_stop_level + be_ladder_max_step_R reset alongside.
+
+    An entry_spx_price in the wrong UNITS entirely (ratio > 3x vs the
+    symbol's own spot — cross-symbol capture) is first repaired to sym_spot;
+    the repair requires fresh provenance (_PLAN_REPAIR_SPOT_SOURCES) — with
+    only a stale bar spot available the parent is NOT evaluated this cycle
+    (returns False; review MINOR-8).
 
     Checked once per parent (memoized). Re-anchored values are re-applied
     to stale in-memory copies (the tick loop's 500ms parent cache).
-    Persists + audits category="plan_reanchored" with before/after."""
+    Persists + audits category="plan_reanchored" with before/after.
+    Returns True when the caller may evaluate the parent this cycle."""
     from fef_sidecar.db.repository import SignalIterRepository
     from fef_sidecar.engine.strikes import _price_scale
     if p.id is None:
-        return
+        return True
     if not hasattr(state, "_watcher_plan_sanity"):
         state._watcher_plan_sanity = {}  # type: ignore[attr-defined]
     memo = state._watcher_plan_sanity  # type: ignore[attr-defined]
@@ -690,11 +873,11 @@ async def _maybe_reanchor_plan(state, p, sym_spot: float | None) -> None:
             # and must never be rewound to its reset value.
             for k, v in fixed.items():
                 setattr(p, k, v)
-        return
+        return True
     entry = float(p.entry_spx_price) if (p.entry_spx_price or 0) > 0 else None
     stop = float(p.spx_target_stop) if p.spx_target_stop is not None else None
     if entry is None or stop is None or not sym_spot or sym_spot <= 0:
-        return  # nothing to validate yet — retry next cycle (no memo)
+        return True  # nothing to validate yet — retry next cycle (no memo)
     before = {
         "entry_spx_price": entry, "spx_target_t1": p.spx_target_t1,
         "spx_target_t2": p.spx_target_t2, "spx_target_t3": p.spx_target_t3,
@@ -705,19 +888,22 @@ async def _maybe_reanchor_plan(state, p, sym_spot: float | None) -> None:
     ratio = entry / float(sym_spot)
     entry_repaired = ratio > _PLAN_UNITS_RATIO or ratio < 1.0 / _PLAN_UNITS_RATIO
     if entry_repaired:
+        if spot_src not in _PLAN_REPAIR_SPOT_SOURCES:
+            # Cross-unit entry ref but no trustworthy anchor this cycle —
+            # skip evaluation entirely rather than repair against a spot
+            # that may be minutes old (no memo; retried when a fresh
+            # tick/snapshot resolves).
+            return False
         entry = float(sym_spot)
         updates["entry_spx_price"] = entry
     scale = _price_scale(float(sym_spot))
     expected_stop = _PLAN_EXPECTED_STOP_PTS * scale
     sign = 1.0 if p.right == "C" else -1.0
     stop_off = sign * (entry - stop)  # >0 iff stop is on the loss side
-    stop_ok = (
-        stop_off > 0
-        and abs(stop_off - expected_stop) / expected_stop <= _PLAN_MAX_REL_DEV
-    )
+    stop_ok = stop_off >= _PLAN_MIN_STOP_RATIO * expected_stop
     if stop_ok and not entry_repaired:
         memo[p.id] = None
-        return
+        return True
     if not stop_ok:
         new_stop = entry - sign * expected_stop
         updates["spx_target_stop"] = new_stop
@@ -760,9 +946,10 @@ async def _maybe_reanchor_plan(state, p, sym_spot: float | None) -> None:
             "after": {k: getattr(p, k) for k in before},
             "entry_repaired": entry_repaired, "scale": scale,
             "expected_stop_pts": expected_stop, "seen_stop_offset": stop_off,
-            "spot_ref": float(sym_spot),
+            "spot_ref": float(sym_spot), "spot_src": spot_src,
         },
     )
+    return True
 
 
 # --- Per-symbol spot resolution + units guard (2026-07-07) -------------------
@@ -782,18 +969,21 @@ def _throttled(state, attr: str, key, now_ms: int,
     return True
 
 
-async def _watcher_symbol_spot(state, p, poll_spot: float, spot_cache: dict) -> float | None:
+async def _watcher_symbol_spot(
+    state, p, poll_spot: float, spot_cache: dict,
+) -> tuple[float | None, str | None]:
     """Resolve parent p's OWN symbol spot for spx_points stop/tier evaluation
     (2026-07-07 incident #2: the SPY 749P plan stop 751.16 was compared
     against the ACTIVE-CHART SPX tick 7533 -> dist=-6781pt -> instant stop).
     Reuses _shadow_cash_spot resolution: active tick only when active_symbol
     == p.symbol, else scanner per-symbol snapshot <=180s, else latest 1-min
-    bar <=10min. No symbol-correct spot -> SKIP evaluation for this parent
+    bar <=10min. Returns (spot, provenance); no symbol-correct spot ->
+    (None, None) and evaluation is SKIPPED for this parent
     (category="watcher_no_spot", once per 5 min per parent)."""
     from fef_sidecar.db.repository import SignalIterRepository
-    spot, _src = await _shadow_cash_spot(state, p.symbol, poll_spot, spot_cache)
+    spot, src = await _shadow_cash_spot(state, p.symbol, poll_spot, spot_cache)
     if spot is not None and spot > 0:
-        return float(spot)
+        return float(spot), src
     now_ms = int(_time.time() * 1000)
     if _throttled(state, "_watcher_no_spot_log_ms", p.id, now_ms):
         try:
@@ -807,7 +997,7 @@ async def _watcher_symbol_spot(state, p, poll_spot: float, spot_cache: dict) -> 
             )
         except Exception:
             pass
-    return None
+    return None, None
 
 
 async def _units_guard_ok(state, p, spot: float) -> bool:
@@ -851,15 +1041,21 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str,
 
     When `outcome` is provided, outcome["kind"] records how the attempt
     resolved so callers can decide whether an optimistic latch must roll back:
-      "placed"        — order placed.
-      "dry"           — non-live provider ([DRY] row written).
-      "refused_guard" — anti-short reservation or safe-sell
-                        no_position/short_blocked; clears once the entry fill
-                        propagates -> RETRYABLE.
-      "refused_cap"   — lifetime sell cap; the watcher already sold the full
-                        filled qty -> NOT retryable.
-      "error"         — exception before placement -> RETRYABLE.
-      "noop"          — qty <= 0.
+      "placed"                 — order placed.
+      "dry"                    — non-live provider ([DRY] row written).
+      "refused_guard"          — anti-short reservation or safe-sell
+                                 no_position/short_blocked; clears once the
+                                 entry fill propagates -> RETRYABLE.
+      "refused_cap"            — lifetime sell cap with the broker flat /
+                                 pending-covered (genuinely sold out) -> NOT
+                                 retryable. Also returned when the broker is
+                                 flat AND the cap shows fully sold (the
+                                 refusal-retry loop's terminal signal).
+      "refused_cap_divergence" — STOP only: cap says fully sold but the
+                                 broker still shows the position -> RETRYABLE
+                                 + loud watcher_cap_divergence escalation.
+      "error"                  — exception, no order placed -> RETRYABLE.
+      "noop"                   — qty <= 0.
     """
     from fef_sidecar.db.repository import SignalIterRepository
     from fef_sidecar.ibkr.live import LiveIBKRProvider
@@ -902,6 +1098,21 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str,
         available = max(0, long_qty - pending)
         sell_qty = min(qty, available)
         if sell_qty <= 0:
+            sold, cap = _lifetime_cap_state(state, p)
+            if long_qty <= 0 and cap > 0 and sold >= cap:
+                # Broker flat AND the watcher already sold the full fill —
+                # the exit is complete; a rolled-back retry loop lands here
+                # once positions catch up, and the terminal latch is TRUE.
+                await SignalIterRepository.write_audit_log(
+                    category="spx_watcher", actor="system",
+                    summary=(
+                        f"{tier_label} RESOLVED: broker flat and watcher already "
+                        f"sold {sold}/{cap} for parent {p.id} "
+                        f"({p.symbol} {p.strike}{p.right}) — exit complete"
+                    ),
+                )
+                _resolve("refused_cap")
+                return False
             await SignalIterRepository.write_audit_log(
                 category="spx_watcher", actor="system",
                 summary=(
@@ -924,8 +1135,8 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str,
         # snapshots: never let the watcher's cumulative sells exceed the
         # parent's filled qty (see _lifetime_cap_reserve).
         requested_after_guards = sell_qty
-        sell_qty = _lifetime_cap_reserve(state, p, sell_qty)
-        if sell_qty <= 0:
+        reserved = _lifetime_cap_reserve(state, p, sell_qty)
+        if reserved <= 0:
             sold, cap = _lifetime_cap_state(state, p)
             await SignalIterRepository.write_audit_log(
                 category="spx_watcher", actor="system",
@@ -936,72 +1147,101 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str,
                     f"— refusing to oversell"
                 ),
             )
-            _resolve("refused_cap")
+            if tier_label == "STOP" and available >= qty:
+                # CAP-vs-BROKER DIVERGENCE (2026-07-07 review BLOCKER-2): the
+                # cap claims fully sold, yet the broker still shows the whole
+                # requested qty available (long minus pending). A leaked
+                # reservation would strand OPEN contracts behind a terminal
+                # latch — escalate loudly and keep the parent managed; the
+                # refusal streak bounds the retries (park -> reconcile).
+                await SignalIterRepository.write_audit_log(
+                    category="watcher_cap_divergence", actor="system",
+                    summary=(
+                        f"LIFETIME-CAP DIVERGENCE on {tier_label}: cap shows "
+                        f"sold {sold}/{cap} for parent {p.id} "
+                        f"({p.symbol} {p.strike}{p.right}) but broker shows "
+                        f"long={long_qty}, pending={pending} — keeping parent "
+                        f"managed; VERIFY POSITION"
+                    ),
+                    details={"parent_id": p.id, "cum_sold": sold, "cap": cap,
+                             "broker_long": long_qty, "pending": pending,
+                             "requested": qty},
+                )
+                _resolve("refused_cap_divergence")
+            else:
+                _resolve("refused_cap")
             return False
-        if sell_qty < requested_after_guards:
-            sold, cap = _lifetime_cap_state(state, p)
-            await SignalIterRepository.write_audit_log(
-                category="spx_watcher", actor="system",
-                summary=(
-                    f"{tier_label} CLAMPED by lifetime sell cap to "
-                    f"{sell_qty}/{requested_after_guards} for parent {p.id} "
-                    f"({p.symbol} {p.strike}{p.right}; cum_sold={sold}, cap={cap})"
-                ),
-            )
-        state.firing_contracts[contract_key] = pending + sell_qty
-
-        async def _release_reservation(key, amount):
-            try:
-                await asyncio.sleep(2.0)
-                cur = state.firing_contracts.get(key, 0)
-                state.firing_contracts[key] = max(0, cur - amount)
-            except Exception:
-                pass
-
-        asyncio.create_task(_release_reservation(contract_key, sell_qty))
-
-        result = await safe_market_sell(
-            ib, ic, sell_qty, purpose="watcher_close", state=state, parent_id=p.id,
-        )
-        if not result.placed:
-            _lifetime_cap_release(state, p, sell_qty)
-            # no_position/short_blocked = the same fill-lag class as the
-            # reservation skip; placement_error = no order placed either.
-            _resolve(
-                "refused_guard"
-                if result.reason in ("no_position", "short_blocked")
-                else "error"
-            )
-            return False
-        _resolve("placed")  # set BEFORE the audit/child writes — an exception
-        # past this point must never classify a placed order as retryable.
-        if int(result.sell_qty) < sell_qty:
-            # safe_market_sell clamped further — release the unplaced slice.
-            _lifetime_cap_release(state, p, sell_qty - int(result.sell_qty))
-        # Tier-fire audit with THIS fill's banked $ + running cumulative +
-        # clearly-labeled whole-position mark. Spawned: fill-price polling
-        # must never block the watcher hot loop.
-        asyncio.create_task(
-            _write_tier_fill_audit(state, p, tier_label, result, ref_desc)
-        )
+        sell_qty = reserved
+        placed_qty = 0
         try:
-            _role = {
-                "T1": "t1", "T2": "t2", "T3": "t3",
-                "STOP": "stop", "RUNNER_PROTECT": "runner_protect",
-            }.get(tier_label, tier_label.lower())
-            await SignalIterRepository.write_watcher_sell_child(
-                parent=p, bracket_role=_role,
-                qty=int(result.sell_qty),
-                ib_order_id=int(result.trade.order.orderId),
-                ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
-                notes=f"watcher_close@{ref_desc}",
+            if sell_qty < requested_after_guards:
+                sold, cap = _lifetime_cap_state(state, p)
+                await SignalIterRepository.write_audit_log(
+                    category="spx_watcher", actor="system",
+                    summary=(
+                        f"{tier_label} CLAMPED by lifetime sell cap to "
+                        f"{sell_qty}/{requested_after_guards} for parent {p.id} "
+                        f"({p.symbol} {p.strike}{p.right}; cum_sold={sold}, cap={cap})"
+                    ),
+                )
+            state.firing_contracts[contract_key] = pending + sell_qty
+
+            async def _release_reservation(key, amount):
+                try:
+                    await asyncio.sleep(2.0)
+                    cur = state.firing_contracts.get(key, 0)
+                    state.firing_contracts[key] = max(0, cur - amount)
+                except Exception:
+                    pass
+
+            asyncio.create_task(_release_reservation(contract_key, sell_qty))
+
+            result = await safe_market_sell(
+                ib, ic, sell_qty, purpose="watcher_close", state=state, parent_id=p.id,
             )
-        except Exception:
-            logger.exception(
-                "spx_watcher: write_watcher_sell_child failed for parent %s", p.id,
+            if not result.placed:
+                # no_position/short_blocked = the same fill-lag class as the
+                # reservation skip; placement_error = no order placed either.
+                _resolve(
+                    "refused_guard"
+                    if result.reason in ("no_position", "short_blocked")
+                    else "error"
+                )
+                return False
+            placed_qty = int(result.sell_qty)
+            _resolve("placed")  # set BEFORE the audit/child writes — an exception
+            # past this point must never classify a placed order as retryable.
+            _clear_refusal_streak(state, p)
+            # Tier-fire audit with THIS fill's banked $ + running cumulative +
+            # clearly-labeled whole-position mark. Spawned: fill-price polling
+            # must never block the watcher hot loop.
+            asyncio.create_task(
+                _write_tier_fill_audit(state, p, tier_label, result, ref_desc)
             )
-        _resolve("placed")
-        return True
+            try:
+                _role = {
+                    "T1": "t1", "T2": "t2", "T3": "t3",
+                    "STOP": "stop", "RUNNER_PROTECT": "runner_protect",
+                }.get(tier_label, tier_label.lower())
+                await SignalIterRepository.write_watcher_sell_child(
+                    parent=p, bracket_role=_role,
+                    qty=int(result.sell_qty),
+                    ib_order_id=int(result.trade.order.orderId),
+                    ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
+                    notes=f"watcher_close@{ref_desc}",
+                )
+            except Exception:
+                logger.exception(
+                    "spx_watcher: write_watcher_sell_child failed for parent %s", p.id,
+                )
+            return True
+        finally:
+            # CAP-LEAK GUARD (2026-07-07 review BLOCKER-2): whatever exits
+            # this block — refusal, clamp, exception, cancellation — any
+            # reserved qty not confirmed placed is released. A leaked
+            # reservation turns every later sell into a cap refusal.
+            if placed_qty < sell_qty:
+                _lifetime_cap_release(state, p, sell_qty - placed_qty)
     except Exception:
         logger.exception("watcher market sell failed")
         return False
@@ -1112,50 +1352,72 @@ async def _check_fixed_dollar(state, p) -> None:
         if (state.runner_protect_enabled and p.spx_target_t1_fired
                 and remaining_qty > 0 and stop_qty == 0 and not fires
                 and mid <= entry_px):
-            state.firing_parent_ids.add(p.id)
-            try:
+
+            async def _fire_fd_runner() -> None:
                 # OPTIMISTIC LATCH (2026-07-06 oversell hotfix): resolve the
                 # parent BEFORE the awaited sell so a re-entrant/stale check
                 # can never re-fire into the placement window. REFUSAL
                 # ROLLBACK (2026-07-07): the terminal status only survives a
                 # sell that actually placed — a guard-refused/errored attempt
-                # reverts it so the parent stays managed and retries.
+                # reverts it (finally-gated so cancellation can't skip it)
+                # and the parent stays managed. Runs shielded.
+                if p.id in state.firing_parent_ids:
+                    return
+                state.firing_parent_ids.add(p.id)
                 prior_status = p.status
-                p.status = "CLOSED"
-                await SignalIterRepository.update_live_order(p.id, status="CLOSED")
                 outcome: dict = {}
-                placed = await _watcher_safe_sell(
-                    state, p, remaining_qty, "RUNNER_PROTECT", ref, outcome=outcome,
-                )
-                if not placed and outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
-                    await _rollback_refused_terminal_latch(
-                        state, p, latched_status="CLOSED", prior_status=prior_status,
-                        tier_label="RUNNER_PROTECT", outcome_kind=outcome.get("kind"),
-                        ref_desc=ref,
+                placed = False
+                try:
+                    p.status = "CLOSED"
+                    await SignalIterRepository.update_live_order(p.id, status="CLOSED")
+                    placed = await _watcher_safe_sell(
+                        state, p, remaining_qty, "RUNNER_PROTECT", ref, outcome=outcome,
                     )
-            finally:
-                state.firing_parent_ids.discard(p.id)
+                finally:
+                    try:
+                        if not placed and outcome.get("kind", "error") in _RETRYABLE_SELL_OUTCOMES:
+                            await _rollback_refused_terminal_latch(
+                                state, p, latched_status="CLOSED",
+                                prior_status=prior_status,
+                                tier_label="RUNNER_PROTECT",
+                                outcome_kind=outcome.get("kind", "error"),
+                                ref_desc=ref,
+                            )
+                    finally:
+                        state.firing_parent_ids.discard(p.id)
+
+            await _run_exit_fire_shielded(state, _fire_fd_runner)
             return
 
         if stop_qty > 0:
-            state.firing_parent_ids.add(p.id)
-            try:
+
+            async def _fire_fd_stop() -> None:
                 # OPTIMISTIC LATCH + REFUSAL ROLLBACK — see RUNNER_PROTECT above.
+                if p.id in state.firing_parent_ids:
+                    return
+                state.firing_parent_ids.add(p.id)
                 prior_status = p.status
-                p.status = "STOPPED"
-                await SignalIterRepository.update_live_order(p.id, status="STOPPED")
-                outcome = {}
-                placed = await _watcher_safe_sell(
-                    state, p, stop_qty, "STOP", ref, outcome=outcome,
-                )
-                if not placed and outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
-                    await _rollback_refused_terminal_latch(
-                        state, p, latched_status="STOPPED", prior_status=prior_status,
-                        tier_label="STOP", outcome_kind=outcome.get("kind"),
-                        ref_desc=ref,
+                outcome: dict = {}
+                placed = False
+                try:
+                    p.status = "STOPPED"
+                    await SignalIterRepository.update_live_order(p.id, status="STOPPED")
+                    placed = await _watcher_safe_sell(
+                        state, p, stop_qty, "STOP", ref, outcome=outcome,
                     )
-            finally:
-                state.firing_parent_ids.discard(p.id)
+                finally:
+                    try:
+                        if not placed and outcome.get("kind", "error") in _RETRYABLE_SELL_OUTCOMES:
+                            await _rollback_refused_terminal_latch(
+                                state, p, latched_status="STOPPED",
+                                prior_status=prior_status, tier_label="STOP",
+                                outcome_kind=outcome.get("kind", "error"),
+                                ref_desc=ref,
+                            )
+                    finally:
+                        state.firing_parent_ids.discard(p.id)
+
+            await _run_exit_fire_shielded(state, _fire_fd_stop)
             return
 
         flag_field = {"T1": "spx_target_t1_fired", "T2": "spx_target_t2_fired",
@@ -1165,27 +1427,56 @@ async def _check_fixed_dollar(state, p) -> None:
             field = flag_field[label]
             if getattr(p, field):
                 continue  # already latched by another path — never re-fire
-            # OPTIMISTIC LATCH (2026-07-06 oversell hotfix): mark the tier
-            # fired BEFORE the awaited sell so a re-entrant check can never
-            # re-fire the same rung mid-placement (the QQQ 724C fourth sell).
-            # Reverted ONLY on a definitive refusal (placed=False: safe-sell
-            # refused / DRY / error) — which preserves the 7520C guarantee
-            # that a refused sell never phantom-banks a tier (all-flags-true
-            # → CLOSED → open runner orphaned from every watcher).
-            setattr(p, field, True)
-            await SignalIterRepository.update_live_order(p.id, **{field: True})
-            outcome = {}
-            placed = await _watcher_safe_sell(state, p, qty, label, ref, outcome=outcome)
-            if not placed:
-                setattr(p, field, False)
-                await SignalIterRepository.update_live_order(p.id, **{field: False})
-                if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
-                    await _audit_tier_refusal_retry(
-                        state, p, label, outcome.get("kind"), ref,
+
+            async def _fire_fd_tier(label=label, field=field, qty=qty) -> bool:
+                # OPTIMISTIC LATCH (2026-07-06 oversell hotfix): mark the tier
+                # fired BEFORE the awaited sell so a re-entrant check can never
+                # re-fire the same rung mid-placement (the QQQ 724C fourth
+                # sell). Reverted on any not-placed outcome (finally-gated so
+                # cancellation can't skip it) — preserves the 7520C guarantee
+                # that a refused sell never phantom-banks a tier. Shielded +
+                # per-parent in-flight guard (2026-07-07 review MAJOR-6).
+                if p.id in state.firing_parent_ids:
+                    return False
+                state.firing_parent_ids.add(p.id)
+                outcome: dict = {}
+                placed = False
+                try:
+                    setattr(p, field, True)
+                    await SignalIterRepository.update_live_order(p.id, **{field: True})
+                    placed = await _watcher_safe_sell(
+                        state, p, qty, label, ref, outcome=outcome,
                     )
-                continue
-            await SignalIterRepository.update_live_order(p.id, status="PARTIAL")
-            any_fired = True
+                    if placed:
+                        await SignalIterRepository.update_live_order(p.id, status="PARTIAL")
+                finally:
+                    try:
+                        if not placed:
+                            setattr(p, field, False)
+                            try:
+                                await SignalIterRepository.update_live_order(
+                                    p.id, **{field: False},
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "fd tier flag revert write failed for parent %s", p.id,
+                                )
+                            kind = outcome.get("kind", "error")
+                            if kind in _RETRYABLE_SELL_OUTCOMES:
+                                await _audit_tier_refusal_retry(state, p, label, kind, ref)
+                            elif kind == "refused_cap":
+                                # Cap-refused tier re-fires would otherwise
+                                # flood at check cadence (review BLOCKER-2):
+                                # back off + count toward the park budget.
+                                _set_refusal_backoff(state, p)
+                                if _note_refusal_over_limit(state, p):
+                                    await _park_stuck_parent(state, p, label, kind, ref)
+                    finally:
+                        state.firing_parent_ids.discard(p.id)
+                return placed
+
+            if await _run_exit_fire_shielded(state, _fire_fd_tier):
+                any_fired = True
         # CLOSED only when the banked tiers cover the FULL original position
         # (real remaining == 0), never on the flags alone.
         current_fired = [p.spx_target_t1_fired, p.spx_target_t2_fired, p.spx_target_t3_fired]
@@ -2024,13 +2315,18 @@ _NEAR_STOP_LOG_INTERVAL_MS = 5000
 
 async def _eval_spx_points_parent(
     state, p, spot: float, last_near_stop_log_ms: dict | None = None,
+    spot_src: str | None = "active_tick",
 ) -> None:
     """One poll-cycle evaluation of a single spx_points parent against ITS
     OWN symbol spot (extracted from spx_target_watcher_loop 2026-07-07 so the
     stop/tier/rollback state machine is unit-testable). `spot` must already
-    be symbol-correct (_watcher_symbol_spot). Guard order: units guard ->
-    arm-time plan sanity -> refusal backoff -> entry-fill grace -> BE ladder
-    -> stop -> T1/T2/T3 -> runner protect -> CLOSED sync."""
+    be symbol-correct (_watcher_symbol_spot); `spot_src` is its provenance
+    (gates the cross-unit entry repair — see _maybe_reanchor_plan). Guard
+    order: units guard -> arm-time plan sanity -> refusal backoff ->
+    entry-fill grace -> BE ladder -> stop -> T1/T2/T3 -> runner protect ->
+    CLOSED sync. Every latch->sell block runs shielded
+    (_run_exit_fire_shielded) so task cancellation can never strand an
+    optimistic latch."""
     from fef_sidecar.db.repository import SignalIterRepository
 
     if last_near_stop_log_ms is None:
@@ -2044,9 +2340,12 @@ async def _eval_spx_points_parent(
         return
 
     # ARM-TIME PLAN SANITY (2026-07-07): two-price-sources kill switch —
-    # re-anchors corrupt levels as offsets from entry_spx_price (parent 751:
-    # R collapsed 10 -> 0.38 and the BE ladder insta-stepped).
-    await _maybe_reanchor_plan(state, p, spot)
+    # re-anchors collapsed/wrong-side levels as offsets from entry_spx_price
+    # (parent 751: R collapsed 10 -> 0.38 and the BE ladder insta-stepped).
+    # False = a cross-unit entry needs repairing but the spot provenance is
+    # too weak to anchor on this cycle.
+    if not await _maybe_reanchor_plan(state, p, spot, spot_src):
+        return
 
     # Retryable-refusal backoff: a just-refused sell retries on a 2s clock,
     # not per 0.1s tick (bounds audit volume while positions() catches up).
@@ -2158,8 +2457,8 @@ async def _eval_spx_points_parent(
             if not p.spx_target_t3_fired and p.spx_target_t3_qty:
                 unfired_qty += p.spx_target_t3_qty
             if unfired_qty > 0:
-                state.firing_parent_ids.add(p.id)
-                try:
+
+                async def _fire_stop() -> None:
                     # OPTIMISTIC LATCH (2026-07-06): status=STOPPED
                     # BEFORE the awaited sell so no other path can
                     # re-fire this parent mid-placement.
@@ -2174,24 +2473,88 @@ async def _eval_spx_points_parent(
                     # REFUSAL ROLLBACK (2026-07-07): the terminal
                     # status only survives an actually-placed order —
                     # a guard-refused/errored sell reverts it so the
-                    # parent stays managed (the eviction hole).
+                    # parent stays managed (the eviction hole). The
+                    # rollback is finally-gated + the fire is shielded
+                    # so cancellation can never skip it (review B-1).
+                    if p.id in state.firing_parent_ids:
+                        return
+                    state.firing_parent_ids.add(p.id)
                     prior_status = p.status
-                    p.status = "STOPPED"
-                    await SignalIterRepository.update_live_order(
-                        p.id, status="STOPPED",
-                    )
                     outcome: dict = {}
-                    placed = await _market_sell(unfired_qty, "STOP", outcome)
-                    if not placed and outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
-                        await _rollback_refused_terminal_latch(
-                            state, p, latched_status="STOPPED",
-                            prior_status=prior_status, tier_label="STOP",
-                            outcome_kind=outcome.get("kind"),
-                            ref_desc=f"{p.symbol} {spot:.2f}",
+                    placed = False
+                    try:
+                        p.status = "STOPPED"
+                        await SignalIterRepository.update_live_order(
+                            p.id, status="STOPPED",
                         )
-                finally:
-                    state.firing_parent_ids.discard(p.id)
+                        placed = await _market_sell(unfired_qty, "STOP", outcome)
+                    finally:
+                        try:
+                            if (not placed and outcome.get("kind", "error")
+                                    in _RETRYABLE_SELL_OUTCOMES):
+                                await _rollback_refused_terminal_latch(
+                                    state, p, latched_status="STOPPED",
+                                    prior_status=prior_status, tier_label="STOP",
+                                    outcome_kind=outcome.get("kind", "error"),
+                                    ref_desc=f"{p.symbol} {spot:.2f}",
+                                )
+                        finally:
+                            state.firing_parent_ids.discard(p.id)
+
+                await _run_exit_fire_shielded(state, _fire_stop)
             return  # nothing else to do on this parent
+
+    async def _fire_tier(label: str, flag_field: str, at_field: str, qty: int) -> None:
+        # OPTIMISTIC LATCH (2026-07-06): flag BEFORE the awaited sell; revert
+        # on any not-placed outcome (finally-gated so cancellation can't skip
+        # it) — a refused sell never phantom-banks the tier (7520C
+        # guarantee). Shielded + per-parent in-flight guard so overlapping
+        # watcher instances can never both sell one tier (review MAJOR-6).
+        if p.id in state.firing_parent_ids:
+            return
+        state.firing_parent_ids.add(p.id)
+        outcome: dict = {}
+        placed = False
+        try:
+            setattr(p, flag_field, True)
+            setattr(p, at_field, spot)
+            await SignalIterRepository.update_live_order(
+                p.id, **{flag_field: True, at_field: spot},
+            )
+            placed = await _market_sell(qty, label, outcome)
+            if placed:
+                await SignalIterRepository.update_live_order(
+                    p.id, status="PARTIAL",
+                )
+        finally:
+            try:
+                if not placed:
+                    setattr(p, flag_field, False)
+                    setattr(p, at_field, None)
+                    try:
+                        await SignalIterRepository.update_live_order(
+                            p.id, **{flag_field: False, at_field: None},
+                        )
+                    except Exception:
+                        logger.exception(
+                            "tier flag revert write failed for parent %s", p.id,
+                        )
+                    kind = outcome.get("kind", "error")
+                    if kind in _RETRYABLE_SELL_OUTCOMES:
+                        await _audit_tier_refusal_retry(
+                            state, p, label, kind, f"{p.symbol} {spot:.2f}",
+                        )
+                    elif kind == "refused_cap":
+                        # Cap-refused re-fires would otherwise flood at the
+                        # 0.1s poll cadence (review BLOCKER-2): back off +
+                        # count toward the park budget.
+                        _set_refusal_backoff(state, p)
+                        if _note_refusal_over_limit(state, p):
+                            await _park_stuck_parent(
+                                state, p, label, kind, f"{p.symbol} {spot:.2f}",
+                            )
+            finally:
+                state.firing_parent_ids.discard(p.id)
 
     # T1
     if not p.spx_target_t1_fired and p.spx_target_t1 is not None and p.spx_target_t1_qty:
@@ -2200,27 +2563,10 @@ async def _eval_spx_points_parent(
             or (not is_long_calls and spot <= p.spx_target_t1)
         )
         if t1_hit:
-            # OPTIMISTIC LATCH (2026-07-06): flag BEFORE the awaited
-            # sell; revert ONLY on definitive refusal (placed=False)
-            # so a refused sell never phantom-banks the tier.
-            p.spx_target_t1_fired = True; p.spx_target_t1_at_spx = spot
-            await SignalIterRepository.update_live_order(
-                p.id, spx_target_t1_fired=True, spx_target_t1_at_spx=spot,
-            )
-            outcome = {}
-            if await _market_sell(p.spx_target_t1_qty, "T1", outcome):
-                await SignalIterRepository.update_live_order(
-                    p.id, status="PARTIAL",
-                )
-            else:
-                p.spx_target_t1_fired = False; p.spx_target_t1_at_spx = None
-                await SignalIterRepository.update_live_order(
-                    p.id, spx_target_t1_fired=False, spx_target_t1_at_spx=None,
-                )
-                if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
-                    await _audit_tier_refusal_retry(
-                        state, p, "T1", outcome.get("kind"), f"{p.symbol} {spot:.2f}",
-                    )
+            await _run_exit_fire_shielded(state, lambda: _fire_tier(
+                "T1", "spx_target_t1_fired", "spx_target_t1_at_spx",
+                p.spx_target_t1_qty,
+            ))
 
     # T2
     if not p.spx_target_t2_fired and p.spx_target_t2 is not None and p.spx_target_t2_qty:
@@ -2229,25 +2575,10 @@ async def _eval_spx_points_parent(
             or (not is_long_calls and spot <= p.spx_target_t2)
         )
         if t2_hit:
-            # OPTIMISTIC LATCH — see T1.
-            p.spx_target_t2_fired = True; p.spx_target_t2_at_spx = spot
-            await SignalIterRepository.update_live_order(
-                p.id, spx_target_t2_fired=True, spx_target_t2_at_spx=spot,
-            )
-            outcome = {}
-            if await _market_sell(p.spx_target_t2_qty, "T2", outcome):
-                await SignalIterRepository.update_live_order(
-                    p.id, status="PARTIAL",
-                )
-            else:
-                p.spx_target_t2_fired = False; p.spx_target_t2_at_spx = None
-                await SignalIterRepository.update_live_order(
-                    p.id, spx_target_t2_fired=False, spx_target_t2_at_spx=None,
-                )
-                if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
-                    await _audit_tier_refusal_retry(
-                        state, p, "T2", outcome.get("kind"), f"{p.symbol} {spot:.2f}",
-                    )
+            await _run_exit_fire_shielded(state, lambda: _fire_tier(
+                "T2", "spx_target_t2_fired", "spx_target_t2_at_spx",
+                p.spx_target_t2_qty,
+            ))
 
     # T3
     if not p.spx_target_t3_fired and p.spx_target_t3 is not None and p.spx_target_t3_qty:
@@ -2256,25 +2587,10 @@ async def _eval_spx_points_parent(
             or (not is_long_calls and spot <= p.spx_target_t3)
         )
         if t3_hit:
-            # OPTIMISTIC LATCH — see T1.
-            p.spx_target_t3_fired = True; p.spx_target_t3_at_spx = spot
-            await SignalIterRepository.update_live_order(
-                p.id, spx_target_t3_fired=True, spx_target_t3_at_spx=spot,
-            )
-            outcome = {}
-            if await _market_sell(p.spx_target_t3_qty, "T3", outcome):
-                await SignalIterRepository.update_live_order(
-                    p.id, status="PARTIAL",
-                )
-            else:
-                p.spx_target_t3_fired = False; p.spx_target_t3_at_spx = None
-                await SignalIterRepository.update_live_order(
-                    p.id, spx_target_t3_fired=False, spx_target_t3_at_spx=None,
-                )
-                if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
-                    await _audit_tier_refusal_retry(
-                        state, p, "T3", outcome.get("kind"), f"{p.symbol} {spot:.2f}",
-                    )
+            await _run_exit_fire_shielded(state, lambda: _fire_tier(
+                "T3", "spx_target_t3_fired", "spx_target_t3_at_spx",
+                p.spx_target_t3_qty,
+            ))
 
     # Runner protect: if T1 has fired but T2/T3 are still open
     # and the spot retraces back to where T1 fired → exit runners
@@ -2292,29 +2608,58 @@ async def _eval_spx_points_parent(
             if not p.spx_target_t3_fired and p.spx_target_t3_qty:
                 runner_qty += p.spx_target_t3_qty
             if runner_qty > 0:
-                # OPTIMISTIC LATCH — flag the runner tiers BEFORE
-                # the awaited sell; revert to their prior values on
-                # definitive refusal (a tier genuinely banked
-                # earlier must never be un-flagged).
-                prev_t2 = p.spx_target_t2_fired
-                prev_t3 = p.spx_target_t3_fired
-                p.spx_target_t2_fired = True; p.spx_target_t3_fired = True
-                await SignalIterRepository.update_live_order(
-                    p.id, spx_target_t2_fired=True, spx_target_t3_fired=True,
-                )
-                outcome = {}
-                if not await _market_sell(runner_qty, "RUNNER_PROTECT", outcome):
-                    p.spx_target_t2_fired = prev_t2
-                    p.spx_target_t3_fired = prev_t3
-                    await SignalIterRepository.update_live_order(
-                        p.id, spx_target_t2_fired=prev_t2,
-                        spx_target_t3_fired=prev_t3,
-                    )
-                    if outcome.get("kind") in _RETRYABLE_SELL_OUTCOMES:
-                        await _audit_tier_refusal_retry(
-                            state, p, "RUNNER_PROTECT", outcome.get("kind"),
-                            f"{p.symbol} {spot:.2f}",
+
+                async def _fire_runner(runner_qty=runner_qty) -> None:
+                    # OPTIMISTIC LATCH — flag the runner tiers BEFORE the
+                    # awaited sell; revert to their prior values on any
+                    # not-placed outcome (finally-gated; a tier genuinely
+                    # banked earlier must never be un-flagged). Shielded +
+                    # per-parent in-flight guard.
+                    if p.id in state.firing_parent_ids:
+                        return
+                    state.firing_parent_ids.add(p.id)
+                    prev_t2 = p.spx_target_t2_fired
+                    prev_t3 = p.spx_target_t3_fired
+                    outcome: dict = {}
+                    placed = False
+                    try:
+                        p.spx_target_t2_fired = True; p.spx_target_t3_fired = True
+                        await SignalIterRepository.update_live_order(
+                            p.id, spx_target_t2_fired=True, spx_target_t3_fired=True,
                         )
+                        placed = await _market_sell(runner_qty, "RUNNER_PROTECT", outcome)
+                    finally:
+                        try:
+                            if not placed:
+                                p.spx_target_t2_fired = prev_t2
+                                p.spx_target_t3_fired = prev_t3
+                                try:
+                                    await SignalIterRepository.update_live_order(
+                                        p.id, spx_target_t2_fired=prev_t2,
+                                        spx_target_t3_fired=prev_t3,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "runner flag revert write failed for parent %s",
+                                        p.id,
+                                    )
+                                kind = outcome.get("kind", "error")
+                                if kind in _RETRYABLE_SELL_OUTCOMES:
+                                    await _audit_tier_refusal_retry(
+                                        state, p, "RUNNER_PROTECT", kind,
+                                        f"{p.symbol} {spot:.2f}",
+                                    )
+                                elif kind == "refused_cap":
+                                    _set_refusal_backoff(state, p)
+                                    if _note_refusal_over_limit(state, p):
+                                        await _park_stuck_parent(
+                                            state, p, "RUNNER_PROTECT", kind,
+                                            f"{p.symbol} {spot:.2f}",
+                                        )
+                        finally:
+                            state.firing_parent_ids.discard(p.id)
+
+                await _run_exit_fire_shielded(state, _fire_runner)
 
     # Sync parent status to CLOSED once the banked tiers cover the full
     # position (real remaining == 0) — not on the flags alone, so a
@@ -2439,11 +2784,13 @@ async def spx_target_watcher_loop(state) -> None:
                 # symbol spot (active tick only when active_symbol matches,
                 # else scanner snapshot <=180s, else 1-min bar <=10min). No
                 # symbol-correct spot -> SKIP this parent (audited 1/5min).
-                sym_spot = await _watcher_symbol_spot(state, p, spot, spot_cache)
+                sym_spot, sym_src = await _watcher_symbol_spot(
+                    state, p, spot, spot_cache,
+                )
                 if sym_spot is None:
                     continue
                 await _eval_spx_points_parent(
-                    state, p, sym_spot, last_near_stop_log_ms,
+                    state, p, sym_spot, last_near_stop_log_ms, spot_src=sym_src,
                 )
 
         except asyncio.CancelledError:
@@ -2553,7 +2900,8 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
         return False
     if not await _units_guard_ok(state, p, spot):
         return False
-    await _maybe_reanchor_plan(state, p, spot)
+    if not await _maybe_reanchor_plan(state, p, spot, "tick_stream"):
+        return False
     if _refusal_backoff_active(state, p):
         return False
     if await _entry_fill_grace_pending(state, p):
@@ -2584,34 +2932,43 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
         unfired_qty += p.spx_target_t3_qty
     if unfired_qty <= 0:
         return False
-    now_ms = int(_time.time() * 1000)
-    # Acquire the firing lock — only one path may fire this parent at a time.
-    state.firing_parent_ids.add(p.id)
-    resolved = True
-    try:
-        # OPTIMISTIC LATCH (2026-07-06): status=STOPPED BEFORE the awaited
-        # sell so the poll loop / a stale spawned check can't re-fire this
-        # parent mid-placement. status=STOPPED is the resolved-marker; don't
-        # overwrite the per-tier fired flags as cleanup — that pollutes
-        # partial-tracking for every downstream analytic.
-        # REFUSAL ROLLBACK (2026-07-07): the terminal status only survives an
-        # actually-placed order — a guard-refused/errored sell reverts it so
-        # the parent stays managed (the eviction hole: "STOP/TICK SKIPPED: 0
-        # available after reservation" returned with STOPPED persisted).
+
+    async def _fire_tick_stop() -> bool:
+        """Latch -> sell -> (terminal | finally-gated rollback). Shielded so
+        tick-watcher cancellation mid-sell can never strand the latch
+        (review BLOCKER-1); the cap reservation is released on every path
+        that doesn't confirm placement (review BLOCKER-2)."""
+        if p.id in state.firing_parent_ids:
+            return False
+        # Acquire the firing lock — only one path may fire this parent at a time.
+        state.firing_parent_ids.add(p.id)
         prior_status = p.status
-        p.status = "STOPPED"
-        await SignalIterRepository.update_live_order(
-            p.id, status="STOPPED",
-        )
-        if not isinstance(state.ibkr, LiveIBKRProvider):
-            await SignalIterRepository.write_audit_log(
-                category="spx_watcher", actor="system",
-                summary=(
-                    f"[DRY/TICK] STOP crossed: would market-sell-to-close "
-                    f"{unfired_qty}x {p.symbol} {p.strike}{p.right} at {symbol} {spot:.2f}"
-                ),
+        rollback_kind: str | None = None
+        ref = f"{symbol} {spot:.2f}"
+        now_ms = int(_time.time() * 1000)
+        try:
+            # OPTIMISTIC LATCH (2026-07-06): status=STOPPED BEFORE the awaited
+            # sell so the poll loop / a stale spawned check can't re-fire this
+            # parent mid-placement. status=STOPPED is the resolved-marker; don't
+            # overwrite the per-tier fired flags as cleanup — that pollutes
+            # partial-tracking for every downstream analytic.
+            # REFUSAL ROLLBACK (2026-07-07): the terminal status only survives an
+            # actually-placed order — a guard-refused/errored sell reverts it so
+            # the parent stays managed (the eviction hole: "STOP/TICK SKIPPED: 0
+            # available after reservation" returned with STOPPED persisted).
+            p.status = "STOPPED"
+            await SignalIterRepository.update_live_order(
+                p.id, status="STOPPED",
             )
-        else:
+            if not isinstance(state.ibkr, LiveIBKRProvider):
+                await SignalIterRepository.write_audit_log(
+                    category="spx_watcher", actor="system",
+                    summary=(
+                        f"[DRY/TICK] STOP crossed: would market-sell-to-close "
+                        f"{unfired_qty}x {p.symbol} {p.strike}{p.right} at {ref}"
+                    ),
+                )
+                return True
             from fef_sidecar.ibkr.safe_sell import safe_market_sell
             ib = state.ibkr._ib  # type: ignore[attr-defined]
             try:
@@ -2635,14 +2992,20 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                 pending = state.firing_contracts.get(contract_key, 0)
                 available = max(0, long_qty - pending)
                 sell_qty = min(unfired_qty, available)
-                # LIFETIME SELL CAP (2026-07-06) — absolute oversell backstop,
-                # independent of the (stale-window-prone) broker position
-                # snapshot. See _lifetime_cap_reserve.
-                cap_qty = (
-                    _lifetime_cap_reserve(state, p, sell_qty)
-                    if sell_qty > 0 else 0
-                )
                 if sell_qty <= 0:
+                    sold, cap = _lifetime_cap_state(state, p)
+                    if long_qty <= 0 and cap > 0 and sold >= cap:
+                        # Broker flat AND the watcher already sold the full
+                        # fill — the exit is complete; keep the terminal latch.
+                        await SignalIterRepository.write_audit_log(
+                            category="spx_watcher", actor="system",
+                            summary=(
+                                f"STOP/TICK RESOLVED: broker flat and watcher already "
+                                f"sold {sold}/{cap} for parent {p.id} "
+                                f"({p.symbol} {p.strike}{p.right}) — exit complete"
+                            ),
+                        )
+                        return True
                     await SignalIterRepository.write_audit_log(
                         category="spx_watcher", actor="system",
                         summary=(
@@ -2651,16 +3014,13 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                             f"for {p.symbol} {p.strike}{p.right} — refusing to short"
                         ),
                     )
-                    await _rollback_refused_terminal_latch(
-                        state, p, latched_status="STOPPED",
-                        prior_status=prior_status, tier_label="STOP/TICK",
-                        outcome_kind="refused_guard",
-                        ref_desc=f"{symbol} {spot:.2f}",
-                    )
-                    resolved = False
-                elif cap_qty <= 0:
-                    # Lifetime cap = the watcher already sold the full filled
-                    # qty; the terminal status is TRUE — no rollback.
+                    rollback_kind = "refused_guard"
+                    return False
+                # LIFETIME SELL CAP (2026-07-06) — absolute oversell backstop,
+                # independent of the (stale-window-prone) broker position
+                # snapshot. See _lifetime_cap_reserve.
+                reserved = _lifetime_cap_reserve(state, p, sell_qty)
+                if reserved <= 0:
                     sold, cap = _lifetime_cap_state(state, p)
                     await SignalIterRepository.write_audit_log(
                         category="spx_watcher", actor="system",
@@ -2671,8 +3031,32 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                             f"— refusing to oversell"
                         ),
                     )
-                else:
-                    sell_qty = cap_qty
+                    if available >= unfired_qty:
+                        # CAP-vs-BROKER DIVERGENCE (review BLOCKER-2): the cap
+                        # claims fully sold, yet the broker still shows the
+                        # whole remaining qty available — a leaked reservation
+                        # would strand OPEN contracts behind a terminal latch.
+                        # Escalate + keep managed; the refusal streak bounds
+                        # the retries (park -> reconcile).
+                        await SignalIterRepository.write_audit_log(
+                            category="watcher_cap_divergence", actor="system",
+                            summary=(
+                                f"LIFETIME-CAP DIVERGENCE on STOP/TICK: cap shows "
+                                f"sold {sold}/{cap} for parent {p.id} "
+                                f"({p.symbol} {p.strike}{p.right}) but broker shows "
+                                f"long={long_qty}, pending={pending} — keeping parent "
+                                f"managed; VERIFY POSITION"
+                            ),
+                            details={"parent_id": p.id, "cum_sold": sold, "cap": cap,
+                                     "broker_long": long_qty, "pending": pending,
+                                     "requested": unfired_qty},
+                        )
+                        rollback_kind = "refused_cap_divergence"
+                        return False
+                    return True
+                sell_qty = reserved
+                placed_qty = 0
+                try:
                     # Reserve before placing. Spawn a 2s-delayed
                     # decrement (see _market_sell rationale).
                     state.firing_contracts[contract_key] = pending + sell_qty
@@ -2692,6 +3076,8 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                         state=state, parent_id=p.id,
                     )
                     if result.placed:
+                        placed_qty = int(result.sell_qty)
+                        _clear_refusal_streak(state, p)
                         tick_age_ms = (
                             now_ms - state.last_live_tick_ms
                             if state.last_live_tick_ms > 0 else -1
@@ -2699,7 +3085,7 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                         # Banked-$ audit line (spawned — see
                         # _write_tier_fill_audit).
                         asyncio.create_task(_write_tier_fill_audit(
-                            state, p, "STOP/TICK", result, f"{symbol} {spot:.2f}",
+                            state, p, "STOP/TICK", result, ref,
                             extra_summary=(
                                 f"stop={effective_stop:.2f}, "
                                 f"tick_age={tick_age_ms}ms"
@@ -2722,36 +3108,37 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                                 "stop_tick: write_watcher_sell_child failed for parent %s",
                                 p.id,
                             )
-                        if int(result.sell_qty) < sell_qty:
-                            _lifetime_cap_release(
-                                state, p, sell_qty - int(result.sell_qty),
-                            )
-                    else:
-                        # safe_market_sell already wrote an audit_log
-                        # (HARD-BLOCK / no_position / placement_error) —
-                        # no order placed, so the latch must roll back.
-                        _lifetime_cap_release(state, p, sell_qty)
-                        await _rollback_refused_terminal_latch(
-                            state, p, latched_status="STOPPED",
-                            prior_status=prior_status, tier_label="STOP/TICK",
-                            outcome_kind=(
-                                "refused_guard"
-                                if result.reason in ("no_position", "short_blocked")
-                                else "error"
-                            ),
-                            ref_desc=f"{symbol} {spot:.2f}",
-                        )
-                        resolved = False
+                        return True
+                    # safe_market_sell wrote its own audit (HARD-BLOCK /
+                    # no_position / placement_error) — no order placed, so
+                    # the latch must roll back.
+                    rollback_kind = (
+                        "refused_guard"
+                        if result.reason in ("no_position", "short_blocked")
+                        else "error"
+                    )
+                    return False
+                finally:
+                    # CAP-LEAK GUARD (review BLOCKER-2): release whatever was
+                    # reserved but not confirmed placed — refusal, exception,
+                    # or cancellation alike.
+                    if placed_qty < sell_qty:
+                        _lifetime_cap_release(state, p, sell_qty - placed_qty)
             except Exception:
                 logger.exception("spx_stop_tick_watcher market sell failed")
                 # Exception before placement (qualify/positions/reserve) —
                 # revert the latch so the parent stays managed and retries.
-                await _rollback_refused_terminal_latch(
-                    state, p, latched_status="STOPPED",
-                    prior_status=prior_status, tier_label="STOP/TICK",
-                    outcome_kind="error", ref_desc=f"{symbol} {spot:.2f}",
-                )
-                resolved = False
-    finally:
-        state.firing_parent_ids.discard(p.id)
-    return resolved
+                rollback_kind = rollback_kind or "error"
+                return False
+        finally:
+            try:
+                if rollback_kind in _RETRYABLE_SELL_OUTCOMES:
+                    await _rollback_refused_terminal_latch(
+                        state, p, latched_status="STOPPED",
+                        prior_status=prior_status, tier_label="STOP/TICK",
+                        outcome_kind=rollback_kind, ref_desc=ref,
+                    )
+            finally:
+                state.firing_parent_ids.discard(p.id)
+
+    return await _run_exit_fire_shielded(state, _fire_tick_stop)
