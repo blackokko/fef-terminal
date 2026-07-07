@@ -572,6 +572,9 @@ async def lifespan(app: FastAPI):
         # rollback write.
         try:
             from fef_sidecar.engine.spx_target_watcher import drain_detached_fires
+            # Refuse NEW fires pre-latch from here on (re-review R4) so the
+            # drain snapshot below is complete.
+            state._watcher_teardown = True  # type: ignore[attr-defined]
             await drain_detached_fires(state, timeout=15.0)
         except Exception:
             logger.exception("detached-fire drain failed during shutdown")

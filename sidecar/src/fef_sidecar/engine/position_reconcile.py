@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time as _time
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlmodel import select
@@ -39,6 +42,36 @@ _TERMINAL_IB_STATUSES = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
 
 def _position_key(symbol: str, strike: float, right: str, expiry: str) -> str:
     return f"{symbol}|{round(float(strike), 2)}|{right}|{expiry}"
+
+
+# Mid-session rearm/re-adoption safety window (re-review R2): a parent whose
+# row changed within this window may be inside a live sell's fill-propagation
+# window — a re-adopt/re-arm there re-sells the full qty against a stale
+# positions cache. Boot reconcile is unaffected (rows from a previous session
+# are old). Env-tunable; 0 disables the guard.
+_REARM_RECENCY_SEC = float(os.environ.get("FEF_RECONCILE_REARM_RECENCY_SEC", "120"))
+
+
+def _rearm_blocked(state, db_p) -> str | None:
+    """Reason to skip MUTATING this parent on this reconcile pass, or None.
+    Two gates (re-review R2): an in-flight exit fire owns the parent, or its
+    row was updated too recently to trust the broker snapshot against it
+    (a just-placed stop's fill takes seconds to reach ib.positions(); the
+    2s pending reservation and the firing lock have both released by the
+    time a reconcile pass can observe the stale long)."""
+    if db_p.id in (getattr(state, "firing_parent_ids", None) or set()):
+        return "exit fire in flight"
+    ts = getattr(db_p, "last_status_at", None)
+    if ts is not None and _REARM_RECENCY_SEC > 0:
+        try:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)  # DB round-trips drop tzinfo; stored UTC
+            age = (datetime.now(UTC) - ts).total_seconds()
+            if age < _REARM_RECENCY_SEC:
+                return f"row updated {age:.0f}s ago"
+        except Exception:
+            pass
+    return None
 
 
 async def _active_exit_order_keys(ib) -> set[str] | None:
@@ -215,6 +248,13 @@ async def reconcile_positions(state) -> dict[str, Any]:
         if key not in parent_keys:
             continue
         db_p = parent_keys[key]
+        blocked = _rearm_blocked(state, db_p)
+        if blocked:
+            # Mid-session pass only — never mutate a parent an exit fire owns
+            # or whose row just changed; the next pass (~5 min) retries.
+            logger.info("reconcile: skipping matched parent %s this pass (%s)",
+                        db_p.id, blocked)
+            continue
         strat = db_p.exit_strategy or "option_price"
         updates: dict[str, Any] = {}
         if db_p.status != "FILLED":
@@ -286,14 +326,31 @@ async def reconcile_positions(state) -> dict[str, Any]:
         if key in parent_keys:
             continue
         resur = _resurrectable_for_orphan(key, parent_keys, resurrectable, spot)
+        if resur is not None and int(ib_p["qty"]) <= 0:
+            resur = None  # short remnant — never re-adopt into a long-exit ladder
+        if resur is not None and (blocked := _rearm_blocked(state, resur)):
+            # Re-review R2: the resurrectable parent may be mid-fire or just
+            # resolved by a sell whose fill hasn't reached the positions
+            # cache — re-adopting inside that window re-sells the full qty.
+            # Defer the contract entirely this pass (no orphan warning yet).
+            logger.info("reconcile: deferring re-adoption of parent %s (%s)",
+                        resur.id, blocked)
+            continue
         if resur is not None:
             # Reopen FILLED with a fresh emergency spx_points stop + targets and
             # CLEAR the (possibly corrupted) tier-fired flags so the watcher
-            # manages the still-open qty. safe_market_sell clamps to the live
-            # position, so fresh targets can never over-sell. Original strategy
-            # preserved in notes.
+            # manages the still-open qty. Original strategy preserved in notes.
             updates = _emergency_backstop_updates(resur, spot)
             updates["status"] = "FILLED"
+            # Re-review R1: rebase the managed quantity to the BROKER REMNANT —
+            # the lifetime sell cap derives from filled_qty/qty, and re-arming
+            # the ORIGINAL size on a partial remnant lets a fresh tier ladder
+            # sell more than exists once the positions cache goes stale
+            # (banked 2 of 3, remnant 1, cap 3 -> T1 sells 1, T2 sells 1 more
+            # = naked short). Parking guarantees no placed sell for >=90s, so
+            # this pass's broker read is settled.
+            updates["qty"] = int(ib_p["qty"])
+            updates["filled_qty"] = int(ib_p["qty"])
             updates["spx_target_t1_fired"] = False
             updates["spx_target_t2_fired"] = False
             updates["spx_target_t3_fired"] = False
@@ -313,6 +370,7 @@ async def reconcile_positions(state) -> dict[str, Any]:
                 readopted.append({
                     "contract": f"{ib_p['symbol']} {ib_p['strike']}{ib_p['right']}",
                     "qty": ib_p["qty"],
+                    "remnant_rebased": True,
                     "parent_id": resur.id,
                     "was_status": resur.status,
                     "emergency_stop": updates.get("dynamic_stop_level"),
@@ -452,6 +510,46 @@ async def reconcile_positions(state) -> dict[str, Any]:
     }
 
 
+async def _sweep_stale_firing_locks(
+    state, seen: dict, *, max_age_sec: float | None = None,
+) -> list[int]:
+    """Force-clear firing_parent_ids entries held continuously for ~10x the
+    fire deadline (re-review R3): a fire whose ROLLBACK wedges forever (the
+    park broker call is bounded, DB writes are not) keeps its lock held —
+    the parent is silently skipped by every watcher path with no alert.
+    `seen` (loop-local, pid -> first-seen monotonic) persists across passes;
+    ids that leave the set are forgotten. Loud watcher_stuck row per clear."""
+    firing = getattr(state, "firing_parent_ids", None)
+    if firing is None:
+        return []
+    if max_age_sec is None:
+        max_age_sec = 10.0 * float(os.environ.get("FEF_FIRE_DEADLINE_SEC", "30"))
+    now = _time.monotonic()
+    for pid in set(seen) - set(firing):
+        seen.pop(pid, None)
+    cleared: list[int] = []
+    for pid in list(firing):
+        first = seen.setdefault(pid, now)
+        if now - first < max_age_sec:
+            continue
+        firing.discard(pid)
+        seen.pop(pid, None)
+        cleared.append(pid)
+        try:
+            await SignalIterRepository.write_audit_log(
+                category="watcher_stuck", actor="system",
+                summary=(
+                    f"FIRING LOCK FORCE-CLEARED: parent {pid} held the firing "
+                    f"lock >{max_age_sec:.0f}s — wedged fire suspected; the "
+                    f"parent returns to watcher management (VERIFY its state)"
+                ),
+                details={"parent_id": pid, "max_age_sec": max_age_sec},
+            )
+        except Exception:
+            logger.exception("firing-lock sweep audit failed for parent %s", pid)
+    return cleared
+
+
 def _reset_watcher_runtime_state(state, parent_id) -> None:
     """Clear per-parent in-memory watcher bookkeeping when a parent is
     re-adopted with fresh levels — the lifetime-sold counter, refusal
@@ -475,14 +573,15 @@ async def position_reconcile_loop(state) -> None:
     rest of the session. Re-runs reconcile_positions every
     FEF_RECONCILE_INTERVAL_SEC (default 300s) — idempotent; fails safe on
     every broker-query path inside."""
-    import os as _os
     from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
-    interval = float(_os.environ.get("FEF_RECONCILE_INTERVAL_SEC", "300"))
+    interval = float(os.environ.get("FEF_RECONCILE_INTERVAL_SEC", "300"))
     logger.info("position reconcile loop starting (interval=%.0fs)", interval)
     await asyncio.sleep(30)  # let boot / IBKR connect settle first
+    stale_firing_seen: dict = {}
     while True:
         try:
             _wd_beat(state, "position-reconcile")
+            await _sweep_stale_firing_locks(state, stale_firing_seen)
             await reconcile_positions(state)
         except asyncio.CancelledError:
             raise

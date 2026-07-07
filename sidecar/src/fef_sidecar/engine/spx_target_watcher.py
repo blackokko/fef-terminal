@@ -666,6 +666,29 @@ async def _run_exit_fire_shielded(state, fire_factory):
     refused/error retry path via the fire's own rollback. Fire start times
     are recorded (state._watcher_fire_started_mono) so the watchdog deferral
     can age-bound itself instead of freezing on a wedge."""
+    if getattr(state, "_watcher_teardown", False):
+        # TEARDOWN GATE (re-review R4): fires started during the shutdown
+        # drain escape its snapshot and their rollbacks race the disposed
+        # DB. Refuse PRE-LATCH (the factory is never invoked, so there is
+        # nothing to roll back); audited once per process.
+        if not getattr(state, "_watcher_teardown_refusal_logged", False):
+            try:
+                state._watcher_teardown_refusal_logged = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                from fef_sidecar.db.repository import SignalIterRepository
+                await SignalIterRepository.write_audit_log(
+                    category="spx_watcher", actor="system",
+                    summary=(
+                        "TEARDOWN: refusing to start new exit fires — sidecar "
+                        "is shutting down; open parents resume on next boot "
+                        "(reconcile re-arms)"
+                    ),
+                )
+            except Exception:
+                pass
+        return None
     deadline = float(os.environ.get("FEF_FIRE_DEADLINE_SEC", "30"))
     task = asyncio.ensure_future(fire_factory())
     fires = getattr(state, "_watcher_detached_fires", None)

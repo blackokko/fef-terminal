@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time as _time
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -63,6 +64,12 @@ class FakeIB:
         # Fresh broker read (re-review N4) — same truth as the cache here.
         return self.positions()
 
+    async def reqAllOpenOrdersAsync(self):
+        return []
+
+    def openTrades(self):
+        return []
+
     def positions(self):
         if self.long_qty <= 0:
             return []
@@ -71,7 +78,7 @@ class FakeIB:
                 secType="OPT", symbol=self._symbol, strike=self._strike,
                 right=self._right, lastTradeDateOrContractMonth=self._expiry,
             ),
-            position=self.long_qty,
+            position=self.long_qty, avgCost=100.0,
         )]
 
     async def qualifyContractsAsync(self, *contracts):
@@ -582,4 +589,181 @@ async def test_teardown_drain_waits_for_detached_fires() -> None:
     # Nothing registered -> immediate no-op.
     state._watcher_detached_fires = set()
     assert await drain_detached_fires(state, timeout=0.05) == 0
+    await _drain()
+
+
+# ---------------------------------------------------------------------------
+# Re-review R1: re-adoption rebases the managed qty to the broker remnant
+# ---------------------------------------------------------------------------
+
+
+async def test_readoption_rebases_qty_to_broker_remnant() -> None:
+    """Parked parent (filled 3, T1+T2 banked, remnant 1 at the broker):
+    re-adoption must rebase qty/filled_qty to the remnant so the fresh cap
+    is 1 — the pre-fix cap of 3 let a fresh T2 sell into the stale positions
+    cache after T1 already sold the remnant (naked short)."""
+    from fef_sidecar.engine.position_reconcile import reconcile_positions
+
+    fake = FakeIB("SPX", 7510.0, "P", EXPIRY, long_qty=1)  # remnant 1 of 3
+    state = _state(_live_provider(fake))
+    state.last_spx_price = 7530.0
+    state.last_live_tick_spx = 7530.0
+    p = await _insert_parent(
+        status="STUCK", qty=3, filled_qty=3,
+        spx_target_t1_fired=True, spx_target_t2_fired=True,  # banked pre-park
+        last_status_at=datetime.now(UTC) - timedelta(seconds=600),
+    )
+    state._watcher_lifetime_sold = {p.id: 2}  # previous life's counter
+
+    res = await reconcile_positions(state)
+    assert res["readopted_count"] == 1
+
+    row = await _db_parent(p.id)
+    assert row.status == "FILLED"
+    assert row.qty == 1 and row.filled_qty == 1          # rebased to remnant
+    assert not row.spx_target_t1_fired and not row.spx_target_t2_fired
+    assert p.id not in getattr(state, "_watcher_lifetime_sold", {})
+
+    # Fresh T1 sells the remnant; fresh T2 against the STALE cache (broker
+    # still shows long=1) must be CAP-refused — never a second sell.
+    placed = await _watcher_safe_sell(state, row, 1, "T1", "SPX 7515.00")
+    assert placed is True
+    state.firing_contracts.clear()                       # reservation decay
+    outcome: dict = {}
+    placed = await _watcher_safe_sell(state, row, 1, "T2", "SPX 7505.00",
+                                      outcome=outcome)
+    assert placed is False
+    assert outcome["kind"] == "refused_cap"
+    assert fake.placed == [("SELL", 1)]                  # exactly the remnant
+    await _drain()
+
+
+# ---------------------------------------------------------------------------
+# Re-review R2: re-adoption defers for in-flight fires and recent rows
+# ---------------------------------------------------------------------------
+
+
+class MultiPositionIB:
+    """Broker stub reporting several OPT positions; reconcile-only API."""
+
+    def __init__(self, entries) -> None:
+        # entries: list of (symbol, strike, right, expiry, qty)
+        self.entries = list(entries)
+
+    def isConnected(self) -> bool:
+        return True
+
+    def positions(self):
+        return [SimpleNamespace(
+            contract=SimpleNamespace(
+                secType="OPT", symbol=sym, strike=strike, right=right,
+                lastTradeDateOrContractMonth=expiry,
+            ),
+            position=qty, avgCost=100.0,
+        ) for sym, strike, right, expiry, qty in self.entries if qty]
+
+    async def reqPositionsAsync(self):
+        return self.positions()
+
+    async def reqAllOpenOrdersAsync(self):
+        return []
+
+    def openTrades(self):
+        return []
+
+
+async def test_readoption_skips_firing_and_recent_parents() -> None:
+    """A resurrectable parent that is mid-fire, or whose row changed within
+    the recency window, must NOT be re-adopted this pass (the broker
+    snapshot may be inside a live sell's fill-propagation window); it
+    becomes eligible once the fire clears and the row ages."""
+    from fef_sidecar.engine.position_reconcile import reconcile_positions
+
+    ib = MultiPositionIB([
+        ("SPX", 7510.0, "P", EXPIRY, 3),
+        ("SPX", 7505.0, "P", EXPIRY, 3),
+    ])
+    prov = LiveIBKRProvider()
+    prov._ib = ib
+    state = _state(prov)
+    state.last_spx_price = 7530.0
+    state.last_live_tick_spx = 7530.0
+
+    p_firing = await _insert_parent(
+        status="STOPPED", strike=7510.0,
+        last_status_at=datetime.now(UTC) - timedelta(seconds=600),
+    )
+    p_recent = await _insert_parent(
+        status="STOPPED", strike=7505.0,  # last_status_at defaults to NOW
+    )
+    state.firing_parent_ids.add(p_firing.id)
+
+    res = await reconcile_positions(state)
+    assert res["readopted_count"] == 0                   # both deferred
+    assert (await _db_parent(p_firing.id)).status == "STOPPED"
+    assert (await _db_parent(p_recent.id)).status == "STOPPED"
+
+    # Fire cleared + row already old -> eligible; the fresh row stays deferred.
+    state.firing_parent_ids.discard(p_firing.id)
+    res = await reconcile_positions(state)
+    assert res["readopted_count"] == 1
+    assert (await _db_parent(p_firing.id)).status == "FILLED"
+    assert (await _db_parent(p_recent.id)).status == "STOPPED"
+    await _drain()
+
+
+# ---------------------------------------------------------------------------
+# Re-review R3: stale firing locks are force-cleared, loudly
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_firing_locks_force_cleared() -> None:
+    from fef_sidecar.engine.position_reconcile import _sweep_stale_firing_locks
+
+    state = SimpleNamespace(firing_parent_ids={42, 43})
+    seen = {42: _time.monotonic() - 400.0}               # held for >300s
+
+    cleared = await _sweep_stale_firing_locks(state, seen)
+    assert cleared == [42]
+    assert state.firing_parent_ids == {43}               # young id untouched
+    assert 43 in seen                                    # stamped for next pass
+    rows = await SignalIterRepository.query_audit_log(category="watcher_stuck")
+    assert sum(1 for r in rows if "FIRING LOCK FORCE-CLEARED" in r.summary) == 1
+
+    # A young lock is never cleared on the next pass either.
+    cleared = await _sweep_stale_firing_locks(state, seen)
+    assert cleared == []
+    assert state.firing_parent_ids == {43}
+    await _drain()
+
+
+# ---------------------------------------------------------------------------
+# Re-review R4: teardown gate refuses new fires pre-latch
+# ---------------------------------------------------------------------------
+
+
+async def test_teardown_gate_refuses_new_fires_pre_latch() -> None:
+    """With the teardown flag set, a stop cross must not latch, sell, or
+    leave anything to roll back — and the drain snapshot stays complete."""
+    fake = FakeIB("SPX", 7510.0, "P", EXPIRY, long_qty=3)
+    state = _state(_live_provider(fake))
+    state._watcher_teardown = True
+    p = await _insert_parent()
+
+    await _eval_spx_points_parent(state, p, 7541.0)      # stop crossed
+
+    assert fake.placed == []
+    assert p.status == "FILLED"                          # never latched
+    row = await _db_parent(p.id)
+    assert row.status == "FILLED"
+    assert p.id not in state.firing_parent_ids
+    rows = await SignalIterRepository.query_audit_log(category="spx_watcher")
+    assert sum(1 for r in rows if "TEARDOWN" in r.summary) == 1
+
+    await _eval_spx_points_parent(state, p, 7541.0)      # audited once only
+    rows = await SignalIterRepository.query_audit_log(category="spx_watcher")
+    assert sum(1 for r in rows if "TEARDOWN" in r.summary) == 1
+
+    # No fires were started -> the drain has nothing to wait for.
+    assert await drain_detached_fires(state, timeout=0.1) == 0
     await _drain()
