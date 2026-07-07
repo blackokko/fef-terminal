@@ -156,7 +156,9 @@ async def reconcile_positions(state) -> dict[str, Any]:
             select(LiveOrder)
             .where(LiveOrder.bracket_role == "parent")
             .where(LiveOrder.dry_run == False)  # noqa: E712
-            .where(LiveOrder.status.in_(["CLOSED", "STOPPED"]))  # type: ignore[attr-defined]
+            .where(LiveOrder.status.in_(  # type: ignore[attr-defined]
+                ["CLOSED", "STOPPED", "STUCK", "CLOSED_EXTERNAL"]
+            ))
             .order_by(LiveOrder.id.desc())  # type: ignore[attr-defined]
             .limit(100)
         )).all())
@@ -301,6 +303,12 @@ async def reconcile_positions(state) -> dict[str, Any]:
             updates["notes"] = f"{prev_notes} | {tag}" if prev_notes else tag
             try:
                 await SignalIterRepository.update_live_order(resur.id, **updates)
+                # A re-adopted parent starts a NEW management life — stale
+                # in-memory bookkeeping from its previous one (lifetime-sold
+                # counter, refusal streak/backoff, re-anchored-plan memo that
+                # would clobber the fresh emergency levels on stale-copy
+                # re-apply) must not carry over.
+                _reset_watcher_runtime_state(state, resur.id)
                 rearmed_count += 1
                 readopted.append({
                     "contract": f"{ib_p['symbol']} {ib_p['strike']}{ib_p['right']}",
@@ -318,6 +326,39 @@ async def reconcile_positions(state) -> dict[str, Any]:
             "avg_cost": ib_p["avg_cost"],
             "key": key,
         })
+
+    # Parked parents (STUCK — re-review N4): a STUCK parent whose position
+    # is confirmed GONE by a fresh broker read resolves to CLOSED_EXTERNAL,
+    # so the manual-intervention flag clears itself once broker truth firms
+    # up (TWS back, positions repopulated). STUCK parents whose contract is
+    # still open are handled by the re-adoption pass above.
+    stuck_resolved: list[dict] = []
+    async with get_session() as session:
+        stuck_parents = list((await session.exec(
+            select(LiveOrder)
+            .where(LiveOrder.bracket_role == "parent")
+            .where(LiveOrder.dry_run == False)  # noqa: E712
+            .where(LiveOrder.status == "STUCK")
+        )).all())
+    for db_p in stuck_parents:
+        key = _position_key(db_p.symbol, db_p.strike, db_p.right, db_p.expiry)
+        if key in ib_positions:
+            continue  # still open — re-adoption above owns it
+        from fef_sidecar.engine.spx_target_watcher import _broker_long_qty_fresh
+        if await _broker_long_qty_fresh(state, db_p) != 0:
+            continue  # not CONFIRMED flat — stay STUCK
+        try:
+            await SignalIterRepository.update_live_order(
+                db_p.id, status="CLOSED_EXTERNAL",
+                notes=(f"{(db_p.notes or '').strip()} | STUCK resolved on reconcile: "
+                       f"fresh broker read confirms flat").strip(" |"),
+            )
+            stuck_resolved.append({
+                "contract": f"{db_p.symbol} {db_p.strike}{db_p.right}",
+                "parent_id": db_p.id,
+            })
+        except Exception:
+            logger.exception("Failed to resolve STUCK parent %s", db_p.id)
 
     # Phantoms: we have, IBKR doesn't
     for key, db_p in parent_keys.items():
@@ -383,6 +424,16 @@ async def reconcile_positions(state) -> dict[str, Any]:
             ),
             details={"phantoms": phantoms},
         )
+    if stuck_resolved:
+        await SignalIterRepository.write_audit_log(
+            category="position_reconcile", actor="system",
+            summary=(
+                f"Resolved {len(stuck_resolved)} STUCK parent(s) to "
+                f"CLOSED_EXTERNAL — a fresh broker read confirms the "
+                f"position is flat."
+            ),
+            details={"stuck_resolved": stuck_resolved},
+        )
 
     logger.info(
         "Position reconcile: %d matched, %d re-adopted, %d orphans, %d phantoms",
@@ -399,6 +450,45 @@ async def reconcile_positions(state) -> dict[str, Any]:
         "orphans_detail": orphans,
         "phantoms_detail": phantoms,
     }
+
+
+def _reset_watcher_runtime_state(state, parent_id) -> None:
+    """Clear per-parent in-memory watcher bookkeeping when a parent is
+    re-adopted with fresh levels — the lifetime-sold counter, refusal
+    streak/backoff, and re-anchored-plan memo belong to its previous life
+    (the memo would re-apply OLD levels over the emergency stop)."""
+    for attr in ("_watcher_lifetime_sold", "_watcher_refusal_streak",
+                 "_watcher_refusal_backoff_ms", "_watcher_plan_sanity"):
+        try:
+            getattr(state, attr, {}).pop(parent_id, None)
+        except Exception:
+            pass
+    try:
+        getattr(state, "_watcher_fill_grace_expired", set()).discard(parent_id)
+    except Exception:
+        pass
+
+
+async def position_reconcile_loop(state) -> None:
+    """Periodic reconcile (re-review N4): boot-only reconciliation left
+    parked (STUCK/CLOSED_EXTERNAL) and orphaned parents uncorrected for the
+    rest of the session. Re-runs reconcile_positions every
+    FEF_RECONCILE_INTERVAL_SEC (default 300s) — idempotent; fails safe on
+    every broker-query path inside."""
+    import os as _os
+    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
+    interval = float(_os.environ.get("FEF_RECONCILE_INTERVAL_SEC", "300"))
+    logger.info("position reconcile loop starting (interval=%.0fs)", interval)
+    await asyncio.sleep(30)  # let boot / IBKR connect settle first
+    while True:
+        try:
+            _wd_beat(state, "position-reconcile")
+            await reconcile_positions(state)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("periodic position reconcile failed")
+        await asyncio.sleep(interval)
 
 
 async def sweep_orphan_positions(state) -> dict[str, Any]:

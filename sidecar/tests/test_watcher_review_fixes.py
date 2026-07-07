@@ -30,7 +30,9 @@ from fef_sidecar.db import SignalIterRepository, dispose_db, init_db
 from fef_sidecar.db.models import LiveOrder
 from fef_sidecar.engine.spx_target_watcher import (
     _eval_spx_points_parent,
+    _tick_check_parent_stop,
     _watcher_safe_sell,
+    drain_detached_fires,
 )
 from fef_sidecar.ibkr.live import LiveIBKRProvider
 
@@ -52,6 +54,14 @@ class FakeIB:
         self._right, self._expiry = right, expiry
         self.long_qty = long_qty
         self.placed: list[tuple[str, int]] = []
+        self.connected = True
+
+    def isConnected(self) -> bool:
+        return self.connected
+
+    async def reqPositionsAsync(self):
+        # Fresh broker read (re-review N4) — same truth as the cache here.
+        return self.positions()
 
     def positions(self):
         if self.long_qty <= 0:
@@ -357,4 +367,219 @@ async def test_stop_cap_divergence_keeps_parent_managed_and_escalates() -> None:
     )
     assert len(divergence) == 1
     assert "VERIFY POSITION" in divergence[0].summary
+    await _drain()
+
+
+# ---------------------------------------------------------------------------
+# Re-review N1: fire deadline + age-bounded watchdog deferral
+# ---------------------------------------------------------------------------
+
+
+async def test_fire_deadline_cancels_wedged_sell_parent_stays_managed(monkeypatch) -> None:
+    """A sell wedged inside IBKR qualify (hung TWS socket — the original
+    incident trigger) must not block the poll loop forever: the fire deadline
+    cancels the inner task, its finally-gated rollback keeps the parent
+    managed, and the eval call returns."""
+    monkeypatch.setenv("FEF_FIRE_DEADLINE_SEC", "0.2")
+    fake = BlockingQualifyIB("SPX", 7510.0, "P", EXPIRY, long_qty=3)
+    state = _state(_live_provider(fake))
+    p = await _insert_parent()
+
+    # Never released — the deadline is the only way out.
+    await asyncio.wait_for(_eval_spx_points_parent(state, p, 7541.0), timeout=2.0)
+    await asyncio.sleep(0.2)           # cancelled fire finishes its rollback
+
+    assert fake.placed == []
+    assert p.status == "FILLED"        # latch rolled back, parent managed
+    row = await _db_parent(p.id)
+    assert row.status == "FILLED"
+    assert p.id not in state.firing_parent_ids
+    rows = await SignalIterRepository.query_audit_log(category="spx_watcher")
+    assert any("FIRE DEADLINE" in r.summary for r in rows)
+    retries = await SignalIterRepository.query_audit_log(category="watcher_refusal_retry")
+    assert any("STOP" in r.summary for r in retries)
+    await _drain()
+
+
+async def test_watchdog_deferral_is_age_bounded() -> None:
+    """A wedged fire must not freeze the watchdog: deferral applies only
+    while the youngest tracked fire is younger than the deadline+slack —
+    older (or untracked) fires let a deliberately-dead OTHER loop respawn."""
+    from fef_sidecar.engine.loop_watchdog import (
+        _watchdog_check_once,
+        heartbeat,
+        spawn_supervised,
+    )
+
+    state = SimpleNamespace()
+
+    async def dies():
+        heartbeat(state, "victim")
+        raise RuntimeError("dead loop")
+
+    spawn_supervised(state, "victim", dies, cadence_sec=0.01, stale_after_sec=3600)
+    await asyncio.sleep(0.05)          # victim is dead and needs a respawn
+
+    # Young in-flight fire -> deferred.
+    state.firing_parent_ids = {1}
+    state._watcher_fire_started_mono = {object(): _time.monotonic()}
+    assert await _watchdog_check_once(state) == []
+
+    # Fire older than deadline+slack (the wedge) -> checks proceed.
+    state._watcher_fire_started_mono = {object(): _time.monotonic() - 3600.0}
+    actions = await _watchdog_check_once(state)
+    assert "respawned:victim" in actions
+
+    # firing id leaked with NO tracked fire -> also proceeds (next pass).
+    state._watcher_fire_started_mono = {}
+    await asyncio.sleep(0.05)          # respawned victim died again
+    actions = await _watchdog_check_once(state)
+    assert "respawned:victim" in actions
+    await _drain()
+
+
+# ---------------------------------------------------------------------------
+# Re-review N2: tick-fire inner cancellation still rolls back
+# ---------------------------------------------------------------------------
+
+
+async def test_tick_fire_inner_cancellation_rolls_back(monkeypatch) -> None:
+    """CancelledError inside _fire_tick_stop (deadline cancel at qualify)
+    bypasses except-Exception — the finally must still roll the STOPPED
+    latch back via the fail-safe rollback_kind default."""
+    monkeypatch.setenv("FEF_FIRE_DEADLINE_SEC", "0.2")
+    fake = BlockingQualifyIB("SPX", 7510.0, "P", EXPIRY, long_qty=3)
+    state = _state(_live_provider(fake))
+    p = await _insert_parent()
+
+    resolved = await asyncio.wait_for(
+        _tick_check_parent_stop(state, p, 7541.0, "SPX"), timeout=2.0,
+    )
+    assert not resolved                # timeout -> parent stays cached
+    await asyncio.sleep(0.2)           # cancelled fire finishes its rollback
+
+    assert fake.placed == []
+    assert p.status == "FILLED"
+    row = await _db_parent(p.id)
+    assert row.status == "FILLED"      # NOT stranded at STOPPED
+    assert p.id not in state.firing_parent_ids
+    retries = await SignalIterRepository.query_audit_log(category="watcher_refusal_retry")
+    assert any("STOP/TICK" in r.summary for r in retries)
+    await _drain()
+
+
+# ---------------------------------------------------------------------------
+# Re-review N3: CancelledError in the clamped audit after placeOrder
+# ---------------------------------------------------------------------------
+
+
+class VaryingLongIB(FakeIB):
+    """positions() returns scripted long qtys per call (last value repeats)."""
+
+    def __init__(self, *a, longs=(), **k) -> None:
+        super().__init__(*a, long_qty=longs[-1] if longs else 0, **k)
+        self._longs = list(longs)
+        self._call = 0
+
+    def positions(self):
+        idx = min(self._call, len(self._longs) - 1)
+        self._call += 1
+        self.long_qty = self._longs[idx]
+        return super().positions()
+
+
+async def test_cancelled_clamped_audit_after_place_stays_placed_cap_kept(monkeypatch) -> None:
+    """A CancelledError delivered during safe_market_sell's clamped-audit
+    write (after placeOrder) must not escape: result stays placed=True, the
+    caller books placed_qty, and the cap keeps the placed slice reserved —
+    no rollback, no re-sell."""
+    orig = SignalIterRepository.write_audit_log
+
+    async def _cancel_on_clamped(category, summary, actor="user", details=None,
+                                 block_reason_code=None):
+        if category == "safe_sell_clamped":
+            raise asyncio.CancelledError()
+        return await orig(category, summary, actor=actor, details=details,
+                          block_reason_code=block_reason_code)
+
+    monkeypatch.setattr(SignalIterRepository, "write_audit_log", _cancel_on_clamped)
+
+    # Outer guard sees long=3 (requests 3); safe_market_sell re-reads long=2
+    # -> inner clamp 3->2 -> placeOrder -> clamped audit raises CancelledError.
+    fake = VaryingLongIB("SPX", 7510.0, "P", EXPIRY, longs=(3, 2))
+    state = _state(_live_provider(fake))
+    p = await _insert_parent()
+
+    outcome: dict = {}
+    placed = await _watcher_safe_sell(state, p, 3, "STOP", "SPX 7541.00",
+                                      outcome=outcome)
+    assert placed is True
+    assert outcome["kind"] == "placed"
+    assert fake.placed == [("SELL", 2)]   # exactly one transmission
+    # Cap accounting: 3 reserved, 2 placed -> only the unplaced 1 released.
+    assert state._watcher_lifetime_sold[p.id] == 2
+    retries = await SignalIterRepository.query_audit_log(category="watcher_refusal_retry")
+    assert retries == []                  # nothing to retry — it placed
+    await _drain()
+
+
+# ---------------------------------------------------------------------------
+# Re-review N4: park classification needs a FRESH broker read
+# ---------------------------------------------------------------------------
+
+
+async def test_park_with_disconnected_broker_is_stuck_not_closed_external() -> None:
+    """During a TWS restart the positions cache is empty but nothing is
+    KNOWN: parking must classify STUCK (intervention), never CLOSED_EXTERNAL
+    (which claims the user closed it)."""
+    fake = FakeIB("SPX", 7510.0, "P", EXPIRY, long_qty=0)  # cache empty
+    fake.connected = False                                  # ...because TWS is down
+    state = _state(_live_provider(fake))
+    p = await _insert_parent()
+    now_ms = int(_time.time() * 1000)
+    state._watcher_refusal_streak = {p.id: (19, now_ms - 10_000, now_ms)}
+
+    await _eval_spx_points_parent(state, p, 7541.0)   # 20th refusal -> park
+
+    assert p.status == "STUCK"                        # NOT CLOSED_EXTERNAL
+    row = await _db_parent(p.id)
+    assert row.status == "STUCK"
+    stuck = await SignalIterRepository.query_audit_log(category="watcher_stuck")
+    assert len(stuck) == 1
+    assert "MANUAL INTERVENTION REQUIRED" in stuck[0].summary
+    await _drain()
+
+
+# ---------------------------------------------------------------------------
+# Re-review N6: teardown drains detached fires
+# ---------------------------------------------------------------------------
+
+
+async def test_teardown_drain_waits_for_detached_fires() -> None:
+    state = SimpleNamespace()
+    finished = {"v": False}
+
+    async def fire():
+        await asyncio.sleep(0.05)
+        finished["v"] = True
+
+    t = asyncio.ensure_future(fire())
+    state._watcher_detached_fires = {t}
+    left = await drain_detached_fires(state, timeout=2.0)
+    assert left == 0 and finished["v"] is True        # fire completed first
+
+    # A wedged fire must not hang teardown past the drain timeout.
+    ev = asyncio.Event()
+
+    async def wedged():
+        await ev.wait()
+
+    t2 = asyncio.ensure_future(wedged())
+    state._watcher_detached_fires = {t2}
+    left = await drain_detached_fires(state, timeout=0.05)
+    assert left == 1
+    t2.cancel()
+    # Nothing registered -> immediate no-op.
+    state._watcher_detached_fires = set()
+    assert await drain_detached_fires(state, timeout=0.05) == 0
     await _drain()

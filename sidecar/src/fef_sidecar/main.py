@@ -393,6 +393,14 @@ def spawn_data_loops(state: AppState) -> None:
         state, "position-monitor", lambda: position_monitor_loop(state),
         cadence_sec=5, stale_after_sec=120,
     )
+    # Periodic position reconcile (re-review N4): parked (STUCK /
+    # CLOSED_EXTERNAL) and orphaned parents get corrected every ~5 min as
+    # broker truth firms up, not only at boot.
+    from fef_sidecar.engine.position_reconcile import position_reconcile_loop
+    spawn_supervised(
+        state, "position-reconcile", lambda: position_reconcile_loop(state),
+        cadence_sec=300, stale_after_sec=900,
+    )
     from fef_sidecar.engine.auto_walk_forward import nightly_scheduler
     if not _task_alive(state.auto_wf_task):
         state.auto_wf_task = asyncio.create_task(
@@ -559,6 +567,14 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         logger.info("fef-sidecar shutting down")
+        # Drain in-flight exit fires FIRST (re-review N6): teardown must not
+        # cancel a live sell mid-placement or dispose the DB underneath a
+        # rollback write.
+        try:
+            from fef_sidecar.engine.spx_target_watcher import drain_detached_fires
+            await drain_detached_fires(state, timeout=15.0)
+        except Exception:
+            logger.exception("detached-fire drain failed during shutdown")
         for task in (
             # Watchdog first — it must not respawn loops mid-teardown.
             state.watchdog_task,

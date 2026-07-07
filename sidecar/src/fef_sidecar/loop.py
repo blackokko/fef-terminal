@@ -1850,6 +1850,7 @@ async def bar_stream_loop(state: AppState) -> None:
                     )
                     await state.broadcaster.publish(event)
             finally:
+                own_cancelled = False
                 if pending is not None and not pending.done():
                     # Await the cancelled waiter BEFORE closing the generator
                     # — aclose() on a generator with a running __anext__
@@ -1858,12 +1859,24 @@ async def bar_stream_loop(state: AppState) -> None:
                     pending.cancel()
                     try:
                         await pending
-                    except (Exception, asyncio.CancelledError):
+                    except asyncio.CancelledError:
+                        # Distinguish the child's cancellation from our OWN
+                        # (re-review N5): swallowing our own here would make
+                        # the loop survive a shutdown/symbol-switch cancel and
+                        # briefly duplicate against its supervised replacement.
+                        cur = asyncio.current_task()
+                        own_cancelled = bool(
+                            cur is not None
+                            and getattr(cur, "cancelling", lambda: 0)()
+                        )
+                    except Exception:
                         pass
                 try:
                     await agen.aclose()
                 except Exception:
                     pass
+                if own_cancelled:
+                    raise asyncio.CancelledError()
             if resub_delay:
                 await asyncio.sleep(resub_delay)
         except asyncio.CancelledError:

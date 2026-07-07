@@ -190,9 +190,19 @@ async def _watchdog_check_once(state: Any, *, now: float | None = None) -> list[
         now = time.monotonic()
     # BLOCKER-1 (2026-07-07 review): never cancel/respawn tasks while an exit
     # fire is in flight — cancellation mid-sell is exactly how an optimistic
-    # latch gets stranded. Fires are short; re-check next pass.
+    # latch gets stranded. AGE-BOUNDED (re-review N1): defer only while the
+    # youngest tracked fire is younger than the fire deadline + slack — a
+    # wedge past that is exactly what the watchdog exists for, and an
+    # unconditional deferral would freeze respawns of EVERY loop (bar/tick
+    # streams included) for as long as the wedge lasts. No tracked fires
+    # (leaked firing id) also proceeds.
     if getattr(state, "firing_parent_ids", None):
-        return actions
+        starts = getattr(state, "_watcher_fire_started_mono", None) or {}
+        if starts:
+            defer_max = float(os.environ.get("FEF_WATCHDOG_FIRE_DEFER_MAX_SEC", "45"))
+            youngest_age = min(time.monotonic() - t0 for t0 in starts.values())
+            if youngest_age < defer_max:
+                return actions
     for spec in list(reg.values()):
         if spec.cancelled or spec.completed:
             continue

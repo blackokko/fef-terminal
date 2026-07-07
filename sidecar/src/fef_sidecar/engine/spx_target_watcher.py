@@ -545,16 +545,27 @@ def _clear_refusal_streak(state, p) -> None:
     getattr(state, "_watcher_refusal_streak", {}).pop(p.id, None)
 
 
-def _broker_long_qty(state, p) -> int:
-    """Net long at the broker for p's contract; -1 when unknown (non-live
-    provider or positions() error)."""
+async def _broker_long_qty_fresh(state, p) -> int:
+    """Net long at the broker for p's contract from a FRESH awaited
+    reqPositionsAsync round-trip; -1 when unknown (non-live provider,
+    disconnected, or request error).
+
+    NOT the ib_async positions cache (re-review N4): during a TWS
+    restart/reconnect the cache is legitimately EMPTY for longer than the
+    refusal-streak window — classifying a live position as flat off the
+    cache would park it CLOSED_EXTERNAL with a receipt claiming the user
+    closed it. Flat may only be concluded from a connected session's fresh
+    answer; anything less certain returns -1 (callers must fail to STUCK)."""
     try:
         from fef_sidecar.ibkr.live import LiveIBKRProvider
         if not isinstance(state.ibkr, LiveIBKRProvider):
             return -1
         ib = state.ibkr._ib  # type: ignore[attr-defined]
+        if ib is None or not ib.isConnected():
+            return -1
+        positions = await asyncio.wait_for(ib.reqPositionsAsync(), timeout=10.0)
         long_qty = 0
-        for pos in ib.positions():
+        for pos in positions:
             c = pos.contract
             if (getattr(c, "secType", "") == "OPT"
                     and getattr(c, "symbol", "") == p.symbol
@@ -575,9 +586,15 @@ async def _park_stuck_parent(
     net-flat means the position was closed outside the watcher (manual
     flatten of a shared strike) -> CLOSED_EXTERNAL; still long or unknown ->
     STUCK for manual intervention. Both statuses leave the watcher scan
-    filter; the single watcher_stuck row is the loud alert."""
+    filter; the single watcher_stuck row is the loud alert.
+
+    CLOSED_EXTERNAL requires a CONNECTED session's fresh reqPositionsAsync
+    confirming flat (re-review N4) — an empty positions cache during a TWS
+    restart is not evidence of anything. Unknown/-1 -> STUCK. The periodic
+    position reconcile re-checks parked parents every few minutes and
+    resolves/re-adopts them as broker truth firms up."""
     from fef_sidecar.db.repository import SignalIterRepository
-    long_qty = _broker_long_qty(state, p)
+    long_qty = await _broker_long_qty_fresh(state, p)
     new_status = "CLOSED_EXTERNAL" if long_qty == 0 else "STUCK"
     try:
         p.status = new_status
@@ -607,6 +624,29 @@ async def _park_stuck_parent(
     _clear_refusal_streak(state, p)
 
 
+async def drain_detached_fires(state, timeout: float = 15.0) -> int:
+    """Await in-flight detached exit fires (bounded) — called by the lifespan
+    teardown BEFORE loops are cancelled and the DB is disposed (re-review
+    N6): a fire cancelled mid-sell at teardown would race its rollback write
+    against dispose_db(). Returns how many fires were still unfinished at
+    the timeout (0 = clean)."""
+    fires = {
+        t for t in (getattr(state, "_watcher_detached_fires", None) or set())
+        if not t.done()
+    }
+    if not fires:
+        return 0
+    logger.info("draining %d in-flight exit fire(s) before teardown", len(fires))
+    try:
+        _done, pending = await asyncio.wait(fires, timeout=timeout)
+        for t in pending:
+            logger.error("exit fire still running after the %.0fs teardown drain", timeout)
+        return len(pending)
+    except Exception:
+        logger.exception("detached-fire drain failed")
+        return len(fires)
+
+
 async def _run_exit_fire_shielded(state, fire_factory):
     """BLOCKER-1 (2026-07-07 review): the watcher task can be CANCELLED
     mid-sell (watchdog stale-respawn, /config/symbol respawn, shutdown) and
@@ -616,7 +656,17 @@ async def _run_exit_fire_shielded(state, fire_factory):
     asyncio.shield: outer cancellation propagates to the caller immediately
     while the fire keeps running detached to completion — its rollback and
     firing_parent_ids release included. Detached fires are strongly
-    referenced on state (asyncio holds tasks weakly)."""
+    referenced on state (asyncio holds tasks weakly).
+
+    DEADLINE (re-review N1): a wedged sell (hung TWS socket inside qualify —
+    the original incident trigger) must not block the poll loop and freeze
+    every OTHER parent's exits. After FEF_FIRE_DEADLINE_SEC (default 30) the
+    INNER fire task is cancelled — every fire's finally-gated rollback + cap
+    release make that safe (N2/N3) — and the attempt lands on the normal
+    refused/error retry path via the fire's own rollback. Fire start times
+    are recorded (state._watcher_fire_started_mono) so the watchdog deferral
+    can age-bound itself instead of freezing on a wedge."""
+    deadline = float(os.environ.get("FEF_FIRE_DEADLINE_SEC", "30"))
     task = asyncio.ensure_future(fire_factory())
     fires = getattr(state, "_watcher_detached_fires", None)
     if fires is None:
@@ -625,9 +675,42 @@ async def _run_exit_fire_shielded(state, fire_factory):
             state._watcher_detached_fires = fires  # type: ignore[attr-defined]
         except Exception:
             pass
+    starts = getattr(state, "_watcher_fire_started_mono", None)
+    if starts is None:
+        starts = {}
+        try:
+            state._watcher_fire_started_mono = starts  # type: ignore[attr-defined]
+        except Exception:
+            pass
     fires.add(task)
-    task.add_done_callback(fires.discard)
-    return await asyncio.shield(task)
+    starts[task] = _time.monotonic()
+
+    def _cleanup(t) -> None:
+        fires.discard(t)
+        starts.pop(t, None)
+
+    task.add_done_callback(_cleanup)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=deadline)
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.error(
+            "exit fire exceeded the %.0fs deadline — cancelling the wedged sell "
+            "(rollback/backoff handled by the fire's own finally)", deadline,
+        )
+        task.cancel()
+        try:
+            from fef_sidecar.db.repository import SignalIterRepository
+            await SignalIterRepository.write_audit_log(
+                category="spx_watcher", actor="system",
+                summary=(
+                    f"FIRE DEADLINE: an exit fire exceeded {deadline:.0f}s "
+                    f"(wedged broker call?) — cancelled; the fire's rollback "
+                    f"keeps the parent managed and the backoff schedules a retry"
+                ),
+            )
+        except Exception:
+            pass
+        return None
 
 
 async def _rollback_refused_terminal_latch(
@@ -1212,13 +1295,17 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str,
             _resolve("placed")  # set BEFORE the audit/child writes — an exception
             # past this point must never classify a placed order as retryable.
             _clear_refusal_streak(state, p)
-            # Tier-fire audit with THIS fill's banked $ + running cumulative +
-            # clearly-labeled whole-position mark. Spawned: fill-price polling
-            # must never block the watcher hot loop.
-            asyncio.create_task(
-                _write_tier_fill_audit(state, p, tier_label, result, ref_desc)
-            )
             try:
+                # Post-placement bookkeeping is BaseException-guarded: a
+                # deadline-cancel landing here must not escape before the
+                # placed result is returned (the order IS transmitted —
+                # escaping would revert flags and re-sell; re-review N3).
+                # Tier-fire audit with THIS fill's banked $ + running
+                # cumulative + clearly-labeled whole-position mark. Spawned:
+                # fill-price polling must never block the watcher hot loop.
+                asyncio.create_task(
+                    _write_tier_fill_audit(state, p, tier_label, result, ref_desc)
+                )
                 _role = {
                     "T1": "t1", "T2": "t2", "T3": "t3",
                     "STOP": "stop", "RUNNER_PROTECT": "runner_protect",
@@ -1230,9 +1317,10 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str,
                     ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
                     notes=f"watcher_close@{ref_desc}",
                 )
-            except Exception:
+            except BaseException:
                 logger.exception(
-                    "spx_watcher: write_watcher_sell_child failed for parent %s", p.id,
+                    "spx_watcher: post-placement bookkeeping interrupted for "
+                    "parent %s (order already placed)", p.id,
                 )
             return True
         finally:
@@ -1451,7 +1539,7 @@ async def _check_fixed_dollar(state, p) -> None:
                         await SignalIterRepository.update_live_order(p.id, status="PARTIAL")
                 finally:
                     try:
-                        if not placed:
+                        if not placed and outcome.get("kind") != "placed":
                             setattr(p, field, False)
                             try:
                                 await SignalIterRepository.update_live_order(
@@ -2528,7 +2616,7 @@ async def _eval_spx_points_parent(
                 )
         finally:
             try:
-                if not placed:
+                if not placed and outcome.get("kind") != "placed":
                     setattr(p, flag_field, False)
                     setattr(p, at_field, None)
                     try:
@@ -2630,7 +2718,7 @@ async def _eval_spx_points_parent(
                         placed = await _market_sell(runner_qty, "RUNNER_PROTECT", outcome)
                     finally:
                         try:
-                            if not placed:
+                            if not placed and outcome.get("kind") != "placed":
                                 p.spx_target_t2_fired = prev_t2
                                 p.spx_target_t3_fired = prev_t3
                                 try:
@@ -2943,7 +3031,12 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
         # Acquire the firing lock — only one path may fire this parent at a time.
         state.firing_parent_ids.add(p.id)
         prior_status = p.status
-        rollback_kind: str | None = None
+        # Fail-safe default (re-review N2): a CancelledError anywhere in the
+        # latch->sell region skips except-Exception handlers — the finally
+        # must still roll back, so "error" is the default and each decisive
+        # TERMINAL path overwrites it explicitly (mirrors the outcome-dict
+        # pattern every other fire uses).
+        rollback_kind: str | None = "error"
         ref = f"{symbol} {spot:.2f}"
         now_ms = int(_time.time() * 1000)
         try:
@@ -2961,6 +3054,7 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                 p.id, status="STOPPED",
             )
             if not isinstance(state.ibkr, LiveIBKRProvider):
+                rollback_kind = "dry"  # terminal — DRY keeps the resolved-marker
                 await SignalIterRepository.write_audit_log(
                     category="spx_watcher", actor="system",
                     summary=(
@@ -2997,6 +3091,7 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                     if long_qty <= 0 and cap > 0 and sold >= cap:
                         # Broker flat AND the watcher already sold the full
                         # fill — the exit is complete; keep the terminal latch.
+                        rollback_kind = "refused_cap"  # terminal
                         await SignalIterRepository.write_audit_log(
                             category="spx_watcher", actor="system",
                             summary=(
@@ -3053,6 +3148,7 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                         )
                         rollback_kind = "refused_cap_divergence"
                         return False
+                    rollback_kind = "refused_cap"  # terminal — genuinely sold out
                     return True
                 sell_qty = reserved
                 placed_qty = 0
@@ -3077,25 +3173,29 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                     )
                     if result.placed:
                         placed_qty = int(result.sell_qty)
+                        rollback_kind = "placed"  # terminal — order transmitted
                         _clear_refusal_streak(state, p)
-                        tick_age_ms = (
-                            now_ms - state.last_live_tick_ms
-                            if state.last_live_tick_ms > 0 else -1
-                        )
-                        # Banked-$ audit line (spawned — see
-                        # _write_tier_fill_audit).
-                        asyncio.create_task(_write_tier_fill_audit(
-                            state, p, "STOP/TICK", result, ref,
-                            extra_summary=(
-                                f"stop={effective_stop:.2f}, "
-                                f"tick_age={tick_age_ms}ms"
-                            ),
-                            extra_details={
-                                "stop_level": effective_stop,
-                                "tick_age_ms": tick_age_ms,
-                            },
-                        ))
                         try:
+                            # Post-placement bookkeeping is BaseException-
+                            # guarded (re-review N3): a deadline-cancel here
+                            # must not skip the terminal return.
+                            tick_age_ms = (
+                                now_ms - state.last_live_tick_ms
+                                if state.last_live_tick_ms > 0 else -1
+                            )
+                            # Banked-$ audit line (spawned — see
+                            # _write_tier_fill_audit).
+                            asyncio.create_task(_write_tier_fill_audit(
+                                state, p, "STOP/TICK", result, ref,
+                                extra_summary=(
+                                    f"stop={effective_stop:.2f}, "
+                                    f"tick_age={tick_age_ms}ms"
+                                ),
+                                extra_details={
+                                    "stop_level": effective_stop,
+                                    "tick_age_ms": tick_age_ms,
+                                },
+                            ))
                             await SignalIterRepository.write_watcher_sell_child(
                                 parent=p, bracket_role="stop",
                                 qty=int(result.sell_qty),
@@ -3103,10 +3203,10 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
                                 ib_perm_id=int(getattr(result.trade.order, "permId", 0) or 0) or None,
                                 notes=f"stop_tick@{symbol}={spot:.2f},age={tick_age_ms}ms",
                             )
-                        except Exception:
+                        except BaseException:
                             logger.exception(
-                                "stop_tick: write_watcher_sell_child failed for parent %s",
-                                p.id,
+                                "stop_tick: post-placement bookkeeping interrupted "
+                                "for parent %s (order already placed)", p.id,
                             )
                         return True
                     # safe_market_sell wrote its own audit (HARD-BLOCK /

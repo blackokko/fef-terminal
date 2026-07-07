@@ -248,8 +248,13 @@ async def safe_market_sell(
                 },
                 block_reason_code=_BR.SAFE_SELL_CLAMPED,
             )
-        except Exception:
+        except BaseException:
+            # BaseException: a CancelledError delivered during this awaited
+            # write (fire-deadline cancel, teardown) must not escape either -
+            # the order is TRANSMITTED; escaping here would leave the caller
+            # with placed_qty unassigned -> cap released for a placed order +
+            # latch reverted -> re-sell (2026-07-07 re-review N3).
             logger.exception(
-                "safe_market_sell: clamped-audit write failed (order already placed)",
+                "safe_market_sell: clamped-audit write interrupted (order already placed)",
             )
     return result
