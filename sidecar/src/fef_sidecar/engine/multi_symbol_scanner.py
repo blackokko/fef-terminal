@@ -800,6 +800,17 @@ async def handle_actionable_scanner_verdict(
         "minute_et": minute_now,
         "skipped": tod_skip,
     }
+    # LO-VIX DAY (2026-07-07): session-level VIX-open-percentile classifier
+    # stamped on every scanner fire, fired or gate-skipped — true/false/
+    # null(unknown). TAG-ONLY + input to the spx_target_watcher
+    # lowvix_shrink_shadow; never gates. Session-cached => one DB read per
+    # session (engine/lo_vix_day.py).
+    lo_vix_day: bool | None = None
+    try:
+        from fef_sidecar.engine.lo_vix_day import is_lo_vix_day
+        lo_vix_day = await is_lo_vix_day(state)
+    except Exception:
+        logger.exception("scanner: lo_vix_day classification failed — stamping null")
     if chop_skip:
         skip_note = (
             f" [CHOP-GATE SKIPPED: r30 pct {chop.percentile:.1f} < {gate_threshold:.1f}]"
@@ -858,12 +869,14 @@ async def handle_actionable_scanner_verdict(
                 "account_id": getattr(state.ibkr, "account_id", "") or "",
                 # TAG-ONLY context on every scanner fire (live data for
                 # future filters): drift-bias disagreement, 30-min ET time
-                # bucket, the TOD-relative 30-min range percentile, and the
-                # nearest per-family wall (strike/distance/family — was
-                # dropped from extras until the 2026-07-02 proximity fix).
+                # bucket, the TOD-relative 30-min range percentile, the
+                # lo-VIX day flag, and the nearest per-family wall
+                # (strike/distance/family — was dropped from extras until
+                # the 2026-07-02 proximity fix).
                 "bias_disagree": bias_disagree,
                 "tod_bucket": chop_extras.get("tod_bucket"),
                 "r30_pct": chop_extras.get("r30_pct"),
+                "lo_vix_day": lo_vix_day,
                 "nearest_wall_strike": verdict_dict.get("nearest_wall_strike"),
                 "nearest_wall_distance": verdict_dict.get("nearest_wall_distance"),
                 "nearest_wall_family": verdict_dict.get("nearest_wall_family"),

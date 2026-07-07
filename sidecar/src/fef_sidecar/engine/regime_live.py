@@ -432,6 +432,16 @@ async def _expected_move_tile(state: Any, at_ms: int) -> dict[str, Any]:
     except Exception:
         logger.exception("regime_live: post-cap flag failed — not fired")
 
+    # --- lo-VIX day flag (VIX daily-bar open percentile; session-cached
+    # classifier behind the lowvix ladder-shrink shadow — see
+    # engine/lo_vix_day.py). null = unknown = NOT lo. ---
+    lo_vix_day: bool | None = None
+    try:
+        from fef_sidecar.engine.lo_vix_day import is_lo_vix_day
+        lo_vix_day = await is_lo_vix_day(state, at_ms=at_ms)
+    except Exception:
+        logger.exception("regime_live: lo_vix_day flag failed — null")
+
     # --- combine into the validated multiple label ---
     idxs: list[int] = []
     parts: list[str] = []
@@ -451,6 +461,7 @@ async def _expected_move_tile(state: Any, at_ms: int) -> dict[str, Any]:
     extra = {
         "vix": round(vix_now, 2) if vix_now is not None else None,
         "vix_percentile": round(vix_pct, 1) if vix_pct is not None else None,
+        "lo_vix_day": lo_vix_day,
         "rvol_30m": round(rvol_cur, 6) if rvol_cur is not None else None,
         "rvol_percentile": round(rvol_pct, 1) if rvol_pct is not None else None,
         "post_cap": fired,

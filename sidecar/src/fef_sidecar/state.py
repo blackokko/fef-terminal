@@ -332,6 +332,18 @@ class AppState:
     # an A/B exit shadow). NEVER places orders.
     shadow_be_ladder: dict[int, dict] = field(default_factory=dict)
 
+    # Lo-VIX ladder-shrink exit shadow (2026-07-07 registered backtest,
+    # shadow-first) — the SECOND shadow spx_points parents carry on lo-VIX
+    # days: the same plan with all four offsets scaled by m=0.6. Separate
+    # dict so both (parent, variant) rows coexist; same lifecycle as
+    # shadow_be_ladder. NEVER places orders.
+    shadow_lowvix: dict[int, dict] = field(default_factory=dict)
+
+    # Lo-VIX day classifier — per-session cached LoVixAssessment
+    # (engine/lo_vix_day.py). Keyed by ET session_date; one DB read + one
+    # audit row per session. Tag/shadow input only — never gates.
+    lo_vix_day_cache: dict[str, object] = field(default_factory=dict)
+
     # Loop watchdog (2026-07-07): heartbeat map (loop name -> monotonic
     # seconds, stamped every healthy cycle), supervised-loop registry, and
     # the supervisor task handle. The week's failure class is "async task
