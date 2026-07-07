@@ -1628,10 +1628,17 @@ async def _safe_persist_execs(state) -> None:
 #       like the real _check_fixed_dollar (triggers evaluate at quote mid).
 #   real == 'spx_points' on a LO-VIX day -> ALSO the LO-VIX SHRINK ladder
 #       (variant_label='lowvix_shrink_shadow', 2026-07-07 registered
-#       backtest, shadow-first): the parent's own stored plan with all four
-#       offsets scaled by m=0.6 via the exact backtest transformation
-#       (_lowvix_scaled_plan), walked with be_ladder-shadow semantics — a
-#       SECOND row for the same parent (see _lowvix_shadow_cycle_one).
+#       backtest, shadow-first; SPX parents only — the adopted arm was
+#       SPX-only): the parent's own stored plan with all four offsets
+#       scaled by m=0.6 via the exact backtest transformation
+#       (_lowvix_scaled_plan), walked with be_ladder-shadow semantics PLUS
+#       the live T1-retrace runner-protect (review MAJOR-2; ~13% of the
+#       adopted arm's lo-fire exits resolved via rp) — a SECOND row for
+#       the same parent (see _lowvix_shadow_cycle_one). KNOWN HORIZON
+#       DIVERGENCE (documented, not replicated): the adopted arm walked a
+#       60-min window cap (~10% of its exits); live spx_points and this
+#       shadow run uncapped to the close — the adoption number assumed a
+#       horizon live doesn't have (variant_params.horizon_note).
 #
 # 2026-07-06 plumbing fixes (7/6 EOD sec. 2):
 #   (a) entry_spx is sourced from the SYMBOL'S OWN CASH spot (the same spot
@@ -2029,11 +2036,17 @@ def _lowvix_shadow_init(
     that was hand-set (anchor >0.5% off entry) makes the transformation
     undefined -> no lo-VIX row for this parent.
 
-    Returns the shadow dict; None to DEFER (no validated entry spot this
-    cycle — retry); or a string reason to DECLINE permanently (memoized by
-    the caller so the 0.1s loop logs once, not per tick)."""
+    Returns the shadow dict; None to DEFER (no validated entry spot / no
+    qty synced yet — retry next cycle); or a string reason to DECLINE
+    (memoized by the caller against the levels it declined, so the 0.1s
+    loop logs once and a later plan repair re-admits the parent)."""
     if not p.qty:
-        return "parent has no qty"
+        return None
+    if getattr(p, "symbol", None) != "SPX":
+        # The adopted backtest arm was SPX-only; the _price_scale
+        # generalization in _lowvix_scaled_plan is UNVALIDATED — do not
+        # collect ETF rows that would blend into the SPX decision dataset.
+        return "non-SPX parent (backtest arm was SPX-only)"
     levels = (p.spx_target_t1, p.spx_target_t2, p.spx_target_t3,
               p.spx_target_stop)
     if any(v is None for v in levels):
@@ -2059,6 +2072,7 @@ def _lowvix_shadow_init(
     risk = abs(float(entry_spx) - ns)
     if risk <= 0:
         return f"scaled stop {ns:.2f} coincides with entry {entry_spx:.2f}"
+    rp_on = bool(getattr(state, "runner_protect_enabled", True))
     sh = _shadow_base(p, _LOWVIX_SHADOW_VARIANT_LABEL, entry_spx,
                       entry_spx_source, parent_entry, spot_source)
     sh.update({
@@ -2066,15 +2080,61 @@ def _lowvix_shadow_init(
         "levels_source": "lowvix_scaled_plan(parent_spx_targets)",
         "dyn_stop": ns,
         "be_step": 0.0, "be_lock_R": 0.0,
+        # T1-retrace runner-protect (review MAJOR-2) — the adopted arm and
+        # the live spx_points executor both run it; _shadow_step honors the
+        # flag only on this variant.
+        "rp_protect": rp_on,
         # Provenance merged into variant_params at finalize.
         "variant_extra": {
             "m_scale": _LOWVIX_SHRINK_M,
             "plan_anchor": anchor,
             "price_scale": ps,
             "original_levels": {"t1": t1, "t2": t2, "t3": t3, "stop": stop},
+            "runner_protect": rp_on,
+            # Horizon divergence (review MAJOR-2, documented not "fixed"):
+            # the ADOPTED arm walked a 60-min window cap; live spx_points
+            # (and this shadow) run uncapped to the real close.
+            "horizon_note": "backtest arm capped at 60min; live+shadow uncapped",
         },
     })
     return sh
+
+
+def _log_shadow_parent_error_once(state, pid) -> None:
+    """Traceback for one parent's failed shadow advance — once per parent
+    per session (the cycle retries it every 0.1s poll regardless)."""
+    from fef_sidecar.engine.chop_gate import session_date_et
+    sess = session_date_et(int(_time.time() * 1000))
+    logged = getattr(state, "_shadow_cycle_err_logged", None)
+    if not isinstance(logged, dict):
+        logged = {}
+        try:
+            state._shadow_cycle_err_logged = logged  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if logged.get(pid) == sess:
+        return
+    logged[pid] = sess
+    logger.exception(
+        "exit shadow: cycle advance failed for parent %s "
+        "(logged once per session; retried every poll)", pid,
+    )
+
+
+def _lowvix_declined(state) -> dict:
+    """Session-scoped {parent_id: stored-levels-at-decline}. A parent whose
+    plan changed since its decline is re-admitted (review MAJOR-1 mirror);
+    the map resets on session roll so it cannot grow unbounded."""
+    from fef_sidecar.engine.chop_gate import session_date_et
+    sess = session_date_et(int(_time.time() * 1000))
+    memo = getattr(state, "_lowvix_shadow_declined", None)
+    if not isinstance(memo, dict) or memo.get("session") != sess:
+        memo = {"session": sess, "ids": {}}
+        try:
+            state._lowvix_shadow_declined = memo  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return memo["ids"]
 
 
 async def _lowvix_shadow_cycle_one(
@@ -2082,44 +2142,77 @@ async def _lowvix_shadow_cycle_one(
     sym_src: str | None,
 ) -> None:
     """Init/advance one parent's lo-VIX shrink shadow. No-op unless the
-    parent is spx_points on a lo-VIX day (None/unknown => NOT lo — the
-    classifier is fail-open to normal behavior). Kept apart from the
-    primary shadow's init/step branching so neither variant's deferral
-    stalls the other. NEVER places orders."""
+    parent is an SPX spx_points parent on a lo-VIX day (None/unknown =>
+    NOT lo — fail-open; non-SPX excluded: the adopted arm was SPX-only).
+    Kept apart from the primary shadow's init/step branching so neither
+    variant's deferral stalls the other. NEVER places orders.
+
+    RE-ANCHOR RACE (review MAJOR-1): this cycle runs BEFORE the eval
+    loop's _maybe_reanchor_plan in each watcher iteration, so init WAITS
+    until plan sanity has vetted the parent (p.id in
+    state._watcher_plan_sanity) — a 751-class corrupt plan (collapsed
+    stop; its recovered anchor sits ~0.13% from entry and PASSES the 0.5%
+    cross-check) would otherwise walk into the shadow one cycle before
+    the repair rewrites it and finalize as a plausible status='ok' row.
+    Post-init plan mutations drop the stale shadow WITHOUT a row and
+    re-init from the current plan; declines are memoized against the
+    levels they declined, so a later repair re-admits the parent."""
     if shadows is None or p.id is None:
         return
     if getattr(p, "exit_strategy", None) != "spx_points":
         return
+    if getattr(p, "symbol", None) != "SPX":
+        return  # backtest arm was SPX-only (see _lowvix_shadow_init)
+    cur_levels = (p.spx_target_t1, p.spx_target_t2, p.spx_target_t3,
+                  p.spx_target_stop)
     sh = shadows.get(p.id)
-    if sh is None:
-        declined = getattr(state, "_lowvix_shadow_declined", None)
-        if declined is not None and p.id in declined:
-            return
-        from fef_sidecar.engine.lo_vix_day import is_lo_vix_day
-        if await is_lo_vix_day(state) is not True:  # session-cached
-            return
-        made = _lowvix_shadow_init(state, p, sym_spot, spot_source=sym_src)
-        if isinstance(made, dict):
-            shadows[p.id] = made
-        elif isinstance(made, str):
-            # Permanent decline — memoize so the 0.1s loop logs ONCE.
-            if declined is None:
-                declined = set()
-                try:
-                    state._lowvix_shadow_declined = declined  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-            declined.add(p.id)
+    if sh is not None:
+        orig = (sh.get("variant_extra") or {}).get("original_levels") or {}
+        if cur_levels != (orig.get("t1"), orig.get("t2"),
+                          orig.get("t3"), orig.get("stop")):
+            # Stored plan mutated after init (re-anchor repair or any
+            # future rewrite): the walked levels were scaled from a
+            # superseded plan — drop WITHOUT finalizing (a plausible
+            # corrupt row is worse than no row) and re-init below.
+            shadows.pop(p.id, None)
             logger.warning(
-                "lowvix shadow: parent %s gets no lo-VIX shrink row — %s",
-                p.id, made,
+                "lowvix shadow: parent %s stored plan changed after init — "
+                "dropped the stale shadow (no row), re-initializing", p.id,
             )
+            sh = None
+        else:
+            # Keep entry premium current once the real fill syncs in.
+            if not sh.get("entry_premium") and (p.avg_fill_price or 0) > 0:
+                sh["entry_premium"] = float(p.avg_fill_price)
+            if not sh["done"] and sym_spot:
+                _shadow_step(state, sh, sym_spot)
+            return
+    declined = _lowvix_declined(state)
+    if p.id in declined:
+        if declined[p.id] == cur_levels:
+            return
+        declined.pop(p.id, None)  # plan changed since the decline — re-admit
+        logger.info(
+            "lowvix shadow: parent %s stored plan changed since decline — "
+            "re-admitting", p.id,
+        )
+    sanity = getattr(state, "_watcher_plan_sanity", None)
+    if not isinstance(sanity, dict) or p.id not in sanity:
+        return  # plan sanity hasn't vetted this parent yet — wait
+    from fef_sidecar.engine.lo_vix_day import is_lo_vix_day
+    if await is_lo_vix_day(state) is not True:  # session-cached
         return
-    # Keep entry premium current once the real fill syncs in.
-    if not sh.get("entry_premium") and (p.avg_fill_price or 0) > 0:
-        sh["entry_premium"] = float(p.avg_fill_price)
-    if not sh["done"] and sym_spot:
-        _shadow_step(state, sh, sym_spot)
+    made = _lowvix_shadow_init(state, p, sym_spot, spot_source=sym_src)
+    if isinstance(made, dict):
+        shadows[p.id] = made
+    elif isinstance(made, str):
+        # Decline memoized against these levels — logs ONCE, re-admitted
+        # if the plan is later repaired/rewritten.
+        declined[p.id] = cur_levels
+        logger.warning(
+            "lowvix shadow: parent %s gets no lo-VIX shrink row — %s",
+            p.id, made,
+        )
 
 
 async def _shadow_capture_premium(state, sh: dict, fill: dict) -> None:
@@ -2354,6 +2447,26 @@ def _shadow_step(state, sh: dict, spot: float) -> None:
         sh["exit_reason"] = "trail" if sh["be_step"] > 0 else "stop"
         return
 
+    # RUNNER-PROTECT (lo-VIX shrink variant only — review MAJOR-2): both
+    # the adopted backtest walker and the live spx_points executor exit the
+    # remainder when the spot retraces to the T1 fill spot (~13% of the
+    # adopted arm's lo-fire exits resolved via rp). Evaluated after the
+    # stop but BEFORE this sample's tier fires (the backtest walker's
+    # ordering), so the T1 fill sample itself can never insta-trigger on
+    # spot == t1_at. Gated on the flag only _lowvix_shadow_init sets —
+    # be_ladder_shadow keeps its shipped no-rp semantics.
+    if sh.get("rp_protect") and sh["tier_fired"][0]:
+        t1_at = sh.get("t1_at_spx")
+        remaining = _shadow_remaining(sh)
+        if t1_at is not None and remaining > 0:
+            retraced = (spot <= t1_at) if is_long else (spot >= t1_at)
+            if retraced:
+                _shadow_record_fill(state, sh, "RUNNER_PROTECT", remaining, spot)
+                sh["tier_fired"] = [True, True, True]
+                sh["done"] = True
+                sh["exit_reason"] = "runner_protect"
+                return
+
     # First-touch tiers — partials scale out while the residual runs.
     for i, (lvl, label) in enumerate(
         zip((sh["t1"], sh["t2"], sh["t3"]), ("T1", "T2", "T3"))
@@ -2364,6 +2477,8 @@ def _shadow_step(state, sh: dict, spot: float) -> None:
         if touched:
             _shadow_record_fill(state, sh, label, sh["tier_qtys"][i], spot)
             sh["tier_fired"][i] = True
+            if i == 0:
+                sh["t1_at_spx"] = float(spot)  # runner-protect anchor
     if _shadow_remaining(sh) <= 0:
         sh["done"] = True
         sh["exit_reason"] = "targets"
@@ -2625,27 +2740,33 @@ async def _shadow_be_ladder_cycle(state, parents, spot: float) -> None:
         if p.id is None:
             continue
         live_ids.add(p.id)
-        sh = shadows.get(p.id)
-        sym_spot, sym_src = await _shadow_cash_spot(state, p.symbol, spot, spot_cache)
-        # LO-VIX SHRINK SHADOW (2026-07-07 registered backtest, shadow-
-        # first): spx_points parents on lo-VIX days get a SECOND shadow —
-        # same plan, all four offsets scaled by m=0.6.
-        await _lowvix_shadow_cycle_one(state, p, lowvix_shadows, sym_spot, sym_src)
-        if sh is None:
-            sh = _shadow_init(state, p, sym_spot, spot_source=sym_src)
-            if sh is not None:
-                shadows[p.id] = sh
-            continue
-        # Keep entry premium current once the real fill syncs in.
-        if not sh.get("entry_premium") and (p.avg_fill_price or 0) > 0:
-            sh["entry_premium"] = float(p.avg_fill_price)
-        if not sh["done"]:
-            if sh.get("variant") == _FD_SHADOW_VARIANT_LABEL:
-                if sym_spot:
-                    sh["last_spot"] = float(sym_spot)
-                _shadow_fd_maybe_sample(state, sh)
-            elif sym_spot:
-                _shadow_step(state, sh, sym_spot)
+        # PER-PARENT GUARD (review minor): one raising parent must not
+        # stall every other parent's A/B this cycle. Logged once per
+        # parent per session (retried every cycle regardless).
+        try:
+            sh = shadows.get(p.id)
+            sym_spot, sym_src = await _shadow_cash_spot(state, p.symbol, spot, spot_cache)
+            # LO-VIX SHRINK SHADOW (2026-07-07 registered backtest, shadow-
+            # first): SPX spx_points parents on lo-VIX days get a SECOND
+            # shadow — same plan, all four offsets scaled by m=0.6.
+            await _lowvix_shadow_cycle_one(state, p, lowvix_shadows, sym_spot, sym_src)
+            if sh is None:
+                sh = _shadow_init(state, p, sym_spot, spot_source=sym_src)
+                if sh is not None:
+                    shadows[p.id] = sh
+                continue
+            # Keep entry premium current once the real fill syncs in.
+            if not sh.get("entry_premium") and (p.avg_fill_price or 0) > 0:
+                sh["entry_premium"] = float(p.avg_fill_price)
+            if not sh["done"]:
+                if sh.get("variant") == _FD_SHADOW_VARIANT_LABEL:
+                    if sym_spot:
+                        sh["last_spot"] = float(sym_spot)
+                    _shadow_fd_maybe_sample(state, sh)
+                elif sym_spot:
+                    _shadow_step(state, sh, sym_spot)
+        except Exception:
+            _log_shadow_parent_error_once(state, p.id)
     # Real position closed (parent left the active set) -> finalize + emit.
     for pid in [pid for pid in list(shadows) if pid not in live_ids]:
         sh = shadows.pop(pid)

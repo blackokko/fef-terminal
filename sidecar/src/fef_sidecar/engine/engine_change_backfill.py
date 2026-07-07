@@ -202,6 +202,17 @@ SEMANTIC_CHANGES: list[tuple[str, str, str, str, str, str | None]] = [
      "19:07 residual: 6 post-fix rows had VALID current spots against a polluted "
      "PREVIOUS reference (cross-stream ref in the delta window) producing dP ±6,794",
      None),
+    ("2026-07-07T20:00:00", "lowvix_shadow_prior_close_basis", "data",
+     "Documented basis deviation for the lo-VIX day classifier "
+     "(engine/lo_vix_day.py): the registered lowvix backtest labeled days on "
+     "the VIX daily-bar OPEN percentile; live intraday classification runs on "
+     "the PRIOR-CLOSE basis because the VIX 1-day rows land at the 16:00 ET "
+     "close. 8.9% of historical sessions flip labels between the two bases.",
+     "None expected — the adversarial reviewer RE-VALIDATED the registered "
+     "ARM-B (m=0.6 shrink on lo days) under prior-close labels on the same "
+     "bars: OOS +$4.69/ct t=2.33 (pess), +$4.63/ct t=2.30 (mid), both OOS "
+     "years positive, TRAIN >= 0. Shadow-only either way (lowvix_shrink_shadow).",
+     None),
 ]
 
 

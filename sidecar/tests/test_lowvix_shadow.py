@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -57,6 +57,12 @@ from fef_sidecar.engine.spx_target_watcher import (
     _lowvix_shadow_init,
     _plan_anchor_from_stop,
     _shadow_be_ladder_cycle,
+)
+from fef_sidecar.engine.vix_daily_ingest import (
+    completed_daily_rows,
+    run_vix_daily_ingest_once,
+    upsert_vix_daily,
+    vix_daily_bar_ts_ms,
 )
 from fef_sidecar.state import AppState
 
@@ -176,6 +182,21 @@ def test_no_rows_is_unknown_and_future_rows_ignored() -> None:
     assert a.lo is None and "no VIX 1-day bars" in (a.data_gap or "")
 
 
+def test_prior_close_stale_is_unknown_fail_open() -> None:
+    """Review MAJOR-3a: a lapsed backfill (series ends 06-20, session 06-26
+    = 6 calendar days) must classify UNKNOWN with reason 'stale_vix', not
+    rank a week-old close confidently. 4 days (Fri close -> Tue) is fresh;
+    the cutoff is tunable (assess reads FEF_VIX_DAILY_MAX_STALE_DAYS)."""
+    rows = _daily(_prior_20(lambda i: (45.0 - i, 45.0 - i)))     # ends 06-20
+    a = vix_open_percentile(rows, "2026-06-26")
+    assert a.lo is None
+    assert (a.data_gap or "").startswith("stale_vix")
+    assert a.value_date == "2026-06-20"
+    assert a.basis == "prior_close"
+    assert vix_open_percentile(rows, "2026-06-24").lo is True    # 4 days: fresh
+    assert vix_open_percentile(rows, "2026-06-26", max_stale_days=10).lo is True
+
+
 # ---------------------------------------------------------------------------
 # 1b. Classifier — assess end-to-end: DB read, session cache, single audit
 # ---------------------------------------------------------------------------
@@ -219,11 +240,29 @@ async def test_assess_lo_day_cached_with_single_audit(
     row = audits[0]
     assert "LO-VIX DAY YES for 2026-06-24" in row.summary
     assert "prior_close" in row.summary
+    assert "(2026-06-20)" in row.summary          # the ranked close's own date
     assert "2026-06-01..2026-06-19" in row.summary
     assert row.details["lo"] is True
     assert row.details["vix_pct"] == pytest.approx(0.0)
+    assert row.details["value_date"] == "2026-06-20"
     assert row.details["n_pool"] == 19
     assert row.details["threshold_pct"] == pytest.approx(33.333)
+
+
+async def test_assess_stale_series_unknown_and_audited() -> None:
+    """Review MAJOR-3a end-to-end: series ends 06-20, session 06-26 ->
+    is_lo_vix_day None (fail-open, no shadow row) with the stale reason and
+    the ranked close's own date audited."""
+    await _seed_vix_daily(_prior_20(lambda i: (45.0 - i, 45.0 - i)))
+    state = AppState.build()
+    at = _et_ms("2026-06-26", 10, 0)
+    assert await is_lo_vix_day(state, at_ms=at) is None
+    audits = await SignalIterRepository.query_audit_log(category="lo_vix_day")
+    assert len(audits) == 1
+    assert "LO-VIX DAY UNKNOWN" in audits[0].summary
+    assert "stale_vix" in audits[0].summary
+    assert audits[0].details["lo"] is None
+    assert audits[0].details["value_date"] == "2026-06-20"
 
 
 async def test_assess_empty_db_unknown_fail_open() -> None:
@@ -516,6 +555,24 @@ def _spx_parent(**kw) -> SimpleNamespace:
     return SimpleNamespace(**d)
 
 
+def _vet(state, *pids: int) -> None:
+    """Mark parents as plan-sanity-vetted — the MAJOR-1 ordering gate: the
+    lo-VIX shadow refuses to init before _maybe_reanchor_plan has seen the
+    parent (production populates state._watcher_plan_sanity in the same
+    watcher iteration, right after the shadow cycle)."""
+    memo = getattr(state, "_watcher_plan_sanity", None)
+    if not isinstance(memo, dict):
+        memo = {}
+        state._watcher_plan_sanity = memo
+    for pid in pids:
+        memo.setdefault(pid, None)
+
+
+def _declined_ids(state) -> dict:
+    memo = getattr(state, "_lowvix_shadow_declined", None)
+    return memo["ids"] if isinstance(memo, dict) else {}
+
+
 async def _settle_tasks() -> None:
     for _ in range(4):
         await asyncio.sleep(0)
@@ -538,6 +595,7 @@ async def test_lo_day_two_shadows_exact_m06_arithmetic_and_two_rows(
     _patch_lo_vix(monkeypatch, True)
     state = _const_quote_state(6.0)
     p = _spx_parent()
+    _vet(state, 201)
 
     await _shadow_be_ladder_cycle(state, [p], 7440.0)       # init both
     assert state.shadow_be_ladder[201]["variant"] == "fixed_dollar_shadow"
@@ -622,6 +680,7 @@ async def test_normal_or_unknown_day_no_extra_row(
     _patch_lo_vix(monkeypatch, flag)
     state = _const_quote_state(6.0)
     p = _spx_parent(id=202)
+    _vet(state, 202)  # isolate the lo-day gate (sanity gate satisfied)
 
     await _shadow_be_ladder_cycle(state, [p], 7440.0)
     await _shadow_be_ladder_cycle(state, [p], 7449.0)
@@ -654,21 +713,192 @@ async def test_lo_day_unrecoverable_plan_declines_once(
 ) -> None:
     """A hand-set stop (anchor inversion lands >0.5% from entry) means the
     backtest transformation is undefined: no lo-VIX row, and the decline is
-    memoized so the 0.1s loop doesn't re-evaluate (or re-log) every tick."""
+    memoized (against the declined levels, session-scoped) so the 0.1s loop
+    doesn't re-evaluate or re-log every tick."""
     _patch_lo_vix(monkeypatch, True)
     state = _const_quote_state(6.0)
     p = _spx_parent(id=204, spx_target_stop=7350.0)     # anchor 7360 vs entry 7440
+    _vet(state, 204)
 
     await _shadow_be_ladder_cycle(state, [p], 7440.0)
     await _shadow_be_ladder_cycle(state, [p], 7441.0)
     assert state.shadow_lowvix == {}
-    assert 204 in state._lowvix_shadow_declined
+    assert 204 in _declined_ids(state)
     assert 204 in state.shadow_be_ladder                # primary unaffected
 
     # Missing stored plan declines with its own reason (direct init).
     p2 = _spx_parent(id=205, spx_target_t2=None)
     made = _lowvix_shadow_init(state, p2, 7440.0, spot_source="active_tick")
     assert made == "parent has no stored spx_target_* plan"
+
+
+async def test_lowvix_waits_for_plan_sanity_then_inits_from_repaired_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MAJOR-1 (re-anchor race): a 751-class corrupt plan — stop
+    collapsed to 0.3pt from entry — inverts to an anchor 0.13% from entry
+    and would PASS the 0.5% cross-check, so the ordering gate is the only
+    defense. The shadow must WAIT (no sanity memo), then init from the
+    REPAIRED plan once _maybe_reanchor_plan has run."""
+    _patch_lo_vix(monkeypatch, True)
+    state = _const_quote_state(6.0)
+    p = _spx_parent(id=210, spx_target_stop=7439.7)     # corrupt: R = 0.3pt
+
+    await _shadow_be_ladder_cycle(state, [p], 7440.0)   # sanity not run yet
+    await _shadow_be_ladder_cycle(state, [p], 7440.0)
+    assert 210 not in state.shadow_lowvix               # waited — no corrupt init
+    assert 210 not in _declined_ids(state)
+
+    # The repair fires: sanity rewrites the stop and memoizes the parent
+    # (exactly what _maybe_reanchor_plan persists + re-applies).
+    p.spx_target_stop = 7430.0
+    p.dynamic_stop_level = 7430.0
+    state._watcher_plan_sanity = {210: {"spx_target_stop": 7430.0}}
+
+    await _shadow_be_ladder_cycle(state, [p], 7440.0)
+    lsh = state.shadow_lowvix[210]
+    # Scaled from the REPAIRED plan (anchor 7440), not the corrupt one
+    # (which would anchor 7449.7 -> stop 7443.7 / t1 7458.7).
+    assert lsh["variant_extra"]["plan_anchor"] == pytest.approx(7440.0)
+    assert lsh["stop"] == pytest.approx(7434.0, abs=1e-9)
+    assert lsh["t1"] == pytest.approx(7449.0, abs=1e-9)
+    assert lsh["variant_extra"]["original_levels"]["stop"] == pytest.approx(7430.0)
+
+
+async def test_lowvix_declined_parent_readmitted_after_plan_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MAJOR-1 mirror: a decline is memoized AGAINST the levels it
+    declined — a later plan rewrite re-admits the parent."""
+    _patch_lo_vix(monkeypatch, True)
+    state = _const_quote_state(6.0)
+    p = _spx_parent(id=211, spx_target_stop=7350.0)     # unrecoverable anchor
+    _vet(state, 211)
+
+    await _shadow_be_ladder_cycle(state, [p], 7440.0)
+    assert 211 in _declined_ids(state)
+    assert 211 not in state.shadow_lowvix
+
+    p.spx_target_stop = 7430.0                          # plan repaired
+    await _shadow_be_ladder_cycle(state, [p], 7440.0)
+    assert 211 not in _declined_ids(state)              # re-admitted
+    assert state.shadow_lowvix[211]["stop"] == pytest.approx(7434.0, abs=1e-9)
+
+
+async def test_lowvix_drops_stale_shadow_on_post_init_plan_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MAJOR-1: a plan rewritten AFTER init supersedes the walked
+    levels — the stale shadow is dropped WITHOUT emitting a row and a fresh
+    one inits from the current plan."""
+    _patch_lo_vix(monkeypatch, True)
+    state = _const_quote_state(6.0)
+    p = _spx_parent(id=212)
+    _vet(state, 212)
+
+    await _shadow_be_ladder_cycle(state, [p], 7440.0)
+    first = state.shadow_lowvix[212]
+    assert first["t3"] == pytest.approx(7470.0, abs=1e-9)   # scaled default
+
+    p.spx_target_t3 = 7500.0                            # plan mutated (T3 wall)
+    await _shadow_be_ladder_cycle(state, [p], 7440.0)
+    second = state.shadow_lowvix[212]
+    assert second is not first                          # re-initialized
+    # T3 wall 7500 beyond the new T2 (7455) -> KEPT by the transformation.
+    assert second["t3"] == pytest.approx(7500.0, abs=1e-9)
+    assert second["variant_extra"]["original_levels"]["t3"] == pytest.approx(7500.0)
+    assert await _outcome_rows() == []                  # stale shadow: NO row
+
+
+async def test_lowvix_runner_protect_retrace_hand_math(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MAJOR-2: the lo-VIX walk runs the live T1-retrace runner-
+    protect (~13% of the adopted arm's lo-fire exits). T1 banks at 7449
+    (t1_at anchor), the NEXT sample retraces to 7448.5 (< t1_at, still
+    above the ratcheted 7446 trail) -> RUNNER_PROTECT exits the remainder.
+    R = 1/3*1.5 + 2/3*((7448.5-7440)/6) = 1.4444; $ at bid 6.0 = +$300."""
+    _patch_lo_vix(monkeypatch, True)
+    state = _const_quote_state(6.0)
+    p = _spx_parent(id=213)
+    _vet(state, 213)
+
+    await _shadow_be_ladder_cycle(state, [p], 7440.0)   # init
+    lsh = state.shadow_lowvix[213]
+    assert lsh["rp_protect"] is True
+
+    await _shadow_be_ladder_cycle(state, [p], 7449.0)   # T1 fill sample
+    await _settle_tasks()
+    # The fill sample itself must NOT insta-trigger rp (spot == t1_at).
+    assert lsh["tier_fired"] == [True, False, False]
+    assert not lsh["done"]
+    assert lsh["t1_at_spx"] == pytest.approx(7449.0)
+
+    await _shadow_be_ladder_cycle(state, [p], 7448.5)   # retrace < t1_at
+    await _settle_tasks()
+    assert lsh["done"] and lsh["exit_reason"] == "runner_protect"
+    assert lsh["fills"][-1]["tier"] == "RUNNER_PROTECT"
+    assert lsh["fills"][-1]["qty"] == 2
+
+    await _shadow_be_ladder_cycle(state, [], 7448.5)    # close -> finalize
+    await _settle_tasks()
+    lv = next(r for r in await _outcome_rows()
+              if r.variant_label == "lowvix_shrink_shadow")
+    assert lv.exit_reason == "runner_protect"
+    assert lv.realized_r == pytest.approx(
+        1.0 / 3 * 1.5 + 2.0 / 3 * ((7448.5 - 7440.0) / 6.0), abs=1e-4,
+    )
+    assert lv.variant_params["shadow_dollars"] == pytest.approx(300.0)
+    assert lv.variant_params["runner_protect"] is True
+    assert "60min" in lv.variant_params["horizon_note"]
+
+
+async def test_be_ladder_shadow_keeps_no_rp_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin: the shipped be_ladder_shadow (fixed_dollar parents)
+    does NOT runner-protect — a T1-retrace that stays above the ratcheted
+    trail leaves the runners open."""
+    _patch_lo_vix(monkeypatch, False)
+    state = _const_quote_state(6.0)
+    p = _spx_parent(id=214, exit_strategy="fixed_dollar")
+
+    await _shadow_be_ladder_cycle(state, [p], 7440.0)   # init (be_ladder)
+    sh = state.shadow_be_ladder[214]
+    assert sh["variant"] == "be_ladder_shadow"
+    await _shadow_be_ladder_cycle(state, [p], 7456.0)   # T1 @ 7455, MFE 1.6R
+    await _settle_tasks()
+    assert sh["tier_fired"] == [True, False, False]
+    await _shadow_be_ladder_cycle(state, [p], 7455.0)   # retrace below t1_at
+    await _settle_tasks()
+    # dyn_stop ratcheted to 7450 (+1.0R); 7455 > 7450 and no rp -> still open.
+    assert not sh["done"]
+    assert all(f["tier"] != "RUNNER_PROTECT" for f in sh["fills"])
+
+
+async def test_one_raising_parent_does_not_stall_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review minor: the cycle's per-parent guard — one parent whose
+    advance raises must not prevent the other parents' shadows from
+    initializing/stepping; the failure logs once per session."""
+
+    class _RaisingQty:
+        def __bool__(self) -> bool:
+            return True
+
+        def __int__(self) -> int:
+            raise RuntimeError("boom")
+
+    _patch_lo_vix(monkeypatch, False)
+    state = _const_quote_state(6.0)
+    bad = _spx_parent(id=220, qty=_RaisingQty())
+    good = _spx_parent(id=221)
+
+    await _shadow_be_ladder_cycle(state, [bad, good], 7440.0)
+    assert 221 in state.shadow_be_ladder                # good parent inited
+    assert 220 not in state.shadow_be_ladder
+    assert 220 in getattr(state, "_shadow_cycle_err_logged", {})
 
 
 async def test_lowvix_init_recovers_anchor_when_entry_drifted() -> None:
@@ -685,33 +915,31 @@ async def test_lowvix_init_recovers_anchor_when_entry_drifted() -> None:
     assert sh["stop"] == pytest.approx(7434.0, abs=1e-9)
 
 
-async def test_lowvix_init_etf_class_default_detection() -> None:
-    """A SPY spx_points parent whose plan came from build_plan (scaled
-    defaults): anchor inversion + _price_scale generalization must detect
-    the defaults and scale them by m — SPX math is bit-identical to the
-    backtest (scale 1.0), ETF class gets the same effective moneyness."""
-    from fef_sidecar.engine.strikes import _price_scale, build_plan
+async def test_non_spx_parent_excluded_from_lowvix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review minor: the adopted backtest arm was SPX-only — the
+    _price_scale generalization is UNVALIDATED, so non-SPX spx_points
+    parents get no lo-VIX row (cycle short-circuits; direct init declines
+    with the reason)."""
+    from fef_sidecar.engine.strikes import build_plan
     spot = 743.2
     plan = build_plan(spot=spot, direction=FEFDirection.LONG_CALLS,
                       top_gex_walls=[], top_dex_walls=[], ntm_max_pain=None)
-    state = SimpleNamespace()
+    _patch_lo_vix(monkeypatch, True)
+    state = _const_quote_state(6.0)
     p = _spx_parent(
         id=207, symbol="SPY", strike=744.0, entry_spx_price=spot,
         spx_target_t1=plan.t1, spx_target_t2=plan.t2,
         spx_target_t3=plan.t3, spx_target_stop=plan.stop,
         avg_fill_price=2.0, limit_price=2.0,
     )
-    sh = _lowvix_shadow_init(state, p, spot, spot_source="active_tick")
-    assert isinstance(sh, dict)
-    s = _price_scale(spot)
-    assert sh["variant_extra"]["plan_anchor"] == pytest.approx(spot, abs=1e-9)
-    assert sh["variant_extra"]["price_scale"] == pytest.approx(s, abs=1e-9)
-    assert sh["t1"] == pytest.approx(spot + 15.0 * s * 0.6, abs=1e-6)
-    assert sh["t2"] == pytest.approx(spot + 25.0 * s * 0.6, abs=1e-6)
-    assert sh["t3"] == pytest.approx(spot + 50.0 * s * 0.6, abs=1e-6)
-    assert sh["stop"] == pytest.approx(spot - 10.0 * s * 0.6, abs=1e-6)
-    # The scaled T1 is NOT the stored (unscaled) T1 — the shrink is real.
-    assert abs(sh["t1"] - plan.t1) > 0.1
+    _vet(state, 207)
+    await _shadow_be_ladder_cycle(state, [p], spot)
+    assert state.shadow_lowvix == {}                    # excluded, no row
+    assert 207 in state.shadow_be_ladder                # primary FD shadow fine
+    made = _lowvix_shadow_init(state, p, spot, spot_source="active_tick")
+    assert made == "non-SPX parent (backtest arm was SPX-only)"
 
 
 async def test_lowvix_init_puts_direction() -> None:
@@ -728,3 +956,84 @@ async def test_lowvix_init_puts_direction() -> None:
     assert sh["t2"] == pytest.approx(7425.0, abs=1e-9)
     assert sh["t3"] == pytest.approx(7410.0, abs=1e-9)
     assert sh["stop"] == pytest.approx(7446.0, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# 5. VIX daily ingest (review MAJOR-3c) — completed-session normalization,
+#    additive idempotent upsert, live-provider-only gating
+# ---------------------------------------------------------------------------
+
+
+def _ib_daily_bar(date_str: str, o: float, c: float) -> SimpleNamespace:
+    """A fetched daily bar as the Bar model coerces it (naive midnight —
+    ib_async daily bars carry a plain date)."""
+    y, mo, d = (int(x) for x in date_str.split("-"))
+    return SimpleNamespace(
+        timestamp=datetime(y, mo, d), open=o, high=max(o, c) + 0.5,
+        low=min(o, c) - 0.5, close=c, volume=0.0,
+    )
+
+
+def test_completed_daily_rows_excludes_todays_partial_pre_close() -> None:
+    """Today's still-forming bar must NOT be ingested pre-close (a frozen
+    partial close would poison future prior-close pools); post-close it is.
+    The timestamp anchor byte-matches the backfill script's 16:00 ET."""
+    bars = [_ib_daily_bar("2026-07-06", 17.0, 16.5),
+            _ib_daily_bar("2026-07-07", 16.8, 16.2)]
+    pre = completed_daily_rows(bars, _et_ms("2026-07-07", 10, 0))
+    assert [r[0] for r in pre] == [vix_daily_bar_ts_ms(date(2026, 7, 6))]
+    post = completed_daily_rows(bars, _et_ms("2026-07-07", 16, 30))
+    assert [r[0] for r in post] == [
+        vix_daily_bar_ts_ms(date(2026, 7, 6)),
+        vix_daily_bar_ts_ms(date(2026, 7, 7)),
+    ]
+    assert vix_daily_bar_ts_ms(date(2026, 7, 6)) == _et_ms("2026-07-06", 16, 0)
+
+
+async def test_upsert_vix_daily_additive_and_idempotent() -> None:
+    """Only missing sessions are inserted; a second run inserts nothing and
+    existing rows keep their values (additive-only)."""
+    await _seed_vix_daily([("2026-07-01", 17.1, 16.0),
+                           ("2026-07-02", 16.2, 15.9)])
+    bars = [_ib_daily_bar(d, 16.0, 15.8)
+            for d in ("2026-07-01", "2026-07-02", "2026-07-06")]
+    rows = completed_daily_rows(bars, _et_ms("2026-07-07", 10, 0))
+    assert await upsert_vix_daily(rows) == 1            # only 07-06 missing
+    assert await upsert_vix_daily(rows) == 0            # idempotent
+    got = await SignalIterRepository.query_bars("VIX", "1 day", limit=50)
+    assert len(got) == 3
+    by_ts = {b.timestamp_ms: b for b in got}
+    # 07-01 keeps its SEEDED open (17.1), not the fetcher's 16.0.
+    assert by_ts[_et_ms("2026-07-01", 16, 0)].open == pytest.approx(17.1)
+    assert by_ts[vix_daily_bar_ts_ms(date(2026, 7, 6))].open == pytest.approx(16.0)
+
+
+async def test_run_ingest_once_gates_on_live_provider_and_audits() -> None:
+    """SAME-SERIES RULE: a non-live provider is skipped (synthetic mock bars
+    must never enter the real VIX series); a live provider's pass inserts
+    the missing completed sessions and writes one audit row."""
+    state = SimpleNamespace(ibkr=SimpleNamespace())     # not LiveIBKRProvider
+    assert await run_vix_daily_ingest_once(state) is None
+    assert await SignalIterRepository.query_audit_log(category="vix_daily_ingest") == []
+
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    prov = LiveIBKRProvider()                           # never connected
+
+    async def fake_fetch(contract, **kw):
+        assert contract.symbol == "VIX"
+        return [_ib_daily_bar("2026-07-06", 17.0, 16.5)]
+
+    prov.fetch_historical_bars = fake_fetch             # type: ignore[method-assign]
+    state2 = SimpleNamespace(ibkr=prov)
+    inserted = await run_vix_daily_ingest_once(
+        state2, now_ms=_et_ms("2026-07-07", 10, 0),
+    )
+    assert inserted == 1
+    audits = await SignalIterRepository.query_audit_log(category="vix_daily_ingest")
+    assert len(audits) == 1
+    assert audits[0].details["inserted"] == 1
+    # Second pass: nothing missing, no extra audit noise.
+    assert await run_vix_daily_ingest_once(
+        state2, now_ms=_et_ms("2026-07-07", 10, 0),
+    ) == 0
+    assert len(await SignalIterRepository.query_audit_log(category="vix_daily_ingest")) == 1

@@ -455,6 +455,15 @@ def spawn_data_loops(state: AppState) -> None:
         state, "bar-capture-health", lambda: bar_capture_health_loop(state),
         cadence_sec=60, stale_after_sec=300,
     )
+    # VIX 1-day ingest — keeps the lo-VIX classifier's daily series current
+    # (boot + one pass per session after the 16:15 ET close; the manual
+    # backfill script had silently lapsed — review MAJOR-3). Additive-only,
+    # live-provider-only. Disable via FEF_VIX_DAILY_INGEST_ENABLED=false.
+    from fef_sidecar.engine.vix_daily_ingest import vix_daily_ingest_loop
+    spawn_supervised(
+        state, "vix-daily-ingest", lambda: vix_daily_ingest_loop(state),
+        cadence_sec=900, stale_after_sec=3600,
+    )
     # Pattern trigger — confirmed-bar candlestick/flag fires into the
     # advisory audit surface; auto-trades ONLY when the user arms the
     # pattern trigger types via a preset (inert by default). Isolated task.

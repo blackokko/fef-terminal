@@ -50,6 +50,11 @@ from zoneinfo import ZoneInfo
 
 from ib_async import IB, Index
 
+# Shared 16:00-ET daily anchor — single definition so this script and the
+# in-sidecar daily ingest (engine/vix_daily_ingest.py, added 2026-07-07)
+# land IDENTICAL timestamps for the same session.
+from fef_sidecar.engine.vix_daily_ingest import vix_daily_bar_ts_ms
+
 ET = ZoneInfo("America/New_York")
 DB = os.path.expanduser("~/.fef-terminal/signal_log.db")
 CLIENT_ID = 171
@@ -63,7 +68,7 @@ def bar_ts_ms(b, daily: bool) -> int:
     if hasattr(d, "timestamp"):  # tz-aware datetime (intraday, formatDate=2)
         return int(d.timestamp() * 1000)
     # daily bar -> plain date; anchor at 16:00 ET (the close the OHLC settles to)
-    return int(dt.datetime(d.year, d.month, d.day, 16, 0, tzinfo=ET).timestamp() * 1000)
+    return vix_daily_bar_ts_ms(d)
 
 
 def fmt(ms: int) -> str:
