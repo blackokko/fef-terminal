@@ -34,8 +34,18 @@ async def _db_fixture():
 
 @pytest.fixture(autouse=True)
 def _deterministic_config(monkeypatch: pytest.MonkeyPatch):
-    """Don't read the developer's real ~/.fef-terminal/config.json."""
+    """Don't read the developer's real ~/.fef-terminal/config.json. Floor
+    pinned LOW at the config_store source (auto_trader imports lazily) —
+    pattern fires are LOW-confidence by design and this suite tests the
+    trigger mechanism, not the 2026-07-08 always-on confidence floor
+    (test_confidence_floor.py owns that; live pattern trading under the
+    default HIGH floor requires POST /config auto_trade_confidence_floor)."""
+    import fef_sidecar.config_store as cs
     monkeypatch.setattr(pt, "load_config", lambda: UIConfig())
+    monkeypatch.setattr(
+        cs, "load_config",
+        lambda: UIConfig(auto_trade_confidence_floor="LOW"),
+    )
 
 
 @pytest.fixture(autouse=True)

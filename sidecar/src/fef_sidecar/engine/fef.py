@@ -23,6 +23,85 @@ from fef_sidecar.quantdata.max_pain import compute_ntm_max_pain
 from fef_sidecar.quantdata.models import MarketSnapshot
 
 
+def classify_confidence(
+    delta_price: float,
+    delta_drift_m: float,
+    fe_ratio: float,
+    *,
+    threshold_scale: float = 1.0,
+) -> FEFConfidence:
+    """THE confidence formula — module-level so non-engine consumers (the
+    auto-trader's wall-collapse re-grade) share the exact same math instead
+    of copying it. HIGH ALSO requires FE in a sane range (1.0 .. 5.0) —
+    outside that band the 2026-05-18 data showed HIGH underperforming LOW
+    because magnitude alone was the trigger. FE > 5 means drift is being
+    absorbed; FE < 1 means price moved without flow confirmation. Both are
+    noise.
+    """
+    scale = threshold_scale
+    # HIGH requires: meaningful magnitude AND FE in confirmation band
+    if (
+        abs(delta_price) >= 5 * scale
+        and abs(delta_drift_m) >= 10 * scale
+        and 1.0 <= fe_ratio <= 5.0
+    ):
+        return FEFConfidence.HIGH
+    # MEDIUM: lower magnitude OR slightly out-of-band FE
+    if (
+        abs(delta_price) >= 2 * scale
+        and abs(delta_drift_m) >= 3 * scale
+        and fe_ratio <= 8.0
+    ):
+        return FEFConfidence.MEDIUM
+    return FEFConfidence.LOW
+
+
+def demote_confidence_on_bias(
+    confidence: FEFConfidence,
+    direction: FEFDirection | str,
+    drift_bias: str | None,
+) -> tuple[FEFConfidence, bool]:
+    """Drift-bias disagreement demotion — the aligned branch's one-notch
+    downgrade (HIGH -> MEDIUM, MEDIUM -> LOW, LOW stays LOW), extracted so
+    the auto-trader's wall-collapse re-grade applies the identical rule.
+    Returns (confidence, bias_disagrees)."""
+    bias = (drift_bias or "NEUTRAL").upper()
+    dir_value = getattr(direction, "value", direction)
+    wants_bull = dir_value == FEFDirection.LONG_CALLS.value
+    bias_disagrees = (
+        (wants_bull and bias == "BEARISH")
+        or (not wants_bull and bias == "BULLISH")
+    )
+    if not bias_disagrees:
+        return confidence, False
+    demoted = (
+        FEFConfidence.MEDIUM if confidence == FEFConfidence.HIGH else
+        FEFConfidence.LOW if confidence == FEFConfidence.MEDIUM else
+        confidence
+    )
+    return demoted, True
+
+
+def formula_confidence(
+    delta_price: float,
+    delta_drift_m: float,
+    fe_ratio: float,
+    *,
+    direction: FEFDirection | str,
+    drift_bias: str | None,
+    threshold_scale: float = 1.0,
+) -> FEFConfidence:
+    """classify_confidence + bias demotion in one call — what an ALIGNED
+    fire's badge would be. The auto-trader uses this to re-grade
+    wall-collapse verdicts, whose hardcoded HIGH badge bypasses the formula
+    (registered study: wc fires -1.56/ct OOS vs formula-HIGH +27.88/ct)."""
+    conf = classify_confidence(
+        delta_price, delta_drift_m, fe_ratio, threshold_scale=threshold_scale,
+    )
+    conf, _ = demote_confidence_on_bias(conf, direction, drift_bias)
+    return conf
+
+
 def snapshot_to_inputs(snap: MarketSnapshot) -> FEFInputs:
     """Convert a QuantData MarketSnapshot into FEF engine inputs."""
     ntm = (
@@ -409,21 +488,13 @@ class FEFEngine:
             confidence = self._classify_confidence(delta_price, delta_drift_m, fe_ratio)
             # Drift bias agreement filter — independent confluence signal.
             # If FEF says LONG_CALLS but the drift_bias field disagrees (BEARISH),
-            # demote one notch. We KEEP the signal (user wanted volume) but
-            # downgrade conviction so the auto-trade confidence floor can gate it.
-            bias = (current.drift_bias or "NEUTRAL").upper()
-            wants_bull = direction == FEFDirection.LONG_CALLS
-            bias_disagrees = (
-                (wants_bull and bias == "BEARISH")
-                or (not wants_bull and bias == "BULLISH")
+            # demote one notch (module-level helper so the auto-trader's
+            # wall-collapse re-grade applies the identical rule). We KEEP the
+            # signal (user wanted volume) but downgrade conviction so the
+            # auto-trade confidence floor can gate it.
+            confidence, bias_disagrees = demote_confidence_on_bias(
+                confidence, direction, current.drift_bias,
             )
-            if bias_disagrees:
-                # HIGH -> MEDIUM, MEDIUM -> LOW, LOW stays LOW
-                confidence = (
-                    FEFConfidence.MEDIUM if confidence == FEFConfidence.HIGH else
-                    FEFConfidence.LOW if confidence == FEFConfidence.MEDIUM else
-                    confidence
-                )
             reasoning = (
                 f"ALIGNED {direction.value} — ΔPrice {delta_price:+.2f}pts, "
                 f"ΔDrift {delta_drift_m:+.2f}M, FE {fe_ratio:.2f}, "
@@ -642,28 +713,13 @@ class FEFEngine:
         delta_drift_m: float,
         fe_ratio: float,
     ) -> FEFConfidence:
-        """Confidence scoring. HIGH now ALSO requires FE in a sane range
-        (1.0 .. 5.0) — outside that band today's data showed HIGH
-        underperforming LOW because magnitude alone was the trigger.
-        FE > 5 means drift is being absorbed; FE < 1 means price moved
-        without flow confirmation. Both are noise.
-        """
-        scale = self._threshold_scale
-        # HIGH requires: meaningful magnitude AND FE in confirmation band
-        if (
-            abs(delta_price) >= 5 * scale
-            and abs(delta_drift_m) >= 10 * scale
-            and 1.0 <= fe_ratio <= 5.0
-        ):
-            return FEFConfidence.HIGH
-        # MEDIUM: lower magnitude OR slightly out-of-band FE
-        if (
-            abs(delta_price) >= 2 * scale
-            and abs(delta_drift_m) >= 3 * scale
-            and fe_ratio <= 8.0
-        ):
-            return FEFConfidence.MEDIUM
-        return FEFConfidence.LOW
+        """Confidence scoring — delegates to the module-level
+        classify_confidence so the formula has exactly one home (the
+        auto-trader's wall-collapse re-grade imports the same function)."""
+        return classify_confidence(
+            delta_price, delta_drift_m, fe_ratio,
+            threshold_scale=self._threshold_scale,
+        )
 
     @staticmethod
     def _qty_for_confidence(confidence: FEFConfidence) -> int:

@@ -321,6 +321,8 @@ async def _maybe_trade_fire(
     try:
         decision = await maybe_auto_trade(
             state, verdict_dict, symbol=symbol, source="auto_pattern",
+            # Counterfactual gates (floor/cap) tag the row persisted above.
+            signal_iter_id=signal.id,
         )
         state.auto_trade_last_block_reason = decision.reason
         if decision.fired:

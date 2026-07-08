@@ -202,6 +202,44 @@ SEMANTIC_CHANGES: list[tuple[str, str, str, str, str, str | None]] = [
      "19:07 residual: 6 post-fix rows had VALID current spots against a polluted "
      "PREVIOUS reference (cross-stream ref in the delta window) producing dP ±6,794",
      None),
+    # ---- 2026-07-08 floor batch ----
+    ("2026-07-08T20:00:00", "confidence_floor_armed", "gate",
+     "Confidence floor RE-ARMED, always-on: auto-trader gates every fire on "
+     "config_store.auto_trade_confidence_floor (default HIGH; persistent, "
+     "hot-read; /auto_trade/toggle IGNORES floor in its body so the panel "
+     "can't stomp it). Wall-collapse verdicts' hardcoded HIGH badge is "
+     "re-graded through the exact ALIGNED formula (fef.classify_confidence "
+     "+ bias demotion) at gate time. Skips are counterfactual-tagged "
+     "(extras.skipped_by='confidence_floor', 'confidence_floor' audit rows, "
+     "CONFIDENCE_FLOOR_SKIP); kill switch FEF_DISABLE_CONFIDENCE_FLOOR "
+     "(fail-open, loud audit once/session)",
+     "12k-fire registered study: floor=HIGH +37.81/ct OOS vs LOW -14.84/ct "
+     "(t=3.31); book flips -$142k -> +$117k. Wall-collapse exclusion: wc "
+     "fires -1.56/ct OOS vs formula-HIGH +27.88/ct — unearned badge gated "
+     "on the recomputed grade",
+     None),
+    ("2026-07-08T20:00:00", "cross_symbol_direction_cap", "gate",
+     "Cross-symbol direction cap: a fire is blocked while a watcher-managed "
+     "parent (SUBMITTED/FILLED/PARTIAL) with the same right is open on a "
+     "DIFFERENT index-complex symbol {SPX,SPY,QQQ,IWM} "
+     "(extras.skipped_by='cross_symbol_cap', 'cross_symbol_cap' audit rows, "
+     "CROSS_SYMBOL_CAP_SKIP, no cooldown consumed); hot-read via "
+     "UIConfig.cross_symbol_cap_enabled; dormant when only SPX is enabled",
+     "Anecdote-grade (+$1,380 across 2 sessions) — shipped as exposure "
+     "discipline, not edge; counterfactual rows grade it in production",
+     None),
+    ("2026-07-08T20:00:00", "runner_protect_plan_anchor", "exit",
+     "Runner-protect fixed to the BACKTESTED semantics: anchor at the T1 "
+     "PLAN level (spx_target_t1), trigger only on a genuine retrace THROUGH "
+     "it with a buffer (FEF_RP_BUFFER_PTS, default 0.5 x _price_scale pts), "
+     "never evaluated in the watcher cycle that filled T1 (RP now runs "
+     "before the tier fires, the backtest walker's ordering); lowvix shrink "
+     "shadow's rp aligned to identical semantics",
+     "Live defect 2026-07-08: 3-for-3 T1 fills triggered RP in the same "
+     "second at the same price (anchor was the T1 fill-moment spot) — "
+     "'sell all at T1' nullified the +$18-25/ct ladder evidence's runner "
+     "layer",
+     None),
     ("2026-07-07T20:00:00", "lowvix_shadow_prior_close_basis", "data",
      "Documented basis deviation for the lo-VIX day classifier "
      "(engine/lo_vix_day.py): the registered lowvix backtest labeled days on "

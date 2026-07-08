@@ -62,9 +62,15 @@ async def _db_fixture():
 @pytest.fixture(autouse=True)
 def _deterministic_config(monkeypatch: pytest.MonkeyPatch):
     """Never read the live ~/.fef-terminal/config.json from tests. Patches
-    the config_store source so auto_trader's in-function import sees it."""
+    the config_store source so auto_trader's in-function import sees it.
+    Floor pinned LOW: this suite's LOW-confidence verdicts test the exit
+    additions, not the 2026-07-08 always-on confidence floor
+    (test_confidence_floor.py owns that)."""
     import fef_sidecar.config_store as cs
-    monkeypatch.setattr(cs, "load_config", lambda: UIConfig())
+    monkeypatch.setattr(
+        cs, "load_config",
+        lambda: UIConfig(auto_trade_confidence_floor="LOW"),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -183,10 +189,13 @@ async def test_etf_scaling_toggle_and_min_magnitude(
     from fef_sidecar.engine.auto_trader import maybe_auto_trade
     import fef_sidecar.config_store as cs
 
-    # Toggle OFF: SPY keeps the raw SPX-notional targets.
+    # Toggle OFF: SPY keeps the raw SPX-notional targets. (Floor stays LOW —
+    # these LOW-confidence fires test the $ scaling, not the floor.)
     state = _armed_fixed_dollar_state(monkeypatch)
     monkeypatch.setattr(
-        cs, "load_config", lambda: UIConfig(etf_dollar_exit_scaling=False)
+        cs, "load_config", lambda: UIConfig(
+            etf_dollar_exit_scaling=False, auto_trade_confidence_floor="LOW",
+        )
     )
     d = await maybe_auto_trade(
         state, _fd_verdict(strike=743.0, underlying=743.0),
@@ -198,7 +207,10 @@ async def test_etf_scaling_toggle_and_min_magnitude(
     assert p.dollar_target_stop == pytest.approx(-400.0)
 
     # $10 minimum magnitude: a $50 T1 would scale to ~$5 -> floored to $10.
-    monkeypatch.setattr(cs, "load_config", lambda: UIConfig())
+    monkeypatch.setattr(
+        cs, "load_config",
+        lambda: UIConfig(auto_trade_confidence_floor="LOW"),
+    )
     state2 = _armed_fixed_dollar_state(monkeypatch)
     state2.exit_dollar_t1 = 50.0
     d2 = await maybe_auto_trade(

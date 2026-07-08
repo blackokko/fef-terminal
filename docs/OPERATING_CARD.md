@@ -9,9 +9,15 @@ Scanner (SPX/SPY/QQQ, 60s, strict flow-surge ALIGNED — the canonical signaler)
   → 250M drift garbage ceiling            (vendor-glitch guard)
   → CHOP GATE      skip if trailing-30m range < 33rd TOD-percentile   [sweep: compressed fires −$25..−$48/ct]
   → BIAS VETO      skip if engine's own flow-bias disagrees           [3 of 5 losers on 7/2; −$17 vs −$1.85/ct at scale]
+  → CONFIDENCE FLOOR  skip if grade < config floor (default HIGH; wall-collapse HIGH badges
+                      re-graded through the formula)                  [12k-fire study 7/8: HIGH +37.81/ct OOS vs LOW −14.84, t=3.31]
   → auto-trader stack (300s/symbol cooldown, per-symbol cap, qty 3, calendar pause, dup-lock)
+  → CROSS-SYMBOL CAP  skip if a same-right watcher parent is open on another index symbol
+                      (exposure discipline; dormant when only SPX is enabled)
   → nearest-ATM strike (all symbols — ETF strikes fixed 7/2)
   → dollar ladder: SPX 300/500/1000/−400 · ETFs auto-scaled (~1/10 at SPY) · runner-protect
+    (7/8 fix: anchors at the T1 PLAN level, fires only on a retrace THROUGH it −0.5pt buffer —
+    never in the T1-fill cycle)
 ```
 Every skipped fire is persisted with its counterfactual (`skipped_by`, scored outcome) — the gates grade themselves live.
 
@@ -20,11 +26,14 @@ Every skipped fire is persisted with its counterfactual (`skipped_by`, scored ou
 - **BE-ladder shadow** — every trade logs "SHADOW BE-ladder would have made $X vs real $Y" (exit A/B, live)
 - Pattern overlay (PAT toggle), main-engine "would be ALIGNED" lines, phase detector, wall context stamps
 
-## The four knobs (POST /config, hot-reload — everything else is not a knob)
+## The knobs (POST /config, hot-reload — everything else is not a knob)
 1. `chop_gate_pct_threshold` (33.3) / `chop_gate_enabled`
 2. `bias_veto_enabled` (on)
 3. Exit style — fixed_dollar live; BE-ladder shadow accumulating the evidence to switch (+$11/ct historical)
 4. Cooldown / per-symbol cap (300s / default 2)
+5. `auto_trade_confidence_floor` (HIGH — 7/8; the ONLY way to change the floor; the panel
+   toggle ignores it; kill switch env `FEF_DISABLE_CONFIDENCE_FLOOR` is loud fail-open)
+6. `cross_symbol_cap_enabled` (on — 7/8, anecdote-grade exposure discipline)
 
 ## The two lines (pre-committed 2026-07-02 — judged on $/contract from broker fills at ~50 SPX fires)
 - **Kill: ≤ $0/ct** → the signal retires, search moves offline

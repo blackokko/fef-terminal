@@ -334,6 +334,9 @@ async def _scan_one_symbol(state, symbol: str) -> None:
         "delta_price": verdict.delta_price,
         "delta_drift_m": verdict.delta_drift_m,
         "fe_ratio": verdict.fe_ratio,
+        # Bias at verdict time — the auto-trader's wall-collapse re-grade
+        # needs it to mirror fef.py's demotion exactly at gate time.
+        "drift_bias": inputs.drift_bias,
         "aligned": verdict.aligned,
         "absorption": verdict.absorption,
         "wall_proximity_skip": verdict.wall_proximity_skip,
@@ -1042,6 +1045,8 @@ async def handle_actionable_scanner_verdict(
         from fef_sidecar.engine.auto_trader import maybe_auto_trade
         decision = await maybe_auto_trade(
             state, verdict_dict, symbol=symbol, source="auto_scanner",
+            # Counterfactual gates (floor/cap) tag the row persisted above.
+            signal_iter_id=signal_id,
         )
         state.auto_trade_last_block_reason = f"[scanner {symbol}] {decision.reason}"
         if decision.fired and decision.order_result:

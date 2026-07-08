@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -103,6 +103,30 @@ class UIConfig(BaseModel):
     tod_gate_enabled: bool = Field(default=True)
     tod_gate_start_et: str = Field(default="14:00", pattern=r"^\d{2}:\d{2}$")
     tod_gate_end_et: str = Field(default="15:30", pattern=r"^\d{2}:\d{2}$")
+
+    # ---- Auto-trade confidence floor (ARMED 2026-07-08) ----
+    # THE floor the auto-trader enforces on every fire — this config value is
+    # the single source of truth (state.auto_trade_confidence_floor is
+    # display-legacy; /auto_trade/toggle IGNORES any floor in its body so the
+    # panel can never again stomp it — observed 3+ times live). Persistent
+    # across restarts, hot-read at gate time. Evidence (12k-fire registered
+    # study): floor=HIGH +37.81/ct OOS vs LOW -14.84/ct (t=3.31); book flips
+    # -$142k -> +$117k. Kill switch: FEF_DISABLE_CONFIDENCE_FLOOR=true
+    # (fail-open, loud audit once per session).
+    auto_trade_confidence_floor: Literal["LOW", "MEDIUM", "HIGH"] = Field(
+        default="HIGH",
+    )
+
+    # ---- Cross-symbol direction cap (2026-07-08) ----
+    # Operational risk rule, user-approved: block a fire when a watcher-
+    # managed parent (SUBMITTED/FILLED/PARTIAL) with the SAME right is
+    # already open on a DIFFERENT index-complex symbol (SPX/SPY/QQQ/IWM) —
+    # they are one correlated underlying trade, not diversification.
+    # Evidence is anecdote-grade (+$1,380 across 2 sessions): shipped as
+    # EXPOSURE DISCIPLINE, not edge. Dormant when only SPX is enabled
+    # (same-symbol stacking stays governed by per-symbol cooldown/cap +
+    # the duplicate-parent guard). Hot-read at fire time.
+    cross_symbol_cap_enabled: bool = Field(default=True)
 
     # ---- Impulse attention flag (ADVISORY ONLY — never trades) ----
     # Validated 2026-07-02: |dPrice| impulse + flow-sign agreement + non-

@@ -56,8 +56,17 @@ async def _db_fixture():
 
 @pytest.fixture(autouse=True)
 def _deterministic_config(monkeypatch: pytest.MonkeyPatch):
-    """Never read the live ~/.fef-terminal/config.json from tests."""
+    """Never read the live ~/.fef-terminal/config.json from tests. Floor
+    pinned LOW at the config_store source (auto_trader imports lazily) —
+    this suite's LOW-confidence verdicts test the CHOP gate, not the
+    2026-07-08 always-on confidence floor (test_confidence_floor.py owns
+    that)."""
+    import fef_sidecar.config_store as cs
     monkeypatch.setattr(mss, "load_config", lambda: UIConfig())
+    monkeypatch.setattr(
+        cs, "load_config",
+        lambda: UIConfig(auto_trade_confidence_floor="LOW"),
+    )
 
 
 @pytest.fixture(autouse=True)

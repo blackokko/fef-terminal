@@ -15,7 +15,9 @@ Mechanics per parent order:
     T2 fires when SPX >= spx_target_t2  → market-sell t2_qty
     T3 fires when SPX >= spx_target_t3  → market-sell t3_qty
     STOP fires when SPX <= spx_target_stop → market-sell ALL remaining
-    After T1 fires, if SPX retraces back to spx_target_t1_at_spx → market-sell remaining (runner_protect)
+    After T1 fires, if SPX retraces THROUGH the T1 PLAN level minus a small
+    buffer (spx_target_t1 - _rp_buffer_pts) → market-sell remaining
+    (runner_protect; never evaluated in the cycle that filled T1)
 
   Direction LONG_PUTS: inverse comparisons.
 
@@ -67,6 +69,29 @@ def _fmt_money(x: float) -> str:
     """-290.4 -> '-$290', 290.4 -> '+$290'."""
     sign = "+" if x >= 0 else "-"
     return f"{sign}${abs(x):,.0f}"
+
+
+def _rp_buffer_pts(level_ref: float) -> float:
+    """Runner-protect retrace buffer, in the symbol's own points.
+
+    2026-07-08 FIX (live defect, 3-for-3 on 7/8): runner-protect anchored at
+    the T1 FILL-MOMENT spot (spx_target_t1_at_spx) and compared spot <=
+    anchor — in the very cycle T1 filled, spot == anchor, so every T1 fill
+    instantly dumped the runners at the same price ("sell all at T1"). The
+    BACKTESTED semantics (the +$18-25/ct ladder evidence) anchor at the T1
+    PLAN level and require a genuine retrace THROUGH it: calls fire at
+    spot <= t1_level - buffer, puts at spot >= t1_level + buffer.
+
+    Buffer = FEF_RP_BUFFER_PTS (default 0.5) SPX-calibrated points, scaled
+    by the symbol's notional (_price_scale: 1.0 for SPX-class, spot/7500
+    below 2000) so ETF-class parents get the same effective moneyness
+    cushion. level_ref = the T1 plan level (same price scale as spot)."""
+    from fef_sidecar.engine.strikes import _price_scale
+    try:
+        base = float(os.environ.get("FEF_RP_BUFFER_PTS", "0.5"))
+    except (TypeError, ValueError):
+        base = 0.5
+    return base * _price_scale(float(level_ref))
 
 
 async def _premium_for_log(state, trade, p) -> tuple[float | None, str]:
@@ -122,16 +147,48 @@ async def _write_tier_fill_audit(
     position mark = (premium - entry) * 100 * ORIGINAL parent qty — the old
     misleading number, kept for reference and clearly labeled.
     Premium is the actual FILL price when available at log time, else a live
-    quote labeled '(quote)'. ref_desc = trigger context ('SPX 6712.50' or the
-    fixed_dollar trigger premium). Runs as a spawned task so fill-price
-    polling never blocks the watcher hot loop.
+    quote labeled '(quote)'.
+
+    entry (2026-07-08 fix): the parent's ACTUAL average entry fill
+    (avg_fill_price) — re-read from the DB when the captured `p` predates
+    the fill sync (this audit task polls the SELL fill up to ~2s, plenty of
+    time for _sync_parent_fill_from_trades to land the BUY fill). Only when
+    no fill price exists anywhere does it fall back to the placement quote
+    (limit_price), and then the summary's banked figures carry an '(est)'
+    marker so a quote-based $ can never read as realized P&L.
+
+    ref_desc = trigger context ('SPX 6712.50' or the fixed_dollar trigger
+    premium). Runs as a spawned task so fill-price polling never blocks the
+    watcher hot loop.
     """
     from fef_sidecar.db.repository import SignalIterRepository
     try:
         order_id = result.trade.order.orderId
         premium, premium_src = await _premium_for_log(state, result.trade, p)
-        entry = p.avg_fill_price if (p.avg_fill_price or 0) > 0 else p.limit_price
-        entry_src = "parent_fill" if (p.avg_fill_price or 0) > 0 else "parent_limit"
+        entry = p.avg_fill_price if (p.avg_fill_price or 0) > 0 else None
+        entry_src = "parent_fill"
+        if entry is None and p.id is not None:
+            # The in-memory parent may predate the entry-fill sync — the DB
+            # row is the freshest cheap source at audit time.
+            try:
+                from sqlmodel import select as _sm_select
+                from fef_sidecar.db.engine import get_session as _gs_audit
+                from fef_sidecar.db.models import LiveOrder as _LO_audit
+                async with _gs_audit() as _session_audit:
+                    _row = (await _session_audit.exec(
+                        _sm_select(_LO_audit).where(_LO_audit.id == p.id)
+                    )).first()
+                if _row is not None and (_row.avg_fill_price or 0) > 0:
+                    entry = _row.avg_fill_price
+                    entry_src = "parent_fill_db"
+            except Exception:
+                logger.exception(
+                    "tier fill audit: entry fill re-read failed for parent %s",
+                    p.id,
+                )
+        if entry is None:
+            entry = p.limit_price
+            entry_src = "parent_limit"
 
         if not hasattr(state, "_watcher_banked_cum"):
             state._watcher_banked_cum = {}  # type: ignore[attr-defined]
@@ -160,10 +217,13 @@ async def _write_tier_fill_audit(
                 "position_mark": round(position_mark, 2),
             })
             px_label = f"{premium:.2f}" + ("" if premium_src == "fill" else f" ({premium_src})")
+            # '(est)' = entry side is the placement quote, not a real fill —
+            # the banked $ is an estimate until the entry fill syncs.
+            est = " (est)" if entry_src == "parent_limit" else ""
             summary = (
                 f"{tier_label}: sold {result.sell_qty}x {p.symbol} {p.strike}{p.right} "
-                f"@ {px_label} -> banked {_fmt_money(banked)} this fill "
-                f"(cum {_fmt_money(cum)}; position mark {_fmt_money(position_mark)}) "
+                f"@ {px_label} -> banked {_fmt_money(banked)}{est} this fill "
+                f"(cum {_fmt_money(cum)}{est}; position mark {_fmt_money(position_mark)}{est}) "
                 f"at {ref_desc}"
             )
         else:
@@ -2447,19 +2507,25 @@ def _shadow_step(state, sh: dict, spot: float) -> None:
         sh["exit_reason"] = "trail" if sh["be_step"] > 0 else "stop"
         return
 
-    # RUNNER-PROTECT (lo-VIX shrink variant only — review MAJOR-2): both
-    # the adopted backtest walker and the live spx_points executor exit the
-    # remainder when the spot retraces to the T1 fill spot (~13% of the
-    # adopted arm's lo-fire exits resolved via rp). Evaluated after the
-    # stop but BEFORE this sample's tier fires (the backtest walker's
-    # ordering), so the T1 fill sample itself can never insta-trigger on
-    # spot == t1_at. Gated on the flag only _lowvix_shadow_init sets —
-    # be_ladder_shadow keeps its shipped no-rp semantics.
+    # RUNNER-PROTECT (lo-VIX shrink variant only — review MAJOR-2), aligned
+    # 2026-07-08 with the FIXED live semantics so the A/B stays apples-to-
+    # apples: anchor at the T1 PLAN level (sh["t1"]) — never the T1 fill
+    # spot, whose fill-print equality was the live "sell all at T1" defect —
+    # and trigger only on a genuine retrace THROUGH it with the shared
+    # buffer (_rp_buffer_pts). Evaluated after the stop but BEFORE this
+    # sample's tier fires (the backtest walker's ordering), so the T1 fill
+    # sample itself can never insta-trigger. Gated on the flag only
+    # _lowvix_shadow_init sets — be_ladder_shadow has no rp to align
+    # (shipped no-rp semantics preserved).
     if sh.get("rp_protect") and sh["tier_fired"][0]:
-        t1_at = sh.get("t1_at_spx")
+        t1_level = sh.get("t1")
         remaining = _shadow_remaining(sh)
-        if t1_at is not None and remaining > 0:
-            retraced = (spot <= t1_at) if is_long else (spot >= t1_at)
+        if t1_level is not None and remaining > 0:
+            buf = _rp_buffer_pts(t1_level)
+            retraced = (
+                (spot <= t1_level - buf) if is_long
+                else (spot >= t1_level + buf)
+            )
             if retraced:
                 _shadow_record_fill(state, sh, "RUNNER_PROTECT", remaining, spot)
                 sh["tier_fired"] = [True, True, True]
@@ -2478,7 +2544,9 @@ def _shadow_step(state, sh: dict, spot: float) -> None:
             _shadow_record_fill(state, sh, label, sh["tier_qtys"][i], spot)
             sh["tier_fired"][i] = True
             if i == 0:
-                sh["t1_at_spx"] = float(spot)  # runner-protect anchor
+                # Provenance only (2026-07-08): rp anchors at the T1 PLAN
+                # level now, never this fill spot.
+                sh["t1_at_spx"] = float(spot)
     if _shadow_remaining(sh) <= 0:
         sh["done"] = True
         sh["exit_reason"] = "targets"
@@ -2805,8 +2873,10 @@ async def _eval_spx_points_parent(
     be symbol-correct (_watcher_symbol_spot); `spot_src` is its provenance
     (gates the cross-unit entry repair — see _maybe_reanchor_plan). Guard
     order: units guard -> arm-time plan sanity -> refusal backoff ->
-    entry-fill grace -> BE ladder -> stop -> T1/T2/T3 -> runner protect ->
-    CLOSED sync. Every latch->sell block runs shielded
+    entry-fill grace -> BE ladder -> stop -> runner protect -> T1/T2/T3 ->
+    CLOSED sync (RP before the tier fires = the backtest walker's ordering,
+    so the cycle that fills T1 can never also fire RP). Every latch->sell
+    block runs shielded
     (_run_exit_fire_shielded) so task cancellation can never strand an
     optimistic latch."""
     from fef_sidecar.db.repository import SignalIterRepository
@@ -2986,6 +3056,87 @@ async def _eval_spx_points_parent(
                 await _run_exit_fire_shielded(state, _fire_stop)
             return  # nothing else to do on this parent
 
+    # Runner protect — BACKTESTED semantics (2026-07-08 fix). The live
+    # defect: the trigger compared spot against the T1 FILL-MOMENT spot
+    # (spx_target_t1_at_spx) in the SAME cycle _fire_tier had just set it to
+    # the current spot — spot <= spot fired instantly, 3-for-3 on 7/8
+    # ("sell all at T1"). The backtested rule (+$18-25/ct ladder evidence):
+    #   anchor  = the T1 PLAN level (spx_target_t1), never the fill spot;
+    #   trigger = a genuine retrace THROUGH the anchor with a small buffer
+    #             (calls: spot <= t1 - buf; puts: spot >= t1 + buf);
+    #   arming  = never in the cycle that fills T1 — evaluated BEFORE this
+    #             cycle's tier fires (the backtest walker's ordering, same
+    #             as _shadow_step), so the T1-fill cycle sees
+    #             spx_target_t1_fired=False here and RP first becomes
+    #             armable on the NEXT cycle.
+    if (state.runner_protect_enabled and p.spx_target_t1_fired
+        and p.spx_target_t1 is not None
+        and (not p.spx_target_t2_fired or not p.spx_target_t3_fired)):
+        rp_buffer = _rp_buffer_pts(p.spx_target_t1)
+        retrace_hit = (
+            (is_long_calls and spot <= p.spx_target_t1 - rp_buffer)
+            or (not is_long_calls and spot >= p.spx_target_t1 + rp_buffer)
+        )
+        if retrace_hit:
+            runner_qty = 0
+            if not p.spx_target_t2_fired and p.spx_target_t2_qty:
+                runner_qty += p.spx_target_t2_qty
+            if not p.spx_target_t3_fired and p.spx_target_t3_qty:
+                runner_qty += p.spx_target_t3_qty
+            if runner_qty > 0:
+
+                async def _fire_runner(runner_qty=runner_qty) -> None:
+                    # OPTIMISTIC LATCH — flag the runner tiers BEFORE the
+                    # awaited sell; revert to their prior values on any
+                    # not-placed outcome (finally-gated; a tier genuinely
+                    # banked earlier must never be un-flagged). Shielded +
+                    # per-parent in-flight guard.
+                    if p.id in state.firing_parent_ids:
+                        return
+                    state.firing_parent_ids.add(p.id)
+                    prev_t2 = p.spx_target_t2_fired
+                    prev_t3 = p.spx_target_t3_fired
+                    outcome: dict = {}
+                    placed = False
+                    try:
+                        p.spx_target_t2_fired = True; p.spx_target_t3_fired = True
+                        await SignalIterRepository.update_live_order(
+                            p.id, spx_target_t2_fired=True, spx_target_t3_fired=True,
+                        )
+                        placed = await _market_sell(runner_qty, "RUNNER_PROTECT", outcome)
+                    finally:
+                        try:
+                            if not placed and outcome.get("kind") != "placed":
+                                p.spx_target_t2_fired = prev_t2
+                                p.spx_target_t3_fired = prev_t3
+                                try:
+                                    await SignalIterRepository.update_live_order(
+                                        p.id, spx_target_t2_fired=prev_t2,
+                                        spx_target_t3_fired=prev_t3,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "runner flag revert write failed for parent %s",
+                                        p.id,
+                                    )
+                                kind = outcome.get("kind", "error")
+                                if kind in _RETRYABLE_SELL_OUTCOMES:
+                                    await _audit_tier_refusal_retry(
+                                        state, p, "RUNNER_PROTECT", kind,
+                                        f"{p.symbol} {spot:.2f}",
+                                    )
+                                elif kind == "refused_cap":
+                                    _set_refusal_backoff(state, p)
+                                    if _note_refusal_over_limit(state, p):
+                                        await _park_stuck_parent(
+                                            state, p, "RUNNER_PROTECT", kind,
+                                            f"{p.symbol} {spot:.2f}",
+                                        )
+                        finally:
+                            state.firing_parent_ids.discard(p.id)
+
+                await _run_exit_fire_shielded(state, _fire_runner)
+
     async def _fire_tier(label: str, flag_field: str, at_field: str, qty: int) -> None:
         # OPTIMISTIC LATCH (2026-07-06): flag BEFORE the awaited sell; revert
         # on any not-placed outcome (finally-gated so cancellation can't skip
@@ -3074,74 +3225,9 @@ async def _eval_spx_points_parent(
                 p.spx_target_t3_qty,
             ))
 
-    # Runner protect: if T1 has fired but T2/T3 are still open
-    # and the spot retraces back to where T1 fired → exit runners
-    if (state.runner_protect_enabled and p.spx_target_t1_fired
-        and p.spx_target_t1_at_spx is not None
-        and (not p.spx_target_t2_fired or not p.spx_target_t3_fired)):
-        retrace_hit = (
-            (is_long_calls and spot <= p.spx_target_t1_at_spx)
-            or (not is_long_calls and spot >= p.spx_target_t1_at_spx)
-        )
-        if retrace_hit:
-            runner_qty = 0
-            if not p.spx_target_t2_fired and p.spx_target_t2_qty:
-                runner_qty += p.spx_target_t2_qty
-            if not p.spx_target_t3_fired and p.spx_target_t3_qty:
-                runner_qty += p.spx_target_t3_qty
-            if runner_qty > 0:
-
-                async def _fire_runner(runner_qty=runner_qty) -> None:
-                    # OPTIMISTIC LATCH — flag the runner tiers BEFORE the
-                    # awaited sell; revert to their prior values on any
-                    # not-placed outcome (finally-gated; a tier genuinely
-                    # banked earlier must never be un-flagged). Shielded +
-                    # per-parent in-flight guard.
-                    if p.id in state.firing_parent_ids:
-                        return
-                    state.firing_parent_ids.add(p.id)
-                    prev_t2 = p.spx_target_t2_fired
-                    prev_t3 = p.spx_target_t3_fired
-                    outcome: dict = {}
-                    placed = False
-                    try:
-                        p.spx_target_t2_fired = True; p.spx_target_t3_fired = True
-                        await SignalIterRepository.update_live_order(
-                            p.id, spx_target_t2_fired=True, spx_target_t3_fired=True,
-                        )
-                        placed = await _market_sell(runner_qty, "RUNNER_PROTECT", outcome)
-                    finally:
-                        try:
-                            if not placed and outcome.get("kind") != "placed":
-                                p.spx_target_t2_fired = prev_t2
-                                p.spx_target_t3_fired = prev_t3
-                                try:
-                                    await SignalIterRepository.update_live_order(
-                                        p.id, spx_target_t2_fired=prev_t2,
-                                        spx_target_t3_fired=prev_t3,
-                                    )
-                                except Exception:
-                                    logger.exception(
-                                        "runner flag revert write failed for parent %s",
-                                        p.id,
-                                    )
-                                kind = outcome.get("kind", "error")
-                                if kind in _RETRYABLE_SELL_OUTCOMES:
-                                    await _audit_tier_refusal_retry(
-                                        state, p, "RUNNER_PROTECT", kind,
-                                        f"{p.symbol} {spot:.2f}",
-                                    )
-                                elif kind == "refused_cap":
-                                    _set_refusal_backoff(state, p)
-                                    if _note_refusal_over_limit(state, p):
-                                        await _park_stuck_parent(
-                                            state, p, "RUNNER_PROTECT", kind,
-                                            f"{p.symbol} {spot:.2f}",
-                                        )
-                        finally:
-                            state.firing_parent_ids.discard(p.id)
-
-                await _run_exit_fire_shielded(state, _fire_runner)
+    # (Runner protect moved ABOVE the tier checks — 2026-07-08 fix. See the
+    # block after the stop check: plan-level anchor + retrace buffer, never
+    # evaluated in the cycle that filled T1.)
 
     # Sync parent status to CLOSED once the banked tiers cover the full
     # position (real remaining == 0) — not on the flags alone, so a

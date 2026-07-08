@@ -83,6 +83,7 @@ Status codes:
 | drift_bias gate v2 (15% relative dominance) | 2026-05-22 | ACTIVE | engine_change `v2_engine_formula_fixes` | live (v2) |
 | Confluence trigger-type gate | 2026-05-18 | ACTIVE | engine_change shipped via `88cb408` (Gate 3.5 trigger types) | live |
 | Confidence floor gate | pre-2026-05-18 | SUPERSEDED | demoted to informational in `88cb408`; FEF_USE_CONFIDENCE_FLOOR=false by default | commit `88cb408` |
+| Confidence floor gate — RE-ARMED, always-on (config_store floor, wall-collapse badge re-graded through formula) | 2026-07-08 | ACTIVE | 12k-fire registered study: HIGH +37.81/ct OOS vs LOW -14.84 (t=3.31), book -$142k->+$117k; wc badge unearned (-1.56/ct vs formula-HIGH +27.88); engine_change `confidence_floor_armed` | live |
 | 2-iter wall_collapse persistence | 2026-05-18 | DROPPED | `04ea21c` — 0/22 confluence today; logged then deprecated | commit `04ea21c` |
 | Direction filter (30m raw SPX, 3pt threshold) | 2026-05-21 | SHADOW | entry_dir_filter_then_baseline in registered variants | ablation 5/21, shadow 5/22 |
 | Direction filter (alt_direction_30m EMA stack) | 2026-05-21 | PROPOSED | research-only signal in extras (312 iters tagged) | loop.py commit `de91eb7` |

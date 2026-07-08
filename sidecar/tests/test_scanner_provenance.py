@@ -43,9 +43,22 @@ async def _db_fixture():
 
 
 @pytest.fixture(autouse=True)
-def _deterministic_config(monkeypatch: pytest.MonkeyPatch):
+def _deterministic_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Never read the live ~/.fef-terminal/config.json from tests. Floor
+    pinned LOW at the config_store source (auto_trader imports lazily) —
+    this suite's LOW-confidence verdicts test provenance, not the
+    2026-07-08 always-on confidence floor (test_confidence_floor.py owns
+    that). CONFIG_PATH also redirected: api.py bound the original
+    load_config at import, and /auto_trade/status now hot-reads the floor
+    through it."""
+    import fef_sidecar.config_store as cs
     from fef_sidecar.engine import pattern_trigger as pt
     monkeypatch.setattr(pt, "load_config", lambda: UIConfig())
+    monkeypatch.setattr(
+        cs, "load_config",
+        lambda: UIConfig(auto_trade_confidence_floor="LOW"),
+    )
+    monkeypatch.setattr(cs, "CONFIG_PATH", tmp_path / "config.json")
 
 
 @pytest.fixture(autouse=True)

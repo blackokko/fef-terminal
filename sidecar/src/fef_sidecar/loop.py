@@ -1249,6 +1249,9 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             "delta_price": verdict.delta_price,
             "delta_drift_m": verdict.delta_drift_m,
             "fe_ratio": verdict.fe_ratio,
+            # Bias at verdict time — the auto-trader's wall-collapse re-grade
+            # needs it to mirror fef.py's demotion exactly at gate time.
+            "drift_bias": inputs.drift_bias,
             "aligned": verdict.aligned,
             "absorption": verdict.absorption,
             "wall_proximity_skip": verdict.wall_proximity_skip,
@@ -1378,7 +1381,11 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     # Defensive: never let an auto-trade exception break the iter pipeline.
     try:
         from fef_sidecar.engine.auto_trader import maybe_auto_trade
-        decision = await maybe_auto_trade(state, event.verdict, source="auto_main")
+        decision = await maybe_auto_trade(
+            state, event.verdict, source="auto_main",
+            # Counterfactual gates (floor/cap) tag this iter's persisted row.
+            signal_iter_id=signal.id,
+        )
         state.auto_trade_last_block_reason = decision.reason
         if decision.fired and decision.order_result:
             logger.info("auto_trade fired: %s", decision.order_result)

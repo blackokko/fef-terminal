@@ -167,6 +167,52 @@ async def test_extra_summary_and_missing_premium() -> None:
     assert rows[0].details["stop_level"] == 7440.0
 
 
+async def test_entry_falls_back_to_quote_with_est_marker() -> None:
+    """2026-07-08 fix: no entry fill anywhere -> banked math runs against
+    the placement quote (limit_price) and the summary carries '(est)' so a
+    quote-based $ can never read as realized P&L."""
+    state = SimpleNamespace(ibkr=None)
+    p = _fake_parent(qty=3, entry=12.60)
+    p.avg_fill_price = None       # never synced
+    p.id = 999_777                # no such DB row -> re-read finds nothing
+
+    await _write_tier_fill_audit(state, p, "T1", _fake_result(1, 15.50, 907), "SPX 7491.20")
+
+    rows = await SignalIterRepository.query_audit_log(category="spx_watcher")
+    assert len(rows) == 1
+    s = rows[0].summary
+    assert "banked +$290 (est) this fill" in s
+    assert "(cum +$290 (est); position mark +$870 (est))" in s
+    assert rows[0].details["entry_price_source"] == "parent_limit"
+    assert rows[0].details["entry_price"] == pytest.approx(12.60)
+
+
+async def test_entry_rereads_actual_fill_from_db() -> None:
+    """The audit task's in-memory parent may predate the entry-fill sync —
+    the DB row's avg_fill_price wins over the placement quote, no '(est)'."""
+    saved = await SignalIterRepository.write_live_order(LiveOrder(
+        symbol="SPX", strike=7490.0, right="C", expiry="20260702",
+        action="BUY", qty=3, order_type="MKT", limit_price=12.60,
+        bracket_role="parent", status="FILLED", filled_qty=3,
+        avg_fill_price=12.35,  # ACTUAL average entry fill
+        exit_strategy="spx_points", dry_run=False,
+    ))
+    state = SimpleNamespace(ibkr=None)
+    p = _fake_parent(qty=3, entry=12.60)
+    p.id = saved.id
+    p.avg_fill_price = None       # stale in-memory copy
+
+    await _write_tier_fill_audit(state, p, "T1", _fake_result(1, 15.50, 908), "SPX 7491.20")
+
+    rows = await SignalIterRepository.query_audit_log(category="spx_watcher")
+    assert len(rows) == 1
+    # banked = (15.50 - 12.35) * 100 * 1 = +315 — vs +290 off the quote.
+    assert "banked +$315 this fill" in rows[0].summary
+    assert "(est)" not in rows[0].summary
+    assert rows[0].details["entry_price"] == pytest.approx(12.35)
+    assert rows[0].details["entry_price_source"] == "parent_fill_db"
+
+
 # ---------------------------------------------------------------------------
 # place_bracket source attribution
 # ---------------------------------------------------------------------------

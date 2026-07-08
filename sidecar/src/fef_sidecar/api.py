@@ -531,15 +531,26 @@ async def quote(request: Request, symbol: str) -> dict[str, Any]:
 @router.get("/auto_trade/status")
 async def auto_trade_status(request: Request) -> dict[str, Any]:
     s = _state(request)
+    from fef_sidecar.engine.auto_trader import _floor_kill_switch_active
     from fef_sidecar.engine.live_trading import is_live_trading_enabled
     import time as _t
     now_ms = int(_t.time() * 1000)
     elapsed = (now_ms - s.auto_trade_last_at_ms) / 1000 if s.auto_trade_last_at_ms else None
     cool_remaining = max(0, s.auto_trade_cool_down_sec - elapsed) if elapsed is not None else 0
+    # SOURCE OF TRUTH (2026-07-08): the floor the gate actually enforces is
+    # the config_store value — report THAT, never the display-legacy
+    # state.auto_trade_confidence_floor the panel toggle used to stomp.
+    try:
+        cfg_floor = load_config().auto_trade_confidence_floor
+    except Exception:
+        cfg_floor = "HIGH"  # gate fails restrictive the same way
     return {
         "enabled": s.auto_trade_enabled,
         "live_trading_env": is_live_trading_enabled(),
-        "confidence_floor": s.auto_trade_confidence_floor,
+        "confidence_floor": cfg_floor,
+        # False only under the FEF_DISABLE_CONFIDENCE_FLOOR kill switch
+        # (fail-open, audited once per session by the gate itself).
+        "floor_enforced": not _floor_kill_switch_active(),
         "cool_down_sec": s.auto_trade_cool_down_sec,
         "cool_down_remaining_sec": int(cool_remaining),
         "count_session": s.auto_trade_count_session,
@@ -702,8 +713,13 @@ async def auto_trade_runner_protect(request: Request, body: dict[str, Any] = Bod
 async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Turn auto-trade on/off + optionally update settings.
 
-    Body: {enabled: bool, confirm: bool, [confidence_floor], [cool_down_sec],
+    Body: {enabled: bool, confirm: bool, [cool_down_sec],
            [qty_override], [trigger_types]}
+
+    confidence_floor in the body is DEPRECATED and IGNORED (2026-07-08):
+    the panel's toggle stomped the in-memory floor 3+ times live. The
+    enforced floor lives in config_store — change it ONLY via POST /config
+    {"auto_trade_confidence_floor": ...} (persistent, hot-read by the gate).
 
     confirm=true required when enabling (defensive — prevent accidental
     enabling via a stale fetch or replay)."""
@@ -721,10 +737,28 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
             "Restart sidecar with FEF_LIVE_TRADING=true first."
         )
 
+    try:
+        cfg_floor = load_config().auto_trade_confidence_floor
+    except Exception:
+        cfg_floor = "HIGH"  # gate fails restrictive the same way
+
     old_enabled = s.auto_trade_enabled
     s.auto_trade_enabled = new_enabled
     if "confidence_floor" in body:
-        s.auto_trade_confidence_floor = str(body["confidence_floor"]).upper()
+        # IGNORED by design — see docstring. One deprecation audit line when
+        # the caller asked for something other than the enforced value, so a
+        # stale panel build that still sends the field is visible in the log.
+        requested_floor = str(body["confidence_floor"]).upper()
+        if requested_floor != cfg_floor:
+            await SignalIterRepository.write_audit_log(
+                category="confidence_floor", actor="user",
+                summary=(
+                    f"DEPRECATED: /auto_trade/toggle sent confidence_floor="
+                    f"{requested_floor} — IGNORED (enforced floor stays "
+                    f"{cfg_floor}; change it via POST /config)"
+                ),
+                details={"requested": requested_floor, "config_floor": cfg_floor},
+            )
     if "cool_down_sec" in body:
         s.auto_trade_cool_down_sec = max(60, int(body["cool_down_sec"]))
     if "qty_override" in body:
@@ -740,17 +774,18 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
     await SignalIterRepository.write_audit_log(
         category="auto_trade_toggle", actor="user",
         summary=f"Auto-trade {'ENABLED' if new_enabled else 'DISABLED'} "
-                f"(was {'on' if old_enabled else 'off'}) — floor={s.auto_trade_confidence_floor}, "
+                f"(was {'on' if old_enabled else 'off'}) — floor={cfg_floor} (config), "
                 f"cool_down={s.auto_trade_cool_down_sec}s, per_symbol_cap={s.auto_trade_max_per_symbol}",
         details={
-            "enabled": new_enabled, "confidence_floor": s.auto_trade_confidence_floor,
+            "enabled": new_enabled, "confidence_floor": cfg_floor,
             "cool_down_sec": s.auto_trade_cool_down_sec,
             "max_per_symbol": s.auto_trade_max_per_symbol,
         },
     )
     return {
         "ok": True, "enabled": s.auto_trade_enabled,
-        "confidence_floor": s.auto_trade_confidence_floor,
+        # The enforced (config_store) floor — the toggle can't change it.
+        "confidence_floor": cfg_floor,
         "cool_down_sec": s.auto_trade_cool_down_sec,
         "max_per_symbol": s.auto_trade_max_per_symbol,
     }
@@ -931,6 +966,10 @@ async def apply_auto_trade_preset(preset_id: int, request: Request) -> dict[str,
         if preset is None:
             raise HTTPException(404, f"AutoTradePreset {preset_id} not found")
 
+        # NOTE (2026-07-08): state.auto_trade_confidence_floor is DISPLAY-
+        # LEGACY — the armed floor gate reads config_store only, so a preset
+        # can no longer lower enforcement. To actually change the floor:
+        # POST /config {"auto_trade_confidence_floor": ...}.
         s.auto_trade_confidence_floor = preset.confidence_floor
         s.auto_trade_cool_down_sec = max(60, preset.cool_down_sec)
         s.auto_trade_qty_override = max(0, min(100, preset.qty_override))

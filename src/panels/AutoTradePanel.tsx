@@ -210,6 +210,23 @@ export function AutoTradePanel() {
     } catch {} finally { setBusy(false); }
   };
 
+  // Confidence floor is ENFORCED from config_store (2026-07-08) — the toggle
+  // endpoint IGNORES a floor in its body (that path stomped the in-memory
+  // value 3+ times live). Changes go through POST /config, the single
+  // persistent source of truth; /auto_trade/status reads it back.
+  const updateFloor = async (value: string) => {
+    setBusy(true);
+    if (selectedPresetId !== "") setSelectedPresetId("");
+    try {
+      await fetch(`${API_BASE}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ auto_trade_confidence_floor: value }),
+      });
+      await refresh();
+    } catch {} finally { setBusy(false); }
+  };
+
   if (!status) return (
     <section className="sidebar-section">
       <h3 className="sidebar-section-title">Auto-trade</h3>
@@ -325,14 +342,14 @@ export function AutoTradePanel() {
       <table className="auto-trade-settings">
         <tbody>
           <tr>
-            <td>Confidence floor <span className="muted small">(label only)</span></td>
+            <td>Confidence floor <span className="muted small">(enforced)</span></td>
             <td>
               <select
                 value={status.confidence_floor}
-                onChange={(e) => void updateSetting("confidence_floor", e.target.value)}
+                onChange={(e) => void updateFloor(e.target.value)}
                 disabled={busy}
                 className="settings-input"
-                title="Demoted to informational. The Trigger Types selection above is the actual auto-trade volume knob. Set FEF_USE_CONFIDENCE_FLOOR=true env to re-enable as a gate."
+                title="ARMED 2026-07-08 (12k-fire study: HIGH +37.81/ct OOS vs LOW -14.84). Every auto-trade fire must grade >= this floor; wall-collapse HIGH badges are re-graded through the formula. Persistent (config.json) and hot — survives restarts; the toggle can no longer change it."
               >
                 <option>HIGH</option>
                 <option>MEDIUM</option>

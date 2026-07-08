@@ -6,12 +6,16 @@ gate in order:
   1. auto_trade_enabled
   2. Live trading env (FEF_LIVE_TRADING=true)
   3. Verdict is actionable (LONG_CALLS or LONG_PUTS, not WAIT)
-  4. Confidence >= floor
+  4. Confidence >= floor (config_store.auto_trade_confidence_floor —
+     ALWAYS ON; wall-collapse badges are re-graded through the formula)
   5. Calendar pause window not active
   6. Cool-down elapsed since last auto fire
   7. Session fire-cap not exceeded
   8. Verdict has option_pricing (strike + premium + targets)
   9. Risk caps not breached (daily loss / max position)
+ 10. No duplicate active parent on the same contract
+ 11. Cross-symbol direction cap (no same-right watcher parent open on
+     another index-complex symbol)
 
 If ANY gate fails, returns a reason string (logged + exposed via
 state.auto_trade_last_block_reason). If ALL pass, calls
@@ -53,6 +57,11 @@ class BlockReason:
     PLACE_ERROR = "PLACE_ERROR"
     DUPLICATE_PARENT = "DUPLICATE_PARENT"
     PHASE_DISAGREE = "PHASE_DISAGREE"
+    # Confidence floor re-armed 2026-07-08 (counterfactual-tagged skips).
+    # BELOW_FLOOR above is the RETIRED env-gated code — kept so historical
+    # audit rows still resolve; new floor skips use this code.
+    CONFIDENCE_FLOOR_SKIP = "CONFIDENCE_FLOOR_SKIP"
+    CROSS_SYMBOL_CAP_SKIP = "CROSS_SYMBOL_CAP_SKIP"
     FIRED = "FIRED"
     # Non-auto-trader codes for other gate paths — used so all block-style
     # audit_log rows carry a structured tag for aggregation.
@@ -86,6 +95,165 @@ def _verdict_trigger_type(v: dict) -> str:
     return "other"
 
 
+# The index-complex the cross-symbol direction cap treats as ONE correlated
+# underlying (same-right entries across these are stacked exposure, not
+# diversification).
+_INDEX_COMPLEX_SYMBOLS = ("SPX", "SPY", "QQQ", "IWM")
+
+# Statuses that mark a watcher-managed parent as still OPEN — mirrors the
+# spx_target_watcher loop's own scan filter exactly (SUBMITTED/FILLED/PARTIAL;
+# DRY_RUN/STOPPED/CLOSED/... fall outside and never gate).
+_OPEN_PARENT_STATUSES = ("SUBMITTED", "FILLED", "PARTIAL")
+
+
+def _floor_kill_switch_active() -> bool:
+    """FEF_DISABLE_CONFIDENCE_FLOOR=true = the floor gate's ONLY off switch
+    (fail-open). There is deliberately no quiet enable/disable knob — the
+    floor is validated policy (12k-fire study: HIGH +37.81/ct OOS vs LOW
+    -14.84, t=3.31) and turning it off must be loud (audited once/session)."""
+    return os.environ.get("FEF_DISABLE_CONFIDENCE_FLOOR", "false").lower() in (
+        "true", "1", "yes",
+    )
+
+
+def _config_floor() -> str:
+    """Hot-read the enforced floor from config_store — the ONE source of
+    truth (state.auto_trade_confidence_floor is display-legacy; the panel
+    toggle used to stomp it in memory, observed 3+ times live). Fails
+    RESTRICTIVE (HIGH) so a corrupt config file can't silently open the
+    volume knob."""
+    try:
+        from fef_sidecar.config_store import load_config as _load_cfg
+        return str(_load_cfg().auto_trade_confidence_floor).upper()
+    except Exception:
+        logger.exception("confidence-floor config read failed — defaulting HIGH")
+        return "HIGH"
+
+
+async def _audit_floor_killswitch_once(state) -> None:
+    """Loud fail-open marker, once per session, when the kill-switch env has
+    the floor gate off. Session-keyed (not process-keyed) so a sidecar left
+    running overnight re-warns each trading day."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    try:
+        from fef_sidecar.engine.chop_gate import session_date_et
+        sess = session_date_et(int(time.time() * 1000))
+    except Exception:
+        sess = time.strftime("%Y-%m-%d")
+    if getattr(state, "_floor_killswitch_audited_session", None) == sess:
+        return
+    try:
+        state._floor_killswitch_audited_session = sess  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    logger.warning(
+        "CONFIDENCE FLOOR DISABLED via FEF_DISABLE_CONFIDENCE_FLOOR — "
+        "auto-trade is running WITHOUT the validated floor gate (fail-open)"
+    )
+    try:
+        await SignalIterRepository.write_audit_log(
+            category="confidence_floor", actor="system",
+            summary=(
+                "CONFIDENCE FLOOR DISABLED via FEF_DISABLE_CONFIDENCE_FLOOR — "
+                "gate is fail-open this session. The floor is validated policy "
+                "(12k-fire study: HIGH +37.81/ct OOS vs LOW -14.84, t=3.31); "
+                "unset the env to re-arm."
+            ),
+        )
+    except Exception:
+        logger.exception("floor kill-switch audit write failed")
+
+
+def _threshold_scale_for(state, sym: str, source: str) -> float:
+    """The threshold_scale of the engine that PRODUCED the verdict, so the
+    wall-collapse re-grade runs the formula at the verdict's own calibration.
+    Scanner verdicts come from per-symbol engines; everything else from the
+    main engine. Both are built by state._make_engine (same scale unless
+    FEF_SCAN_THRESHOLD_SCALE_SEC opts the scanner out)."""
+    eng = None
+    if source == "auto_scanner":
+        eng = (getattr(state, "scanner_engines", None) or {}).get(sym)
+    if eng is None:
+        eng = getattr(state, "engine", None)
+    try:
+        return float(getattr(eng, "_threshold_scale", 1.0) or 1.0)
+    except Exception:
+        return 1.0
+
+
+def _wall_collapse_regrade(
+    state, verdict_dict: dict, sym: str, source: str,
+) -> tuple[str, str | None]:
+    """Formula grade for a wall-collapse verdict, for the FLOOR decision.
+
+    fef.py stamps every wall-collapse fire confidence=HIGH, bypassing
+    _classify_confidence — a badge the studies show it does not earn
+    (wc fires -1.56/ct OOS vs formula-HIGH +27.88/ct). At gate time we
+    recompute what the ALIGNED formula would have graded this exact fire
+    (same delta_price/delta_drift_m/fe_ratio + the same bias demotion,
+    imported from fef.py — never copied) and gate on THAT.
+
+    Returns (grade, note). note is set when the recompute differs from the
+    stored badge (audit-noted by the caller). Missing recompute inputs
+    grade LOW — fail-restrictive, matching this module's design rule."""
+    from fef_sidecar.engine.fef import formula_confidence
+
+    stored = str(verdict_dict.get("confidence", "NONE")).upper()
+    dp = verdict_dict.get("delta_price")
+    dd = verdict_dict.get("delta_drift_m")
+    fe = verdict_dict.get("fe_ratio")
+    if any(v is None or not isinstance(v, (int, float)) for v in (dp, dd, fe)):
+        return "LOW", (
+            f"wall-collapse re-grade inputs missing "
+            f"(dp={dp!r}, dd={dd!r}, fe={fe!r}) -> LOW (fail-restrictive), "
+            f"stored badge {stored}"
+        )
+    grade = formula_confidence(
+        float(dp), float(dd), float(fe),
+        direction=verdict_dict.get("direction", "WAIT"),
+        drift_bias=verdict_dict.get("drift_bias"),
+        threshold_scale=_threshold_scale_for(state, sym, source),
+    ).value
+    note = (
+        f"wall-collapse badge re-graded: stored {stored} -> formula {grade}"
+        if grade != stored else None
+    )
+    return grade, note
+
+
+async def _tag_signal_skip(
+    signal_iter_id: int | None, skipped_by: str, suffix: str,
+) -> None:
+    """Counterfactual marker on the ALREADY-persisted signal row (callers
+    write the row before maybe_auto_trade): reasoning gets the human-visible
+    skip suffix, extras.skipped_by gets the machine tag — the same contract
+    the scanner gates (chop/bias/fomc/tod) follow, so the lookahead worker
+    scores floor/cap skips like any other withheld fire. Never raises."""
+    if signal_iter_id is None:
+        return
+    try:
+        from sqlmodel import select as _sm_select
+        from fef_sidecar.db.engine import get_session as _gs
+        from fef_sidecar.db.models import SignalIter as _SI
+        async with _gs() as session:
+            row = (await session.exec(
+                _sm_select(_SI).where(_SI.id == signal_iter_id)
+            )).first()
+            if row is None:
+                return
+            if suffix and suffix not in (row.reasoning or ""):
+                row.reasoning = f"{row.reasoning or ''} {suffix}".strip()
+            # Replace (never mutate) the JSON column — SQLAlchemy JSON does
+            # not change-track in-place mutation.
+            row.extras = {**(row.extras or {}), "skipped_by": skipped_by}
+            session.add(row)
+    except Exception:
+        logger.exception(
+            "counterfactual tag write failed for signal %s (%s)",
+            signal_iter_id, skipped_by,
+        )
+
+
 @dataclass(frozen=True)
 class AutoTradeDecision:
     fired: bool
@@ -96,7 +264,7 @@ class AutoTradeDecision:
 
 async def maybe_auto_trade(
     state, verdict_dict: dict, *, symbol: str | None = None,
-    source: str = "auto_main",
+    source: str = "auto_main", signal_iter_id: int | None = None,
 ) -> AutoTradeDecision:
     """Evaluate gates + maybe place a bracket order.
 
@@ -112,6 +280,12 @@ async def maybe_auto_trade(
     NOTE: cool-down + session caps are PER-SYMBOL and shared ACROSS sources —
     a pattern fire can be cool-down-blocked by a recent scanner fire on the
     same symbol (and vice versa). That is intentional risk throttling.
+
+    signal_iter_id: the caller's already-persisted SignalIter row for this
+    verdict. Counterfactual gates (confidence floor, cross-symbol cap) tag
+    that row (extras.skipped_by + reasoning suffix) when they block, so the
+    withheld fire stays scoreable in signal history. None = no tagging
+    (gates still block; only the row marker is skipped).
 
     Serialized per symbol via an asyncio.Lock: two near-simultaneous calls
     (e.g. scanner + tick-loop, or a scanner retry racing itself — the 7/1
@@ -134,11 +308,14 @@ async def maybe_auto_trade(
         state.auto_trade_symbol_locks = locks  # type: ignore[attr-defined]
     lock = locks.setdefault(sym, _asyncio.Lock())
     async with lock:
-        return await _maybe_auto_trade_locked(state, verdict_dict, sym, source)
+        return await _maybe_auto_trade_locked(
+            state, verdict_dict, sym, source, signal_iter_id,
+        )
 
 
 async def _maybe_auto_trade_locked(
     state, verdict_dict: dict, sym: str, source: str,
+    signal_iter_id: int | None = None,
 ) -> AutoTradeDecision:
 
     # Gate 2: live trading env
@@ -188,17 +365,90 @@ async def _maybe_auto_trade_locked(
             BlockReason.TRIGGER_NOT_ENABLED,
         )
 
-    # Gate 4: confidence floor — DEMOTED to informational. Confidence is still
-    # computed and stored on the verdict, but it no longer gates auto-trade.
-    # The above trigger-type gate is the actual volume knob. To re-enable
-    # confidence-floor gating, set FEF_USE_CONFIDENCE_FLOOR=true.
-    import os as _os
+    # Gate 4: confidence floor — RE-ARMED 2026-07-08, ALWAYS ON. The May
+    # demotion (env-gated FEF_USE_CONFIDENCE_FLOOR) reacted to a single-day
+    # HIGH/LOW inversion; the 12k-fire registered study reversed it decisively
+    # OOS: floor=HIGH +37.81/ct vs LOW -14.84/ct (t=3.31), book -$142k ->
+    # +$117k. The floor is read from config_store (persistent, hot) — NEVER
+    # state.auto_trade_confidence_floor, which the panel toggle stomped in
+    # memory 3+ times live. Only off switch: FEF_DISABLE_CONFIDENCE_FLOOR
+    # (fail-open kill switch, loud audit once per session).
+    #
+    # WALL-COLLAPSE EXCLUSION: wall-collapse verdicts carry a hardcoded HIGH
+    # badge that bypasses the formula (fef.py) and does not earn it (wc fires
+    # -1.56/ct OOS vs formula-HIGH +27.88/ct) — re-grade them through the
+    # exact ALIGNED formula (classify + bias demotion, imported from fef.py)
+    # and gate on the recomputed grade.
     conf = verdict_dict.get("confidence", "NONE")
-    if _os.environ.get("FEF_USE_CONFIDENCE_FLOOR", "false").lower() in ("true", "1", "yes"):
-        if _CONFIDENCE_RANK.get(conf, 0) < _CONFIDENCE_RANK.get(state.auto_trade_confidence_floor, 3):
-            return AutoTradeDecision(False,
-                f"{conf} below floor {state.auto_trade_confidence_floor}",
-                BlockReason.BELOW_FLOOR)
+    if _floor_kill_switch_active():
+        await _audit_floor_killswitch_once(state)
+    else:
+        floor = _config_floor()
+        effective_conf = str(conf).upper()
+        regrade_note: str | None = None
+        if verdict_dict.get("wall_collapse_trigger"):
+            effective_conf, regrade_note = _wall_collapse_regrade(
+                state, verdict_dict, sym, source,
+            )
+        if _CONFIDENCE_RANK.get(effective_conf, 0) < _CONFIDENCE_RANK.get(floor, 3):
+            # Counterfactual, same contract as the scanner gates: signal row
+            # stays in history tagged + suffixed, dedicated audit category,
+            # structured block code. No cooldown consumed, no budget spent
+            # (counters/timestamps only move on a successful fire).
+            suffix = f"[FLOOR SKIPPED: {effective_conf} < {floor}]"
+            await _tag_signal_skip(signal_iter_id, "confidence_floor", suffix)
+            summary = (
+                f"FLOOR SKIPPED {direction} {sym}: {effective_conf} < floor {floor}"
+                + (f" ({regrade_note})" if regrade_note else "")
+            )
+            try:
+                from fef_sidecar.db.repository import SignalIterRepository as _Repo_fl
+                await _Repo_fl.write_audit_log(
+                    category="confidence_floor", actor="system",
+                    summary=summary,
+                    details={
+                        "source": source,
+                        "symbol": sym,
+                        "direction": direction,
+                        "stored_confidence": conf,
+                        "effective_confidence": effective_conf,
+                        "floor": floor,
+                        "wall_collapse_regraded": bool(regrade_note),
+                        "strike_rec": verdict_dict.get("strike_rec"),
+                        "signal_iter_id": signal_iter_id,
+                    },
+                    block_reason_code=BlockReason.CONFIDENCE_FLOOR_SKIP,
+                )
+            except Exception:
+                logger.exception("confidence_floor audit write failed")
+            return AutoTradeDecision(
+                False,
+                f"{effective_conf} below floor {floor}"
+                + (" (wall-collapse re-graded)" if regrade_note else ""),
+                BlockReason.CONFIDENCE_FLOOR_SKIP,
+            )
+        if regrade_note:
+            # Passed the floor but the recomputed grade differs from the
+            # stored badge — audit-note the divergence (rare: wall-collapse
+            # fires only) so the badge inflation stays measurable.
+            try:
+                from fef_sidecar.db.repository import SignalIterRepository as _Repo_fl
+                await _Repo_fl.write_audit_log(
+                    category="confidence_floor", actor="system",
+                    summary=(
+                        f"WALL-COLLAPSE RE-GRADE (passed floor {floor}) "
+                        f"{direction} {sym}: {regrade_note}"
+                    ),
+                    details={
+                        "source": source, "symbol": sym, "direction": direction,
+                        "stored_confidence": conf,
+                        "effective_confidence": effective_conf,
+                        "floor": floor,
+                        "signal_iter_id": signal_iter_id,
+                    },
+                )
+            except Exception:
+                logger.exception("confidence_floor regrade-note write failed")
 
     # Gate 5: calendar pause window
     try:
@@ -428,6 +678,85 @@ async def _maybe_auto_trade_locked(
         # block trading on a query failure). The structural HARD-BLOCK in
         # spx_target_watcher still prevents the bad outcome.
         logger.exception("Auto-trade duplicate-parent guard failed; proceeding")
+
+    # CROSS-SYMBOL DIRECTION CAP (2026-07-08, user-approved OPERATIONAL RISK
+    # RULE): refuse to open a same-right position while a watcher-managed
+    # parent (SUBMITTED/FILLED/PARTIAL) is open on a DIFFERENT index-complex
+    # symbol {SPX,SPY,QQQ,IWM} — SPX C + QQQ C is one correlated underlying
+    # trade at double size, not two trades. Evidence is anecdote-grade
+    # (+$1,380 across 2 sessions): shipped as EXPOSURE DISCIPLINE, not edge —
+    # the counterfactual rows grade it in production like the scanner gates.
+    # DORMANT when only SPX is enabled: same-symbol stacking stays governed
+    # by the per-symbol cooldown/cap + the duplicate-parent guard above.
+    # Runs LAST (after every other gate) so its counterfactual population is
+    # exactly "fires that would otherwise have placed". Hot-read config flag;
+    # fail-open on query error (same rationale as the duplicate guard).
+    try:
+        from fef_sidecar.config_store import load_config as _load_cfg_cap
+        _cap_enabled = bool(_load_cfg_cap().cross_symbol_cap_enabled)
+    except Exception:
+        logger.exception("cross_symbol_cap config read failed — defaulting ON")
+        _cap_enabled = True
+    if _cap_enabled:
+        try:
+            from sqlmodel import select as _sm_select_cap
+            from fef_sidecar.db.engine import get_session as _gs_cap
+            from fef_sidecar.db.models import LiveOrder as _LO_cap
+            from fef_sidecar.db.repository import SignalIterRepository as _Repo_cap
+
+            _right_cap = "C" if direction == "LONG_CALLS" else "P"
+            _other_syms = [s for s in _INDEX_COMPLEX_SYMBOLS if s != sym]
+            async with _gs_cap() as _session_cap:
+                _open_cap = (await _session_cap.exec(
+                    _sm_select_cap(_LO_cap)
+                    .where(_LO_cap.bracket_role == "parent")
+                    .where(_LO_cap.exit_strategy.in_(("spx_points", "fixed_dollar")))
+                    .where(_LO_cap.status.in_(_OPEN_PARENT_STATUSES))
+                    .where(_LO_cap.right == _right_cap)
+                    .where(_LO_cap.symbol.in_(_other_syms))
+                )).first()
+            if _open_cap is not None:
+                suffix = (
+                    f"[CROSS-SYMBOL CAP SKIPPED: {_open_cap.symbol} "
+                    f"{_open_cap.strike:.0f}{_open_cap.right} open]"
+                )
+                await _tag_signal_skip(signal_iter_id, "cross_symbol_cap", suffix)
+                try:
+                    await _Repo_cap.write_audit_log(
+                        category="cross_symbol_cap", actor="system",
+                        summary=(
+                            f"CROSS-SYMBOL CAP SKIPPED {direction} {sym}: "
+                            f"same-right parent open on {_open_cap.symbol} "
+                            f"{_open_cap.strike:.0f}{_open_cap.right} "
+                            f"(parent_id={_open_cap.id}, status={_open_cap.status})"
+                        ),
+                        details={
+                            "source": source,
+                            "symbol": sym,
+                            "direction": direction,
+                            "right": _right_cap,
+                            "open_parent_id": _open_cap.id,
+                            "open_parent_symbol": _open_cap.symbol,
+                            "open_parent_strike": _open_cap.strike,
+                            "open_parent_status": _open_cap.status,
+                            "strike_rec": verdict_dict.get("strike_rec"),
+                            "signal_iter_id": signal_iter_id,
+                        },
+                        block_reason_code=BlockReason.CROSS_SYMBOL_CAP_SKIP,
+                    )
+                except Exception:
+                    logger.exception("cross_symbol_cap audit write failed")
+                # No cooldown consumed, no budget spent — counters move only
+                # on a successful fire.
+                return AutoTradeDecision(
+                    False,
+                    f"cross-symbol cap: {_open_cap.symbol} "
+                    f"{_open_cap.strike:.0f}{_open_cap.right} open "
+                    f"(id={_open_cap.id})",
+                    BlockReason.CROSS_SYMBOL_CAP_SKIP,
+                )
+        except Exception:
+            logger.exception("Cross-symbol cap check failed; proceeding")
 
     try:
         result = await place_bracket(
