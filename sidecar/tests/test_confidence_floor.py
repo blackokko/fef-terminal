@@ -75,7 +75,9 @@ def _restore_mock_coherent_env():
 def _patch_floor(monkeypatch: pytest.MonkeyPatch, floor: str = "HIGH",
                  cap_enabled: bool = True) -> None:
     """Pin the config at the config_store SOURCE — auto_trader's in-function
-    import resolves it at call time (never reads ~/.fef-terminal live)."""
+    import resolves it at call time (never reads ~/.fef-terminal live). The
+    F1 corruption probe is pinned 'ok' here; the corruption tests exercise
+    the real probe against a redirected CONFIG_PATH instead."""
     import fef_sidecar.config_store as cs
     monkeypatch.setattr(
         cs, "load_config",
@@ -84,6 +86,7 @@ def _patch_floor(monkeypatch: pytest.MonkeyPatch, floor: str = "HIGH",
             cross_symbol_cap_enabled=cap_enabled,
         ),
     )
+    monkeypatch.setattr(cs, "config_file_status", lambda: "ok")
 
 
 def _state(**kw) -> SimpleNamespace:
@@ -226,6 +229,72 @@ async def test_floor_config_read_failure_fails_restrictive(
     d = await maybe_auto_trade(_state(), _verdict("MEDIUM"))
     assert d.reason_code == BlockReason.CONFIDENCE_FLOOR_SKIP
     assert "below floor HIGH" in d.reason
+
+
+async def test_corrupt_config_enforces_high_with_one_audit_per_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """F1: config.json EXISTS but is invalid -> load_config() silently
+    defaults, so the gate enforces HIGH — and now SAYS so: exactly one
+    'CONFIG UNREADABLE' audit row per session (plus the normal skip rows)."""
+    import fef_sidecar.config_store as cs
+    cfg = tmp_path / "config.json"
+    cfg.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setattr(cs, "CONFIG_PATH", cfg)  # REAL load_config + probe
+
+    state = _state()
+    d1 = await maybe_auto_trade(state, _verdict("MEDIUM"))
+    d2 = await maybe_auto_trade(state, _verdict("MEDIUM"))
+    assert d1.reason_code == BlockReason.CONFIDENCE_FLOOR_SKIP
+    assert "below floor HIGH" in d1.reason
+    assert d2.reason_code == BlockReason.CONFIDENCE_FLOOR_SKIP
+
+    unreadable = [r for r in await _floor_audit_rows()
+                  if "CONFIG UNREADABLE" in r.summary]
+    assert len(unreadable) == 1  # loud, but once per session
+
+
+async def test_valid_json_invalid_value_also_audited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """F1: parseable JSON with an out-of-domain floor is the same outage
+    class — validation fails, defaults enforced, audited."""
+    import fef_sidecar.config_store as cs
+    cfg = tmp_path / "config.json"
+    cfg.write_text('{"auto_trade_confidence_floor": "SUPER"}', encoding="utf-8")
+    monkeypatch.setattr(cs, "CONFIG_PATH", cfg)
+
+    d = await maybe_auto_trade(_state(), _verdict("MEDIUM"))
+    assert d.reason_code == BlockReason.CONFIDENCE_FLOOR_SKIP  # default HIGH
+    assert len([r for r in await _floor_audit_rows()
+                if "CONFIG UNREADABLE" in r.summary]) == 1
+
+
+async def test_missing_config_defaults_quietly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """F1 counterpart: a MISSING file is a fresh install — default HIGH is
+    legitimate and must NOT raise the outage alarm."""
+    import fef_sidecar.config_store as cs
+    monkeypatch.setattr(cs, "CONFIG_PATH", tmp_path / "config.json")  # absent
+
+    d = await maybe_auto_trade(_state(), _verdict("MEDIUM"))
+    assert d.reason_code == BlockReason.CONFIDENCE_FLOOR_SKIP  # default HIGH
+    assert [r for r in await _floor_audit_rows()
+            if "CONFIG UNREADABLE" in r.summary] == []
+
+
+def test_config_file_status_probe(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    import fef_sidecar.config_store as cs
+    p = tmp_path / "config.json"
+    monkeypatch.setattr(cs, "CONFIG_PATH", p)
+    assert cs.config_file_status() == "missing"
+    p.write_text("{broken", encoding="utf-8")
+    assert cs.config_file_status() == "invalid"
+    p.write_text('{"auto_trade_confidence_floor": "SUPER"}', encoding="utf-8")
+    assert cs.config_file_status() == "invalid"  # parses, fails validation
+    save_config(UIConfig())
+    assert cs.config_file_status() == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +680,77 @@ async def test_status_reports_config_floor_and_enforcement(
     monkeypatch.setenv("FEF_DISABLE_CONFIDENCE_FLOOR", "true")
     out2 = await auto_trade_status(_fake_request(state))
     assert out2["floor_enforced"] is False
+
+
+async def test_config_post_writes_changed_keys_audit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """F4: POST /config is the canonical floor-change path — every effective
+    change writes one 'config' audit row listing key: old -> new; a no-op
+    POST writes nothing."""
+    import fef_sidecar.config_store as cs
+    monkeypatch.setattr(cs, "CONFIG_PATH", tmp_path / "config.json")
+    from fef_sidecar.api import update_config
+    from fef_sidecar.state import AppState
+
+    state = AppState.build()
+    await update_config(
+        _fake_request(state),
+        updates={"auto_trade_confidence_floor": "MEDIUM",
+                 "cross_symbol_cap_enabled": False},
+    )
+    rows = await SignalIterRepository.query_audit_log(category="config")
+    assert len(rows) == 1
+    assert "auto_trade_confidence_floor: HIGH -> MEDIUM" in rows[0].summary
+    assert "cross_symbol_cap_enabled: True -> False" in rows[0].summary
+    assert rows[0].details["changed"]["auto_trade_confidence_floor"] == {
+        "old": "HIGH", "new": "MEDIUM",
+    }
+
+    # No-op re-POST of the same value -> no new row.
+    await update_config(
+        _fake_request(state), updates={"auto_trade_confidence_floor": "MEDIUM"},
+    )
+    assert len(await SignalIterRepository.query_audit_log(category="config")) == 1
+
+
+async def test_preset_apply_echoes_config_floor_and_logs_deprecation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """F3: applying a preset whose floor differs from config echoes the
+    ENFORCED (config) floor in the response and logs the same deprecation
+    line the toggle uses — display/enforcement divergence is visible."""
+    import fef_sidecar.config_store as cs
+    monkeypatch.setattr(cs, "CONFIG_PATH", tmp_path / "config.json")  # HIGH
+    from fef_sidecar.api import apply_auto_trade_preset, create_auto_trade_preset
+    from fef_sidecar.state import AppState
+
+    made = await create_auto_trade_preset(body={
+        "name": "aggr-test", "confidence_floor": "MEDIUM",
+        "cool_down_sec": 180, "trigger_types": ["confluence"],
+        "qty_override": 5, "runner_protect_enabled": True,
+    })
+    state = AppState.build()
+    out = await apply_auto_trade_preset(made["preset_id"], _fake_request(state))
+
+    # Response reports the ENFORCED floor, not the preset's.
+    assert out["settings"]["confidence_floor"] == "HIGH"
+    # Legacy display field still mirrors the preset (harmless, documented).
+    assert state.auto_trade_confidence_floor == "MEDIUM"
+    dep = [r for r in await _floor_audit_rows() if "DEPRECATED" in r.summary]
+    assert len(dep) == 1
+    assert dep[0].details == {
+        "preset_id": made["preset_id"], "requested": "MEDIUM",
+        "config_floor": "HIGH",
+    }
+
+    # Preset floor == config floor -> no deprecation noise.
+    made2 = await create_auto_trade_preset(body={
+        "name": "match-test", "confidence_floor": "HIGH",
+    })
+    await apply_auto_trade_preset(made2["preset_id"], _fake_request(state))
+    assert len([r for r in await _floor_audit_rows()
+                if "DEPRECATED" in r.summary]) == 1
 
 
 # ---------------------------------------------------------------------------

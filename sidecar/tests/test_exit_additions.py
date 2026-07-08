@@ -71,6 +71,7 @@ def _deterministic_config(monkeypatch: pytest.MonkeyPatch):
         cs, "load_config",
         lambda: UIConfig(auto_trade_confidence_floor="LOW"),
     )
+    monkeypatch.setattr(cs, "config_file_status", lambda: "ok")
 
 
 @pytest.fixture(autouse=True)

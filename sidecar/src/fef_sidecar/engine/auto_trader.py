@@ -116,18 +116,70 @@ def _floor_kill_switch_active() -> bool:
     )
 
 
-def _config_floor() -> str:
+async def _config_floor(state) -> str:
     """Hot-read the enforced floor from config_store — the ONE source of
     truth (state.auto_trade_confidence_floor is display-legacy; the panel
     toggle used to stomp it in memory, observed 3+ times live). Fails
     RESTRICTIVE (HIGH) so a corrupt config file can't silently open the
-    volume knob."""
+    volume knob.
+
+    OUTAGE TRACE (2026-07-08 review F1): load_config() swallows an
+    exists-but-invalid config.json into silent defaults — the gate would
+    enforce HIGH forever with zero trace, and /auto_trade/status reads
+    through the same silent default, so the outage is indistinguishable
+    from a deliberate setting. Probe the FILE separately
+    (config_file_status) and on exists-but-invalid say so LOUDLY once per
+    session (audit + error log). A missing file (fresh install) stays
+    quiet — that default is legitimate."""
+    from fef_sidecar import config_store as _cs
     try:
-        from fef_sidecar.config_store import load_config as _load_cfg
-        return str(_load_cfg().auto_trade_confidence_floor).upper()
+        floor = str(_cs.load_config().auto_trade_confidence_floor).upper()
     except Exception:
         logger.exception("confidence-floor config read failed — defaulting HIGH")
         return "HIGH"
+    try:
+        status = _cs.config_file_status()
+    except Exception:
+        status = "ok"  # probe failure must never affect the read path
+    if status == "invalid":
+        await _audit_floor_config_invalid_once(state)
+    return floor
+
+
+async def _audit_floor_config_invalid_once(state) -> None:
+    """One loud row per session when config.json EXISTS but cannot be
+    parsed/validated — the enforced floor is the DEFAULT (HIGH), not an
+    operator setting, and that distinction must be visible in the log
+    (review F1). Session-keyed like the kill-switch marker."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    try:
+        from fef_sidecar.engine.chop_gate import session_date_et
+        sess = session_date_et(int(time.time() * 1000))
+    except Exception:
+        sess = time.strftime("%Y-%m-%d")
+    if getattr(state, "_floor_config_invalid_audited_session", None) == sess:
+        return
+    try:
+        state._floor_config_invalid_audited_session = sess  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    logger.error(
+        "CONFIG UNREADABLE: config.json exists but fails to parse/validate — "
+        "confidence floor enforcing default HIGH (NOT an operator setting). "
+        "Fix or delete the file."
+    )
+    try:
+        await SignalIterRepository.write_audit_log(
+            category="confidence_floor", actor="system",
+            summary=(
+                "CONFIG UNREADABLE — config.json exists but fails to parse/"
+                "validate; enforcing default floor HIGH (NOT an operator "
+                "setting; /auto_trade/status shows the same silent default). "
+                "Fix or delete the file to clear this."
+            ),
+        )
+    except Exception:
+        logger.exception("floor config-invalid audit write failed")
 
 
 async def _audit_floor_killswitch_once(state) -> None:
@@ -383,7 +435,7 @@ async def _maybe_auto_trade_locked(
     if _floor_kill_switch_active():
         await _audit_floor_killswitch_once(state)
     else:
-        floor = _config_floor()
+        floor = await _config_floor(state)
         effective_conf = str(conf).upper()
         regrade_note: str | None = None
         if verdict_dict.get("wall_collapse_trigger"):

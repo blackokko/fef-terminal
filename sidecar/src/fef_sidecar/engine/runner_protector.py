@@ -26,6 +26,31 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _legacy_rp_parents(all_orders) -> list:
+    """Parents this LEGACY bid-retrace protector may manage: option_price
+    BRACKET parents only.
+
+    STRUCTURAL EXCLUSION (2026-07-08 review F2): watcher-managed strategies
+    (spx_points / fixed_dollar) must never enter this loop. The watcher
+    writes its t1/t2/t3 market sells as CHILD rows with status=SUBMITTED /
+    filled_qty=0, so a t1-banked watcher parent with open runners looks to
+    this loop exactly like a bracket with a filled T1 and resting T2/T3 —
+    on a bid <= t1_fill sample it would "cancel" the already-filled sells
+    (no-op) and place a SECOND market sell through bare safe_market_sell,
+    with NO lifetime-cap protection: the 2026-07-06 oversell class. The
+    7/8 runner-protect fix makes t1-banked/runners-open the NORMAL
+    multi-hour state, so this exposure had to be closed structurally. The
+    watcher runs its own plan-anchored runner-protect for those parents.
+    A NULL exit_strategy (old/manual bracket rows) stays managed here —
+    legacy behavior."""
+    return [
+        o for o in all_orders
+        if o.bracket_role == "parent" and not o.dry_run
+        and o.status not in ("CANCELLED", "REJECTED", "CLOSED")
+        and getattr(o, "exit_strategy", None) not in ("spx_points", "fixed_dollar")
+    ]
+
+
 async def runner_protector_loop(state) -> None:
     """Poll filled brackets; exit runners on T1-retrace."""
     from fef_sidecar.db.models import LiveOrder
@@ -53,11 +78,11 @@ async def runner_protector_loop(state) -> None:
                 await asyncio.sleep(interval)
                 continue
 
-            # Pull all parent orders that have been submitted (not dry_run)
+            # Pull all parent orders that have been submitted (not dry_run).
+            # Watcher-managed parents (spx_points/fixed_dollar) are
+            # structurally excluded — see _legacy_rp_parents (review F2).
             all_orders = await SignalIterRepository.query_live_orders(limit=200)
-            parents = [o for o in all_orders
-                       if o.bracket_role == "parent" and not o.dry_run
-                       and o.status not in ("CANCELLED", "REJECTED", "CLOSED")]
+            parents = _legacy_rp_parents(all_orders)
             for p in parents:
                 if p.id in tracked and tracked[p.id].get("exited"):
                     continue

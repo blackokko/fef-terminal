@@ -151,6 +151,25 @@ def load_config() -> UIConfig:
         return UIConfig()
 
 
+def config_file_status() -> str:
+    """'missing' | 'invalid' | 'ok' — the trace load_config() swallows.
+
+    load_config() silently returns defaults for BOTH a fresh install
+    (legitimate) and a corrupt/truncated file (a config OUTAGE that silently
+    changes enforced policy — 2026-07-08 review F1: a corrupt config.json
+    would enforce the default HIGH floor forever with zero trace,
+    indistinguishable from a deliberate setting). Consumers that enforce
+    policy from config (the confidence-floor gate) probe this so
+    exists-but-invalid gets AUDITED while missing stays quiet."""
+    if not CONFIG_PATH.exists():
+        return "missing"
+    try:
+        UIConfig.model_validate(json.loads(CONFIG_PATH.read_text()))
+        return "ok"
+    except Exception:
+        return "invalid"
+
+
 def save_config(cfg: UIConfig) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(cfg.model_dump_json(indent=2), encoding="utf-8")

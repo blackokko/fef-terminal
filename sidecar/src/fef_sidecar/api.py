@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -11,6 +12,12 @@ from fastapi import Body
 from fef_sidecar.config_store import UIConfig, load_config, save_config
 from fef_sidecar.db import SignalIterRepository
 from fef_sidecar.loop import _run_one_iter
+
+# NOTE (2026-07-08): this binding was MISSING while six handlers already
+# called logger.exception(...) in their error paths — each was a latent
+# NameError that would replace the real error. Defining it fixes all of
+# them plus the F4 config-change audit's failure path.
+logger = logging.getLogger(__name__)
 from fef_sidecar.state import AppState
 
 router = APIRouter()
@@ -969,7 +976,10 @@ async def apply_auto_trade_preset(preset_id: int, request: Request) -> dict[str,
         # NOTE (2026-07-08): state.auto_trade_confidence_floor is DISPLAY-
         # LEGACY — the armed floor gate reads config_store only, so a preset
         # can no longer lower enforcement. To actually change the floor:
-        # POST /config {"auto_trade_confidence_floor": ...}.
+        # POST /config {"auto_trade_confidence_floor": ...}. Review F3: the
+        # response echoes the ENFORCED (config) floor, and a preset carrying
+        # a different floor logs the same deprecation line as the toggle so
+        # the display/enforcement divergence is visible in the audit log.
         s.auto_trade_confidence_floor = preset.confidence_floor
         s.auto_trade_cool_down_sec = max(60, preset.cool_down_sec)
         s.auto_trade_qty_override = max(0, min(100, preset.qty_override))
@@ -978,6 +988,23 @@ async def apply_auto_trade_preset(preset_id: int, request: Request) -> dict[str,
         types = [t for t in preset.trigger_types if t in valid_triggers]
         s.auto_trade_trigger_types = types if types else ["confluence"]
         s.runner_protect_enabled = bool(preset.runner_protect_enabled)
+
+        try:
+            cfg_floor = load_config().auto_trade_confidence_floor
+        except Exception:
+            cfg_floor = "HIGH"  # gate fails restrictive the same way
+        preset_floor = str(preset.confidence_floor or "").upper()
+        if preset_floor and preset_floor != cfg_floor:
+            await SignalIterRepository.write_audit_log(
+                category="confidence_floor", actor="user",
+                summary=(
+                    f"DEPRECATED: preset '{preset.name}' carries confidence_floor="
+                    f"{preset_floor} — IGNORED for enforcement (config floor stays "
+                    f"{cfg_floor}; change it via POST /config)"
+                ),
+                details={"preset_id": preset_id, "requested": preset_floor,
+                         "config_floor": cfg_floor},
+            )
 
         await SignalIterRepository.write_audit_log(
             category="auto_trade_preset_apply", actor="user",
@@ -995,7 +1022,8 @@ async def apply_auto_trade_preset(preset_id: int, request: Request) -> dict[str,
             "ok": True,
             "applied": preset.name,
             "settings": {
-                "confidence_floor": s.auto_trade_confidence_floor,
+                # The ENFORCED (config_store) floor — presets can't change it.
+                "confidence_floor": cfg_floor,
                 "cool_down_sec": s.auto_trade_cool_down_sec,
                 "trigger_types": s.auto_trade_trigger_types,
                 "qty_override": s.auto_trade_qty_override,
@@ -4724,6 +4752,31 @@ async def update_config(
     current = load_config()
     merged = UIConfig.model_validate(current.model_dump() | updates)
     save_config(merged)
+
+    # AUDIT TRAIL (2026-07-08 review F4): POST /config is now the canonical
+    # change path for ENFORCED policy (auto_trade_confidence_floor,
+    # cross_symbol_cap_enabled) — every effective change writes one audit
+    # row listing key: old -> new. Generic across all keys (cheap, and the
+    # other gates' knobs deserve the same trace). Never blocks the save.
+    try:
+        before = current.model_dump()
+        after = merged.model_dump()
+        changed = {
+            k: {"old": before.get(k), "new": after.get(k)}
+            for k in updates
+            if before.get(k) != after.get(k)
+        }
+        if changed:
+            from fef_sidecar.db.repository import SignalIterRepository
+            await SignalIterRepository.write_audit_log(
+                category="config", actor="user",
+                summary="CONFIG CHANGED: " + "; ".join(
+                    f"{k}: {v['old']} -> {v['new']}" for k, v in sorted(changed.items())
+                ),
+                details={"changed": changed},
+            )
+    except Exception:
+        logger.exception("config-change audit write failed (config saved)")
 
     # Hot-reload engine thresholds (those that don't require restart)
     s.engine._wall_proximity_pts = merged.wall_proximity_pts  # type: ignore[attr-defined]

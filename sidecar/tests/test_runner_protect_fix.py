@@ -285,6 +285,50 @@ async def test_rp_disabled_leaves_runners(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# F2 — legacy runner_protector must never manage watcher parents
+# ---------------------------------------------------------------------------
+
+
+async def test_legacy_rp_scan_excludes_watcher_parents() -> None:
+    """Review F2: the watcher's t1/t2/t3 market-sell CHILDREN are written
+    status=SUBMITTED/filled_qty=0, so a t1-banked spx_points parent with
+    open runners masquerades as a bracket with a filled T1 + resting
+    runners — the legacy bid-retrace loop would place a SECOND uncapped
+    market sell on top of the watcher's own RP. Structural exclusion: the
+    legacy scan only ever sees option_price (or legacy NULL-strategy)
+    bracket parents."""
+    from fef_sidecar.engine.runner_protector import _legacy_rp_parents
+
+    # The exact 7/8-fix steady state: T1 banked, runners open, PARTIAL.
+    watcher_p = await _insert_call_parent(
+        status="PARTIAL", spx_target_t1_fired=True, spx_target_t1_at_spx=7455.0,
+    )
+    await SignalIterRepository.write_watcher_sell_child(
+        parent=await _db_parent(watcher_p.id), bracket_role="t1", qty=1,
+        ib_order_id=5001, notes="watcher_close@SPX 7455.00",
+    )
+    fd_p = await _insert_call_parent(exit_strategy="fixed_dollar", strike=7460.0)
+    legacy_p = await _insert_call_parent(exit_strategy="option_price", strike=7470.0)
+    null_p = await _insert_call_parent(exit_strategy=None, strike=7480.0)
+    closed_p = await _insert_call_parent(
+        exit_strategy="option_price", strike=7500.0, status="CLOSED",
+    )
+    dry_p = await _insert_call_parent(
+        exit_strategy="option_price", strike=7510.0, dry_run=True,
+    )
+
+    rows = await SignalIterRepository.query_live_orders(limit=200)
+    managed_ids = {o.id for o in _legacy_rp_parents(rows)}
+
+    assert watcher_p.id not in managed_ids   # spx_points -> invisible
+    assert fd_p.id not in managed_ids        # fixed_dollar -> invisible
+    assert legacy_p.id in managed_ids        # option_price bracket -> managed
+    assert null_p.id in managed_ids          # legacy NULL strategy -> managed
+    assert closed_p.id not in managed_ids    # resolved -> out
+    assert dry_p.id not in managed_ids       # dry-run -> out
+
+
+# ---------------------------------------------------------------------------
 # Shadow alignment — the lowvix shrink walker runs the identical semantics
 # ---------------------------------------------------------------------------
 
