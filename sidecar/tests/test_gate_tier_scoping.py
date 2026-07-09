@@ -83,6 +83,15 @@ def _restore_mock_coherent_env():
         os.environ["FEF_MOCK_COHERENT"] = before
 
 
+@pytest.fixture(autouse=True)
+def _no_kill_switch(monkeypatch: pytest.MonkeyPatch):
+    """The MAJOR-2 floor coupling makes high_bypass require the floor ARMED
+    (FEF_DISABLE_CONFIDENCE_FLOOR unset). Pin a clean baseline so a stray
+    kill-switch from another module can't silently disable the bypass under
+    test; the MAJOR-2 case sets it back on explicitly."""
+    monkeypatch.delenv("FEF_DISABLE_CONFIDENCE_FLOOR", raising=False)
+
+
 def _pin_clock(monkeypatch: pytest.MonkeyPatch, date_str: str, hh: int, mm: int) -> None:
     monkeypatch.setattr(
         mss, "_now_et_parts", lambda now_ms=None: (date_str, hh * 60 + mm),
@@ -443,3 +452,129 @@ async def test_high_fire_clear_tape_no_bypass_tag(
     assert "high_bypassed_gate" not in row.extras
     assert "[HIGH-BYPASS" not in row.reasoning
     assert row.extras["high_bypass_enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# 6. Adversarial-review fixes (2026-07-09): tag corruption (MAJOR-1), floor
+#    coupling (MAJOR-2), fail-restrictive config read (MINOR).
+# ---------------------------------------------------------------------------
+
+
+async def test_wall_collapse_bypass_then_floor_block_sets_no_bypass_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MAJOR-1 (negative): a wall-collapse HIGH badge on compressed tape BYPASSES
+    chop (raw HIGH), reaches maybe_auto_trade, but the floor re-grades the badge
+    (missing regrade inputs => LOW, fail-restrictive) and BLOCKS it. The row must
+    carry skipped_by='confidence_floor' and NO high_bypassed_gate - the bypass
+    tag marks only fires that actually TRADED, so it never co-occurs with a floor
+    skip merged onto the same row."""
+    import fef_sidecar.config_store as cs
+    state = _armed_state(monkeypatch)
+    # Floor ARMED at HIGH so the re-graded LOW badge is blocked.
+    monkeypatch.setattr(cs, "load_config", lambda: UIConfig(auto_trade_confidence_floor="HIGH"))
+    monkeypatch.setattr(cs, "config_file_status", lambda: "ok")
+    _patch_assess(monkeypatch, _compressed_assessment())
+    _pin_clock(monkeypatch, CLEAR_DAY, 10, 30)
+    calls = _record_auto_trades(monkeypatch)
+
+    verdict = {
+        "direction": "LONG_CALLS",
+        "confidence": "HIGH",                 # hardcoded wall-collapse badge
+        "reasoning": "WALL COLLAPSE LONG_CALLS - 7440C wall thinned.",
+        "strike_rec": 625.0,
+        "t1": 635.0, "t2": 645.0, "t3": 670.0, "stop": 610.0,
+        "aligned": True,
+        "wall_collapse_trigger": True,        # => 'confluence' trigger + floor re-grade
+        "option_pricing": _option_pricing(),
+        "suggested_qty": 5,
+        # NO delta_price / delta_drift_m / fe_ratio => re-grade LOW (fail-restrictive)
+    }
+
+    await handle_actionable_scanner_verdict(state, "SPY", spot=620.0, verdict_dict=verdict)
+
+    assert len(calls) == 1                         # bypassed chop -> reached the floor
+    assert state.auto_trade_count_by_symbol == {}  # floor blocked -> did NOT trade
+    row = await _last_signal()
+    assert row.extras["skipped_by"] == "confidence_floor"
+    assert "high_bypassed_gate" not in row.extras  # <- the MAJOR-1 fix
+    assert "[FLOOR SKIPPED" in row.reasoning
+    assert "[HIGH-BYPASS" not in row.reasoning
+    assert len(await SignalIterRepository.query_audit_log(category="confidence_floor")) >= 1
+    assert await SignalIterRepository.query_audit_log(category="chop_gate") == []
+
+
+async def test_traded_bypass_sets_tag_and_no_skipped_by(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MAJOR-1 (positive): a HIGH fire that bypasses chop AND actually TRADES
+    carries high_bypassed_gate='chop' with NO skipped_by - the clean
+    'bypassed a gate AND traded' population the grading counts. The tag is
+    written post-fire, proving the timing move did not drop it."""
+    state = _armed_state(monkeypatch)
+    _patch_assess(monkeypatch, _compressed_assessment())
+    _pin_clock(monkeypatch, CLEAR_DAY, 10, 30)
+    calls = _record_auto_trades(monkeypatch)
+
+    await handle_actionable_scanner_verdict(
+        state, "SPY", spot=620.0, verdict_dict=_verdict(confidence="HIGH"),
+    )
+
+    assert len(calls) == 1
+    assert state.auto_trade_count_by_symbol == {"SPY": 1}   # traded
+    row = await _last_signal()
+    assert row.extras["high_bypassed_gate"] == "chop"
+    assert "skipped_by" not in row.extras
+    assert "[HIGH-BYPASS chop]" in row.reasoning
+
+
+async def test_kill_switch_disables_bypass_high_fire_chop_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MAJOR-2: with the floor kill-switch ON (FEF_DISABLE_CONFIDENCE_FLOOR),
+    the floor can't catch the regrade gap, so the bypass must be OFF - a HIGH
+    fire on compressed tape is chop-blocked (all tiers), never reaching the
+    (disabled) floor."""
+    monkeypatch.setenv("FEF_DISABLE_CONFIDENCE_FLOOR", "true")
+    state = _armed_state(monkeypatch)
+    _patch_assess(monkeypatch, _compressed_assessment())
+    _pin_clock(monkeypatch, CLEAR_DAY, 10, 30)
+    calls = _record_auto_trades(monkeypatch)
+
+    await handle_actionable_scanner_verdict(
+        state, "SPX", spot=7450.0, verdict_dict=_verdict(confidence="HIGH"),
+    )
+
+    assert calls == []
+    assert state.auto_trade_count_by_symbol == {}
+    row = await _last_signal()
+    assert row.extras["skipped_by"] == "chop_gate"
+    assert "high_bypassed_gate" not in row.extras
+    assert len(await SignalIterRepository.query_audit_log(category="chop_gate")) == 1
+
+
+async def test_config_read_failure_disables_bypass_fail_restrictive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MINOR: a gate-config read failure must FAIL RESTRICTIVE for the bypass
+    (mirrors the floor's fail-restrictive HIGH default) - high_bypass_enabled
+    flips False, so a HIGH fire on compressed tape is chop-blocked, not silently
+    opened."""
+    def _boom() -> UIConfig:
+        raise RuntimeError("config.json unreadable")
+    monkeypatch.setattr(mss, "load_config", _boom)
+    state = _armed_state(monkeypatch)
+    _patch_assess(monkeypatch, _compressed_assessment())
+    _pin_clock(monkeypatch, CLEAR_DAY, 10, 30)
+    calls = _record_auto_trades(monkeypatch)
+
+    await handle_actionable_scanner_verdict(
+        state, "SPX", spot=7450.0, verdict_dict=_verdict(confidence="HIGH"),
+    )
+
+    assert calls == []
+    row = await _last_signal()
+    assert row.extras["skipped_by"] == "chop_gate"
+    assert row.extras["high_bypass_enabled"] is False
+    assert "high_bypassed_gate" not in row.extras
+    assert len(await SignalIterRepository.query_audit_log(category="chop_gate")) == 1

@@ -499,6 +499,13 @@ async def _chop_gate_context(state) -> tuple[Any | None, _EntryGatesConfig]:
             )
     except Exception:
         logger.exception("scanner: gate config read failed — using defaults")
+        # Fail RESTRICTIVE for the tier bypass (mirrors the floor's fail-
+        # restrictive HIGH default in auto_trader._config_floor): a config
+        # outage must NOT silently open HIGH fires past chop/bias/tod. Every
+        # OTHER knob keeps its harm-reduction fail-OPEN default; only the
+        # bypass flips off, so all gates apply to all tiers until config
+        # reads cleanly again (2026-07-09 review MINOR).
+        gates.high_bypass_enabled = False
     assessment = None
     try:
         from fef_sidecar.engine import chop_gate as _cg
@@ -673,6 +680,45 @@ async def maybe_impulse_flag(
     return True
 
 
+async def _tag_high_bypass(signal_iter_id: int | None, gate: str) -> None:
+    """Post-FIRE counterfactual tag for the tier-scoped gate bypass.
+
+    Written ONLY after maybe_auto_trade returns fired=True, so
+    extras.high_bypassed_gate ('chop'|'bias'|'tod') and the matching
+    [HIGH-BYPASS <gate>] reasoning note land on rows that BYPASSED a gate AND
+    actually TRADED. 2026-07-09 review MAJOR-1: tagging at persist time (before
+    the trade) co-occurred with the floor / cross-symbol-cap skipped_by tag -
+    their auto_trader._tag_signal_skip MERGES skipped_by into this same row, so a
+    bypassed-then-blocked fire falsely read as 'bypassed and traded' and inflated
+    the grading (`high_bypassed_gate IS NOT NULL`). Written here it can NEVER
+    co-occur with skipped_by. Mirrors _tag_signal_skip's replace-not-mutate JSON
+    contract (SQLAlchemy JSON does not change-track in-place mutation). Never
+    raises."""
+    if signal_iter_id is None:
+        return
+    try:
+        from sqlmodel import select as _sm_select
+        from fef_sidecar.db.engine import get_session as _gs
+        from fef_sidecar.db.models import SignalIter as _SI
+        note = f"[HIGH-BYPASS {gate}]"
+        async with _gs() as session:
+            row = (await session.exec(
+                _sm_select(_SI).where(_SI.id == signal_iter_id)
+            )).first()
+            if row is None:
+                return
+            if note not in (row.reasoning or ""):
+                row.reasoning = f"{row.reasoning or ''} {note}".strip()
+            # Replace (never mutate) the JSON column so SQLAlchemy change-tracks it.
+            row.extras = {**(row.extras or {}), "high_bypassed_gate": gate}
+            session.add(row)
+    except Exception:
+        logger.exception(
+            "scanner: high_bypass tag write failed for signal %s (%s)",
+            signal_iter_id, gate,
+        )
+
+
 async def handle_actionable_scanner_verdict(
     state, symbol: str, *, spot: float, verdict_dict: dict[str, Any],
     inputs: Any | None = None,
@@ -719,10 +765,17 @@ async def handle_actionable_scanner_verdict(
          HIGH confidence floor, so on HIGH they only ever pre-empted fires
          the floor already passes (study: ~+$3,134/ct and ~35% of fire
          frequency left on the table). 2c (FOMC) is NOT bypassed — it binds
-         on ALL tiers. A bypassing HIGH fire the old all-tiers chain would
-         have chop/bias/TOD-skipped is tagged extras.high_bypassed_gate=
-         'chop'|'bias'|'tod' (observable, never blocking); LOW/MEDIUM run
-         the full chain unchanged. Flag false => old all-tiers behavior,
+         on ALL tiers. The bypass ALSO requires the floor ARMED (its
+         FEF_DISABLE_CONFIDENCE_FLOOR kill-switch OFF) - with the floor gone
+         there is nothing to catch the regrade gap it opens, so gates apply
+         to all tiers (2026-07-09 review MAJOR-2). A bypassing HIGH fire the
+         old all-tiers chain would have chop/bias/TOD-skipped is tagged
+         extras.high_bypassed_gate='chop'|'bias'|'tod' + a [HIGH-BYPASS
+         <gate>] reasoning note, written POST-FIRE (only once the fire
+         actually TRADES, so it can never co-occur with a floor/cap
+         skipped_by on the same row - review MAJOR-1); observable, never
+         blocking. LOW/MEDIUM run the full chain unchanged. Flag false (or a
+         failed gate-config read) => old all-tiers behavior,
       3. flows through maybe_auto_trade with source='auto_scanner'
          (per-symbol lock + all gates; cool-downs/caps are shared with the
          pattern trigger and main loop on the same symbol),
@@ -765,7 +818,27 @@ async def handle_actionable_scanner_verdict(
     # tod can never trade a fire the floor would reject). Mental model: gates
     # apply BELOW the floor tier, not above it.
     verdict_confidence = str(verdict_dict.get("confidence", "LOW"))
-    high_bypass = bool(gates.high_bypass_enabled and verdict_confidence == "HIGH")
+    # MAJOR-2 coupling (2026-07-09 review): the bypass is only SAFE because the
+    # ARMED HIGH floor catches the gap it opens - a raw-HIGH wall-collapse badge
+    # that bypasses chop is re-graded + floor-blocked downstream. The floor has a
+    # kill-switch (FEF_DISABLE_CONFIDENCE_FLOOR); when it is ON the floor is gone,
+    # so the bypass MUST also be off (gates apply to all tiers - safe: no floor
+    # left to catch the regrade). Read the SAME switch the floor reads
+    # (auto_trader._floor_kill_switch_active - never a copy). Probe failure =>
+    # treat the floor as DISARMED (bypass off), fail-restrictive.
+    floor_armed = True
+    try:
+        from fef_sidecar.engine.auto_trader import _floor_kill_switch_active
+        floor_armed = not _floor_kill_switch_active()
+    except Exception:
+        logger.exception(
+            "scanner: floor kill-switch probe failed — treating floor DISARMED "
+            "(HIGH-bypass off, gates apply to all tiers)"
+        )
+        floor_armed = False
+    high_bypass = bool(
+        gates.high_bypass_enabled and verdict_confidence == "HIGH" and floor_armed
+    )
     # Raw per-gate block conditions in chain order — each already encodes "no
     # earlier gate in the chop->bias->tod sub-chain already won". Tier scoping
     # is applied AFTER: chop_skip/bias_skip (and tod_skip below) are forced
@@ -885,12 +958,13 @@ async def handle_actionable_scanner_verdict(
         )
     else:
         skip_note = ""
-    # HIGH-bypass annotation (never a skip — the fire trades). Mutually
-    # exclusive with skip_note: high_bypassed_gate is only set when no gate
-    # skipped this HIGH fire, so at most one of the two notes is non-empty.
-    bypass_note = (
-        f" [HIGH-BYPASS {high_bypassed_gate}]" if high_bypassed_gate else ""
-    )
+    # NOTE (2026-07-09 review MAJOR-1): the [HIGH-BYPASS <gate>] reasoning note
+    # and extras.high_bypassed_gate are NOT written here (pre-fire). A HIGH fire
+    # that bypasses chop/bias/tod may STILL be blocked downstream by the floor
+    # (wall-collapse re-grade) or the cross-symbol cap, whose _tag_signal_skip
+    # MERGES skipped_by into THIS same row - pre-fire tagging then mislabeled
+    # non-traded rows as 'bypassed and traded' and inflated the grading. Both
+    # are written by _tag_high_bypass AFTER maybe_auto_trade returns fired=True.
     # Barrier class of the nearest wall (decision-support tag, never gates):
     # True = the wall lies in the fire's direction of travel (today's 7440P
     # pattern = toward-barrier — flat-to-POSITIVE at scale per the wall
@@ -915,7 +989,7 @@ async def handle_actionable_scanner_verdict(
             spx_price=spot,
             direction=FEFDirection(direction),
             confidence=FEFConfidence(conf_value) if conf_value in FEFConfidence._value2member_map_ else FEFConfidence.LOW,
-            reasoning=f"[SCANNER {symbol}] {verdict_dict.get('reasoning', '')}{skip_note}{bypass_note}",
+            reasoning=f"[SCANNER {symbol}] {verdict_dict.get('reasoning', '')}{skip_note}",
             drift_cum_net_m=(inputs.drift_cum_net_m if inputs is not None else 0.0),
             drift_bias=(inputs.drift_bias if inputs is not None else "NEUTRAL"),
             ntm_max_pain=(inputs.ntm_max_pain if inputs is not None else 0.0),
@@ -958,11 +1032,10 @@ async def handle_actionable_scanner_verdict(
                 # 'chop_gate' / 'bias_veto' / 'fomc_gate' / 'tod_gate'
                 # (first gate wins); absent on fires.
                 **({"skipped_by": skipped_by} if skipped_by else {}),
-                # HIGH-bypass marker — row TRADED (bypassed chop/bias/tod on a
-                # HIGH fire the old all-tiers chain would have skipped).
-                # 'chop' / 'bias' / 'tod'; absent otherwise. Never co-occurs
-                # with skipped_by (a bypassing fire is, by definition, unskipped).
-                **({"high_bypassed_gate": high_bypassed_gate} if high_bypassed_gate else {}),
+                # high_bypassed_gate is written POST-FIRE by _tag_high_bypass
+                # (review MAJOR-1), never here - see the note above the persist
+                # block. It lands on FIRED rows only, so it can never co-occur
+                # with a floor/cap skipped_by tag on the same row.
             },
             session_date=_today_et(),
             provider_mode=_current_provider_mode(state),
@@ -1122,6 +1195,13 @@ async def handle_actionable_scanner_verdict(
         state.auto_trade_last_block_reason = f"[scanner {symbol}] {decision.reason}"
         if decision.fired and decision.order_result:
             logger.info("scanner: %s auto-trade fired: %s", symbol, decision.order_result)
+            # Tag the HIGH-bypass ONLY now that the fire actually TRADED (review
+            # MAJOR-1). fired=True always carries order_result - the sole fired
+            # return is AutoTradeDecision(True, ..., order_result=result) - so
+            # this branch == the fire outcome, and high_bypassed_gate can never
+            # co-occur with a floor/cap skipped_by tag on the same row.
+            if high_bypassed_gate:
+                await _tag_high_bypass(signal_id, high_bypassed_gate)
         elif state.auto_trade_enabled and decision.reason != "auto_trade disabled":
             try:
                 await SignalIterRepository.write_audit_log(
