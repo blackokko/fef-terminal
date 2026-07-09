@@ -46,7 +46,9 @@ from fef_sidecar.engine import lo_vix_day as lvd
 from fef_sidecar.engine import multi_symbol_scanner as mss
 from fef_sidecar.engine.chop_gate import _ET, ChopAssessment
 from fef_sidecar.engine.lo_vix_day import (
+    LoVixAssessment,
     assess_lo_vix,
+    invalidate_cache_on_fresher_vix,
     is_lo_vix_day,
     vix_open_percentile,
 )
@@ -1037,3 +1039,131 @@ async def test_run_ingest_once_gates_on_live_provider_and_audits() -> None:
         state2, now_ms=_et_ms("2026-07-07", 10, 0),
     ) == 0
     assert len(await SignalIterRepository.query_audit_log(category="vix_daily_ingest")) == 1
+
+
+# ---------------------------------------------------------------------------
+# 6. Boot-race cache invalidation (2026-07-09) — a fresher VIX ingest drops the
+#    stale-basis lo_vix_day session cache so the next classify recomputes.
+#    Observed: classifier cached '7/07 close -> LO-VIX YES' at 12:46:54Z; the
+#    ingest inserted the 7/08 close 29s later; the correct 7/09 basis is 7/08
+#    (-> NOT lo). Fix is cache-invalidation (robust to loop scheduling), not
+#    boot-ordering.
+# ---------------------------------------------------------------------------
+
+
+def _flip_series() -> list[tuple[str, float, float]]:
+    """VIX daily (date, open, close) tuned so 2026-07-09's prior-close basis
+    flips YES->NO when the 2026-07-08 close lands: on the 7/07 basis the ranked
+    close 16.13 sits at the 15th pctile of the prior 20 (LO-VIX YES); on the
+    7/08 basis the ranked close 16.9 sits at the 40th pctile (NOT lo). The
+    oldest pooled session (2026-06-17) is a high value that drops OUT of the
+    20-session pool when the basis advances to 7/08."""
+    # 19 closes for the sessions 2026-06-18..2026-07-06 (P2..P20): 3 below
+    # 16.13, 4 in (16.13, 16.9), 12 above 16.9.
+    mid = [14.0, 14.5, 15.0, 16.3, 16.4, 16.5, 16.6,
+           17.1, 17.2, 17.3, 17.4, 17.5, 17.6, 17.7, 17.8, 17.9, 18.0, 18.1, 18.2]
+    rows = [("2026-06-17", 17.0, 17.0)]          # P1 (oldest) — a high; drops at 7/08 basis
+    d = date(2026, 6, 18)
+    for c in mid:
+        rows.append((d.isoformat(), c, c))
+        d = date.fromordinal(d.toordinal() + 1)
+    rows.append(("2026-07-07", 16.13, 16.13))    # ranked on the 7/07 basis
+    return rows
+
+
+async def _invalidation_audits() -> list:
+    return [r for r in await SignalIterRepository.query_audit_log(category="lo_vix_day")
+            if "cache invalidated" in r.summary]
+
+
+async def test_ingest_invalidates_stale_lo_vix_cache_yes_to_no_flip() -> None:
+    """The full boot-race repro with the exact 7/7->7/8 numbers: 16.13 @ 15pct
+    YES on the 7/07 basis, then 16.9 @ 40pct NO once the 7/08 close is
+    ingested and the stale-basis cache is invalidated."""
+    await _seed_vix_daily(_flip_series())
+    state = AppState.build()
+    at = _et_ms("2026-07-09", 10, 0)
+
+    # Boot classification off the then-current series (ends 7/07): LO-VIX YES.
+    a = await assess_lo_vix(state, at_ms=at)
+    assert a.lo is True and a.basis == "prior_close"
+    assert a.value_date == "2026-07-07"
+    assert a.value == pytest.approx(16.13)
+    assert a.vix_pct == pytest.approx(15.0)
+    assert "2026-07-09" in state.lo_vix_day_cache
+
+    # The vix_daily_ingest boot pass lands the 2026-07-08 close (16.9).
+    from fef_sidecar.ibkr.live import LiveIBKRProvider
+    prov = LiveIBKRProvider()                    # never connected
+
+    async def fake_fetch(contract, **kw):
+        assert contract.symbol == "VIX"
+        return [_ib_daily_bar("2026-07-08", 16.8, 16.9)]
+
+    prov.fetch_historical_bars = fake_fetch       # type: ignore[method-assign]
+    state.ibkr = prov
+    assert await run_vix_daily_ingest_once(state, now_ms=at) == 1
+
+    # The stale-basis cache was invalidated (7/08 > basis 7/07) + ONE note.
+    assert state.lo_vix_day_cache == {}
+    inval = await _invalidation_audits()
+    assert len(inval) == 1
+    assert "fresher VIX (2026-07-08)" in inval[0].summary
+    assert "was basis 2026-07-07" in inval[0].summary
+    assert inval[0].details["was_basis"] == "2026-07-07"
+    assert inval[0].details["newest_ingested"] == "2026-07-08"
+    assert inval[0].details["was_lo"] is True
+
+    # Next classification recomputes against the now-current series: NO.
+    b = await assess_lo_vix(state, at_ms=at)
+    assert b.lo is False and b.basis == "prior_close"
+    assert b.value_date == "2026-07-08"
+    assert b.value == pytest.approx(16.9)
+    assert b.vix_pct == pytest.approx(40.0)
+
+
+async def test_ingest_same_or_older_session_does_not_invalidate() -> None:
+    """The guard: a same/older-session ingest (a deep-history gap fill) does
+    NOT move the prior-close basis, so it must NOT invalidate the cache."""
+    state = AppState.build()
+    state.lo_vix_day_cache["2026-07-09"] = LoVixAssessment(
+        session_date="2026-07-09", lo=False, vix_pct=40.0, value=16.9,
+        value_date="2026-07-08", basis="prior_close", n_pool=20,
+    )
+    # Older gap-fill (2026-07-03) -> basis unchanged -> no invalidation.
+    assert await invalidate_cache_on_fresher_vix(
+        state, [_et_ms("2026-07-03", 16, 0)]
+    ) is False
+    # Same-session re-ingest (2026-07-08) -> not STRICTLY newer -> no-op.
+    assert await invalidate_cache_on_fresher_vix(
+        state, [_et_ms("2026-07-08", 16, 0)]
+    ) is False
+    assert "2026-07-09" in state.lo_vix_day_cache
+    assert await _invalidation_audits() == []
+
+
+async def test_invalidate_supersedes_unknown_basis_cache() -> None:
+    """A cached UNKNOWN with no usable basis (empty/short series, value_date
+    None) is superseded by ANY fresh session landing."""
+    state = AppState.build()
+    state.lo_vix_day_cache["2026-07-09"] = LoVixAssessment(
+        session_date="2026-07-09", lo=None, value_date=None,
+        basis="prior_close", data_gap="no prior VIX daily bars",
+    )
+    assert await invalidate_cache_on_fresher_vix(
+        state, [_et_ms("2026-07-08", 16, 0)]
+    ) is True
+    assert state.lo_vix_day_cache == {}
+    inval = await _invalidation_audits()
+    assert len(inval) == 1
+    assert "was basis n/a" in inval[0].summary
+
+
+async def test_invalidate_noop_on_empty_cache() -> None:
+    """No cached assessment -> nothing to invalidate (the happy path where the
+    ingest ran BEFORE any consumer classified — no stale label ever produced)."""
+    state = AppState.build()
+    assert await invalidate_cache_on_fresher_vix(
+        state, [_et_ms("2026-07-08", 16, 0)]
+    ) is False
+    assert await SignalIterRepository.query_audit_log(category="lo_vix_day") == []

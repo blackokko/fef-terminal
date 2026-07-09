@@ -117,6 +117,22 @@ class UIConfig(BaseModel):
         default="HIGH",
     )
 
+    # ---- Auto-trade quantity (PERSISTENT 2026-07-09) ----
+    # THE contracts-per-fire the auto-trader places — this config value is the
+    # single source of truth (state.auto_trade_qty_override is display-legacy;
+    # /auto_trade/toggle + presets IGNORE any qty_override in their body so the
+    # panel can never again set it in-memory-only). Persistent across restarts,
+    # hot-read at fire time (mirrors auto_trade_confidence_floor exactly).
+    # 2026-07-09 near-miss (pre-open): qty_override lived ONLY in memory and
+    # reset to 0 on restart while floor/symbols persisted; scanner verdicts
+    # carry suggested_qty=None, so the gate's retired `override if >0 else
+    # suggested_qty or 15` resolved a fire to 15 contracts — 5x the operator's
+    # 3-lot size, and the -$1,800 catastrophe cap + every exit geometry are
+    # calibrated to the chosen size. Validated 1..100; 0 and >100 are REJECTED
+    # (there is no "use suggested" sentinel any more — the gate always resolves
+    # a concrete size, never 15). Default 3 = the operator's live size.
+    auto_trade_qty_override: int = Field(default=3, ge=1, le=100)
+
     # ---- Cross-symbol direction cap (2026-07-08) ----
     # Operational risk rule, user-approved: block a fire when a watcher-
     # managed parent (SUBMITTED/FILLED/PARTIAL) with the SAME right is

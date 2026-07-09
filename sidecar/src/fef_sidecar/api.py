@@ -548,9 +548,12 @@ async def auto_trade_status(request: Request) -> dict[str, Any]:
     # the config_store value — report THAT, never the display-legacy
     # state.auto_trade_confidence_floor the panel toggle used to stomp.
     try:
-        cfg_floor = load_config().auto_trade_confidence_floor
+        _cfg = load_config()
+        cfg_floor = _cfg.auto_trade_confidence_floor
+        cfg_qty = _cfg.auto_trade_qty_override
     except Exception:
         cfg_floor = "HIGH"  # gate fails restrictive the same way
+        cfg_qty = 3         # gate falls back to the validated default size
     return {
         "enabled": s.auto_trade_enabled,
         "live_trading_env": is_live_trading_enabled(),
@@ -563,7 +566,10 @@ async def auto_trade_status(request: Request) -> dict[str, Any]:
         "count_session": s.auto_trade_count_session,
         "last_at_ms": s.auto_trade_last_at_ms,
         "last_block_reason": s.auto_trade_last_block_reason,
-        "qty_override": s.auto_trade_qty_override,
+        # SOURCE OF TRUTH (2026-07-09): the size the gate actually places is
+        # the config_store value — report THAT, never the display-legacy
+        # state.auto_trade_qty_override the panel toggle/preset used to set.
+        "qty_override": cfg_qty,
         "trigger_types": s.auto_trade_trigger_types,
         "runner_protect_enabled": s.runner_protect_enabled,
         # STATUS TRUTH (2026-07-02): the scanner fires trades in parallel with
@@ -720,13 +726,18 @@ async def auto_trade_runner_protect(request: Request, body: dict[str, Any] = Bod
 async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Turn auto-trade on/off + optionally update settings.
 
-    Body: {enabled: bool, confirm: bool, [cool_down_sec],
-           [qty_override], [trigger_types]}
+    Body: {enabled: bool, confirm: bool, [cool_down_sec], [trigger_types]}
 
     confidence_floor in the body is DEPRECATED and IGNORED (2026-07-08):
     the panel's toggle stomped the in-memory floor 3+ times live. The
     enforced floor lives in config_store — change it ONLY via POST /config
     {"auto_trade_confidence_floor": ...} (persistent, hot-read by the gate).
+
+    qty_override in the body is DEPRECATED and IGNORED (2026-07-09), same
+    reason: it lived only in memory and reset to 0 on restart, and the gate's
+    retired `or 15` fallback would then size a fire at 15 contracts (5x the
+    operator's 3-lot). The enforced size lives in config_store — change it ONLY
+    via POST /config {"auto_trade_qty_override": ...} (persistent, hot-read).
 
     confirm=true required when enabling (defensive — prevent accidental
     enabling via a stale fetch or replay)."""
@@ -769,7 +780,29 @@ async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) 
     if "cool_down_sec" in body:
         s.auto_trade_cool_down_sec = max(60, int(body["cool_down_sec"]))
     if "qty_override" in body:
-        s.auto_trade_qty_override = max(0, min(100, int(body["qty_override"])))
+        # IGNORED by design (2026-07-09) — mirrors the confidence_floor field.
+        # The enforced size lives in config_store (persistent, hot-read); the
+        # toggle can no longer set it in-memory-only. One deprecation audit line
+        # when a stale panel still sends the field and it differs from the
+        # enforced value, so the divergence is visible in the log.
+        try:
+            cfg_qty = load_config().auto_trade_qty_override
+        except Exception:
+            cfg_qty = 3
+        try:
+            requested_qty = int(body["qty_override"])
+        except (TypeError, ValueError):
+            requested_qty = None
+        if requested_qty is not None and requested_qty != cfg_qty:
+            await SignalIterRepository.write_audit_log(
+                category="auto_trade_qty", actor="user",
+                summary=(
+                    f"DEPRECATED: /auto_trade/toggle sent qty_override="
+                    f"{requested_qty} — IGNORED (enforced size stays {cfg_qty}; "
+                    f"change it via POST /config)"
+                ),
+                details={"requested": requested_qty, "config_qty": cfg_qty},
+            )
     if "trigger_types" in body:
         valid = {"confluence", "aligned_only", "wall_only",
                  "flag_bull", "flag_bear", "pattern_bull", "pattern_bear"}
@@ -980,6 +1013,10 @@ async def apply_auto_trade_preset(preset_id: int, request: Request) -> dict[str,
         # response echoes the ENFORCED (config) floor, and a preset carrying
         # a different floor logs the same deprecation line as the toggle so
         # the display/enforcement divergence is visible in the audit log.
+        # NOTE (2026-07-09): state.auto_trade_qty_override is DISPLAY-LEGACY
+        # too — the gate reads the config_store size only, so a preset can no
+        # longer set the traded size. Same deprecation line + POST /config
+        # {"auto_trade_qty_override": ...} to actually change it.
         s.auto_trade_confidence_floor = preset.confidence_floor
         s.auto_trade_cool_down_sec = max(60, preset.cool_down_sec)
         s.auto_trade_qty_override = max(0, min(100, preset.qty_override))
@@ -1004,6 +1041,28 @@ async def apply_auto_trade_preset(preset_id: int, request: Request) -> dict[str,
                 ),
                 details={"preset_id": preset_id, "requested": preset_floor,
                          "config_floor": cfg_floor},
+            )
+
+        # Same deprecation line for the size (2026-07-09): a preset can no
+        # longer set the enforced contracts-per-fire (config_store owns it).
+        try:
+            cfg_qty = load_config().auto_trade_qty_override
+        except Exception:
+            cfg_qty = 3
+        try:
+            preset_qty = int(preset.qty_override)
+        except (TypeError, ValueError):
+            preset_qty = None
+        if preset_qty is not None and preset_qty != cfg_qty:
+            await SignalIterRepository.write_audit_log(
+                category="auto_trade_qty", actor="user",
+                summary=(
+                    f"DEPRECATED: preset '{preset.name}' carries qty_override="
+                    f"{preset_qty} — IGNORED for enforcement (config size stays "
+                    f"{cfg_qty}; change it via POST /config)"
+                ),
+                details={"preset_id": preset_id, "requested": preset_qty,
+                         "config_qty": cfg_qty},
             )
 
         await SignalIterRepository.write_audit_log(
@@ -4755,9 +4814,12 @@ async def update_config(
 
     # AUDIT TRAIL (2026-07-08 review F4): POST /config is now the canonical
     # change path for ENFORCED policy (auto_trade_confidence_floor,
-    # cross_symbol_cap_enabled) — every effective change writes one audit
-    # row listing key: old -> new. Generic across all keys (cheap, and the
-    # other gates' knobs deserve the same trace). Never blocks the save.
+    # auto_trade_qty_override, cross_symbol_cap_enabled) — every effective
+    # change writes one audit row listing key: old -> new. Generic across all
+    # keys (cheap, and the other gates' knobs deserve the same trace), so the
+    # persistent qty size is covered here with no key-specific code. Never
+    # blocks the save. Invalid values (qty 0 / >100) fail model_validate above
+    # and are rejected before persistence (same convention as the floor).
     try:
         before = current.model_dump()
         after = merged.model_dump()

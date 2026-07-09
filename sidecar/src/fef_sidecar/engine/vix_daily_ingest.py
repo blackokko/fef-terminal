@@ -94,16 +94,27 @@ def completed_daily_rows(
 async def upsert_vix_daily(
     rows: list[tuple[int, float, float, float, float, float]],
 ) -> int:
-    """INSERT the missing (VIX, '1 day', timestamp_ms) rows — additive
-    only, idempotent (existing timestamps skipped; uq_bar backstops).
-    Returns the number of rows inserted."""
+    """INSERT the missing (VIX, '1 day', timestamp_ms) rows — additive only,
+    idempotent (existing timestamps skipped; uq_bar backstops). Returns the
+    number of rows inserted. See _insert_missing_vix_daily for the variant that
+    returns the inserted timestamps (used to invalidate the lo_vix_day cache
+    against the newest landed session)."""
+    return len(await _insert_missing_vix_daily(rows))
+
+
+async def _insert_missing_vix_daily(
+    rows: list[tuple[int, float, float, float, float, float]],
+) -> list[int]:
+    """INSERT the missing rows; return the list of INSERTED timestamp_ms so the
+    caller can invalidate the lo_vix_day cache against the newest landed
+    session. Additive only, idempotent (existing timestamps skipped)."""
     if not rows:
-        return 0
+        return []
     from sqlmodel import select
     from fef_sidecar.db.engine import get_session
     from fef_sidecar.db.models import HistoricalBar
     min_ts = min(r[0] for r in rows)
-    inserted = 0
+    inserted: list[int] = []
     async with get_session() as session:
         existing = {
             b.timestamp_ms for b in (await session.exec(
@@ -121,7 +132,7 @@ async def upsert_vix_daily(
                 open=o, high=h, low=lo, close=c, volume=v,
             ))
             existing.add(ts)
-            inserted += 1
+            inserted.append(ts)
     return inserted
 
 
@@ -159,7 +170,8 @@ async def run_vix_daily_ingest_once(state: Any, *, now_ms: int | None = None) ->
         )
         now = int(now_ms if now_ms is not None else _time.time() * 1000)
         rows = completed_daily_rows(bars, now)
-        inserted = await upsert_vix_daily(rows)
+        inserted_ts = await _insert_missing_vix_daily(rows)
+        inserted = len(inserted_ts)
         logger.info(
             "VIX daily ingest: fetched=%d completed=%d inserted=%d",
             len(bars or []), len(rows), inserted,
@@ -174,6 +186,21 @@ async def run_vix_daily_ingest_once(state: Any, *, now_ms: int | None = None) ->
                 ),
                 details={"inserted": inserted, "fetched": len(bars or [])},
             )
+            # Boot-race fix (2026-07-09): a fresher completed session just
+            # landed (the transaction committed above — get_session commits on
+            # block exit) — drop any stale-basis lo_vix_day session cache so the
+            # next classification recomputes against the now-current series. The
+            # guard + audit note live in lo_vix_day.invalidate_cache_on_fresher_vix;
+            # a same/older gap-fill is a no-op there.
+            try:
+                from fef_sidecar.engine.lo_vix_day import (
+                    invalidate_cache_on_fresher_vix,
+                )
+                await invalidate_cache_on_fresher_vix(state, inserted_ts)
+            except Exception:
+                logger.exception(
+                    "lo_vix_day cache invalidation after VIX ingest failed"
+                )
         return inserted
     except Exception:
         logger.exception(

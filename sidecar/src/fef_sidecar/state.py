@@ -131,10 +131,14 @@ class AppState:
     auto_trade_count_session: int = 0           # bumped after each successful fire (display only; cap is per-symbol)
     auto_trade_last_at_ms: int = 0              # epoch ms of last fire
     auto_trade_last_block_reason: str = ""      # why most-recent eligible signal was skipped
-    # Override the FEF engine's suggested_qty (which is 15/10/5 by
-    # HIGH/MEDIUM/LOW confidence). 0 = use suggested. Otherwise fixed
-    # contracts per fire across all confidences. Capped by
-    # FEF_MAX_CONTRACTS_PER_TRADE env.
+    # DISPLAY-LEGACY (2026-07-09): the auto-trader NO LONGER reads this — the
+    # traded contracts-per-fire is the PERSISTENT config_store value
+    # (UIConfig.auto_trade_qty_override, hot-read via auto_trader._config_qty),
+    # mirroring how the confidence floor was moved to config. This in-memory
+    # field reset to 0 on restart while floor/symbols persisted; with the old
+    # `override if >0 else suggested_qty or 15` resolution a scanner fire then
+    # placed 15 contracts (5x the operator's 3-lot). The panel toggle + presets
+    # still set this for backward-compat display, but it never sizes a trade.
     auto_trade_qty_override: int = 0
 
     # Runner protector — after T1 fills, market-exit remaining T2/T3 qty if

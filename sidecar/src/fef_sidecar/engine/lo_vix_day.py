@@ -333,3 +333,94 @@ async def is_lo_vix_day(state: Any, *, at_ms: int | None = None) -> bool | None:
     prior-close basis deviation, and the same-series consistency
     requirement."""
     return (await assess_lo_vix(state, at_ms=at_ms)).lo
+
+
+async def invalidate_cache_on_fresher_vix(
+    state: Any, inserted_ts: Iterable[int],
+) -> bool:
+    """Boot-race fix (2026-07-09): drop the session lo_vix_day cache when a VIX
+    daily ingest lands a session STRICTLY NEWER than the date a cached
+    assessment ranked as its prior-close basis (value_date), so the next
+    classification recomputes against the now-current series. Returns True iff
+    it invalidated. Never raises. Call AFTER the ingest transaction commits
+    (the recompute reads the new rows).
+
+    The race: a consumer asks for the lo-VIX label at boot and the classifier
+    caches the answer off whatever VIX rows exist THEN; moments later the
+    vix_daily_ingest boot pass inserts the freshest completed session. Observed
+    2026-07-09 — the classifier cached '2026-07-07 close 16.13 @ 15th pctile ->
+    LO-VIX YES' at 12:46:54Z; the ingest inserted the 2026-07-08 close (16.9)
+    29s later. The correct 2026-07-09 basis is the 7/8 prior close (40th pctile
+    -> NOT lo); the stale label would otherwise stick all session (shadow-only,
+    but it mislabels the lo-VIX shrink evidence and recurs every morning the
+    series is one day stale at boot).
+
+    Cache-invalidation (not boot-ordering) is the robust fix — it corrects the
+    label the moment the fresher row commits, regardless of loop scheduling.
+    GUARD: only invalidate when the new data would actually change the basis —
+    a session STRICTLY newer than the cached value_date (a newer prior-close,
+    or today's now-completed bar). A cached UNKNOWN with NO usable basis
+    (value_date is None: empty/short series) is superseded by ANY fresh
+    session. A same/older-session ingest (a deep-history gap fill) does NOT
+    invalidate: it never moves the prior-close basis."""
+    try:
+        cache = getattr(state, "lo_vix_day_cache", None)
+        if not cache:
+            return False
+        newest: str | None = None
+        for ts in inserted_ts:
+            try:
+                d = session_date_et(int(ts))
+            except Exception:
+                continue
+            if newest is None or d > newest:
+                newest = d
+        if newest is None:
+            return False
+        superseded: list[tuple[str, LoVixAssessment]] = [
+            (sess, a)
+            for sess, a in list(cache.items())
+            if isinstance(a, LoVixAssessment)
+            and (a.value_date is None or newest > a.value_date)
+        ]
+        if not superseded:
+            return False
+        # The cache holds at most the current session (assess_lo_vix evicts
+        # other sessions on each compute); clear it so the next classify
+        # recomputes against the freshly-committed series.
+        cache.clear()
+        for sess, prior in superseded:
+            await _write_cache_invalidation_audit(sess, prior, newest)
+        return True
+    except Exception:
+        logger.exception("lo_vix_day: cache invalidation failed")
+        return False
+
+
+async def _write_cache_invalidation_audit(
+    session_date: str, prior: LoVixAssessment, newest_date: str,
+) -> None:
+    """One category='lo_vix_day' note per invalidated session: which fresher
+    VIX session forced the recompute and the basis it replaced. Never raises."""
+    try:
+        from fef_sidecar.db.repository import SignalIterRepository
+        was = prior.value_date or "n/a"
+        await SignalIterRepository.write_audit_log(
+            category="lo_vix_day", actor="system",
+            summary=(
+                f"lo_vix_day cache invalidated for {session_date} — fresher VIX "
+                f"({newest_date}) ingested, was basis {was}; next classification "
+                f"recomputes against the current series"
+            ),
+            details={
+                "session_date": session_date,
+                "was_basis": prior.value_date,
+                "newest_ingested": newest_date,
+                "was_lo": prior.lo,
+                "was_vix_pct": (
+                    round(prior.vix_pct, 2) if prior.vix_pct is not None else None
+                ),
+            },
+        )
+    except Exception:
+        logger.exception("lo_vix_day: cache-invalidation audit write failed")

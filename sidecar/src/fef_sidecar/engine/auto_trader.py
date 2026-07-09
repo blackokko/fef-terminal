@@ -216,6 +216,104 @@ async def _audit_floor_killswitch_once(state) -> None:
         logger.exception("floor kill-switch audit write failed")
 
 
+def _default_config_qty() -> int:
+    """The validated UIConfig default for auto_trade_qty_override (3) — read
+    from the model so the gate's fallback size can't drift from the field
+    definition. Fails to 3 if config_store is unimportable."""
+    try:
+        from fef_sidecar.config_store import UIConfig
+        return int(UIConfig().auto_trade_qty_override)
+    except Exception:
+        return 3
+
+
+async def _config_qty(state) -> int:
+    """Hot-read the persistent contracts-per-fire from config_store — the ONE
+    source of truth (state.auto_trade_qty_override is display-legacy; the panel
+    toggle/preset used to set it in memory only, so it reset to 0 on restart
+    while floor/symbols persisted). Mirrors _config_floor exactly.
+
+    The RETIRED resolution (`override if >0 else suggested_qty or 15`) placed
+    15 contracts on a scanner fire (suggested_qty=None) with override reset to
+    0 — 5x the operator's 3-lot size, against which the -$1,800 cap and all
+    exit geometry are calibrated (2026-07-09 near-miss, caught pre-open). There
+    is NO `or 15` any more: if no valid operator size resolves, fall back to
+    the validated config DEFAULT (3) and AUDIT it loudly once per session so a
+    config outage sizing at the default is visible in the log — never 15.
+
+    A valid UIConfig always carries 1..100, so the normal path returns the
+    operator's size. The fallback fires only when load_config()/the read
+    RAISES, when the resolved value is somehow out of 1..100, or when the file
+    EXISTS-but-invalid (load_config silently returned defaults — the same F1
+    outage class the floor audits)."""
+    from fef_sidecar import config_store as _cs
+    try:
+        qty = int(_cs.load_config().auto_trade_qty_override)
+    except Exception:
+        logger.exception("auto-trade qty config read failed — using default")
+        fallback = _default_config_qty()
+        await _audit_qty_fallback_once(state, fallback, "config read raised")
+        return fallback
+    if qty < 1 or qty > 100:
+        fallback = _default_config_qty()
+        await _audit_qty_fallback_once(
+            state, fallback, f"resolved qty {qty!r} outside 1..100",
+        )
+        return fallback
+    try:
+        status = _cs.config_file_status()
+    except Exception:
+        status = "ok"  # probe failure must never affect the read path
+    if status == "invalid":
+        # config.json exists but fails to parse/validate -> load_config()
+        # silently returned the DEFAULT (qty here == the default), NOT an
+        # operator setting. Say so loudly once (mirrors the floor's F1 audit)
+        # and use the default.
+        await _audit_qty_fallback_once(
+            state, qty, "config.json exists but is invalid — enforcing default",
+        )
+    return qty
+
+
+async def _audit_qty_fallback_once(state, qty: int, reason: str) -> None:
+    """One loud row per session when the auto-trade size falls back to the
+    config DEFAULT instead of a resolved operator setting. The retired `or 15`
+    fallback would have placed 15 contracts on this path (5x size); now the
+    fallback is the validated default and it is AUDITED so a silent config
+    outage sizing at the default is visible (2026-07-09). Session-keyed like
+    the floor audits."""
+    from fef_sidecar.db.repository import SignalIterRepository
+    try:
+        from fef_sidecar.engine.chop_gate import session_date_et
+        sess = session_date_et(int(time.time() * 1000))
+    except Exception:
+        sess = time.strftime("%Y-%m-%d")
+    if getattr(state, "_qty_fallback_audited_session", None) == sess:
+        return
+    try:
+        state._qty_fallback_audited_session = sess  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    logger.error(
+        "QTY FALLBACK — using default %d contracts/fire (%s); NOT an operator "
+        "setting (the retired `or 15` fallback would have sized 5x here). Set "
+        "auto_trade_qty_override via POST /config.", qty, reason,
+    )
+    try:
+        await SignalIterRepository.write_audit_log(
+            category="auto_trade_qty", actor="system",
+            summary=(
+                f"QTY FALLBACK — using default {qty} contracts/fire ({reason}); "
+                f"NOT an operator setting (the retired `or 15` fallback would "
+                f"have sized 5x here). Set auto_trade_qty_override via POST "
+                f"/config to clear this."
+            ),
+            details={"qty": qty, "reason": reason},
+        )
+    except Exception:
+        logger.exception("qty fallback audit write failed")
+
+
 def _threshold_scale_for(state, sym: str, source: str) -> float:
     """The threshold_scale of the engine that PRODUCED the verdict, so the
     wall-collapse re-grade runs the formula at the verdict's own calibration.
@@ -552,8 +650,15 @@ async def _maybe_auto_trade_locked(
                                      BlockReason.INVALID_PRICING)
 
     strike = verdict_dict.get("strike_rec")
-    override = getattr(state, "auto_trade_qty_override", 0)
-    qty = override if override > 0 else (verdict_dict.get("suggested_qty") or 15)
+    # QTY (2026-07-09): the PERSISTENT config value is the ONE source of truth.
+    # NEVER state.auto_trade_qty_override (display-legacy; reset to 0 on restart
+    # while floor/symbols persisted) and NEVER suggested_qty (scanner verdicts
+    # carry None). The retired `override if >0 else suggested_qty or 15` sized a
+    # fire at 15 contracts on that path — 5x the operator's 3-lot, against which
+    # the -$1,800 cap + every exit geometry are calibrated (live near-miss).
+    # _config_qty hot-reads config and falls back to the validated default (3)
+    # with a loud once/session audit — never 15.
+    qty = await _config_qty(state)
     if not strike:
         return AutoTradeDecision(False, "no strike_rec on verdict", BlockReason.NO_STRIKE)
 
