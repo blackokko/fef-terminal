@@ -441,6 +441,7 @@ class _EntryGatesConfig:
         "chop_enabled", "chop_threshold", "bias_veto_enabled",
         "fomc_gate_enabled", "tod_gate_enabled",
         "tod_start_min", "tod_end_min", "tod_window_label",
+        "high_bypass_enabled",
     )
 
     def __init__(self) -> None:
@@ -453,6 +454,8 @@ class _EntryGatesConfig:
         self.tod_start_min: int | None = 14 * 60
         self.tod_end_min: int | None = 15 * 60 + 30
         self.tod_window_label = "14:00-15:30"
+        # Tier-scoped gate bypass (2026-07-09): HIGH fires skip chop/bias/tod.
+        self.high_bypass_enabled = True
 
 
 async def _chop_gate_context(state) -> tuple[Any | None, _EntryGatesConfig]:
@@ -463,8 +466,8 @@ async def _chop_gate_context(state) -> tuple[Any | None, _EntryGatesConfig]:
     Config is re-read on EVERY actionable evaluation (load_config is a
     module-level import so tests can monkeypatch it), which makes every gate
     knob (chop_gate_enabled / chop_gate_pct_threshold / bias_veto_enabled /
-    fomc_gate_enabled / tod_gate_enabled + the TOD window edges) tunable via
-    POST /config without a restart. Both steps are exception-guarded; a
+    fomc_gate_enabled / tod_gate_enabled / gate_high_bypass_enabled + the TOD
+    window edges) tunable via POST /config without a restart. Both steps are exception-guarded; a
     failed assessment returns None which the caller treats as gate-open (the
     filters are harm-reduction — they must never block on their own failure).
     An unparseable or inverted TOD window disables the TOD gate (fail-open)
@@ -477,6 +480,7 @@ async def _chop_gate_context(state) -> tuple[Any | None, _EntryGatesConfig]:
         gates.bias_veto_enabled = bool(cfg.bias_veto_enabled)
         gates.fomc_gate_enabled = bool(cfg.fomc_gate_enabled)
         gates.tod_gate_enabled = bool(cfg.tod_gate_enabled)
+        gates.high_bypass_enabled = bool(cfg.gate_high_bypass_enabled)
         start = _parse_hhmm(cfg.tod_gate_start_et)
         end = _parse_hhmm(cfg.tod_gate_end_et)
         if start is None or end is None or start >= end:
@@ -709,6 +713,16 @@ async def handle_actionable_scanner_verdict(
          block_reason_code=TOD_GATE_SKIP. UIConfig.tod_gate_enabled +
          window edges hot-read. Gate order: chop -> bias -> fomc -> tod
          (first gate to skip wins; distinct audit categories),
+      2e. TIER SCOPING (2026-07-09, UIConfig.gate_high_bypass_enabled,
+         default true): a HIGH-confidence verdict BYPASSES 2, 2b and 2d
+         (chop / bias-veto / TOD). Those gates run ahead of the now-armed
+         HIGH confidence floor, so on HIGH they only ever pre-empted fires
+         the floor already passes (study: ~+$3,134/ct and ~35% of fire
+         frequency left on the table). 2c (FOMC) is NOT bypassed — it binds
+         on ALL tiers. A bypassing HIGH fire the old all-tiers chain would
+         have chop/bias/TOD-skipped is tagged extras.high_bypassed_gate=
+         'chop'|'bias'|'tod' (observable, never blocking); LOW/MEDIUM run
+         the full chain unchanged. Flag false => old all-tiers behavior,
       3. flows through maybe_auto_trade with source='auto_scanner'
          (per-symbol lock + all gates; cool-downs/caps are shared with the
          pattern trigger and main loop on the same symbol),
@@ -738,13 +752,37 @@ async def handle_actionable_scanner_verdict(
     # The engine stamps ' (bias-disagrees, demoted)' into ALIGNED reasoning
     # when drift_bias opposes the fire direction — parse it out.
     bias_disagree = "bias-disagrees" in reasoning_txt
-    chop_skip = bool(
+    # ---- Tier-scoped gate bypass (2026-07-09 registered study) ----
+    # The chop / bias-veto / TOD gates run BEFORE the now-armed HIGH
+    # confidence floor, so on a HIGH fire they only ever pre-empt trades the
+    # floor already passes — profitable ones (study: ~+$3,134/ct and ~35% of
+    # fire frequency left on the table). When gate_high_bypass_enabled a
+    # HIGH-confidence verdict BYPASSES those three; LOW/MEDIUM fires run the
+    # full chain unchanged. FOMC is NOT bypassed — it binds on ALL tiers as an
+    # event-risk guard (blocks HIGH fires that lose -$28/ct on FOMC mornings).
+    # The confidence floor remains the downstream arbiter (a wall-collapse
+    # HIGH badge it re-grades is still re-graded there — bypassing chop/bias/
+    # tod can never trade a fire the floor would reject). Mental model: gates
+    # apply BELOW the floor tier, not above it.
+    verdict_confidence = str(verdict_dict.get("confidence", "LOW"))
+    high_bypass = bool(gates.high_bypass_enabled and verdict_confidence == "HIGH")
+    # Raw per-gate block conditions in chain order — each already encodes "no
+    # earlier gate in the chop->bias->tod sub-chain already won". Tier scoping
+    # is applied AFTER: chop_skip/bias_skip (and tod_skip below) are forced
+    # open for a bypassing HIGH fire. FOMC (further down) is computed from the
+    # SCOPED skips, so it still catches a HIGH fire whose chop/bias would
+    # otherwise have won first.
+    chop_would_block = bool(
         gate_enabled and chop is not None and chop.is_compressed(gate_threshold)
     )
     # Bias veto (2026-07-02): 3 of the day's 5 live losers wore the tag
     # (-$1,710); sweep OOS disagree -$17.00/ct vs agree -$1.85/ct. Applies
     # only when the chop gate did not already skip (first gate wins).
-    bias_skip = bool(bias_veto_enabled and bias_disagree and not chop_skip)
+    bias_would_block = bool(
+        bias_veto_enabled and bias_disagree and not chop_would_block
+    )
+    chop_skip = bool(chop_would_block and not high_bypass)
+    bias_skip = bool(bias_would_block and not high_bypass)
     # FOMC-morning gate (2026-07-06 event study: FOMC pre-statement fires
     # -$61/ct t=-4.4, 80% of FOMC sessions negative). Skips actionable fires
     # on an event_calendar FOMC day while the ET clock is before the 14:00
@@ -767,10 +805,11 @@ async def handle_actionable_scanner_verdict(
         gates.tod_start_min is not None and gates.tod_end_min is not None
         and gates.tod_start_min <= minute_now < gates.tod_end_min
     )
-    tod_skip = bool(
+    tod_would_block = bool(
         gates.tod_gate_enabled and tod_in_window
         and not (chop_skip or bias_skip or fomc_skip)
     )
+    tod_skip = bool(tod_would_block and not high_bypass)
     skipped_by = (
         "chop_gate" if chop_skip
         else "bias_veto" if bias_skip
@@ -778,6 +817,23 @@ async def handle_actionable_scanner_verdict(
         else "tod_gate" if tod_skip
         else None
     )
+    # Counterfactual bypass tag (tier scoping observability): a HIGH fire that
+    # FOMC did NOT catch proceeds to maybe_auto_trade even though the OLD
+    # all-tiers chop->bias->tod chain would have skipped it. Record the first
+    # such gate so the behavioral change (fires that NOW trade) is gradeable
+    # in the verdict window. Tag-only — never blocks. When FOMC DID catch the
+    # HIGH fire there is no bypass to grade (the fire is still skipped); the
+    # fomc_skip row is written as usual and this stays None. Because we only
+    # reach the tod branch when chop_would_block and bias_would_block are both
+    # False, tod_would_block there equals the old chain's tod decision.
+    high_bypassed_gate: str | None = None
+    if high_bypass and not fomc_skip:
+        if chop_would_block:
+            high_bypassed_gate = "chop"
+        elif bias_would_block:
+            high_bypassed_gate = "bias"
+        elif tod_would_block:
+            high_bypassed_gate = "tod"
     chop_extras: dict[str, Any] = (
         chop.to_extras() if chop is not None
         else {"r30": None, "r30_pct": None, "tod_bucket": None,
@@ -829,6 +885,12 @@ async def handle_actionable_scanner_verdict(
         )
     else:
         skip_note = ""
+    # HIGH-bypass annotation (never a skip — the fire trades). Mutually
+    # exclusive with skip_note: high_bypassed_gate is only set when no gate
+    # skipped this HIGH fire, so at most one of the two notes is non-empty.
+    bypass_note = (
+        f" [HIGH-BYPASS {high_bypassed_gate}]" if high_bypassed_gate else ""
+    )
     # Barrier class of the nearest wall (decision-support tag, never gates):
     # True = the wall lies in the fire's direction of travel (today's 7440P
     # pattern = toward-barrier — flat-to-POSITIVE at scale per the wall
@@ -848,12 +910,12 @@ async def handle_actionable_scanner_verdict(
             _current_provider_mode,
             _walls_json,
         )
-        conf_value = verdict_dict.get("confidence", "LOW")
+        conf_value = verdict_confidence
         signal = await SignalIterRepository.write_iter(
             spx_price=spot,
             direction=FEFDirection(direction),
             confidence=FEFConfidence(conf_value) if conf_value in FEFConfidence._value2member_map_ else FEFConfidence.LOW,
-            reasoning=f"[SCANNER {symbol}] {verdict_dict.get('reasoning', '')}{skip_note}",
+            reasoning=f"[SCANNER {symbol}] {verdict_dict.get('reasoning', '')}{skip_note}{bypass_note}",
             drift_cum_net_m=(inputs.drift_cum_net_m if inputs is not None else 0.0),
             drift_bias=(inputs.drift_bias if inputs is not None else "NEUTRAL"),
             ntm_max_pain=(inputs.ntm_max_pain if inputs is not None else 0.0),
@@ -888,10 +950,19 @@ async def handle_actionable_scanner_verdict(
                 "bias_veto_enabled": bias_veto_enabled,
                 "fomc_gate": fomc_extras,
                 "tod_gate": tod_extras,
+                # Tier scoping (2026-07-09): the flag's live state on every
+                # fire (parity with bias_veto_enabled) so the counterfactual
+                # logs record whether HIGH-bypass was active for this row.
+                "high_bypass_enabled": gates.high_bypass_enabled,
                 # Counterfactual marker — row persisted, trade withheld.
                 # 'chop_gate' / 'bias_veto' / 'fomc_gate' / 'tod_gate'
                 # (first gate wins); absent on fires.
                 **({"skipped_by": skipped_by} if skipped_by else {}),
+                # HIGH-bypass marker — row TRADED (bypassed chop/bias/tod on a
+                # HIGH fire the old all-tiers chain would have skipped).
+                # 'chop' / 'bias' / 'tod'; absent otherwise. Never co-occurs
+                # with skipped_by (a bypassing fire is, by definition, unskipped).
+                **({"high_bypassed_gate": high_bypassed_gate} if high_bypassed_gate else {}),
             },
             session_date=_today_et(),
             provider_mode=_current_provider_mode(state),

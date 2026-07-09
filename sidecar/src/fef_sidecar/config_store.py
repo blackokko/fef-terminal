@@ -117,6 +117,23 @@ class UIConfig(BaseModel):
         default="HIGH",
     )
 
+    # ---- Tier-scoped gate bypass (2026-07-09 registered study) ----
+    # The chop / bias-veto / TOD scanner gates were built BEFORE the HIGH
+    # confidence floor was armed (2026-07-08). They run ahead of the floor in
+    # the chain, so now that the floor is HIGH-only they only ever pre-empt
+    # HIGH-confidence fires that the floor would have PASSED — i.e. profitable
+    # fires. The study attributes ~+$3,134/ct left on the table and ~35% of
+    # fire frequency suppressed to that overlap; the gates' real job (culling
+    # LOW/MEDIUM fires) is now fully handled by the floor. When True (default)
+    # a HIGH-confidence fire BYPASSES chop / bias-veto / TOD (they still apply
+    # normally to LOW/MEDIUM). The FOMC gate is deliberately NOT in the bypass
+    # set — it is an event-risk guard that must bind on ALL tiers (it blocks
+    # HIGH fires that lose -$28/ct on FOMC mornings). Mental model: "gates
+    # apply BELOW the floor tier, not above it." Set False to restore the old
+    # all-tiers behavior (every gate applies to every tier). Hot-read per
+    # actionable scanner evaluation — reversible via POST /config, no restart.
+    gate_high_bypass_enabled: bool = Field(default=True)
+
     # ---- Cross-symbol direction cap (2026-07-08) ----
     # Operational risk rule, user-approved: block a fire when a watcher-
     # managed parent (SUBMITTED/FILLED/PARTIAL) with the SAME right is
