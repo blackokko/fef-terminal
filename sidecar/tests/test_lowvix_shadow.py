@@ -1167,3 +1167,48 @@ async def test_invalidate_noop_on_empty_cache() -> None:
         state, [_et_ms("2026-07-08", 16, 0)]
     ) is False
     assert await SignalIterRepository.query_audit_log(category="lo_vix_day") == []
+
+
+async def test_assess_recomputes_when_fresher_session_lands_mid_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MAJOR-2 (the SYMMETRIC race cache-invalidation alone can't close):
+    a consumer suspends at query_bars reading the PRE-insert series while the
+    ingest commits the 7/08 close + sets state.vix_latest_ingested_date, then
+    the (empty-cache) invalidation no-ops — so the consumer would cache the
+    stale YES. The mid-read marker guard forces a recompute against the now-
+    committed series instead -> the 16.13->16.9 flip resolves to NO even in
+    this interleaving, and NO is what gets cached."""
+    await _seed_vix_daily(_flip_series())               # series ends 7/07
+    state = AppState.build()
+    at = _et_ms("2026-07-09", 10, 0)
+
+    real_query = SignalIterRepository.query_bars
+    calls = {"n": 0}
+
+    async def racing_query(symbol, bar_size, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Read the pre-insert series (ends 7/07), THEN simulate the ingest
+            # committing 7/08 + advancing the monotonic marker DURING this read.
+            bars = await real_query(symbol, bar_size, **kw)
+            await _seed_vix_daily([("2026-07-08", 16.8, 16.9)])
+            state.vix_latest_ingested_date = "2026-07-08"
+            return bars
+        return await real_query(symbol, bar_size, **kw)
+
+    monkeypatch.setattr(SignalIterRepository, "query_bars", racing_query)
+    a = await assess_lo_vix(state, at_ms=at)
+
+    assert calls["n"] == 2                              # exactly one recompute
+    assert a.lo is False                               # NOT the stale YES
+    assert a.value_date == "2026-07-08"
+    assert a.value == pytest.approx(16.9)
+    assert a.vix_pct == pytest.approx(40.0)
+    # The CORRECT (recomputed) result is what got cached.
+    assert state.lo_vix_day_cache["2026-07-09"].lo is False
+    # Exactly one session audit — the final NO, not the discarded YES.
+    audits = [r for r in await SignalIterRepository.query_audit_log(category="lo_vix_day")
+              if "LO-VIX DAY" in r.summary]
+    assert len(audits) == 1
+    assert audits[0].summary.startswith("LO-VIX DAY NO")

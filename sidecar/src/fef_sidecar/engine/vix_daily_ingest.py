@@ -188,10 +188,22 @@ async def run_vix_daily_ingest_once(state: Any, *, now_ms: int | None = None) ->
             )
             # Boot-race fix (2026-07-09): a fresher completed session just
             # landed (the transaction committed above — get_session commits on
-            # block exit) — drop any stale-basis lo_vix_day session cache so the
-            # next classification recomputes against the now-current series. The
-            # guard + audit note live in lo_vix_day.invalidate_cache_on_fresher_vix;
-            # a same/older gap-fill is a no-op there.
+            # block exit). Two coordinated mechanisms in lo_vix_day close the
+            # race robustly, regardless of loop scheduling:
+            #   (1) record the newest ingested session (monotonic) so a consumer
+            #       SUSPENDED mid-computation at query_bars recomputes before
+            #       caching a stale label (review MAJOR-2 — the invalidation
+            #       below can't catch it: the cache is still empty then);
+            #   (2) invalidate any ALREADY-cached stale-basis assessment so the
+            #       next classification recomputes against the current series.
+            try:
+                from fef_sidecar.engine.chop_gate import session_date_et as _sde
+                _newest = max(_sde(int(t)) for t in inserted_ts)
+                _prev = getattr(state, "vix_latest_ingested_date", None)
+                if _prev is None or _newest > _prev:
+                    state.vix_latest_ingested_date = _newest
+            except Exception:
+                logger.exception("vix_latest_ingested_date update failed")
             try:
                 from fef_sidecar.engine.lo_vix_day import (
                     invalidate_cache_on_fresher_vix,

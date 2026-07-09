@@ -347,6 +347,14 @@ class AppState:
     # (engine/lo_vix_day.py). Keyed by ET session_date; one DB read + one
     # audit row per session. Tag/shadow input only — never gates.
     lo_vix_day_cache: dict[str, object] = field(default_factory=dict)
+    # Newest VIX daily session (ET date) the ingest has committed this process
+    # (engine/vix_daily_ingest.py). Advisory monotonic marker read by
+    # assess_lo_vix to close the SYMMETRIC boot race: a consumer that suspended
+    # at query_bars on the pre-insert series can detect that a fresher basis
+    # landed during its read and recompute BEFORE caching a stale label — the
+    # cache-invalidation alone can't catch a mid-computation consumer (it runs
+    # against a still-empty cache). None until the first ingest inserts.
+    vix_latest_ingested_date: str | None = None
 
     # Loop watchdog (2026-07-07): heartbeat map (loop name -> monotonic
     # seconds, stamped every healthy cycle), supervised-loop registry, and

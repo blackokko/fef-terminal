@@ -28,7 +28,8 @@ os.environ["FEF_DB_URL"] = "sqlite+aiosqlite:///:memory:"
 
 from fef_sidecar.config_store import UIConfig, load_config, save_config
 from fef_sidecar.db import SignalIterRepository, dispose_db, init_db
-from fef_sidecar.engine.auto_trader import _config_qty, maybe_auto_trade
+from fef_sidecar.engine.auto_trader import _config_qty, _tier_split, maybe_auto_trade
+from fef_sidecar.engine.spx_target_watcher import _all_tiers_banked
 
 
 @pytest.fixture(autouse=True)
@@ -377,10 +378,68 @@ async def test_preset_apply_ignores_qty_and_logs_deprecation(
         "qty_override": 12, "runner_protect_enabled": True,
     })
     state = AppState.build()
-    await apply_auto_trade_preset(made["preset_id"], _fake_request(state))
+    out = await apply_auto_trade_preset(made["preset_id"], _fake_request(state))
 
     dep = await _qty_audits("DEPRECATED")
     assert len(dep) == 1
     assert dep[0].details == {
         "preset_id": made["preset_id"], "requested": 12, "config_qty": 3,
     }
+    # MINOR-1: the response echoes the ENFORCED (config) size, not the preset's.
+    assert out["settings"]["qty_override"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 5. Tier split (review MAJOR-1) — qty < 3 must not degenerate; the CLOSED-sync
+#    still fires; a MAX_CONTRACTS clip into 1/2 is safe.
+# ---------------------------------------------------------------------------
+
+
+def test_tier_split_small_qty_never_degenerates() -> None:
+    assert _tier_split(1) == (1, 0, 0)          # was (-1, 1, 1): T1 churn/naked
+    assert _tier_split(2) == (1, 1, 0)          # was (0, 1, 1): T1 never fired
+    assert _tier_split(3) == (1, 1, 1)
+    # qty >= 3 is the unchanged 30/40/30.
+    assert _tier_split(4) == (1, 2, 1)
+    assert _tier_split(5) == (2, 2, 1)
+    assert _tier_split(10) == (3, 4, 3)
+    assert _tier_split(20) == (6, 8, 6)
+    for q in range(1, 101):
+        t = _tier_split(q)
+        assert all(x >= 0 for x in t)           # never negative (no -1 churn)
+        assert sum(t) == q                      # parts cover the full position
+        assert t[0] >= 1                        # T1 always takes the first partial
+        nz = [x for x in t if x > 0]
+        assert list(t[:len(nz)]) == nz          # zeros only ever trail (T2/T3)
+
+
+def test_tier_split_closed_sync_fires_for_small_qty() -> None:
+    """Each split fully exits and the sold-qty CLOSED-sync recognizes it: the
+    NON-ZERO tiers banking cover the whole position — no deadlock on a 0-qty
+    tier, no over/under-sell."""
+    for q in (1, 2, 3, 5, 10):
+        tier_qtys = list(_tier_split(q))
+        fired = [x > 0 for x in tier_qtys]      # only non-zero tiers ever fire
+        assert _all_tiers_banked(tier_qtys, fired, q) is True
+        assert sum(qq for qq, f in zip(tier_qtys, fired) if qq and f) == q
+        # A partial (only T1 sold) closes ONLY when T1 == the whole position.
+        assert _all_tiers_banked(tier_qtys, [True, False, False], q) is (q == 1)
+
+
+async def test_gate_qty_2_places_valid_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_config(monkeypatch, qty=2)
+    calls = _stub_bracket(monkeypatch)
+    d = await maybe_auto_trade(_state(), _priced_verdict())
+    assert d.fired and calls[0].qty == 2
+    assert (calls[0].t1_qty, calls[0].t2_qty, calls[0].t3_qty) == (1, 1, 0)
+
+
+async def test_max_contracts_clip_to_2_is_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FEF_MAX_CONTRACTS_PER_TRADE clipping a larger config size down to 2 must
+    still produce the safe (1,1,0), not the old (0,1,1)."""
+    _patch_config(monkeypatch, qty=10)
+    monkeypatch.setenv("FEF_MAX_CONTRACTS_PER_TRADE", "2")
+    calls = _stub_bracket(monkeypatch)
+    d = await maybe_auto_trade(_state(), _priced_verdict())
+    assert d.fired and calls[0].qty == 2
+    assert (calls[0].t1_qty, calls[0].t2_qty, calls[0].t3_qty) == (1, 1, 0)

@@ -314,6 +314,41 @@ async def _audit_qty_fallback_once(state, qty: int, reason: str) -> None:
         logger.exception("qty fallback audit write failed")
 
 
+def _tier_split(qty: int) -> tuple[int, int, int]:
+    """30/40/30 T1/T2/T3 contract split (weight toward the 2.5R T2).
+
+    For qty < 3 there aren't enough lots for three tiers — fill T1, then T2,
+    leaving the rest at 0 (qty=1 -> (1,0,0); qty=2 -> (1,1,0)). A 0-qty tier is
+    the ONLY valid "skip this tier" marker: every watcher tier-gate is
+    `not fired and p.spx_target_tN_qty` (0 is falsy -> never evaluates/fires,
+    no _market_sell(0) churn) and the CLOSED-sync banks on SOLD qty vs original
+    (_all_tiers_banked) + all-NON-ZERO-tiers-fired, so a 0-qty tier neither
+    orphans a runner nor deadlocks CLOSED. The parts always sum to qty.
+
+    The retired `max(1, round(q*.3))/.4/rest` split produced (0,1,1) for qty=2
+    (T1 silently never fires — no first partial) and (-1,1,1) for qty=1 (a
+    NEGATIVE t1_qty is truthy -> T1 fires every 0.1s, sells -1 = noop, reverts
+    the flag -> ~20 DB writes/sec for the life of the position). FEF_MAX_
+    CONTRACTS_PER_TRADE=1|2 clips ANY size into the same degeneracy; this
+    function makes all of those safe. For qty >= 3 it is the SAME 30/40/30
+    formula as before (behavior byte-unchanged)."""
+    q = int(qty)
+    if q <= 0:
+        return (0, 0, 0)
+    if q == 1:
+        return (1, 0, 0)
+    if q == 2:
+        return (1, 1, 0)
+    # qty >= 3: historical 30/40/30 with the remainder on T3 (each tier >= 1,
+    # parts summing to qty). Unchanged from the pre-2026-07-09 split.
+    t1 = max(1, round(q * 0.30))
+    t2 = max(1, round(q * 0.40))
+    t3 = max(1, q - t1 - t2)
+    if t1 + t2 + t3 != q:
+        t1 = q - t2 - t3
+    return (t1, t2, t3)
+
+
 def _threshold_scale_for(state, sym: str, source: str) -> float:
     """The threshold_scale of the engine that PRODUCED the verdict, so the
     wall-collapse re-grade runs the formula at the verdict's own calibration.
@@ -675,13 +710,10 @@ async def _maybe_auto_trade_locked(
     today = time.strftime("%Y%m%d")
     # 30/40/30 split — shift weight toward T2 (now 2.5R). At 41% win rate
     # (confluence), the math favors carrying more capital into the larger
-    # R-multiples. T1 reduced from 50% to 30%; T2 raised from 30% to 40%;
-    # T3 stays roughly even.
-    t1_qty = max(1, round(qty * 0.30))
-    t2_qty = max(1, round(qty * 0.40))
-    t3_qty = max(1, qty - t1_qty - t2_qty)
-    if t1_qty + t2_qty + t3_qty != qty:
-        t1_qty = qty - t2_qty - t3_qty
+    # R-multiples. _tier_split handles small qty (1->(1,0,0), 2->(1,1,0))
+    # so a 1/2-lot fire (or a MAX_CONTRACTS clip to 1/2) can't produce a
+    # zero/negative T1 tier; qty >= 3 is the unchanged 30/40/30.
+    t1_qty, t2_qty, t3_qty = _tier_split(qty)
 
     # Honor the operator's chosen exit strategy at ANY size (freeze lifted 2026-06-30).
     # The old qty>=15 gate silently forced spx_points below 15 contracts, overriding

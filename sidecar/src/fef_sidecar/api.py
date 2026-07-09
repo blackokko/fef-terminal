@@ -1081,11 +1081,12 @@ async def apply_auto_trade_preset(preset_id: int, request: Request) -> dict[str,
             "ok": True,
             "applied": preset.name,
             "settings": {
-                # The ENFORCED (config_store) floor — presets can't change it.
+                # The ENFORCED (config_store) floor + size — presets can't
+                # change either; echo config, not the display-legacy state.
                 "confidence_floor": cfg_floor,
                 "cool_down_sec": s.auto_trade_cool_down_sec,
                 "trigger_types": s.auto_trade_trigger_types,
-                "qty_override": s.auto_trade_qty_override,
+                "qty_override": cfg_qty,
                 "runner_protect_enabled": s.runner_protect_enabled,
             },
         }

@@ -3230,15 +3230,18 @@ async def _eval_spx_points_parent(
     # evaluated in the cycle that filled T1.)
 
     # Sync parent status to CLOSED once the banked tiers cover the full
-    # position (real remaining == 0) — not on the flags alone, so a
-    # tier flagged without a completed sell can't orphan an open runner.
-    if (p.spx_target_t1_fired and p.spx_target_t2_fired
-        and p.spx_target_t3_fired and p.status not in ("STOPPED", "CLOSED")
-        and _all_tiers_banked(
-            [p.spx_target_t1_qty or 0, p.spx_target_t2_qty or 0, p.spx_target_t3_qty or 0],
-            [p.spx_target_t1_fired, p.spx_target_t2_fired, p.spx_target_t3_fired],
-            p.qty,
-        )):
+    # position (real remaining == 0) — not on the flags alone, so a tier
+    # flagged without a completed sell can't orphan an open runner.
+    #
+    # ALL NON-ZERO TIERS FIRED, not the three flags literally (2026-07-09): a
+    # small-qty split leaves 0-qty tiers (qty=2 -> [1,1,0]) that never evaluate,
+    # so requiring spx_target_t3_fired would DEADLOCK CLOSED for a 1/2-lot that
+    # has fully exited. _all_tiers_banked (sold >= original) stays the real gate.
+    _tier_qtys_now = [p.spx_target_t1_qty or 0, p.spx_target_t2_qty or 0, p.spx_target_t3_qty or 0]
+    _tier_fired_now = [p.spx_target_t1_fired, p.spx_target_t2_fired, p.spx_target_t3_fired]
+    _nonzero_all_fired = all(f for q, f in zip(_tier_qtys_now, _tier_fired_now) if q > 0)
+    if (_nonzero_all_fired and p.status not in ("STOPPED", "CLOSED")
+            and _all_tiers_banked(_tier_qtys_now, _tier_fired_now, p.qty)):
         await SignalIterRepository.update_live_order(p.id, status="CLOSED")
 
 

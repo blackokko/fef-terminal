@@ -460,15 +460,17 @@ def spawn_data_loops(state: AppState) -> None:
     # backfill script had silently lapsed — review MAJOR-3). Additive-only,
     # live-provider-only. Disable via FEF_VIX_DAILY_INGEST_ENABLED=false.
     # BOOT RACE (2026-07-09): this loop's boot pass can land the freshest VIX
-    # session AFTER a consumer already cached the day's lo-VIX label off the
-    # then-stale series. No boot-ordering change is made here — the ingest is
-    # deliberately delayed until IBKR connects (a 0s boot pass would fetch
-    # nothing and insert nothing), and gating the consumer loops on it would be
-    # an invasive live-loop change for a shadow-only mislabel. Instead the
-    # ingest INVALIDATES the lo_vix_day session cache when it lands a session
-    # newer than the cached basis (lo_vix_day.invalidate_cache_on_fresher_vix),
-    # which self-heals the label the moment the fresher row commits, robust to
-    # loop scheduling.
+    # session AFTER a consumer already cached (or is mid-computing) the day's
+    # lo-VIX label off the then-stale series. No boot-ordering change is made
+    # here — the ingest is deliberately delayed until IBKR connects (a 0s boot
+    # pass would fetch/insert nothing), and gating the consumer loops on it
+    # would be an invasive live-loop change for a shadow-only mislabel. Instead
+    # the ingest closes the race with TWO coordinated lo_vix_day mechanisms,
+    # robust to loop scheduling: (1) a monotonic state.vix_latest_ingested_date
+    # marker so a consumer suspended mid-read recomputes before caching a stale
+    # label (review MAJOR-2), and (2) invalidate_cache_on_fresher_vix drops any
+    # already-cached stale-basis assessment. Self-heals the moment the fresher
+    # row commits.
     from fef_sidecar.engine.vix_daily_ingest import vix_daily_ingest_loop
     spawn_supervised(
         state, "vix-daily-ingest", lambda: vix_daily_ingest_loop(state),

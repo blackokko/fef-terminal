@@ -292,13 +292,29 @@ async def assess_lo_vix(state: Any, *, at_ms: int | None = None) -> LoVixAssessm
 
     try:
         from fef_sidecar.db.repository import SignalIterRepository
-        bars = await SignalIterRepository.query_bars(
-            VIX_BAR_SYMBOL, VIX_BAR_SIZE,
-            from_ms=at - LOOKBACK_CALENDAR_DAYS * 86_400_000,
-            to_ms=at,
-            limit=200,
-        )
-        a = vix_open_percentile(bars, sess, max_stale_days=_max_stale_days())
+        a: LoVixAssessment | None = None
+        for _ in range(3):
+            bars = await SignalIterRepository.query_bars(
+                VIX_BAR_SYMBOL, VIX_BAR_SIZE,
+                from_ms=at - LOOKBACK_CALENDAR_DAYS * 86_400_000,
+                to_ms=at,
+                limit=200,
+            )
+            a = vix_open_percentile(bars, sess, max_stale_days=_max_stale_days())
+            # SYMMETRIC boot race (2026-07-09 review MAJOR-2): a consumer that
+            # suspended at query_bars can read the PRE-insert series while the
+            # ingest task commits a fresher session AND runs its cache-
+            # invalidation against a still-EMPTY cache (a no-op) — this call
+            # would then cache a stale basis the invalidation never catches. If
+            # a VIX session strictly newer than the basis we just ranked (or ANY
+            # session, when we ranked nothing) was committed during the read,
+            # recompute against the now-committed series before caching. Same
+            # supersession test invalidate_cache_on_fresher_vix uses; bounded
+            # (the re-query opens a fresh session -> sees committed rows ->
+            # converges in one retry; an ingest lands once per session).
+            latest = getattr(state, "vix_latest_ingested_date", None)
+            if not (latest and (a.value_date is None or latest > a.value_date)):
+                break
     except Exception as e:
         now_ms = _time.time() * 1000
         if now_ms - _last_err_log_ms >= _ERR_LOG_INTERVAL_MS:
@@ -355,14 +371,22 @@ async def invalidate_cache_on_fresher_vix(
     but it mislabels the lo-VIX shrink evidence and recurs every morning the
     series is one day stale at boot).
 
-    Cache-invalidation (not boot-ordering) is the robust fix — it corrects the
-    label the moment the fresher row commits, regardless of loop scheduling.
-    GUARD: only invalidate when the new data would actually change the basis —
-    a session STRICTLY newer than the cached value_date (a newer prior-close,
-    or today's now-completed bar). A cached UNKNOWN with NO usable basis
-    (value_date is None: empty/short series) is superseded by ANY fresh
-    session. A same/older-session ingest (a deep-history gap fill) does NOT
-    invalidate: it never moves the prior-close basis."""
+    This is ONE of TWO coordinated mechanisms (the other is the mid-read guard
+    in assess_lo_vix, which catches a consumer SUSPENDED at query_bars whose
+    call would cache a stale label THIS invalidation can't see — the cache is
+    empty at that instant). Together, and with the ingest's monotonic
+    state.vix_latest_ingested_date marker, the label is corrected regardless of
+    loop scheduling.
+
+    GUARD: for a cached DEFINITE-basis assessment (value_date set) invalidate
+    only when a session STRICTLY newer than that basis landed (a newer
+    prior-close, or today's now-completed bar); a same/older-session ingest (a
+    deep-history gap fill) does NOT move a definite prior-close basis, so it is
+    a no-op. A cached UNKNOWN with NO usable basis (value_date is None:
+    empty/short series) is superseded by ANY fresh session — INCLUDING an older
+    gap-fill, because supplying previously-missing pool data can turn the
+    unknown into a definite classification, so it correctly forces a
+    recompute."""
     try:
         cache = getattr(state, "lo_vix_day_cache", None)
         if not cache:
