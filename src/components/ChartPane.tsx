@@ -239,6 +239,20 @@ interface RegressionChannelPayload {
   status: string;
 }
 
+// Apply a regression-channel payload (center + ±dev·σ arrays, epoch-second
+// times) to a channel's three line series. Pure fn of its args — module
+// scope so it isn't recreated each render / needed in effect deps.
+type RegRefs = { center: ISeriesApi<"Line"> | null; upper: ISeriesApi<"Line"> | null; lower: ISeriesApi<"Line"> | null };
+function _applyChannel(refs: RegRefs, data: RegressionChannelPayload): void {
+  const toLine = (arr: { time: number; value: number }[] | undefined): LineData[] =>
+    (arr ?? []).map((p) => ({ time: p.time as UTCTimestamp, value: p.value }));
+  try {
+    refs.center?.setData(toLine(data.center));
+    refs.upper?.setData(toLine(data.upper_dev));
+    refs.lower?.setData(toLine(data.lower_dev));
+  } catch { /* chart may be tearing down */ }
+}
+
 // Deviation-multiplier options for the regression channel (channel half-width
 // in σ). Dale's setups use 2σ.
 const REG_DEVS = [1, 1.5, 2, 2.5, 3];
@@ -642,21 +656,8 @@ export function ChartPane() {
   }, [showTrendlines, symbol, timeframe, historicalDate, isTickTf]);
 
   // Regression channel (mode A + mode B) — server-fit via
-  // /chart/regression_channel. Applies the returned center + ±dev·σ arrays
-  // (epoch-second times) to a channel's three line series. Read-only overlay.
-  const applyChannel = (
-    refs: { center: ISeriesApi<"Line"> | null; upper: ISeriesApi<"Line"> | null; lower: ISeriesApi<"Line"> | null },
-    data: RegressionChannelPayload,
-  ) => {
-    const toLine = (arr: { time: number; value: number }[] | undefined): LineData[] =>
-      (arr ?? []).map((p) => ({ time: p.time as UTCTimestamp, value: p.value }));
-    try {
-      refs.center?.setData(toLine(data.center));
-      refs.upper?.setData(toLine(data.upper_dev));
-      refs.lower?.setData(toLine(data.lower_dev));
-    } catch { /* chart may be tearing down */ }
-  };
-
+  // /chart/regression_channel; rendered by the module-scope _applyChannel.
+  //
   // Mode A — CHART-FOLLOWING: bar_size = the chart timeframe; fit window =
   // regLookbackA, or the chart's own lookback when "auto". Live time-bars only.
   useEffect(() => {
@@ -675,7 +676,7 @@ export function ChartPane() {
         if (!r.ok || cancelled) return;
         const data = (await r.json()) as RegressionChannelPayload;
         if (cancelled) return;
-        applyChannel(refs, data);
+        _applyChannel(refs, data);
       } catch (e) {
         console.error("regression channel A fetch failed:", e);
       }
@@ -703,7 +704,7 @@ export function ChartPane() {
         if (!r.ok || cancelled) return;
         const data = (await r.json()) as RegressionChannelPayload;
         if (cancelled) return;
-        applyChannel(refs, data);
+        _applyChannel(refs, data);
       } catch (e) {
         console.error("regression channel B fetch failed:", e);
       }
