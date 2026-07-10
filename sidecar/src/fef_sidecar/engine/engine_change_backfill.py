@@ -240,6 +240,22 @@ SEMANTIC_CHANGES: list[tuple[str, str, str, str, str, str | None]] = [
      "'sell all at T1' nullified the +$18-25/ct ladder evidence's runner "
      "layer",
      None),
+    # ---- 2026-07-09 tier-scoping ----
+    ("2026-07-09T12:00:00", "gate_tier_scoping", "gate",
+     "Tier-scope the scanner CHOP / BIAS-VETO / TOD gates to LOW+MEDIUM fires "
+     "only — a HIGH-confidence verdict BYPASSES them (they run BEFORE the "
+     "2026-07-08 HIGH confidence floor, so on HIGH they only pre-empted fires "
+     "the floor already passes). FOMC gate UNCHANGED — binds on ALL tiers as "
+     "an event-risk guard. Bypassing HIGH fires that the old all-tiers chain "
+     "would have skipped are tagged extras.high_bypassed_gate='chop'|'bias'|"
+     "'tod' (observable, never blocking); LOW/MEDIUM run the full chain. "
+     "Hot-read toggle UIConfig.gate_high_bypass_enabled (default true); false "
+     "restores the old all-tiers behavior.",
+     "Registered study: chop/bias/tod block PROFITABLE HIGH fires — ~+$3,134/ct "
+     "left on the table and ~+35% fire frequency suppressed; their LOW/MEDIUM "
+     "job is now fully handled by the HIGH floor. FOMC kept: it blocks HIGH "
+     "fires that lose -$28/ct on FOMC mornings.",
+     None),
     ("2026-07-07T20:00:00", "lowvix_shadow_prior_close_basis", "data",
      "Documented basis deviation for the lo-VIX day classifier "
      "(engine/lo_vix_day.py): the registered lowvix backtest labeled days on "
