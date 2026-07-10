@@ -235,12 +235,13 @@ class AppState:
     # (no 0DTE) and for SPY/QQQ/IWM on Tu/Th.
     expiry_cache_by_key: dict[tuple, str] = field(default_factory=dict)
 
-    # 30-min bar cache per symbol — feeds the credit-spread recommender's
-    # TA entry detector (EMA 8/21, StdDev channel, engulfing). Re-fetched
-    # at most every 25 minutes per symbol so freshly closed 30-min bars
-    # get picked up without hammering IBKR.
-    spread_bars_by_symbol: dict[str, list[object]] = field(default_factory=dict)
-    spread_bars_fetched_ms: dict[str, int] = field(default_factory=dict)
+    # Generalized historical-bar cache keyed by (symbol, bar_size, duration).
+    # Backs BOTH the credit-spread recommender's 30-min/5-D TA fetch (EMA
+    # 8/21, StdDev channel, engulfing) AND the chart regression-channel
+    # overlay. Value = (fetched_at_ms, bars). Re-fetched at most every
+    # 25 minutes per key so freshly closed bars get picked up without
+    # hammering IBKR. Read-only DISPLAY/TA data — NOT part of the trade path.
+    bars_cache: dict[tuple[str, str, str], tuple[int, list[object]]] = field(default_factory=dict)
     # Last triggered signature — used so the recommender alert fires
     # exactly once per fresh trigger bar (per user preference).
     last_spread_trigger_signature: str = ""

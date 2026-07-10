@@ -134,7 +134,7 @@ enum value so `DailyReview.by_block_reason` aggregates cleanly.
 | `last_live_tick_spx`, `last_live_tick_ms` | Live SPX from IBKR |
 | `prior_close_by_symbol` | For day-change % in Live Quote panel |
 | `auto_trade_*` | All auto-trade config + counters |
-| `spread_bars_by_symbol` | 30-min bar cache for TA spread recommender |
+| `bars_cache` | Historical-bar cache keyed by (symbol, bar_size, duration) — spread recommender's 30m/5D TA fetch + chart regression overlay |
 
 ## Lifecycle invariants
 

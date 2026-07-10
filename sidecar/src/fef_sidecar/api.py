@@ -11,7 +11,7 @@ from fastapi import Body
 
 from fef_sidecar.config_store import UIConfig, load_config, save_config
 from fef_sidecar.db import SignalIterRepository
-from fef_sidecar.loop import _run_one_iter
+from fef_sidecar.loop import _get_cached_bars, _run_one_iter
 
 # NOTE (2026-07-08): this binding was MISSING while six handlers already
 # called logger.exception(...) in their error paths — each was a latent
@@ -5403,6 +5403,108 @@ async def chart_pattern_overlay(
     cfg = overlay_config_from_ui(load_config(), include_doji=doji)
     payload = build_overlay(window, cfg)
     return {**payload, "bar_count": len(window), "status": "ok", "source": source}
+
+
+@router.get("/chart/regression_channel")
+async def chart_regression_channel(
+    request: Request,
+    symbol: str = "SPX",
+    bar_size: str = "1 day",
+    duration: str = "6 M",
+    dev: float = 2.0,
+) -> dict[str, Any]:
+    """Regression (centered-OLS StdDev) channel overlay for the chart.
+
+    Fetches bars at (bar_size, duration) via the shared cached bar-fetch
+    (the SAME helper the spread recommender uses — IBKR serves any
+    bar_size/duration on demand, no new data source), runs the reused
+    engine.technical.stddev_channel, and returns the center line plus band
+    arrays as {time, value} points. `time` is epoch SECONDS, matching the
+    /chart/pattern_overlay convention.
+
+    Powers both chart modes: (A) chart-following — bar_size = the chart's
+    timeframe, duration = the user's lookback; (B) independent overlay —
+    caller-chosen (bar_size, duration) decoupled from the chart timeframe.
+
+    Bands: fixed +/-1 sigma /+/-2 sigma /+/-3 sigma PLUS a custom +/-dev*sigma
+    pair (upper_dev/lower_dev) so the frontend can draw the user's chosen
+    deviation multiplier. `dev` defaults to 2.0 (Dale's 2-sigma setup).
+
+    Fail-soft: returns empty arrays + a status string on any fetch/parse
+    failure (never raises), like /chart/pattern_overlay.
+
+    DISPLAY ONLY — read-only bar fetch; does NOT touch the auto-trade /
+    scanner / watcher / exit path.
+    """
+    from fef_sidecar.engine.technical import stddev_channel
+
+    s = _state(request)
+    sym = symbol.upper()
+    try:
+        dev_mult = float(dev)
+    except (TypeError, ValueError):
+        dev_mult = 2.0
+    if not (dev_mult > 0):
+        dev_mult = 2.0
+
+    empty = {
+        "center": [], "upper_1": [], "upper_2": [], "upper_3": [],
+        "lower_1": [], "lower_2": [], "lower_3": [],
+        "upper_dev": [], "lower_dev": [],
+    }
+
+    def _fail(status: str) -> dict[str, Any]:
+        return {**empty, "dev": dev_mult, "bar_size": bar_size,
+                "duration": duration, "bar_count": 0, "status": status}
+
+    try:
+        bars = await _get_cached_bars(s, sym, bar_size, duration)
+    except Exception:
+        logger.exception(
+            "regression_channel bar fetch failed for %s (%s / %s)", sym, bar_size, duration
+        )
+        return _fail("bar fetch failed")
+    if not bars:
+        return _fail(f"no bars for {sym} ({bar_size} / {duration})")
+
+    # Bars are ibkr.models.Bar — need epoch-second timestamps + closes.
+    # Sort ascending + dedupe on time (defense: the frontend's setData
+    # requires strictly ascending, distinct times).
+    dedup: dict[int, float] = {}
+    for b in bars:
+        try:
+            t = int(b.timestamp.timestamp())
+            dedup[t] = float(b.close)
+        except Exception:
+            continue
+    if not dedup:
+        return _fail("bars had no usable timestamps/closes")
+    times = sorted(dedup)
+    closes = [dedup[t] for t in times]
+
+    channel = stddev_channel(closes)
+
+    def _series(getter) -> list[dict[str, float]]:
+        return [{"time": times[i], "value": round(getter(channel[i]), 4)}
+                for i in range(len(times))]
+
+    # sigma_i = center-to-1-sigma distance (stddev_channel: upper_1 = center + sigma).
+    return {
+        "center": _series(lambda p: p.center),
+        "upper_1": _series(lambda p: p.upper_1),
+        "upper_2": _series(lambda p: p.upper_2),
+        "upper_3": _series(lambda p: p.upper_3),
+        "lower_1": _series(lambda p: p.lower_1),
+        "lower_2": _series(lambda p: p.lower_2),
+        "lower_3": _series(lambda p: p.lower_3),
+        "upper_dev": _series(lambda p: p.center + dev_mult * (p.upper_1 - p.center)),
+        "lower_dev": _series(lambda p: p.center - dev_mult * (p.upper_1 - p.center)),
+        "dev": dev_mult,
+        "bar_size": bar_size,
+        "duration": duration,
+        "bar_count": len(times),
+        "status": "ok",
+    }
 
 
 @router.get("/chart/tick_candles")

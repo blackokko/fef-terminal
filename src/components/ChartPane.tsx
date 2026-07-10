@@ -6,16 +6,12 @@ import {
   LineSeries,
   LineStyle,
   createChart,
-  createSeriesMarkers,
   type AutoscaleInfo,
   type CandlestickData,
   type IChartApi,
   type IPriceLine,
   type ISeriesApi,
-  type ISeriesMarkersPluginApi,
   type LineData,
-  type SeriesMarker,
-  type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
 import { useSidecar } from "../context/WebSocketContext";
@@ -72,9 +68,51 @@ function _fmtChartTime(time: unknown, includeDate: boolean, includeSeconds: bool
     if (!includeDate) return timeStr;
     const datePart = new Intl.DateTimeFormat("en-US", {
       timeZone: "America/Chicago",
-      month: "short", day: "numeric",
+      // Year included so the crosshair tooltip reads e.g. "Jul 10, 2026,
+      // 12:00pm" — the user does multi-YEAR lookback and must see the year.
+      year: "numeric", month: "short", day: "numeric",
     }).format(date);
     return `${datePart}, ${timeStr}`;
+  } catch {
+    return "";
+  }
+}
+
+// Axis tick-mark formatter. lightweight-charts calls tickMarkFormatter with
+// (time, tickMarkType, locale). The OLD formatter ignored tickMarkType and
+// always showed time-only, which loses all date context on daily/multi-year
+// charts. tickMarkType tells us the granularity of each tick, so we show:
+//   year ticks -> "2026", month ticks -> "Jul '26",
+//   day ticks  -> "Jul 10", intraday ticks -> the time.
+// Enum values (a const enum in lightweight-charts — NOT imported, so
+// isolatedModules builds stay clean): 0=Year 1=Month 2=DayOfMonth 3=Time
+// 4=TimeWithSeconds. All formatting stays in America/Chicago; never blank
+// the chart on a bad value (try/catch -> "").
+function _fmtAxisTick(time: unknown, tickMarkType: number, _locale: string): string {
+  const date = _toDate(time);
+  if (!date) return "";
+  try {
+    if (tickMarkType === 0) {
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/Chicago", year: "numeric",
+      }).format(date);
+    }
+    if (tickMarkType === 1) {
+      const mon = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/Chicago", month: "short",
+      }).format(date);
+      const yy = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/Chicago", year: "2-digit",
+      }).format(date);
+      return `${mon} '${yy}`;
+    }
+    if (tickMarkType === 2) {
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/Chicago", month: "short", day: "numeric",
+      }).format(date);
+    }
+    // Intraday ticks: 3 = Time, 4 = TimeWithSeconds
+    return _fmtChartTime(time, false, tickMarkType === 4);
   } catch {
     return "";
   }
@@ -90,7 +128,8 @@ const DARK_THEME = {
   crosshair: { mode: CrosshairMode.Normal },
   timeScale: {
     borderColor: "#2a323e", timeVisible: true, secondsVisible: false,
-    tickMarkFormatter: (time: unknown) => _fmtChartTime(time, false, false),
+    tickMarkFormatter: (time: unknown, tickMarkType: number, locale: string) =>
+      _fmtAxisTick(time, tickMarkType, locale),
   },
   rightPriceScale: { borderColor: "#2a323e" },
   localization: {
@@ -160,6 +199,7 @@ const LOOKBACK_OPTIONS = [
   { label: "1D", value: "1 D" },
   { label: "2D", value: "2 D" },
   { label: "1W", value: "1 W" },
+  { label: "10D", value: "10 D" },  // Dale's 10D/30min regression preset window
   { label: "2W", value: "2 W" },
   { label: "1M", value: "1 M" },
   { label: "3M", value: "3 M" },
@@ -175,19 +215,56 @@ const MIN_Y_RANGE_PTS = 50;
 const POLL_INTERVAL_MS = 3000;  // refresh historical bars every 3s
 const TICK_POLL_INTERVAL_MS = 1000;     // tick candles are in-memory — poll fast
 const PATTERN_POLL_INTERVAL_MS = 5000;  // pattern overlay refresh
+const REGRESSION_POLL_INTERVAL_MS = 15000;  // regression channel refresh — the
+// server caches bars ~25min so repeated polls are cheap; this just eventually
+// picks up a freshly-closed bar into the fit.
 
 // Pattern overlay payload (GET /chart/pattern_overlay). Times are epoch SECONDS.
-interface PatternOverlayPayload {
-  markers: {
-    time: number; position: string; shape: string;
-    color: string; text: string; size?: number; kind: string;
-  }[];
-  target_lines: { price: number; from_time: number; label: string; color: string; dir: string }[];
-  flag_zones: { from_time: number; to_time: number; top: number; bottom: number; dir: string }[];
+// We now consume ONLY the auto pivot trendlines — the candlestick-pattern
+// markers and measured-move flag target lines were dropped from the chart
+// (backend still returns them; the frontend just ignores those fields).
+interface TrendlineOverlayPayload {
   trendlines: { kind: string; points: [number, number][]; projected: [number, number] | null }[];
+}
+
+// Regression channel payload (GET /chart/regression_channel). Times are epoch
+// SECONDS. We draw center + the chosen ±dev·σ band (upper_dev/lower_dev); the
+// fixed ±1/2/3σ arrays are also returned by the endpoint but unused here.
+interface RegressionChannelPayload {
+  center: { time: number; value: number }[];
+  upper_dev: { time: number; value: number }[];
+  lower_dev: { time: number; value: number }[];
+  dev: number;
   bar_count: number;
   status: string;
 }
+
+// Deviation-multiplier options for the regression channel (channel half-width
+// in σ). Dale's setups use 2σ.
+const REG_DEVS = [1, 1.5, 2, 2.5, 3];
+// Fit-window (lookback) options for the regression channel dropdowns.
+const REG_LOOKBACKS = [
+  { label: "5D", value: "5 D" },
+  { label: "10D", value: "10 D" },
+  { label: "1M", value: "1 M" },
+  { label: "3M", value: "3 M" },
+  { label: "6M", value: "6 M" },
+  { label: "1Y", value: "1 Y" },
+];
+// Bar-size options for the INDEPENDENT overlay (mode B), decoupled from the
+// chart timeframe.
+const REG_BAR_SIZES = [
+  { label: "5m", value: "5 mins" },
+  { label: "30m", value: "30 mins" },
+  { label: "1h", value: "1 hour" },
+  { label: "1D", value: "1 day" },
+];
+// Dale's one-click regression setups: [label, duration, bar_size].
+const REG_PRESETS: { label: string; duration: string; barSize: string }[] = [
+  { label: "6mo·1D", duration: "6 M", barSize: "1 day" },
+  { label: "10D·30m", duration: "10 D", barSize: "30 mins" },
+  { label: "5D·5m", duration: "5 D", barSize: "5 mins" },
+];
 
 interface AggregatedWall {
   strike: number; sources: string[]; dominantColor: string;
@@ -233,12 +310,28 @@ export function ChartPane() {
   }>({ mid: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null });
   const [showEMA, setShowEMA] = useState(true);
   const [showSD, setShowSD] = useState(false);
-  // Pattern overlay (sidecar-detected candlestick patterns / flags / trendlines)
-  const [showPatterns, setShowPatterns] = useState(false);
-  const markersPluginRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
-  const patternLinesRef = useRef<IPriceLine[]>([]);
+  // Auto-trendline overlay (sidecar-detected support/resistance pivot rays).
+  // NOTE: the candlestick-pattern markers + measured-move flag target lines
+  // were removed — this toggle now draws ONLY the trendline rays.
+  const [showTrendlines, setShowTrendlines] = useState(false);
   const trendSupportRef = useRef<ISeriesApi<"Line"> | null>(null);
   const trendResistRef = useRef<ISeriesApi<"Line"> | null>(null);
+  // Customizable regression channel (centered-OLS StdDev channel, server-fit
+  // via /chart/regression_channel). Mode A = chart-following (solid purple);
+  // mode B = independent overlay at its OWN bar_size/lookback (dashed pink).
+  // Each draws center + the chosen ±dev·σ band.
+  const regARef = useRef<{
+    center: ISeriesApi<"Line"> | null; upper: ISeriesApi<"Line"> | null; lower: ISeriesApi<"Line"> | null;
+  }>({ center: null, upper: null, lower: null });
+  const regBRef = useRef<{
+    center: ISeriesApi<"Line"> | null; upper: ISeriesApi<"Line"> | null; lower: ISeriesApi<"Line"> | null;
+  }>({ center: null, upper: null, lower: null });
+  const [showRegA, setShowRegA] = useState(false);
+  const [showRegB, setShowRegB] = useState(false);
+  const [regDev, setRegDev] = useState(2);
+  const [regLookbackA, setRegLookbackA] = useState("");   // "" = follow the chart's lookback
+  const [regBarSizeB, setRegBarSizeB] = useState("1 day");
+  const [regLookbackB, setRegLookbackB] = useState("6 M");
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const ambientLinesRef = useRef<IPriceLine[]>([]);
   const renderedBarCountRef = useRef(0);
@@ -317,8 +410,21 @@ export function ChartPane() {
       color: "#f85149", lineWidth: 2,
       priceLineVisible: false, lastValueVisible: false,
     });
-    // Series markers plugin (v5 API) — pattern labels live here.
-    const markersPlugin = createSeriesMarkers(series, []);
+    // Customizable regression channel — mode A (chart-following, SOLID purple)
+    // + mode B (independent overlay, DASHED pink). Each = center + ±dev·σ.
+    // Distinct style so the two channels are never confused with each other
+    // or with the StdDev channel (gray/amber/red) / EMAs (orange/cyan).
+    const regLine = (color: string, width: 1 | 2, style: LineStyle) =>
+      chart.addSeries(LineSeries, {
+        color, lineWidth: width, lineStyle: style,
+        priceLineVisible: false, lastValueVisible: false, visible: false,
+      });
+    const regACenter = regLine("#d2a8ff", 2, LineStyle.Solid);
+    const regAUpper = regLine("#a371f7", 1, LineStyle.Solid);
+    const regALower = regLine("#a371f7", 1, LineStyle.Solid);
+    const regBCenter = regLine("#f778ba", 2, LineStyle.Dashed);
+    const regBUpper = regLine("#db61a2", 1, LineStyle.Dashed);
+    const regBLower = regLine("#db61a2", 1, LineStyle.Dashed);
 
     chartRef.current = chart;
     seriesRef.current = series;
@@ -327,7 +433,8 @@ export function ChartPane() {
     sdRefs.current = { mid, up1, up2, up3, dn1, dn2, dn3 };
     trendSupportRef.current = trendSupport;
     trendResistRef.current = trendResist;
-    markersPluginRef.current = markersPlugin;
+    regARef.current = { center: regACenter, upper: regAUpper, lower: regALower };
+    regBRef.current = { center: regBCenter, upper: regBUpper, lower: regBLower };
 
     const resize = () => {
       if (containerRef.current && chartRef.current) {
@@ -349,8 +456,8 @@ export function ChartPane() {
       sdRefs.current = { mid: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null };
       trendSupportRef.current = null;
       trendResistRef.current = null;
-      markersPluginRef.current = null;
-      patternLinesRef.current = [];
+      regARef.current = { center: null, upper: null, lower: null };
+      regBRef.current = { center: null, upper: null, lower: null };
       priceLinesRef.current = [];
       ambientLinesRef.current = [];
       renderedBarCountRef.current = 0;
@@ -428,9 +535,9 @@ export function ChartPane() {
       const sd = sdRefs.current;
       sd.mid?.setData([]); sd.up1?.setData([]); sd.up2?.setData([]); sd.up3?.setData([]);
       sd.dn1?.setData([]); sd.dn2?.setData([]); sd.dn3?.setData([]);
-      // Pattern overlay artifacts are stale on any symbol/timeframe/date
-      // change — clear markers, trendlines and flag-target lines.
-      markersPluginRef.current?.setMarkers([]);
+      // Trendline rays are stale on any symbol/timeframe/date change — clear
+      // them. (The regression channels A/B manage their own clear/refetch in
+      // their dedicated effects.)
       trendSupportRef.current?.setData([]);
       trendResistRef.current?.setData([]);
       if (seriesRef.current) {
@@ -438,8 +545,6 @@ export function ChartPane() {
         priceLinesRef.current = [];
         for (const line of ambientLinesRef.current) seriesRef.current.removePriceLine(line);
         ambientLinesRef.current = [];
-        for (const line of patternLinesRef.current) seriesRef.current.removePriceLine(line);
-        patternLinesRef.current = [];
       }
       // Re-enable price-axis autoscale. Without this, the Y-axis stays
       // pinned to the previous symbol's range (e.g. SMH ~270) when you
@@ -477,24 +582,21 @@ export function ChartPane() {
     return () => { cancelled = true; };
   }, [symbol, timeframe]);
 
-  // Pattern overlay — poll the sidecar's detector endpoint and render
-  // markers (candles/flags), dashed flag-target price lines, and the two
-  // pivot trendline rays. Live time-bars only: tick candles are ES prints
+  // Auto-trendline overlay — poll the sidecar's detector endpoint and render
+  // ONLY the two pivot trendline rays (support green / resistance red).
+  // Candlestick-pattern markers and flag measured-move target lines were
+  // intentionally dropped from the chart (the endpoint still returns them; we
+  // just don't consume them). Live time-bars only: tick candles are ES prints
   // (different price basis) and historical replay would need a date-window
   // variant of the endpoint, so both clear the overlay instead.
   useEffect(() => {
     const clearOverlay = () => {
       try {
-        markersPluginRef.current?.setMarkers([]);
         trendSupportRef.current?.setData([]);
         trendResistRef.current?.setData([]);
-        if (seriesRef.current) {
-          for (const line of patternLinesRef.current) seriesRef.current.removePriceLine(line);
-        }
-        patternLinesRef.current = [];
       } catch { /* chart may be tearing down */ }
     };
-    if (!showPatterns || isTickTf || historicalDate) {
+    if (!showTrendlines || isTickTf || historicalDate) {
       clearOverlay();
       return;
     }
@@ -504,36 +606,8 @@ export function ChartPane() {
         const url = `${API_BASE}/chart/pattern_overlay?symbol=${encodeURIComponent(symbol)}&bar_size=${encodeURIComponent(timeframe)}&lookback=400`;
         const r = await fetch(url);
         if (!r.ok || cancelled) return;
-        const data = (await r.json()) as PatternOverlayPayload;
+        const data = (await r.json()) as TrendlineOverlayPayload;
         if (cancelled || !seriesRef.current) return;
-
-        // Markers — payload is already lightweight-charts-shaped (bar-anchored
-        // positions only, so the SeriesMarkerPrice variant never applies).
-        const markers = (data.markers ?? []).map((m) => ({
-          time: m.time as UTCTimestamp,
-          position: m.position,
-          shape: m.shape,
-          color: m.color,
-          text: m.text,
-          size: m.size ?? 1,
-        }) as SeriesMarker<Time>);
-        markersPluginRef.current?.setMarkers(markers);
-
-        // Flag measured-move targets — keep the freshest 2 per direction so
-        // a busy session doesn't wallpaper the pane with stale targets.
-        for (const line of patternLinesRef.current) seriesRef.current.removePriceLine(line);
-        patternLinesRef.current = [];
-        const targets = data.target_lines ?? [];
-        const recent = [
-          ...targets.filter((t) => t.dir === "BULL").slice(-2),
-          ...targets.filter((t) => t.dir === "BEAR").slice(-2),
-        ];
-        for (const t of recent) {
-          patternLinesRef.current.push(seriesRef.current.createPriceLine({
-            price: t.price, color: t.color, lineWidth: 1, lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true, title: t.label,
-          }));
-        }
 
         // Trendlines — draw from the older pivot to the projection at the
         // newest bar (the sidecar computes the ray in bar-index space).
@@ -555,7 +629,7 @@ export function ChartPane() {
         applyTrend("support", trendSupportRef.current);
         applyTrend("resistance", trendResistRef.current);
       } catch (e) {
-        console.error("pattern overlay fetch failed:", e);
+        console.error("trendline overlay fetch failed:", e);
       }
     };
     void fetchOverlay();
@@ -565,7 +639,79 @@ export function ChartPane() {
       window.clearInterval(id);
       clearOverlay();
     };
-  }, [showPatterns, symbol, timeframe, historicalDate, isTickTf]);
+  }, [showTrendlines, symbol, timeframe, historicalDate, isTickTf]);
+
+  // Regression channel (mode A + mode B) — server-fit via
+  // /chart/regression_channel. Applies the returned center + ±dev·σ arrays
+  // (epoch-second times) to a channel's three line series. Read-only overlay.
+  const applyChannel = (
+    refs: { center: ISeriesApi<"Line"> | null; upper: ISeriesApi<"Line"> | null; lower: ISeriesApi<"Line"> | null },
+    data: RegressionChannelPayload,
+  ) => {
+    const toLine = (arr: { time: number; value: number }[] | undefined): LineData[] =>
+      (arr ?? []).map((p) => ({ time: p.time as UTCTimestamp, value: p.value }));
+    try {
+      refs.center?.setData(toLine(data.center));
+      refs.upper?.setData(toLine(data.upper_dev));
+      refs.lower?.setData(toLine(data.lower_dev));
+    } catch { /* chart may be tearing down */ }
+  };
+
+  // Mode A — CHART-FOLLOWING: bar_size = the chart timeframe; fit window =
+  // regLookbackA, or the chart's own lookback when "auto". Live time-bars only.
+  useEffect(() => {
+    const refs = regARef.current;
+    const clear = () => {
+      try { refs.center?.setData([]); refs.upper?.setData([]); refs.lower?.setData([]); } catch {}
+    };
+    if (!showRegA || isTickTf || historicalDate) { clear(); return; }
+    let cancelled = false;
+    const durationA = regLookbackA || effectiveLookback;
+    const fetchChannel = async () => {
+      try {
+        const url = `${API_BASE}/chart/regression_channel?symbol=${encodeURIComponent(symbol)}`
+          + `&bar_size=${encodeURIComponent(timeframe)}&duration=${encodeURIComponent(durationA)}&dev=${regDev}`;
+        const r = await fetch(url);
+        if (!r.ok || cancelled) return;
+        const data = (await r.json()) as RegressionChannelPayload;
+        if (cancelled) return;
+        applyChannel(refs, data);
+      } catch (e) {
+        console.error("regression channel A fetch failed:", e);
+      }
+    };
+    void fetchChannel();
+    const id = window.setInterval(fetchChannel, REGRESSION_POLL_INTERVAL_MS);
+    return () => { cancelled = true; window.clearInterval(id); clear(); };
+  }, [showRegA, symbol, timeframe, regLookbackA, regDev, effectiveLookback, isTickTf, historicalDate]);
+
+  // Mode B — INDEPENDENT OVERLAY: its OWN (bar_size, lookback), decoupled from
+  // the chart timeframe (e.g. sit on a 5-min chart, overlay the 6mo-daily
+  // channel). NOT re-fetched on chart-timeframe change (that's the point).
+  useEffect(() => {
+    const refs = regBRef.current;
+    const clear = () => {
+      try { refs.center?.setData([]); refs.upper?.setData([]); refs.lower?.setData([]); } catch {}
+    };
+    if (!showRegB || isTickTf || historicalDate) { clear(); return; }
+    let cancelled = false;
+    const fetchChannel = async () => {
+      try {
+        const url = `${API_BASE}/chart/regression_channel?symbol=${encodeURIComponent(symbol)}`
+          + `&bar_size=${encodeURIComponent(regBarSizeB)}&duration=${encodeURIComponent(regLookbackB)}&dev=${regDev}`;
+        const r = await fetch(url);
+        if (!r.ok || cancelled) return;
+        const data = (await r.json()) as RegressionChannelPayload;
+        if (cancelled) return;
+        applyChannel(refs, data);
+      } catch (e) {
+        console.error("regression channel B fetch failed:", e);
+      }
+    };
+    void fetchChannel();
+    const id = window.setInterval(fetchChannel, REGRESSION_POLL_INTERVAL_MS);
+    return () => { cancelled = true; window.clearInterval(id); clear(); };
+  }, [showRegB, symbol, regBarSizeB, regLookbackB, regDev, isTickTf, historicalDate]);
 
   // Toggle indicator visibility
   useEffect(() => {
@@ -578,6 +724,14 @@ export function ChartPane() {
       ref?.applyOptions({ visible: showSD });
     }
   }, [showSD]);
+  useEffect(() => {
+    const r = regARef.current;
+    for (const ref of [r.center, r.upper, r.lower]) ref?.applyOptions({ visible: showRegA });
+  }, [showRegA]);
+  useEffect(() => {
+    const r = regBRef.current;
+    for (const ref of [r.center, r.upper, r.lower]) ref?.applyOptions({ visible: showRegB });
+  }, [showRegB]);
 
   // Apply bars to the chart + ALWAYS recompute indicators when bars change.
   //
@@ -778,6 +932,20 @@ export function ChartPane() {
     }
   }, [dayHighLow]);
 
+  // Regression preset — one click configures BOTH modes to a Dale setup:
+  //   mode A (chart-following) gets the chart timeframe + display lookback
+  //     (regLookbackA left "auto" so the fit tracks that same window), and
+  //   mode B (independent overlay) gets the same bar_size + lookback.
+  // If you want a 5-min chart with a daily overlay, use mode B's dropdowns
+  // directly instead of a preset (a preset intentionally moves the chart).
+  const applyPreset = (duration: string, barSize: string) => {
+    setTimeframe(barSize);
+    setLookbackOverride(duration);
+    setRegLookbackA("");
+    setRegBarSizeB(barSize);
+    setRegLookbackB(duration);
+  };
+
   return (
     <div className="chart-pane">
       <div className="chart-toolbar">
@@ -829,12 +997,71 @@ export function ChartPane() {
                   onClick={() => setShowSD(s => !s)} title="StandardDevChannel — TOS-style linear regression across the full chart, ±1σ / 2σ / 3σ. Recomputes on timeframe / lookback change.">
             STD
           </button>
-          <button className={`chart-toolbar-btn ${showPatterns ? "active" : ""}`}
-                  onClick={() => setShowPatterns(s => !s)}
+          <button className={`chart-toolbar-btn ${showTrendlines ? "active" : ""}`}
+                  onClick={() => setShowTrendlines(s => !s)}
                   disabled={isTickTf || !!historicalDate}
-                  title="Pattern overlay — engulfing / hammer / 3-soldiers / stars / inside-bar coil markers, measured-move flag breakouts with dashed target lines, and auto pivot trendlines (support green, resistance red). Detected sidecar-side on persisted 1-min bars; live time-bars only.">
-            PAT
+                  title="Auto trendlines — support (green) / resistance (red) rays through the last two pivot lows/highs, projected to the newest bar. Detected sidecar-side; live time-bars only.">
+            Trendlines
           </button>
+        </div>
+        <div className="chart-toolbar-group">
+          {/* FEATURE 3 — customizable regression channel. Mode A follows the
+              chart timeframe; mode B is an independent (bar_size, lookback)
+              overlay. Sub-controls appear only for the enabled mode(s). */}
+          <button className={`chart-toolbar-btn ${showRegA ? "active" : ""}`}
+                  onClick={() => setShowRegA(s => !s)}
+                  disabled={isTickTf || !!historicalDate}
+                  title="Regression channel A (chart-following) — centered-OLS linear regression over the chart's timeframe across your chosen fit window, ±dev·σ bands. Solid purple.">
+            Reg A
+          </button>
+          <button className={`chart-toolbar-btn ${showRegB ? "active" : ""}`}
+                  onClick={() => setShowRegB(s => !s)}
+                  disabled={isTickTf || !!historicalDate}
+                  title="Regression channel B (independent overlay) — a SECOND channel at its OWN bar size + lookback, decoupled from the chart timeframe (e.g. sit on 5-min, overlay the 6-month daily channel). Dashed pink.">
+            Reg B
+          </button>
+          {(showRegA || showRegB) && (
+            <select value={String(regDev)} onChange={(e) => setRegDev(Number(e.target.value))}
+                    className="chart-date-select"
+                    title="Deviation multiplier — channel half-width in standard deviations (Dale = 2σ). Applies to both regression channels.">
+              {REG_DEVS.map((d) => (
+                <option key={d} value={d}>{d}σ</option>
+              ))}
+            </select>
+          )}
+          {showRegA && (
+            <select value={regLookbackA} onChange={(e) => setRegLookbackA(e.target.value)}
+                    className="chart-date-select"
+                    title="Regression A fit window. 'auto' fits over the chart's current lookback; pick a value to fit a different window than displayed.">
+              <option value="">fit: auto ({effectiveLookback})</option>
+              {REG_LOOKBACKS.map((o) => (
+                <option key={o.value} value={o.value}>fit: {o.label}</option>
+              ))}
+            </select>
+          )}
+          {showRegB && (
+            <>
+              <select value={regBarSizeB} onChange={(e) => setRegBarSizeB(e.target.value)}
+                      className="chart-date-select" title="Regression B (independent) bar size.">
+                {REG_BAR_SIZES.map((o) => (
+                  <option key={o.value} value={o.value}>B bars: {o.label}</option>
+                ))}
+              </select>
+              <select value={regLookbackB} onChange={(e) => setRegLookbackB(e.target.value)}
+                      className="chart-date-select" title="Regression B (independent) lookback / fit window.">
+                {REG_LOOKBACKS.map((o) => (
+                  <option key={o.value} value={o.value}>B back: {o.label}</option>
+                ))}
+              </select>
+            </>
+          )}
+          {REG_PRESETS.map((p) => (
+            <button key={p.label} className="chart-toolbar-btn"
+                    onClick={() => applyPreset(p.duration, p.barSize)}
+                    title={`Dale preset — set the chart timeframe + lookback (mode A) and the independent overlay's bar size + lookback (mode B) to ${p.label}.`}>
+              {p.label}
+            </button>
+          ))}
         </div>
         <div className="chart-toolbar-info muted small">
           {bars.length} {isTickTf ? "candle" : "bar"}{bars.length === 1 ? "" : "s"}

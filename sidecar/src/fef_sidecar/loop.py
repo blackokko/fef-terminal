@@ -759,39 +759,68 @@ async def quantdata_poll_loop(state: AppState) -> None:
         await asyncio.sleep(interval)
 
 
-async def _get_spread_bars_30m(state: AppState) -> list[Any]:
-    """Return cached 30-min bars for the active symbol. Re-fetches if the
-    cache is older than 25 min OR is missing entirely. Best-effort: returns
-    [] if the fetch fails (recommender will then short-circuit to NONE).
+# Historical-bar cache TTL — a freshly closed bar is picked up within this
+# window without hammering IBKR. Shared by the spread recommender + chart.
+_BARS_CACHE_TTL_MS = 25 * 60 * 1000
 
-    30-min bars are resampled from finer-grained 30-min bar requests when
-    the broker supports it directly. For LiveIBKRProvider, we ask for
-    '30 mins' directly. For mock, the same — its fetch_historical_bars
-    synthesizes whatever bar size we request.
+
+async def _get_cached_bars(
+    state: AppState,
+    symbol: str,
+    bar_size: str,
+    duration: str,
+    *,
+    max_age_ms: int = _BARS_CACHE_TTL_MS,
+) -> list[Any]:
+    """Fetch + cache historical bars keyed by (symbol, bar_size, duration).
+
+    Re-fetches when the cached entry is missing/empty OR older than
+    max_age_ms; otherwise serves the cache so repeated callers (the spread
+    recommender's 30-min/5-D TA fetch + the chart regression overlay) don't
+    each hit IBKR. Best-effort: returns [] if the fetch fails, and an empty
+    result is NOT served from cache (keeps retrying — matches the original
+    spread-recommender behaviour where an empty list fell through).
+
+    IBKR serves any bar_size/duration on demand — no new data source. For
+    mock, fetch_historical_bars synthesizes whatever bar size is requested.
+
+    Read-only DISPLAY/TA data — NOT part of the auto-trade / scanner /
+    watcher / exit path.
     """
     import time as _t
     from fef_sidecar.ibkr.models import Contract
 
-    symbol = state.active_symbol
     now_ms = int(_t.time() * 1000)
-    cached = state.spread_bars_by_symbol.get(symbol)
-    fetched_at = state.spread_bars_fetched_ms.get(symbol, 0)
-    if cached and (now_ms - fetched_at) < 25 * 60 * 1000:
-        return cached  # type: ignore[return-value]
+    key = (symbol, bar_size, duration)
+    cached = state.bars_cache.get(key)
+    if cached is not None:
+        fetched_at, bars = cached
+        if bars and (now_ms - fetched_at) < max_age_ms:
+            return bars  # type: ignore[return-value]
 
     try:
         bars = await state.ibkr.fetch_historical_bars(  # type: ignore[attr-defined]
             Contract.for_symbol(symbol),
-            bar_size="30 mins",
-            duration="5 D",
+            bar_size=bar_size,
+            duration=duration,
         )
     except Exception:
-        logger.exception("fetch_historical_bars (30m) failed for %s", symbol)
+        logger.exception(
+            "fetch_historical_bars failed for %s (%s / %s)", symbol, bar_size, duration
+        )
         bars = []
 
-    state.spread_bars_by_symbol[symbol] = bars  # type: ignore[assignment]
-    state.spread_bars_fetched_ms[symbol] = now_ms
+    state.bars_cache[key] = (now_ms, bars)
     return bars  # type: ignore[return-value]
+
+
+async def _get_spread_bars_30m(state: AppState) -> list[Any]:
+    """Cached 30-min / 5-D bars for the active symbol — feeds the credit-
+    spread recommender's TA entry detector (EMA 8/21 cross + StdDev channel
+    + engulfing). Thin wrapper over the generalized _get_cached_bars; the
+    25-min TTL and best-effort [] semantics are unchanged.
+    """
+    return await _get_cached_bars(state, state.active_symbol, "30 mins", "5 D")
 
 
 def _ntm_max_pain(snap: Any) -> float:
