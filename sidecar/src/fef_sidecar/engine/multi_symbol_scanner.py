@@ -305,6 +305,11 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
     now_ms = int(_time.time() * 1000)
     qd_drift = float(inputs.drift_cum_net_m)
 
+    # The scanner loop runs around the clock; the flow comparison is only
+    # meaningful (and the audit volume only justified) during the session.
+    sess_now, minute_now = _now_et_parts(now_ms)
+    in_session_window = (9 * 60 + 25) <= minute_now <= (16 * 60 + 15)
+
     # QD 3-min delta from the scanner's own sample history (evidence only).
     qd_d3 = None
     try:
@@ -329,7 +334,7 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
         else:
             # Fail-soft fallback to the QD input — audit once per session so
             # a silent mid-session source degradation is visible.
-            sess, _ = _now_et_parts(now_ms)
+            sess = sess_now
             if getattr(state, "_theta_fallback_audited", None) != sess:
                 state._theta_fallback_audited = sess
                 try:
@@ -347,8 +352,28 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
                 except Exception:
                     logger.exception("scanner: theta fallback audit failed")
 
-    # flow_shadow evidence row — only once the ingest loop has published.
-    if holder is not None:
+    # In theta mode, an ACTIVE swap flipping to fallback (or back) mid-session
+    # is the same scale discontinuity as a config flip — the engine's delta
+    # window would straddle theta-scale and QD-scale levels. Quarantine once
+    # per transition (no-op in the default 'qd' mode, where swap never arms).
+    try:
+        prev_swap = getattr(state, "_theta_swap_active", None)
+        if prev_swap is not None and prev_swap != swap_applied and engine is not None:
+            if hasattr(engine, "reset"):
+                engine.reset()
+            logger.warning(
+                "scanner: theta drift swap %s mid-process — SPX engine window "
+                "quarantined (scale discontinuity)",
+                "armed" if swap_applied else "fell back to QD",
+            )
+        state._theta_swap_active = swap_applied
+    except Exception:
+        pass
+
+    # flow_shadow evidence row — only once the ingest loop has published,
+    # and only inside the session window (audit-volume bound; the scanner
+    # loop itself never sleeps).
+    if holder is not None and in_session_window:
         try:
             details = {
                 "qd_drift_m": round(qd_drift, 4),

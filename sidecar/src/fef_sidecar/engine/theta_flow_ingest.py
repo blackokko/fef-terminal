@@ -159,11 +159,20 @@ def et_iso_to_utc_ms(ts_iso: str) -> int:
 _RIGHT_MAP = {"CALL": "C", "PUT": "P"}  # ingest_thetadata_flow.py:82
 
 
-def parse_trade_obj(o: dict) -> tuple[int, float, str, float, int] | None:
-    """One ndjson trade object -> (utc_ms, strike, right, price, size).
+def parse_trade_obj(o: dict) -> tuple[int, float, str, float, int, tuple] | None:
+    """One ndjson trade object -> (utc_ms, strike, right, price, size, disc).
 
     Field handling mirrors ingest_thetadata_flow.py:88-94 (malformed rows
     are silently dropped, exactly like the original `except: continue`).
+
+    disc = (sequence, exchange, condition) — the tape's own print
+    discriminator, used ONLY for incremental-overlap dedupe. The original
+    construction had NO dedupe (it processed every line of one full-day
+    pull); a coarser key silently merged distinct prints — sweep components
+    routinely land at the SAME ms/strike/right/price/size on different
+    exchanges/sequences (measured 13.2% of a real session tape,
+    proof-of-construction root cause 2026-07-15). Zero collisions measured
+    with the full discriminator.
     """
     try:
         price = float(o["price"])
@@ -175,7 +184,8 @@ def parse_trade_obj(o: dict) -> tuple[int, float, str, float, int] | None:
         return None
     if right not in ("C", "P"):
         return None
-    return (tms, strike, right, price, size)
+    disc = (o.get("sequence"), o.get("exchange"), o.get("condition"))
+    return (tms, strike, right, price, size, disc)
 
 
 def parse_quote_obj(o: dict) -> tuple[int, float, str, float, float] | None:
@@ -269,11 +279,17 @@ class ThetaFlowSessionBuilder:
         return n
 
     def ingest_trades(self, parsed: Iterable[tuple]) -> int:
-        """Buffer parsed trades (deduped) for later finalization."""
+        """Buffer parsed trades for later finalization.
+
+        Dedupe (incremental-overlap protection) keys on the FULL tuple
+        including the tape discriminator — distinct prints sharing
+        ms/strike/right/price/size (sweep components across exchanges) must
+        all count, exactly as the original no-dedupe full-day construction
+        counted them."""
         n = 0
         for t in parsed:
-            tms, strike, right, price, size = t
-            key = (tms, strike, right, price, size)
+            tms = t[0]
+            key = t
             if key in self._seen:
                 self.trades_deduped += 1
                 continue
@@ -298,7 +314,7 @@ class ThetaFlowSessionBuilder:
         """Classify + aggregate one minute — VERBATIM construction of
         ingest_thetadata_flow.py aggregate() lines 95-116."""
         b = dict(cbp=0.0, csp=0.0, pbp=0.0, psp=0.0, cbv=0, csv=0, pbv=0, psv=0)
-        for tms, strike, right, price, size in trades:
+        for tms, strike, right, price, size, *_ in trades:
             qmin = self.quotes.minute_at_or_before(tms)
             q = self.quotes.quote(qmin, strike, right) if qmin is not None else None
             sign = classify(price, q[0], q[1]) if q else 0

@@ -107,9 +107,11 @@ QUOTE_OBJ = {
 def test_parse_trade_obj():
     p = parse_trade_obj(TRADE_OBJ)
     assert p is not None
-    tms, strike, right, price, size = p
+    tms, strike, right, price, size, disc = p
     assert (strike, right, price, size) == (7315.0, "C", 28.40, 2)
     assert tms == _ms("2026-06-26T09:30:08.725")
+    # the tape's print discriminator rides along for overlap dedupe
+    assert disc == (1779355774, 5, 130)
     assert parse_trade_obj({**TRADE_OBJ, "right": "PUT"})[2] == "P"
     assert parse_trade_obj({k: v for k, v in TRADE_OBJ.items() if k != "price"}) is None
     assert parse_trade_obj({**TRADE_OBJ, "right": "X"}) is None
@@ -164,11 +166,11 @@ def _builder_with_quotes() -> tuple[ThetaFlowSessionBuilder, int]:
 def test_aggregate_minute_and_net_sign_convention():
     b, m0 = _builder_with_quotes()
     b.ingest_trades([
-        (m0 + 1_000, 7300.0, "C", 1.2, 2),   # call buy at ask: prem 240
-        (m0 + 2_000, 7300.0, "C", 1.0, 1),   # call sell at bid: prem 100
-        (m0 + 3_000, 7300.0, "P", 2.4, 1),   # put buy at ask: prem 240
-        (m0 + 4_000, 7300.0, "P", 2.2, 3),   # exactly mid -> sign 0, excluded
-        (m0 + 5_000, 7310.0, "C", 5.0, 1),   # no quote for strike -> excluded
+        (m0 + 1_000, 7300.0, "C", 1.2, 2, ("d1",)),   # call buy at ask: prem 240
+        (m0 + 2_000, 7300.0, "C", 1.0, 1, ("d2",)),   # call sell at bid: prem 100
+        (m0 + 3_000, 7300.0, "P", 2.4, 1, ("d3",)),   # put buy at ask: prem 240
+        (m0 + 4_000, 7300.0, "P", 2.2, 3, ("d4",)),   # exactly mid -> sign 0, excluded
+        (m0 + 5_000, 7310.0, "C", 5.0, 1, ("d5",)),   # no quote for strike -> excluded
     ])
     rows = b.finalize(0, force=True)
     assert len(rows) == 1
@@ -184,7 +186,7 @@ def test_minute_bucketing_and_quote_at_or_before():
     b, m0 = _builder_with_quotes()
     m1 = m0 + 60_000
     b.ingest_trades([
-        (m0 + 59_999, 7300.0, "C", 1.2, 1),  # last ms of minute 0
+        (m0 + 59_999, 7300.0, "C", 1.2, 1, ("d6",)),  # last ms of minute 0
         (m1, 7300.0, "C", 1.2, 1),           # first ms of minute 1
     ])
     rows = {r[1]: r for r in b.finalize(0, force=True)}
@@ -195,9 +197,9 @@ def test_minute_bucketing_and_quote_at_or_before():
 def test_cumsum_fresh_per_session_starting_at_zero():
     b, m0 = _builder_with_quotes()
     b.ingest_trades([
-        (m0 + 1_000, 7300.0, "C", 1.2, 1),            # min0 net +120
-        (m0 + 61_000, 7300.0, "P", 2.4, 1),           # min1 net -240
-        (m0 + 121_000, 7300.0, "C", 1.2, 2),          # min2 net +240
+        (m0 + 1_000, 7300.0, "C", 1.2, 1, ("d7",)),            # min0 net +120
+        (m0 + 61_000, 7300.0, "P", 2.4, 1, ("d8",)),           # min1 net -240
+        (m0 + 121_000, 7300.0, "C", 1.2, 2, ("d9",)),          # min2 net +240
     ])
     b.finalize(0, force=True)
     assert b.drift_cum_net_m(m0 - 1) is None          # before first minute
@@ -215,7 +217,7 @@ def test_incremental_chunking_matches_full_rebuild():
     m0 = _ms("2026-06-26T09:30:00")
     for i in range(4):
         trades.append((m0 + i * 60_000 + 5_000, 7300.0, "C", 1.2, i + 1))
-        trades.append((m0 + i * 60_000 + 6_000, 7300.0, "P", 2.0, 1))
+        trades.append((m0 + i * 60_000 + 6_000, 7300.0, "P", 2.0, 1, ("d10",)))
     # full rebuild
     full, _ = _builder_with_quotes()
     full.ingest_trades(trades)
@@ -236,7 +238,7 @@ def test_incremental_chunking_matches_full_rebuild():
 def test_finalize_gating_waits_for_complete_minute_and_quote():
     b = ThetaFlowSessionBuilder("2026-06-26")
     m0 = _ms("2026-06-26T09:30:00")
-    b.ingest_trades([(m0 + 1_000, 7300.0, "C", 1.2, 1)])
+    b.ingest_trades([(m0 + 1_000, 7300.0, "C", 1.2, 1, ("d11",))])
     # minute not complete yet
     assert b.finalize(m0 + 30_000) == []
     # complete + lag passed, but NO quote minute yet and grace not expired
@@ -250,7 +252,7 @@ def test_finalize_gating_waits_for_complete_minute_and_quote():
 def test_finalize_quote_grace_expiry_yields_unclassified_row():
     b = ThetaFlowSessionBuilder("2026-06-26")
     m0 = _ms("2026-06-26T09:30:00")
-    b.ingest_trades([(m0 + 1_000, 7300.0, "C", 1.2, 1)])
+    b.ingest_trades([(m0 + 1_000, 7300.0, "C", 1.2, 1, ("d12",))])
     rows = b.finalize(m0 + 60_000 + 130_000)   # grace expired, no quotes
     assert len(rows) == 1
     # no quote -> sign 0 -> bucket exists but all aggregates zero
@@ -259,15 +261,34 @@ def test_finalize_quote_grace_expiry_yields_unclassified_row():
 
 def test_trade_dedupe_and_late_print_drop():
     b, m0 = _builder_with_quotes()
-    t = (m0 + 1_000, 7300.0, "C", 1.2, 1)
+    t = (m0 + 1_000, 7300.0, "C", 1.2, 1, ("d13",))
     assert b.ingest_trades([t]) == 1
     assert b.ingest_trades([t]) == 0               # exact duplicate
     assert b.trades_deduped == 1
     b.finalize(0, force=True)
     # a late print behind an already-finalized minute is dropped (the EOD
     # reconcile pass repairs the stored row from the authoritative rebuild)
-    assert b.ingest_trades([(m0 + 2_000, 7300.0, "C", 1.0, 1)]) == 0
+    assert b.ingest_trades([(m0 + 2_000, 7300.0, "C", 1.0, 1, ("d14",))]) == 0
     assert b.rows[m0][2] == 120.0                   # row unchanged
+
+
+def test_sweep_components_all_count():
+    """REGRESSION (Phase-C root cause, 2026-07-15): sweep components print at
+    the SAME ms/strike/right/price/size on different exchanges/sequences —
+    13.2% of a real session tape shares the coarse 5-field key. Every
+    distinct print must count (the validated construction had no dedupe);
+    only true re-pull duplicates (identical discriminator) may be dropped."""
+    b, m0 = _builder_with_quotes()
+    sweep = [
+        (m0 + 1_000, 7300.0, "C", 1.2, 1, (101, 5, 130)),
+        (m0 + 1_000, 7300.0, "C", 1.2, 1, (102, 7, 130)),   # same ms/px/size
+        (m0 + 1_000, 7300.0, "C", 1.2, 1, (103, 5, 18)),
+    ]
+    assert b.ingest_trades(sweep) == 3
+    rows = b.finalize(0, force=True)
+    assert rows[0][2] == 3 * 120.0 and rows[0][6] == 3
+    # identical discriminator = the same print re-pulled -> deduped
+    assert b.ingest_trades([sweep[0]]) == 0
 
 
 # ---------------------------------------------------------------------------
