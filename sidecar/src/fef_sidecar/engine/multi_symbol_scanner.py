@@ -452,6 +452,10 @@ async def _scan_one_symbol(state, symbol: str) -> None:
             state, symbol, spot=inputs.spx_price,
             delta_price=verdict.delta_price,
             delta_drift_m=verdict.delta_drift_m,
+            # Real drift context for the advisory row (the values the engine
+            # actually consumed this scan — post flow_source selection).
+            drift_cum_net_m=inputs.drift_cum_net_m,
+            drift_bias=inputs.drift_bias,
         )
     except Exception:
         logger.exception("scanner: impulse flag evaluation failed for %s", symbol)
@@ -651,6 +655,7 @@ async def _chop_gate_context(state) -> tuple[Any | None, _EntryGatesConfig]:
 async def maybe_impulse_flag(
     state, symbol: str, *, spot: float,
     delta_price: float | None, delta_drift_m: float | None,
+    drift_cum_net_m: float | None = None, drift_bias: str | None = None,
 ) -> bool:
     """IMPULSE ATTENTION FLAG — advisory only, NEVER trades.
 
@@ -765,11 +770,23 @@ async def maybe_impulse_flag(
                 f"[IMPULSE {direction}] {body}. "
                 "Advisory attention flag — decision-support only, no trade."
             ),
-            drift_cum_net_m=0.0, drift_bias="NEUTRAL",
+            # Log the REAL drift context the scan evaluated (2026-07-15 fix:
+            # these advisory rows used to hardcode drift_cum_net_m=0.0,
+            # polluting any signal_iter drift analytics that didn't filter
+            # them out). The column is non-nullable, so when the caller has
+            # no drift context the legacy 0.0/NEUTRAL stands — the
+            # extras.is_impulse marker below makes the rows unambiguously
+            # separable either way.
+            drift_cum_net_m=(
+                float(drift_cum_net_m) if drift_cum_net_m is not None else 0.0
+            ),
+            drift_bias=(drift_bias if drift_bias else "NEUTRAL"),
             ntm_max_pain=0.0, raw_max_pain=0.0,
             top_gex_walls=[], top_dex_walls=[],
             extras={
                 "source": "impulse_flag",
+                "is_impulse": True,
+                "drift_context_logged": drift_cum_net_m is not None,
                 "advisory": True,
                 "scanner_symbol": symbol,
                 "impulse_direction": direction,
