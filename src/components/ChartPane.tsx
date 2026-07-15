@@ -228,35 +228,44 @@ interface TrendlineOverlayPayload {
 }
 
 // Regression channel payload (GET /chart/regression_channel). Times are epoch
-// SECONDS. We draw center + the chosen ±dev·σ band (upper_dev/lower_dev); the
-// fixed ±1/2/3σ arrays are also returned by the endpoint but unused here.
+// SECONDS. The independent StdDev-channel OVERLAY draws the full ±1σ/2σ/3σ nest
+// (same bands as the chart-following StdDev channel, just fit over its own
+// bar_size/lookback window).
 interface RegressionChannelPayload {
   center: { time: number; value: number }[];
-  upper_dev: { time: number; value: number }[];
-  lower_dev: { time: number; value: number }[];
-  dev: number;
+  upper_1: { time: number; value: number }[];
+  upper_2: { time: number; value: number }[];
+  upper_3: { time: number; value: number }[];
+  lower_1: { time: number; value: number }[];
+  lower_2: { time: number; value: number }[];
+  lower_3: { time: number; value: number }[];
   bar_count: number;
   status: string;
 }
 
-// Apply a regression-channel payload (center + ±dev·σ arrays, epoch-second
-// times) to a channel's three line series. Pure fn of its args — module
+// Apply a regression-channel payload (center + ±1/2/3σ arrays, epoch-second
+// times) to the overlay's seven line series. Pure fn of its args — module
 // scope so it isn't recreated each render / needed in effect deps.
-type RegRefs = { center: ISeriesApi<"Line"> | null; upper: ISeriesApi<"Line"> | null; lower: ISeriesApi<"Line"> | null };
+type RegRefs = {
+  center: ISeriesApi<"Line"> | null;
+  up1: ISeriesApi<"Line"> | null; up2: ISeriesApi<"Line"> | null; up3: ISeriesApi<"Line"> | null;
+  dn1: ISeriesApi<"Line"> | null; dn2: ISeriesApi<"Line"> | null; dn3: ISeriesApi<"Line"> | null;
+};
 function _applyChannel(refs: RegRefs, data: RegressionChannelPayload): void {
   const toLine = (arr: { time: number; value: number }[] | undefined): LineData[] =>
     (arr ?? []).map((p) => ({ time: p.time as UTCTimestamp, value: p.value }));
   try {
     refs.center?.setData(toLine(data.center));
-    refs.upper?.setData(toLine(data.upper_dev));
-    refs.lower?.setData(toLine(data.lower_dev));
+    refs.up1?.setData(toLine(data.upper_1));
+    refs.up2?.setData(toLine(data.upper_2));
+    refs.up3?.setData(toLine(data.upper_3));
+    refs.dn1?.setData(toLine(data.lower_1));
+    refs.dn2?.setData(toLine(data.lower_2));
+    refs.dn3?.setData(toLine(data.lower_3));
   } catch { /* chart may be tearing down */ }
 }
 
-// Deviation-multiplier options for the regression channel (channel half-width
-// in σ). Dale's setups use 2σ.
-const REG_DEVS = [1, 1.5, 2, 2.5, 3];
-// Fit-window (lookback) options for the regression channel dropdowns.
+// Fit-window (lookback) options for the overlay's lookback dropdown.
 const REG_LOOKBACKS = [
   { label: "5D", value: "5 D" },
   { label: "10D", value: "10 D" },
@@ -330,22 +339,16 @@ export function ChartPane() {
   const [showTrendlines, setShowTrendlines] = useState(false);
   const trendSupportRef = useRef<ISeriesApi<"Line"> | null>(null);
   const trendResistRef = useRef<ISeriesApi<"Line"> | null>(null);
-  // Customizable regression channel (centered-OLS StdDev channel, server-fit
-  // via /chart/regression_channel). Mode A = chart-following (solid purple);
-  // mode B = independent overlay at its OWN bar_size/lookback (dashed pink).
-  // Each draws center + the chosen ±dev·σ band.
-  const regARef = useRef<{
-    center: ISeriesApi<"Line"> | null; upper: ISeriesApi<"Line"> | null; lower: ISeriesApi<"Line"> | null;
-  }>({ center: null, upper: null, lower: null });
-  const regBRef = useRef<{
-    center: ISeriesApi<"Line"> | null; upper: ISeriesApi<"Line"> | null; lower: ISeriesApi<"Line"> | null;
-  }>({ center: null, upper: null, lower: null });
-  const [showRegA, setShowRegA] = useState(false);
-  const [showRegB, setShowRegB] = useState(false);
-  const [regDev, setRegDev] = useState(2);
-  const [regLookbackA, setRegLookbackA] = useState("");   // "" = follow the chart's lookback
-  const [regBarSizeB, setRegBarSizeB] = useState("1 day");
-  const [regLookbackB, setRegLookbackB] = useState("6 M");
+  // Independent StdDev-channel OVERLAY — a SECOND channel, server-fit via
+  // /chart/regression_channel at its OWN bar_size/lookback, decoupled from the
+  // chart timeframe (e.g. sit on a 5-min chart, overlay the 6mo-daily channel).
+  // Draws the full ±1σ/2σ/3σ nest, same as the chart-following StdDev channel.
+  const overlayRef = useRef<RegRefs>({
+    center: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null,
+  });
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [overlayBarSize, setOverlayBarSize] = useState("1 day");
+  const [overlayLookback, setOverlayLookback] = useState("6 M");
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const ambientLinesRef = useRef<IPriceLine[]>([]);
   const renderedBarCountRef = useRef(0);
@@ -424,21 +427,22 @@ export function ChartPane() {
       color: "#f85149", lineWidth: 2,
       priceLineVisible: false, lastValueVisible: false,
     });
-    // Customizable regression channel — mode A (chart-following, SOLID purple)
-    // + mode B (independent overlay, DASHED pink). Each = center + ±dev·σ.
-    // Distinct style so the two channels are never confused with each other
-    // or with the StdDev channel (gray/amber/red) / EMAs (orange/cyan).
-    const regLine = (color: string, width: 1 | 2, style: LineStyle) =>
+    // Independent StdDev-channel OVERLAY — full ±1σ/2σ/3σ nest in a PINK family
+    // (center magenta, 1σ light pink, 2σ pink, 3σ deep magenta), all DASHED so
+    // it's never confused with the chart-following StdDev channel (gray/amber/
+    // red, dotted/dashed/solid) or the EMAs (orange/cyan).
+    const ovLine = (color: string, width: 1 | 2) =>
       chart.addSeries(LineSeries, {
-        color, lineWidth: width, lineStyle: style,
+        color, lineWidth: width, lineStyle: LineStyle.Dashed,
         priceLineVisible: false, lastValueVisible: false, visible: false,
       });
-    const regACenter = regLine("#d2a8ff", 2, LineStyle.Solid);
-    const regAUpper = regLine("#a371f7", 1, LineStyle.Solid);
-    const regALower = regLine("#a371f7", 1, LineStyle.Solid);
-    const regBCenter = regLine("#f778ba", 2, LineStyle.Dashed);
-    const regBUpper = regLine("#db61a2", 1, LineStyle.Dashed);
-    const regBLower = regLine("#db61a2", 1, LineStyle.Dashed);
+    const ovCenter = ovLine("#f778ba", 2);
+    const ovUp1 = ovLine("#f0b3d4", 1);
+    const ovDn1 = ovLine("#f0b3d4", 1);
+    const ovUp2 = ovLine("#db61a2", 1);
+    const ovDn2 = ovLine("#db61a2", 1);
+    const ovUp3 = ovLine("#bf4b8a", 2);
+    const ovDn3 = ovLine("#bf4b8a", 2);
 
     chartRef.current = chart;
     seriesRef.current = series;
@@ -447,8 +451,9 @@ export function ChartPane() {
     sdRefs.current = { mid, up1, up2, up3, dn1, dn2, dn3 };
     trendSupportRef.current = trendSupport;
     trendResistRef.current = trendResist;
-    regARef.current = { center: regACenter, upper: regAUpper, lower: regALower };
-    regBRef.current = { center: regBCenter, upper: regBUpper, lower: regBLower };
+    overlayRef.current = {
+      center: ovCenter, up1: ovUp1, up2: ovUp2, up3: ovUp3, dn1: ovDn1, dn2: ovDn2, dn3: ovDn3,
+    };
 
     const resize = () => {
       if (containerRef.current && chartRef.current) {
@@ -470,8 +475,9 @@ export function ChartPane() {
       sdRefs.current = { mid: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null };
       trendSupportRef.current = null;
       trendResistRef.current = null;
-      regARef.current = { center: null, upper: null, lower: null };
-      regBRef.current = { center: null, upper: null, lower: null };
+      overlayRef.current = {
+        center: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null,
+      };
       priceLinesRef.current = [];
       ambientLinesRef.current = [];
       renderedBarCountRef.current = 0;
@@ -655,64 +661,38 @@ export function ChartPane() {
     };
   }, [showTrendlines, symbol, timeframe, historicalDate, isTickTf]);
 
-  // Regression channel (mode A + mode B) — server-fit via
-  // /chart/regression_channel; rendered by the module-scope _applyChannel.
-  //
-  // Mode A — CHART-FOLLOWING: bar_size = the chart timeframe; fit window =
-  // regLookbackA, or the chart's own lookback when "auto". Live time-bars only.
+  // Independent StdDev-channel OVERLAY — server-fit via /chart/regression_channel
+  // at its OWN (bar_size, lookback), decoupled from the chart timeframe (e.g. sit
+  // on a 5-min chart, overlay the 6mo-daily channel). Draws the full ±1/2/3σ nest
+  // via _applyChannel. Live time-bars only.
   useEffect(() => {
-    const refs = regARef.current;
+    const refs = overlayRef.current;
     const clear = () => {
-      try { refs.center?.setData([]); refs.upper?.setData([]); refs.lower?.setData([]); } catch {}
+      try {
+        refs.center?.setData([]);
+        refs.up1?.setData([]); refs.up2?.setData([]); refs.up3?.setData([]);
+        refs.dn1?.setData([]); refs.dn2?.setData([]); refs.dn3?.setData([]);
+      } catch {}
     };
-    if (!showRegA || isTickTf || historicalDate) { clear(); return; }
+    if (!showOverlay || isTickTf || historicalDate) { clear(); return; }
     let cancelled = false;
-    const durationA = regLookbackA || effectiveLookback;
     const fetchChannel = async () => {
       try {
         const url = `${API_BASE}/chart/regression_channel?symbol=${encodeURIComponent(symbol)}`
-          + `&bar_size=${encodeURIComponent(timeframe)}&duration=${encodeURIComponent(durationA)}&dev=${regDev}`;
+          + `&bar_size=${encodeURIComponent(overlayBarSize)}&duration=${encodeURIComponent(overlayLookback)}`;
         const r = await fetch(url);
         if (!r.ok || cancelled) return;
         const data = (await r.json()) as RegressionChannelPayload;
         if (cancelled) return;
         _applyChannel(refs, data);
       } catch (e) {
-        console.error("regression channel A fetch failed:", e);
+        console.error("stddev overlay fetch failed:", e);
       }
     };
     void fetchChannel();
     const id = window.setInterval(fetchChannel, REGRESSION_POLL_INTERVAL_MS);
     return () => { cancelled = true; window.clearInterval(id); clear(); };
-  }, [showRegA, symbol, timeframe, regLookbackA, regDev, effectiveLookback, isTickTf, historicalDate]);
-
-  // Mode B — INDEPENDENT OVERLAY: its OWN (bar_size, lookback), decoupled from
-  // the chart timeframe (e.g. sit on a 5-min chart, overlay the 6mo-daily
-  // channel). NOT re-fetched on chart-timeframe change (that's the point).
-  useEffect(() => {
-    const refs = regBRef.current;
-    const clear = () => {
-      try { refs.center?.setData([]); refs.upper?.setData([]); refs.lower?.setData([]); } catch {}
-    };
-    if (!showRegB || isTickTf || historicalDate) { clear(); return; }
-    let cancelled = false;
-    const fetchChannel = async () => {
-      try {
-        const url = `${API_BASE}/chart/regression_channel?symbol=${encodeURIComponent(symbol)}`
-          + `&bar_size=${encodeURIComponent(regBarSizeB)}&duration=${encodeURIComponent(regLookbackB)}&dev=${regDev}`;
-        const r = await fetch(url);
-        if (!r.ok || cancelled) return;
-        const data = (await r.json()) as RegressionChannelPayload;
-        if (cancelled) return;
-        _applyChannel(refs, data);
-      } catch (e) {
-        console.error("regression channel B fetch failed:", e);
-      }
-    };
-    void fetchChannel();
-    const id = window.setInterval(fetchChannel, REGRESSION_POLL_INTERVAL_MS);
-    return () => { cancelled = true; window.clearInterval(id); clear(); };
-  }, [showRegB, symbol, regBarSizeB, regLookbackB, regDev, isTickTf, historicalDate]);
+  }, [showOverlay, symbol, overlayBarSize, overlayLookback, isTickTf, historicalDate]);
 
   // Toggle indicator visibility
   useEffect(() => {
@@ -726,13 +706,11 @@ export function ChartPane() {
     }
   }, [showSD]);
   useEffect(() => {
-    const r = regARef.current;
-    for (const ref of [r.center, r.upper, r.lower]) ref?.applyOptions({ visible: showRegA });
-  }, [showRegA]);
-  useEffect(() => {
-    const r = regBRef.current;
-    for (const ref of [r.center, r.upper, r.lower]) ref?.applyOptions({ visible: showRegB });
-  }, [showRegB]);
+    const r = overlayRef.current;
+    for (const ref of [r.center, r.up1, r.up2, r.up3, r.dn1, r.dn2, r.dn3]) {
+      ref?.applyOptions({ visible: showOverlay });
+    }
+  }, [showOverlay]);
 
   // Apply bars to the chart + ALWAYS recompute indicators when bars change.
   //
@@ -933,18 +911,16 @@ export function ChartPane() {
     }
   }, [dayHighLow]);
 
-  // Regression preset — one click configures BOTH modes to a Dale setup:
-  //   mode A (chart-following) gets the chart timeframe + display lookback
-  //     (regLookbackA left "auto" so the fit tracks that same window), and
-  //   mode B (independent overlay) gets the same bar_size + lookback.
-  // If you want a 5-min chart with a daily overlay, use mode B's dropdowns
-  // directly instead of a preset (a preset intentionally moves the chart).
+  // Dale preset — one click sets the chart timeframe + lookback (the
+  // chart-following StdDev channel fits that window automatically) AND points
+  // the independent overlay at the same bar_size + lookback. To see two
+  // timeframes at once (e.g. a 5-min chart with a 6mo-daily channel), set the
+  // overlay's own dropdowns instead of clicking a preset (which moves the chart).
   const applyPreset = (duration: string, barSize: string) => {
     setTimeframe(barSize);
     setLookbackOverride(duration);
-    setRegLookbackA("");
-    setRegBarSizeB(barSize);
-    setRegLookbackB(duration);
+    setOverlayBarSize(barSize);
+    setOverlayLookback(duration);
   };
 
   return (
@@ -1006,52 +982,27 @@ export function ChartPane() {
           </button>
         </div>
         <div className="chart-toolbar-group">
-          {/* FEATURE 3 — customizable regression channel. Mode A follows the
-              chart timeframe; mode B is an independent (bar_size, lookback)
-              overlay. Sub-controls appear only for the enabled mode(s). */}
-          <button className={`chart-toolbar-btn ${showRegA ? "active" : ""}`}
-                  onClick={() => setShowRegA(s => !s)}
+          {/* Independent StdDev-channel OVERLAY — a SECOND ±1/2/3σ channel at
+              its own bar size + lookback, decoupled from the chart timeframe.
+              The chart-following StdDev channel is the "STD" button above. */}
+          <button className={`chart-toolbar-btn ${showOverlay ? "active" : ""}`}
+                  onClick={() => setShowOverlay(s => !s)}
                   disabled={isTickTf || !!historicalDate}
-                  title="Regression channel A (chart-following) — centered-OLS linear regression over the chart's timeframe across your chosen fit window, ±dev·σ bands. Solid purple.">
-            Reg A
+                  title="StdDev overlay — a SECOND ±1σ/2σ/3σ channel at its OWN bar size + lookback, independent of the chart timeframe (e.g. sit on a 5-min chart, overlay the 6-month daily channel). Pink dashed.">
+            Overlay
           </button>
-          <button className={`chart-toolbar-btn ${showRegB ? "active" : ""}`}
-                  onClick={() => setShowRegB(s => !s)}
-                  disabled={isTickTf || !!historicalDate}
-                  title="Regression channel B (independent overlay) — a SECOND channel at its OWN bar size + lookback, decoupled from the chart timeframe (e.g. sit on 5-min, overlay the 6-month daily channel). Dashed pink.">
-            Reg B
-          </button>
-          {(showRegA || showRegB) && (
-            <select value={String(regDev)} onChange={(e) => setRegDev(Number(e.target.value))}
-                    className="chart-date-select"
-                    title="Deviation multiplier — channel half-width in standard deviations (Dale = 2σ). Applies to both regression channels.">
-              {REG_DEVS.map((d) => (
-                <option key={d} value={d}>{d}σ</option>
-              ))}
-            </select>
-          )}
-          {showRegA && (
-            <select value={regLookbackA} onChange={(e) => setRegLookbackA(e.target.value)}
-                    className="chart-date-select"
-                    title="Regression A fit window. 'auto' fits over the chart's current lookback; pick a value to fit a different window than displayed.">
-              <option value="">fit: auto ({effectiveLookback})</option>
-              {REG_LOOKBACKS.map((o) => (
-                <option key={o.value} value={o.value}>fit: {o.label}</option>
-              ))}
-            </select>
-          )}
-          {showRegB && (
+          {showOverlay && (
             <>
-              <select value={regBarSizeB} onChange={(e) => setRegBarSizeB(e.target.value)}
-                      className="chart-date-select" title="Regression B (independent) bar size.">
+              <select value={overlayBarSize} onChange={(e) => setOverlayBarSize(e.target.value)}
+                      className="chart-date-select" title="Overlay bar size (independent of the chart).">
                 {REG_BAR_SIZES.map((o) => (
-                  <option key={o.value} value={o.value}>B bars: {o.label}</option>
+                  <option key={o.value} value={o.value}>bars: {o.label}</option>
                 ))}
               </select>
-              <select value={regLookbackB} onChange={(e) => setRegLookbackB(e.target.value)}
-                      className="chart-date-select" title="Regression B (independent) lookback / fit window.">
+              <select value={overlayLookback} onChange={(e) => setOverlayLookback(e.target.value)}
+                      className="chart-date-select" title="Overlay lookback / fit window (independent of the chart).">
                 {REG_LOOKBACKS.map((o) => (
-                  <option key={o.value} value={o.value}>B back: {o.label}</option>
+                  <option key={o.value} value={o.value}>back: {o.label}</option>
                 ))}
               </select>
             </>
@@ -1059,7 +1010,7 @@ export function ChartPane() {
           {REG_PRESETS.map((p) => (
             <button key={p.label} className="chart-toolbar-btn"
                     onClick={() => applyPreset(p.duration, p.barSize)}
-                    title={`Dale preset — set the chart timeframe + lookback (mode A) and the independent overlay's bar size + lookback (mode B) to ${p.label}.`}>
+                    title={`Dale preset — set the chart timeframe + lookback (the STD channel follows) and point the overlay at ${p.label}.`}>
               {p.label}
             </button>
           ))}
