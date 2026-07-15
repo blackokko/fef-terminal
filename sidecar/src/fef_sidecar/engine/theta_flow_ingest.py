@@ -435,6 +435,13 @@ def _et_hhmmss(ts_ms: int) -> str:
     return dt.datetime.fromtimestamp(ts_ms / 1000, ET).strftime("%H:%M:%S")
 
 
+# Ingest in chunks of this many parsed rows, yielding to the event loop
+# between chunks — a full-day tape is order 10^6 prints and a single
+# synchronous ingest would stall the shared loop (adversarial review MAJOR-1)
+# and hold the whole batch in memory at once (MINOR-9).
+_INGEST_CHUNK = 20_000
+
+
 async def pull_quotes(client: Any, builder: ThetaFlowSessionBuilder,
                       start_time: str | None = None) -> int:
     d = _yyyymmdd(builder.session_date)
@@ -450,6 +457,10 @@ async def pull_quotes(client: Any, builder: ThetaFlowSessionBuilder,
         if p is not None:
             batch.append(p)
             n += 1
+        if len(batch) >= _INGEST_CHUNK:
+            builder.ingest_quotes(batch)
+            batch = []
+            await asyncio.sleep(0)
     builder.ingest_quotes(batch)
     return n
 
@@ -467,7 +478,11 @@ async def pull_trades(client: Any, builder: ThetaFlowSessionBuilder,
         p = parse_trade_obj(o)
         if p is not None:
             batch.append(p)
-    n = builder.ingest_trades(batch)
+        if len(batch) >= _INGEST_CHUNK:
+            n += builder.ingest_trades(batch)
+            batch = []
+            await asyncio.sleep(0)
+    n += builder.ingest_trades(batch)
     return n
 
 
@@ -481,7 +496,11 @@ async def rebuild_session(client: Any, session_date: str, *,
     builder = ThetaFlowSessionBuilder(session_date)
     await pull_quotes(client, builder)
     await pull_trades(client, builder)
-    builder.finalize(
+    # The full-day finalize classifies order 10^6 prints — run it off the
+    # event loop (the builder is loop-owned and untouched while awaited;
+    # adversarial review MAJOR-1).
+    await asyncio.to_thread(
+        builder.finalize,
         int(_time.time() * 1000) if finalize_now_ms is None else finalize_now_ms,
         force=force,
     )
@@ -500,8 +519,28 @@ async def persist_rows(rows: list[tuple]) -> int:
     if not rows:
         return 0
     from sqlalchemy.exc import IntegrityError
+    from sqlmodel import select
     from fef_sidecar.db.engine import get_session
     from fef_sidecar.db.models import ThetaFlowMinute
+
+    # Pre-filter minutes already persisted (one indexed read) — a boot
+    # rebuild re-produces the whole session and a naive bulk insert would
+    # hit the unique index and degrade to ~390 per-row rollback transactions
+    # (adversarial review MAJOR-1 amplifier).
+    try:
+        dates = {r[0] for r in rows}
+        async with get_session() as session:
+            existing = {
+                (e.session_date, e.ts_ms) for e in (await session.exec(
+                    select(ThetaFlowMinute)
+                    .where(ThetaFlowMinute.session_date.in_(dates))  # type: ignore[attr-defined]
+                )).all()
+            }
+        rows = [r for r in rows if (r[0], int(r[1])) not in existing]
+        if not rows:
+            return 0
+    except Exception:
+        logger.exception("theta_flow: persist pre-filter failed — inserting raw")
 
     def _model(r: tuple) -> ThetaFlowMinute:
         return ThetaFlowMinute(
@@ -546,7 +585,7 @@ async def reconcile_session_rows(session_date: str,
     from fef_sidecar.db.engine import get_session
     from fef_sidecar.db.models import ThetaFlowMinute
 
-    changed = added = 0
+    changed = added = removed = 0
     async with get_session() as session:
         existing = {
             r.ts_ms: r for r in (await session.exec(
@@ -554,6 +593,14 @@ async def reconcile_session_rows(session_date: str,
                 .where(ThetaFlowMinute.session_date == session_date)
             )).all()
         }
+        # Rows the authoritative tape does NOT contain (e.g. a provisional
+        # minute built from later-busted prints) must be REMOVED — the table
+        # contract is exact equality with the full-tape construction
+        # (adversarial review MINOR-6).
+        for ts, cur in existing.items():
+            if ts not in authoritative:
+                await session.delete(cur)
+                removed += 1
         for minute, row in sorted(authoritative.items()):
             cur = existing.get(minute)
             vals = dict(
@@ -573,7 +620,8 @@ async def reconcile_session_rows(session_date: str,
                     setattr(cur, k, v)
                 session.add(cur)
                 changed += 1
-    return {"added": added, "changed": changed, "total": len(authoritative)}
+    return {"added": added, "changed": changed, "removed": removed,
+            "total": len(authoritative)}
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +655,7 @@ def _update_holder(state: Any, builder: ThetaFlowSessionBuilder | None, *,
         pass
 
 
-def theta_drift_read(state: Any, *, max_age_min: float = 5.0) -> tuple[float | None, bool]:
+def theta_drift_read(state: Any, *, max_age_min: float = 8.0) -> tuple[float | None, bool]:
     """(drift_theta_cum_m, fresh) for consumers. fresh=False when the ingest
     is disabled/stale/absent or the last finalized minute is older than
     max_age_min — callers must then fall back to the QD input (fail-soft)."""
@@ -654,13 +702,23 @@ async def _poll_cycle(client: Any, builder: ThetaFlowSessionBuilder) -> list[tup
     return builder.finalize(int(_time.time() * 1000))
 
 
-async def _settle_session(client: Any, builder: ThetaFlowSessionBuilder) -> None:
+async def _settle_session(client: Any, builder: ThetaFlowSessionBuilder) -> bool:
     """EOD: force-finalize the remainder, then rebuild the full session from
     the tape through the same code path and reconcile the persisted rows to
     the authoritative construction. Audit row carries the self-check stats —
-    the per-session construction evidence for the swap decision."""
-    rows = builder.finalize(int(_time.time() * 1000), force=True)
-    await persist_rows(rows)
+    the per-session construction evidence for the swap decision.
+
+    NEVER raises; returns True on full success. A False from the reconcile
+    stage is retried by the caller a bounded number of times (adversarial
+    review MINOR-7: an unbounded 30s retry would hammer the Terminal with
+    full-day rebuilds until midnight)."""
+    try:
+        rows = await asyncio.to_thread(
+            builder.finalize, int(_time.time() * 1000), force=True)
+        await persist_rows(rows)
+    except Exception:
+        logger.exception("theta_flow: EOD force-finalize/persist failed")
+        return False
     try:
         authoritative = await rebuild_session(
             client, builder.session_date, force=True)
@@ -671,32 +729,39 @@ async def _settle_session(client: Any, builder: ThetaFlowSessionBuilder) -> None
             f"reconcile skipped (intraday rows stand)",
             {"session_date": builder.session_date, "eod_rebuild": "failed"},
         )
-        return
-    # Compare intraday (incremental) construction vs authoritative full-tape.
-    live_rows, auth_rows = builder.rows, authoritative.rows
-    common = sorted(set(live_rows) & set(auth_rows))
-    mismatched = [m for m in common
-                  if abs(live_rows[m][10] - auth_rows[m][10]) > 1e-6]
-    summary_stats = {
-        "session_date": builder.session_date,
-        "live_minutes": len(live_rows),
-        "auth_minutes": len(auth_rows),
-        "net_mismatched_minutes": len(mismatched),
-        "live_eod_drift_m": builder.drift_cum_net_m(),
-        "auth_eod_drift_m": authoritative.drift_cum_net_m(),
-    }
-    recon = await reconcile_session_rows(builder.session_date, auth_rows)
-    summary_stats.update(recon)
-    await _audit(
-        f"theta_flow EOD settle {builder.session_date}: "
-        f"{len(auth_rows)} authoritative minutes, "
-        f"{len(mismatched)} intraday net mismatches, "
-        f"reconcile changed={recon['changed']} added={recon['added']}; "
-        f"EOD drift live {summary_stats['live_eod_drift_m']} vs "
-        f"auth {summary_stats['auth_eod_drift_m']} (M$)",
-        summary_stats,
-    )
-    logger.info("theta_flow: EOD settle %s — %s", builder.session_date, summary_stats)
+        return False
+    try:
+        # Compare intraday (incremental) construction vs authoritative tape.
+        live_rows, auth_rows = builder.rows, authoritative.rows
+        common = sorted(set(live_rows) & set(auth_rows))
+        mismatched = [m for m in common
+                      if abs(live_rows[m][10] - auth_rows[m][10]) > 1e-6]
+        summary_stats = {
+            "session_date": builder.session_date,
+            "live_minutes": len(live_rows),
+            "auth_minutes": len(auth_rows),
+            "net_mismatched_minutes": len(mismatched),
+            "live_eod_drift_m": builder.drift_cum_net_m(),
+            "auth_eod_drift_m": authoritative.drift_cum_net_m(),
+        }
+        recon = await reconcile_session_rows(builder.session_date, auth_rows)
+        summary_stats.update(recon)
+        await _audit(
+            f"theta_flow EOD settle {builder.session_date}: "
+            f"{len(auth_rows)} authoritative minutes, "
+            f"{len(mismatched)} intraday net mismatches, "
+            f"reconcile changed={recon['changed']} added={recon['added']} "
+            f"removed={recon['removed']}; "
+            f"EOD drift live {summary_stats['live_eod_drift_m']} vs "
+            f"auth {summary_stats['auth_eod_drift_m']} (M$)",
+            summary_stats,
+        )
+        logger.info("theta_flow: EOD settle %s — %s",
+                    builder.session_date, summary_stats)
+        return True
+    except Exception:
+        logger.exception("theta_flow: EOD reconcile failed")
+        return False
 
 
 async def theta_flow_ingest_loop(state: Any) -> None:
@@ -718,8 +783,13 @@ async def theta_flow_ingest_loop(state: Any) -> None:
     builder: ThetaFlowSessionBuilder | None = None
     session_ready = False          # boot rebuild done for builder.session_date
     settled_date: str | None = None
+    settle_attempts = 0            # bounded EOD retry (MINOR-7)
     outage = False
     disabled_logged = False
+    SETTLE_MAX_ATTEMPTS = 3
+    PULL_DEADLINE_SEC = 240.0      # end-to-end bound per poll/rebuild stage
+    REBUILD_DEADLINE_SEC = 600.0   # a drip-feeding Terminal must not wedge
+                                   # the loop past the watchdog (MINOR-8)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
         while True:
@@ -743,6 +813,7 @@ async def theta_flow_ingest_loop(state: Any) -> None:
                 if builder is None or builder.session_date != today:
                     builder = ThetaFlowSessionBuilder(today)
                     session_ready = False
+                    settle_attempts = 0
 
                 in_poll_window = weekday and POLL_START_MIN <= mod <= POLL_END_MIN
                 past_settle = weekday and mod >= SETTLE_AFTER_MIN
@@ -751,7 +822,10 @@ async def theta_flow_ingest_loop(state: Any) -> None:
                     if not session_ready:
                         # Boot / mid-session restart: rebuild today from the
                         # tape (exact; the pull is cheap on the live day).
-                        rebuilt = await rebuild_session(client, today)
+                        rebuilt = await asyncio.wait_for(
+                            rebuild_session(client, today),
+                            REBUILD_DEADLINE_SEC,
+                        )
                         builder = rebuilt
                         session_ready = True
                         n_rows = await persist_rows(list(builder.rows.values()))
@@ -771,13 +845,27 @@ async def theta_flow_ingest_loop(state: Any) -> None:
                              "drift_cum_net_m": builder.drift_cum_net_m()},
                         )
                     elif in_poll_window:
-                        new_rows = await _poll_cycle(client, builder)
+                        new_rows = await asyncio.wait_for(
+                            _poll_cycle(client, builder), PULL_DEADLINE_SEC)
                         if new_rows:
                             await persist_rows(new_rows)
 
                     if past_settle and settled_date != today:
-                        await _settle_session(client, builder)
-                        settled_date = today
+                        settle_attempts += 1
+                        ok = await asyncio.wait_for(
+                            _settle_session(client, builder),
+                            REBUILD_DEADLINE_SEC,
+                        )
+                        if ok or settle_attempts >= SETTLE_MAX_ATTEMPTS:
+                            if not ok:
+                                await _audit(
+                                    f"theta_flow EOD settle {today}: gave up "
+                                    f"after {settle_attempts} attempts — "
+                                    f"intraday rows stand unreconciled",
+                                    {"session_date": today,
+                                     "attempts": settle_attempts},
+                                )
+                            settled_date = today
 
                     if outage:
                         outage = False

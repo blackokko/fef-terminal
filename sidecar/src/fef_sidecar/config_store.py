@@ -186,6 +186,10 @@ class UIConfig(BaseModel):
     #           (fail-soft; audited once per session).
     # FLIP ONLY after >=5 sessions of flow_shadow evidence (construction match
     # + HIGH-eligible rate in the validated 1-6/day band) — human decision.
+    # SCOPE: governs the SCANNER's SPX engine only (the canonical flow-surge
+    # signaler). The main fef_tick_loop engine keeps QD inputs; its flow-surge
+    # path is retired (advisory-only) — never arm 'theta' here together with
+    # FEF_FLOW_SURGE_GATE_ENABLED=true on the main engine.
     flow_source: Literal["qd", "theta"] = Field(default="qd")
 
 

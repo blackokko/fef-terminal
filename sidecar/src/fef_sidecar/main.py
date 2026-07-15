@@ -483,11 +483,16 @@ def spawn_data_loops(state: AppState) -> None:
     # 'qd'). Kill switch FEF_THETA_FLOW_ENABLED=false; fail-soft on Terminal
     # outages (stale marker, engine unaffected). Idles outside RTH — the
     # 30/180s watchdog cadence matches its poll/idle sleeps.
+    # NOT re-registered on symbol switches (spawn_data_loops re-runs on every
+    # POST /config/symbol): re-registration would cancel the live instance and
+    # trigger a fresh full-day rebuild mid-RTH each switch (adversarial review
+    # MAJOR-1). Symbol-agnostic singleton — guard like auto_wf/runner_protect.
     from fef_sidecar.engine.theta_flow_ingest import theta_flow_ingest_loop
-    state.theta_flow_task = spawn_supervised(
-        state, "theta-flow-ingest", lambda: theta_flow_ingest_loop(state),
-        cadence_sec=30, stale_after_sec=600,
-    )
+    if not _task_alive(state.theta_flow_task):
+        state.theta_flow_task = spawn_supervised(
+            state, "theta-flow-ingest", lambda: theta_flow_ingest_loop(state),
+            cadence_sec=30, stale_after_sec=600,
+        )
     # Pattern trigger — confirmed-bar candlestick/flag fires into the
     # advisory audit surface; auto-trades ONLY when the user arms the
     # pattern trigger types via a preset (inert by default). Isolated task.

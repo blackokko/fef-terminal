@@ -274,41 +274,72 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
 
     Source flips are expected PRE-OPEN only; if one happens mid-session the
     engine's delta window would straddle two scales (QD ~7-9% of theta), so
-    the window is quarantined (engine.reset()) on flip detection.
+    the window is quarantined (engine.reset()) on flip detection —
+    rate-limited to one quarantine per 10 minutes so flapping can never
+    thrash the engine into perpetual re-warmup.
+
+    SCOPE (adversarial review MAJOR-2, deliberate): the swap governs the
+    SCANNER's SPX engine only — the canonical flow-surge signaler per the
+    2026-07-02 config decision. The main fef_tick_loop engine keeps its QD
+    inputs; its flow-surge path is RETIRED (advisory WAIT rows), so no trade
+    fires from the un-swapped feed. Do not arm flow_source='theta' together
+    with FEF_FLOW_SURGE_GATE_ENABLED=true on the main engine.
     """
     from dataclasses import replace as _dc_replace
 
-    flow_source = "qd"
     try:
         flow_source = str(getattr(load_config(), "flow_source", "qd"))
     except Exception:
-        logger.exception("scanner: flow_source config read failed — using 'qd'")
+        # Keep the PREVIOUS source on a transient config-read failure — a
+        # blind 'qd' fallback would register a spurious flip (and quarantine)
+        # in theta mode (adversarial review MAJOR-3).
+        flow_source = str(getattr(state, "_flow_source_last", None) or "qd")
+        logger.exception(
+            "scanner: flow_source config read failed — keeping '%s'", flow_source)
 
-    # Mid-session source-flip quarantine (see docstring).
+    # Mid-session source-flip quarantine (see docstring), rate-limited so a
+    # flapping condition costs at most one engine re-warmup per 10 minutes
+    # instead of one per scan (MAJOR-3).
+    now_ms = int(_time.time() * 1000)
+
+    def _quarantine_once(reason: str) -> None:
+        last_q = getattr(state, "_theta_quarantine_last_ms", 0)
+        if now_ms - last_q < 600_000:
+            return
+        state._theta_quarantine_last_ms = now_ms
+        if engine is not None and hasattr(engine, "reset"):
+            engine.reset()
+        logger.warning(
+            "scanner: %s — SPX engine window quarantined (scale "
+            "discontinuity)", reason,
+        )
+
     try:
         prev = getattr(state, "_flow_source_last", None)
-        if prev is not None and prev != flow_source and engine is not None:
-            if hasattr(engine, "reset"):
-                engine.reset()
-            logger.warning(
-                "scanner: flow_source flipped %s -> %s mid-process — SPX "
-                "engine window quarantined (scale discontinuity)", prev, flow_source,
-            )
+        if prev is not None and prev != flow_source:
+            _quarantine_once(f"flow_source flipped {prev} -> {flow_source} mid-process")
         state._flow_source_last = flow_source
     except Exception:
         pass
 
-    from fef_sidecar.engine.theta_flow_ingest import theta_drift_read
+    from fef_sidecar.engine.theta_flow_ingest import ET as _ET, theta_drift_read
     holder = getattr(state, "theta_flow", None)
     theta_drift, theta_fresh = theta_drift_read(state)
 
-    now_ms = int(_time.time() * 1000)
     qd_drift = float(inputs.drift_cum_net_m)
+    sess_now, _ = _now_et_parts(now_ms)
 
     # The scanner loop runs around the clock; the flow comparison is only
     # meaningful (and the audit volume only justified) during the session.
-    sess_now, minute_now = _now_et_parts(now_ms)
-    in_session_window = (9 * 60 + 25) <= minute_now <= (16 * 60 + 15)
+    # REAL ET (DST-correct), not the app's fixed UTC-4 — a fixed offset
+    # truncates the evidence stream an hour before the close every winter
+    # session (adversarial review MINOR-5). Weekends excluded (MINOR-4).
+    import datetime as _dt
+    _et_now = _dt.datetime.now(_ET)
+    in_session_window = (
+        _et_now.weekday() < 5
+        and (9 * 60 + 25) <= (_et_now.hour * 60 + _et_now.minute) <= (16 * 60 + 15)
+    )
 
     # QD 3-min delta from the scanner's own sample history (evidence only).
     qd_d3 = None
@@ -354,26 +385,32 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
 
     # In theta mode, an ACTIVE swap flipping to fallback (or back) mid-session
     # is the same scale discontinuity as a config flip — the engine's delta
-    # window would straddle theta-scale and QD-scale levels. Quarantine once
-    # per transition (no-op in the default 'qd' mode, where swap never arms).
+    # window would straddle theta-scale and QD-scale levels. Quarantine on
+    # transition, rate-limited with the config-flip guard above (no-op in the
+    # default 'qd' mode, where swap never arms).
     try:
         prev_swap = getattr(state, "_theta_swap_active", None)
-        if prev_swap is not None and prev_swap != swap_applied and engine is not None:
-            if hasattr(engine, "reset"):
-                engine.reset()
-            logger.warning(
-                "scanner: theta drift swap %s mid-process — SPX engine window "
-                "quarantined (scale discontinuity)",
-                "armed" if swap_applied else "fell back to QD",
+        if prev_swap is not None and prev_swap != swap_applied:
+            _quarantine_once(
+                "theta drift swap "
+                + ("armed" if swap_applied else "fell back to QD")
+                + " mid-process"
             )
         state._theta_swap_active = swap_applied
     except Exception:
         pass
 
-    # flow_shadow evidence row — only once the ingest loop has published,
-    # and only inside the session window (audit-volume bound; the scanner
-    # loop itself never sleeps).
-    if holder is not None and in_session_window:
+    # flow_shadow evidence row — only once the ingest loop has published AND
+    # is enabled (a killed ingest must not leave n/a rows in the live scan
+    # path — MINOR-4), only inside the session window (audit-volume bound;
+    # the scanner loop itself never sleeps), and written FIRE-AND-FORGET
+    # single-flight so the awaited INSERT never sits between the snapshot
+    # fetch and engine.push (claim-1 latency note): at most one write is in
+    # flight; under DB contention rows are skipped, not queued.
+    if holder is not None and holder.get("enabled") and in_session_window:
+        prev_task = getattr(state, "_flow_shadow_write_task", None)
+        if prev_task is not None and not prev_task.done():
+            return out
         try:
             details = {
                 "qd_drift_m": round(qd_drift, 4),
@@ -389,19 +426,28 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
                 "swap_applied": swap_applied,
             }
             td = details["theta_drift_m"]
-            await SignalIterRepository.write_audit_log(
-                category="flow_shadow", actor="system",
-                summary=(
-                    f"flow_shadow SPX: qd={qd_drift:+.2f}M "
-                    f"theta={'n/a' if td is None else format(td, '+.2f') + 'M'} "
-                    f"(d3 qd={'n/a' if qd_d3 is None else format(qd_d3, '+.2f')}"
-                    f"/theta={details['theta_d3_m'] if details['theta_d3_m'] is not None else 'n/a'}) "
-                    f"src={flow_source}{'*' if swap_applied else ''}"
-                ),
-                details=details,
+            summary = (
+                f"flow_shadow SPX: qd={qd_drift:+.2f}M "
+                f"theta={'n/a' if td is None else format(td, '+.2f') + 'M'} "
+                f"(d3 qd={'n/a' if qd_d3 is None else format(qd_d3, '+.2f')}"
+                f"/theta={details['theta_d3_m'] if details['theta_d3_m'] is not None else 'n/a'}) "
+                f"src={flow_source}{'*' if swap_applied else ''}"
+            )
+
+            async def _write_shadow_row() -> None:
+                try:
+                    await SignalIterRepository.write_audit_log(
+                        category="flow_shadow", actor="system",
+                        summary=summary, details=details,
+                    )
+                except Exception:
+                    logger.exception("scanner: flow_shadow audit write failed")
+
+            state._flow_shadow_write_task = asyncio.create_task(
+                _write_shadow_row(), name="flow-shadow-write",
             )
         except Exception:
-            logger.exception("scanner: flow_shadow audit write failed")
+            logger.exception("scanner: flow_shadow audit dispatch failed")
     return out
 
 
