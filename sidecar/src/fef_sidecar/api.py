@@ -59,6 +59,24 @@ async def status(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/theta_flow/status")
+async def theta_flow_status(request: Request) -> dict[str, Any]:
+    """Live ThetaData flow-ingest read (2026-07-15 input-parity fix): the
+    holder published by theta_flow_ingest_loop (drift_theta_cum_m, staleness,
+    finalized-minute stats) plus the active flow_source config. Read-only —
+    additive observability for the shadow-validation window."""
+    s = _state(request)
+    from fef_sidecar.config_store import load_config
+    try:
+        flow_source = load_config().flow_source
+    except Exception:
+        flow_source = "qd"
+    return {
+        "flow_source": flow_source,
+        "holder": dict(s.theta_flow) if isinstance(s.theta_flow, dict) else None,
+    }
+
+
 @router.get("/diag/depth")
 async def diag_depth(request: Request, symbol: str = "ES", wait_seconds: int = 5) -> dict[str, Any]:
     """One-shot diagnostic: subscribe to L2 depth for `wait_seconds`, report

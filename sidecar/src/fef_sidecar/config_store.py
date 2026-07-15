@@ -173,6 +173,21 @@ class UIConfig(BaseModel):
     impulse_flag_require_agree: bool = Field(default=True)
     impulse_flag_cooldown_sec: int = Field(default=600, ge=0, le=7200)
 
+    # ---- Scanner drift-input source (2026-07-15 input-parity fix) ----
+    # Which flow feed supplies the SPX scanner engine's drift_cum_net_m input:
+    #   'qd'    (DEFAULT) — QuantData snapshot drift, byte-identical to the
+    #           pre-change behavior. The parity diagnostic (scratchpad
+    #           parity_report.md) showed this feed runs at ~7-9% of the
+    #           validated backtest input's magnitude (31x fewer >=10M 3-min
+    #           surges) — but swapping is a REGISTERED-VALIDATION decision.
+    #   'theta' — the live theta_flow_ingest drift (the validated
+    #           option_flow_minute construction rebuilt in real time). Falls
+    #           back to 'qd' input when the theta read is stale/absent
+    #           (fail-soft; audited once per session).
+    # FLIP ONLY after >=5 sessions of flow_shadow evidence (construction match
+    # + HIGH-eligible rate in the validated 1-6/day band) — human decision.
+    flow_source: Literal["qd", "theta"] = Field(default="qd")
+
 
 def load_config() -> UIConfig:
     if not CONFIG_PATH.exists():

@@ -256,6 +256,130 @@ def _make_engine_for(symbol: str) -> FEFEngine:
     return _make_engine(flow_surge_gate=scanner_gate)
 
 
+async def _apply_flow_source_and_shadow(state, inputs, engine):
+    """Drift-input source selection + flow_shadow evidence row (2026-07-15
+    input-parity fix). SPX only.
+
+    With UIConfig.flow_source='qd' (DEFAULT) the returned inputs are the
+    UNTOUCHED snapshot inputs — live behavior byte-identical to before this
+    change. With 'theta', drift_cum_net_m is replaced by the live
+    theta_flow_ingest read (the validated option_flow_minute construction);
+    a stale/absent theta read falls back to the QD input (fail-soft, audited
+    once per session).
+
+    Every SPX scan also emits ONE category='flow_shadow' audit row with both
+    feeds' drift levels + 3-minute deltas — the evidence stream the eventual
+    swap decision requires (>=5 sessions; see parity_report.md). Best-effort:
+    any failure here returns the original inputs and never blocks the scan.
+
+    Source flips are expected PRE-OPEN only; if one happens mid-session the
+    engine's delta window would straddle two scales (QD ~7-9% of theta), so
+    the window is quarantined (engine.reset()) on flip detection.
+    """
+    from dataclasses import replace as _dc_replace
+
+    flow_source = "qd"
+    try:
+        flow_source = str(getattr(load_config(), "flow_source", "qd"))
+    except Exception:
+        logger.exception("scanner: flow_source config read failed — using 'qd'")
+
+    # Mid-session source-flip quarantine (see docstring).
+    try:
+        prev = getattr(state, "_flow_source_last", None)
+        if prev is not None and prev != flow_source and engine is not None:
+            if hasattr(engine, "reset"):
+                engine.reset()
+            logger.warning(
+                "scanner: flow_source flipped %s -> %s mid-process — SPX "
+                "engine window quarantined (scale discontinuity)", prev, flow_source,
+            )
+        state._flow_source_last = flow_source
+    except Exception:
+        pass
+
+    from fef_sidecar.engine.theta_flow_ingest import theta_drift_read
+    holder = getattr(state, "theta_flow", None)
+    theta_drift, theta_fresh = theta_drift_read(state)
+
+    now_ms = int(_time.time() * 1000)
+    qd_drift = float(inputs.drift_cum_net_m)
+
+    # QD 3-min delta from the scanner's own sample history (evidence only).
+    qd_d3 = None
+    try:
+        hist = state.flow_shadow_qd_history
+        hist.append((now_ms, qd_drift))
+        floor = now_ms - 10 * 60_000
+        while hist and hist[0][0] < floor:
+            hist.pop(0)
+        target = now_ms - 180_000
+        past = [v for t, v in hist if t <= target + 10_000]
+        if past:
+            qd_d3 = qd_drift - past[-1]
+    except Exception:
+        qd_d3 = None
+
+    out = inputs
+    swap_applied = False
+    if flow_source == "theta":
+        if theta_fresh and theta_drift is not None:
+            out = _dc_replace(inputs, drift_cum_net_m=float(theta_drift))
+            swap_applied = True
+        else:
+            # Fail-soft fallback to the QD input — audit once per session so
+            # a silent mid-session source degradation is visible.
+            sess, _ = _now_et_parts(now_ms)
+            if getattr(state, "_theta_fallback_audited", None) != sess:
+                state._theta_fallback_audited = sess
+                try:
+                    await SignalIterRepository.write_audit_log(
+                        category="theta_flow", actor="system",
+                        summary=(
+                            "flow_source='theta' but theta drift read is "
+                            "stale/absent — SPX scanner fell back to the QD "
+                            "drift input (fail-soft)"
+                        ),
+                        details={"session_date": sess,
+                                 "theta_drift": theta_drift,
+                                 "holder_present": holder is not None},
+                    )
+                except Exception:
+                    logger.exception("scanner: theta fallback audit failed")
+
+    # flow_shadow evidence row — only once the ingest loop has published.
+    if holder is not None:
+        try:
+            details = {
+                "qd_drift_m": round(qd_drift, 4),
+                "theta_drift_m": (round(theta_drift, 4)
+                                  if theta_drift is not None else None),
+                "qd_d3_m": round(qd_d3, 4) if qd_d3 is not None else None,
+                "theta_d3_m": holder.get("drift_theta_d3_m"),
+                "theta_last_final_minute_ms": holder.get("last_final_minute_ms"),
+                "theta_stale": bool(holder.get("stale")),
+                "theta_fresh": theta_fresh,
+                "spx": float(inputs.spx_price),
+                "flow_source": flow_source,
+                "swap_applied": swap_applied,
+            }
+            td = details["theta_drift_m"]
+            await SignalIterRepository.write_audit_log(
+                category="flow_shadow", actor="system",
+                summary=(
+                    f"flow_shadow SPX: qd={qd_drift:+.2f}M "
+                    f"theta={'n/a' if td is None else format(td, '+.2f') + 'M'} "
+                    f"(d3 qd={'n/a' if qd_d3 is None else format(qd_d3, '+.2f')}"
+                    f"/theta={details['theta_d3_m'] if details['theta_d3_m'] is not None else 'n/a'}) "
+                    f"src={flow_source}{'*' if swap_applied else ''}"
+                ),
+                details=details,
+            )
+        except Exception:
+            logger.exception("scanner: flow_shadow audit write failed")
+    return out
+
+
 async def _scan_one_symbol(state, symbol: str) -> None:
     """Run one FEF iter for the given symbol. Broadcasts an IterEvent
     with symbol field set so the FE can route to the right per-symbol UI.
@@ -293,6 +417,15 @@ async def _scan_one_symbol(state, symbol: str) -> None:
         state, symbol, inputs.spx_price, engine=engine,
     ):
         return
+
+    # Drift-input source selection + flow_shadow evidence row (2026-07-15
+    # input-parity fix). SPX only; with the default flow_source='qd' this
+    # returns `inputs` untouched — behavior byte-identical to before.
+    if symbol == "SPX":
+        try:
+            inputs = await _apply_flow_source_and_shadow(state, inputs, engine)
+        except Exception:
+            logger.exception("scanner: flow-source/shadow hook failed — QD input used")
 
     verdict = engine.push(inputs)
 

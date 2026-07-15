@@ -785,6 +785,43 @@ class OptionQuoteHistory(SQLModel, table=True):
     source: str = Field(default="thetadata", index=True)
 
 
+class ThetaFlowMinute(SQLModel, table=True):
+    """One minute of LIVE-built SPXW 0DTE signed option flow — the validated
+    `option_flow_minute` construction (aggressor-classified net premium; see
+    engine/theta_flow_ingest.py module docstring for the full construction
+    contract + Phase-A citations) rebuilt in real time from the local Theta
+    Terminal.
+
+    Deliberately a SEPARATE table from `option_flow_minute` (source
+    'thetadata', built offline by scripts/maintenance/ingest_thetadata_flow.py,
+    frozen research provenance 2022-01-03..2026-06-26): live-built rows must
+    never contaminate the backtest input table. Schema mirrors it column for
+    column; source defaults to 'theta_live'.
+
+    Written by engine/theta_flow_ingest.theta_flow_ingest_loop (incremental
+    during RTH + EOD reconcile to the authoritative full-tape rebuild).
+    Idempotency: UNIQUE (session_date, ts_ms) via init_db.
+    """
+
+    __tablename__ = "theta_flow_minute"
+
+    id: int | None = Field(default=None, primary_key=True)
+    session_date: str = Field(index=True)   # YYYY-MM-DD ET
+    ts_ms: int = Field(index=True)          # UTC ms, minute bucket
+
+    call_buy_prem: float = 0.0
+    call_sell_prem: float = 0.0
+    put_buy_prem: float = 0.0
+    put_sell_prem: float = 0.0
+    call_buy_vol: int = 0
+    call_sell_vol: int = 0
+    put_buy_vol: int = 0
+    put_sell_vol: int = 0
+    # (call_buy - call_sell) - (put_buy - put_sell); bullish > 0
+    net_signed_prem: float = 0.0
+    source: str = Field(default="theta_live", index=True)
+
+
 # ---------------------------------------------------------------------------
 # Audit log — every config change, override, kill switch
 # ---------------------------------------------------------------------------

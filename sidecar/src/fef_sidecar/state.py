@@ -357,6 +357,18 @@ class AppState:
     # against a still-empty cache). None until the first ingest inserts.
     vix_latest_ingested_date: str | None = None
 
+    # ---- Live ThetaData flow ingest (2026-07-15 parity fix, Phase B) ----
+    # Holder dict published by engine/theta_flow_ingest.theta_flow_ingest_loop
+    # every cycle: {enabled, stale, session_date, drift_theta_cum_m,
+    # drift_theta_d3_m, last_final_minute_ms, ...}. Consumers: the scanner's
+    # flow_shadow audit row, the flow_source='theta' swap (default OFF) and
+    # GET /theta_flow/status. None until the loop's first cycle.
+    theta_flow: dict | None = None
+    theta_flow_task: object | None = None
+    # Rolling (ts_ms, qd_drift_m) samples appended by the SPX scanner scan —
+    # gives the flow_shadow row its QD-side 3-minute delta. Pruned to ~10 min.
+    flow_shadow_qd_history: list = field(default_factory=list)
+
     # Loop watchdog (2026-07-07): heartbeat map (loop name -> monotonic
     # seconds, stamped every healthy cycle), supervised-loop registry, and
     # the supervisor task handle. The week's failure class is "async task

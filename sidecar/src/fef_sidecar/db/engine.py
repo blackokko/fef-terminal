@@ -243,6 +243,15 @@ async def init_db() -> None:
                 "ON flow_series_point "
                 "(timestamp_ms, symbol)",
             ),
+            # theta_flow_minute: one row per session minute — dedup across
+            # incremental polls, boot rebuilds and EOD reconcile reruns
+            # (mirrors option_flow_minute's idx_flow_min_unique convention).
+            (
+                "idx_theta_flow_min_unique",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_theta_flow_min_unique "
+                "ON theta_flow_minute "
+                "(session_date, ts_ms)",
+            ),
             # es_vwap_point: one row per (bar, symbol).
             (
                 "idx_es_vwap_pt_unique",
