@@ -67,7 +67,14 @@ def _to_ib_contract(c: Contract):
     if c.kind == ContractKind.OPTION:
         if not (c.expiry and c.strike is not None and c.right):
             raise ValueError("Option contract requires expiry, strike, right")
-        return Option(c.symbol, c.expiry, c.strike, c.right, c.exchange, currency=c.currency)
+        # SPX options MUST pin tradingClass="SPXW" (the daily class this bot
+        # always trades). Without it, on every monthly-expiration eve the
+        # AM-settled SPX monthly shares the same lastTradeDate and the request
+        # goes AMBIGUOUS -> qualify fails -> all quotes come back empty
+        # (2026-07-16 incident: gate-8 blocked the first theta-era HIGH fire).
+        trading_class = "SPXW" if c.symbol == "SPX" else ""
+        return Option(c.symbol, c.expiry, c.strike, c.right, c.exchange,
+                      currency=c.currency, tradingClass=trading_class)
     raise ValueError(f"Unsupported contract kind: {c.kind}")
 
 
