@@ -1778,6 +1778,9 @@ def _option_pricing_dict(targets: OptionTargets | None) -> dict[str, Any] | None
         "iv": targets.iv,
         "bid": targets.bid,
         "ask": targets.ask,
+        # Quote-snapshot age drives the marketable-limit entry's freshness
+        # check (auto_trader gate 9.5 / entry_pricing.resolve_entry_ask).
+        "quote_ts_ms": targets.quote_ts_ms,
     }
 
 

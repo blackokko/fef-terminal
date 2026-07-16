@@ -110,10 +110,43 @@ class BracketSpec:
     # premium drops enough that the open position is down by this many
     # dollars. Auto-trader sets this to -3000 by default. None = no $ cap.
     dollar_loss_cap: float | None = None
-    # When true (default for auto-trade), submit a MarketOrder for the parent
-    # BUY instead of a LimitOrder. Limit orders frequently miss fast-moving
-    # 0DTE setups because premium ticks past the limit before the broker hits.
+    # When true, submit a MarketOrder for the parent BUY instead of a
+    # LimitOrder. RETIRED for auto-trade 2026-07-16: IBKR's price cap on
+    # market option orders rested live_order 776 for 4m20s on a running ask
+    # ($8.10 fill vs ~$5.50-6.00 at signal). Auto-trade now sends a
+    # marketable LMT (fresh ask + buffer, entry_pricing.py) instead; the
+    # flag remains for manual/legacy callers.
     use_market_entry: bool = False
+    # If set (>0), place_bracket spawns entry_timeout.entry_timeout_monitor:
+    # an entry not FULLY filled within this many seconds is cancelled and the
+    # fire stood down (partials: remainder cancelled, filled portion kept +
+    # watcher-managed). None/0 = no timeout (manual tickets).
+    entry_timeout_sec: float | None = None
+
+
+def _spawn_entry_timeout(
+    *, state, ibkr, spec: BracketSpec, parent_id: int,
+    ib_order_id: int | None, parent_trade, source: str,
+    signal_ref: dict | None, child_ids: tuple[int, ...],
+) -> None:
+    """Arm the 45s entry-timeout watchdog on a just-placed LIVE parent BUY
+    (2026-07-16 hang incident). No-op when the spec carries no timeout
+    (manual tickets). Spawn failure can never break order placement."""
+    if not spec.entry_timeout_sec or spec.entry_timeout_sec <= 0:
+        return
+    try:
+        from fef_sidecar.engine.entry_timeout import spawn_entry_timeout_monitor
+        spawn_entry_timeout_monitor(
+            state=state, ibkr=ibkr, parent_id=parent_id,
+            ib_order_id=ib_order_id, symbol=spec.symbol, qty=spec.qty,
+            exit_strategy=spec.exit_strategy, source=source,
+            limit_price=None if spec.use_market_entry else spec.entry_limit,
+            signal_iter_id=(signal_ref or {}).get("signal_iter_id"),
+            child_ids=child_ids, timeout_sec=spec.entry_timeout_sec,
+            parent_trade=parent_trade,
+        )
+    except Exception:
+        logger.exception("entry-timeout monitor spawn failed for parent %s", parent_id)
 
 
 @dataclass(frozen=True)
@@ -140,6 +173,7 @@ async def place_bracket(
     ticket_id: int | None = None,
     source: str = "manual_ticket",
     signal_ref: dict | None = None,
+    state: object | None = None,
 ) -> dict:
     """Submit a bracket order: parent BUY + 3 limit SELL children + stop SELL.
 
@@ -154,6 +188,9 @@ async def place_bracket(
     — so auto-vs-manual AND scanner-vs-pattern are unambiguous from the
     audit trail (previously everything logged actor='user').
     signal_ref: optional verdict/trigger context stamped into audit details.
+    state: AppState (auto-trade callers only) — handed to the entry-timeout
+    monitor so a zero-fill stand-down can release the per-symbol session-cap
+    slot. None (manual path) simply skips budget release.
 
     Bracket structure used (IBKR-compatible):
       parent     LMT BUY  qty @ entry_limit
@@ -300,7 +337,15 @@ async def place_bracket(
                 summary=f"{audit_prefix}PLACED {spec.exit_strategy} entry: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}. {exits_desc}",
                 details={"parent_order_id": parent_saved.id, "exit_strategy": spec.exit_strategy,
                          "order_type": "MKT" if spec.use_market_entry else "LMT",
+                         "entry_timeout_sec": spec.entry_timeout_sec,
                          "source": source, "signal_ref": signal_ref},
+            )
+            _spawn_entry_timeout(
+                state=state, ibkr=ibkr, spec=spec,
+                parent_id=parent_saved.id,
+                ib_order_id=parent_trade.order.orderId,
+                parent_trade=parent_trade, source=source,
+                signal_ref=signal_ref, child_ids=(),
             )
             return {"ok": True, "dry_run": False, "parent_order_id": parent_saved.id,
                     "exit_strategy": spec.exit_strategy}
@@ -413,6 +458,14 @@ async def place_bracket(
                 ib_perm_id=child_trade.order.permId,
             )
 
+        _spawn_entry_timeout(
+            state=state, ibkr=ibkr, spec=spec,
+            parent_id=parent_saved.id,
+            ib_order_id=parent_trade.order.orderId,
+            parent_trade=parent_trade, source=source,
+            signal_ref=signal_ref,
+            child_ids=tuple(c.id for c in children_saved if c.id is not None),
+        )
         return {"ok": True, "dry_run": False, "parent_order_id": parent_saved.id,
                 "children": [c.id for c in children_saved],
                 "runner_oca_group": runner_oca}

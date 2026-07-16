@@ -20,6 +20,7 @@ Mirrors the confidence-floor contract (test_confidence_floor.py):
 from __future__ import annotations
 
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -115,6 +116,10 @@ def _priced_verdict(**kw) -> dict:
             "contract_strike": 7450.0, "right": "C", "entry_limit": 5.1,
             "delta": 0.4, "underlying_price_at_quote": 7440.0,
             "t1": 11.1, "t2": 15.1, "t3": 25.1, "stop": 1.1,
+            # Fresh fire-time quote — gate 9.5 (marketable-LMT entry,
+            # 2026-07-16) prices the entry from this ask without a re-fetch.
+            "bid": 4.9, "ask": 5.1,
+            "quote_ts_ms": int(time.time() * 1000),
         },
         # The legacy engine suggestion — MUST be ignored now (scanner verdicts
         # carry None, which the retired `or 15` turned into 15 contracts).

@@ -30,3 +30,67 @@ def test_no_readopt_without_spot():
     # No spot → can't anchor an emergency stop → leave it a warned orphan.
     assert _resurrectable_for_orphan(KEY, parent_keys={}, resurrectable={KEY: PARENT}, spot=None) is None
     assert _resurrectable_for_orphan(KEY, parent_keys={}, resurrectable={KEY: PARENT}, spot=0) is None
+
+
+# ---------------------------------------------------------------------------
+# Entry-timeout CANCELLED resurrection (2026-07-16) — the 'cancelled but
+# filled' race backstop must NEVER adopt the user's manual lots.
+# ---------------------------------------------------------------------------
+
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+from fef_sidecar.engine.position_reconcile import _cancelled_entry_race_candidate
+
+
+def _cancelled_parent(qty=3, notes="entry_timeout: unfilled after 45s — cancelled",
+                      age_sec=60):
+    return SimpleNamespace(
+        status="CANCELLED", qty=qty, notes=notes,
+        last_status_at=datetime.now(UTC) - timedelta(seconds=age_sec),
+    )
+
+
+def test_cancelled_race_candidate_recent_tagged():
+    assert _cancelled_entry_race_candidate(_cancelled_parent()) is True
+
+
+def test_cancelled_race_candidate_rejects_untagged():
+    # A CANCELLED parent NOT cancelled by the entry-timeout path is never
+    # resurrectable — only the race the watchdog created gets the backstop.
+    assert _cancelled_entry_race_candidate(
+        _cancelled_parent(notes="user cancelled in TWS")) is False
+
+
+def test_cancelled_race_candidate_rejects_stale():
+    # Beyond the window an orphan on that strike is presumed the user's own
+    # manual trade (shared strikes are their documented habit).
+    assert _cancelled_entry_race_candidate(
+        _cancelled_parent(age_sec=3600)) is False
+
+
+def test_cancelled_readopt_qty_bound_blocks_manual_lots():
+    # Race fill can never exceed the bot's own cancelled order size: a
+    # 100-lot orphan against a 3-lot CANCELLED parent is the USER'S manual
+    # position — leave it a warned orphan, never adopt it into a sell ladder.
+    p = _cancelled_parent(qty=3)
+    resurrectable = {KEY: p}
+    assert _resurrectable_for_orphan(
+        KEY, parent_keys={}, resurrectable=resurrectable, spot=7518.0,
+        orphan_qty=100) is None
+    # The genuine race shapes (partial or full fill of OUR order) re-adopt.
+    assert _resurrectable_for_orphan(
+        KEY, parent_keys={}, resurrectable=resurrectable, spot=7518.0,
+        orphan_qty=3) is p
+    assert _resurrectable_for_orphan(
+        KEY, parent_keys={}, resurrectable=resurrectable, spot=7518.0,
+        orphan_qty=1) is p
+
+
+def test_qty_bound_only_applies_to_cancelled():
+    # CLOSED/STOPPED resurrection keeps its historical semantics (the bot
+    # genuinely held the contract; remnant rebase handles size).
+    p = SimpleNamespace(status="CLOSED", qty=3)
+    assert _resurrectable_for_orphan(
+        KEY, parent_keys={}, resurrectable={KEY: p}, spot=7518.0,
+        orphan_qty=100) is p

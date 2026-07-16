@@ -90,6 +90,10 @@ def _option_pricing() -> dict:
         "contract_strike": 625.0, "right": "C", "entry_limit": 5.1,
         "delta": 0.4, "underlying_price_at_quote": 620.0,
         "t1": 11.1, "t2": 15.1, "t3": 25.1, "stop": 1.1,
+        # Fresh fire-time quote — gate 9.5 (marketable-LMT entry, 2026-07-16)
+        # prices the entry from this ask without a re-fetch.
+        "bid": 4.9, "ask": 5.1,
+        "quote_ts_ms": int(__import__("time").time() * 1000),
     }
 
 

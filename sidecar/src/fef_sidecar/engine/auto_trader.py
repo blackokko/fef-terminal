@@ -13,6 +13,9 @@ gate in order:
   7. Session fire-cap not exceeded
   8. Verdict has option_pricing (strike + premium + targets)
   9. Risk caps not breached (daily loss / max position)
+  9.5 Fresh ask resolvable for the marketable-LMT entry (2026-07-16:
+     entries are LMT at ask+buffer with a 45s cancel timeout, never MKT;
+     stale quote re-fetched once, else NO_FRESH_QUOTE block)
  10. No duplicate active parent on the same contract
  11. Cross-symbol direction cap (no same-right watcher parent open on
      another index-complex symbol)
@@ -62,6 +65,12 @@ class BlockReason:
     # audit rows still resolve; new floor skips use this code.
     CONFIDENCE_FLOOR_SKIP = "CONFIDENCE_FLOOR_SKIP"
     CROSS_SYMBOL_CAP_SKIP = "CROSS_SYMBOL_CAP_SKIP"
+    # Marketable-limit entry (2026-07-16): no fresh ask could be resolved to
+    # price the entry LMT (fire-time quote stale >10s AND the one-shot
+    # re-fetch failed). NEVER falls back to a market order — the 7/16 MKT
+    # entry hang (live_order 776, 4m20s rest, $8.10 vs ~$5.50-6.00) is the
+    # incident this gate exists to prevent.
+    NO_FRESH_QUOTE = "NO_FRESH_QUOTE"
     FIRED = "FIRED"
     # Non-auto-trader codes for other gate paths — used so all block-style
     # audit_log rows carry a structured tag for aggregation.
@@ -708,6 +717,11 @@ async def _maybe_auto_trade_locked(
     from fef_sidecar.engine.live_trading import BracketSpec, place_bracket
 
     today = time.strftime("%Y%m%d")
+
+    # Entry timeout (2026-07-16, paired with gate 9.5 below): specs carry the
+    # 45s cancel deadline so place_bracket arms the watchdog on the live parent.
+    from fef_sidecar.engine.entry_timeout import entry_timeout_sec as _entry_tmo
+    entry_timeout = _entry_tmo()
     # 30/40/30 split — shift weight toward T2 (now 2.5R). At 41% win rate
     # (confluence), the math favors carrying more capital into the larger
     # R-multiples. _tier_split handles small qty (1->(1,0,0), 2->(1,1,0))
@@ -779,6 +793,10 @@ async def _maybe_auto_trade_locked(
             symbol=trade_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
             expiry=today, qty=qty,
+            # PLACEHOLDER: replaced with the marketable LMT (fresh ask +
+            # buffer) by gate 9.5 just before placement. t1..stop option-
+            # limits are unused for this strategy (parent-only placement)
+            # and stay at the fire-quote entry_limit as filler.
             entry_limit=float(opt["entry_limit"]),
             t1_limit=float(opt["entry_limit"]), t2_limit=float(opt["entry_limit"]),
             t3_limit=float(opt["entry_limit"]), stop_limit=float(opt["entry_limit"]),
@@ -787,17 +805,19 @@ async def _maybe_auto_trade_locked(
             d_t1=d_t1, d_t2=d_t2,
             d_t3=d_t3, d_stop=d_stop,
             dollar_loss_cap=-abs(float(os.environ.get("FEF_DOLLAR_LOSS_CAP", "1800"))),
-            use_market_entry=True,
+            entry_timeout_sec=entry_timeout,
         )
     elif strategy == "spx_points":
-        # Auto-trade default: market-order entry + catastrophic dollar loss cap
-        # (FEF_DOLLAR_LOSS_CAP, default -$1800 per user decision 2026-07-06 —
-        # sits beyond the -10pt ladder stop, binds only on gap disasters) +
-        # BE ladder (initialized via entry_spx_price captured from state).
+        # Auto-trade default: marketable-LMT entry (gate 9.5, was MKT until
+        # 2026-07-16) + catastrophic dollar loss cap (FEF_DOLLAR_LOSS_CAP,
+        # default -$1800 per user decision 2026-07-06 — sits beyond the -10pt
+        # ladder stop, binds only on gap disasters) + BE ladder (initialized
+        # via entry_spx_price captured from state).
         spec = BracketSpec(
             symbol=trade_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
             expiry=today, qty=qty,
+            # PLACEHOLDER — gate 9.5 swaps in the marketable LMT pre-placement.
             entry_limit=float(opt["entry_limit"]),
             t1_limit=float(opt["t1"]), t2_limit=float(opt["t2"]),
             t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
@@ -806,20 +826,21 @@ async def _maybe_auto_trade_locked(
             spx_t1=spx_t1, spx_t2=spx_t2, spx_t3=spx_t3, spx_stop=spx_stop,
             entry_spx_price=state.last_spx_price,
             dollar_loss_cap=-abs(float(os.environ.get("FEF_DOLLAR_LOSS_CAP", "1800"))),
-            use_market_entry=True,
+            entry_timeout_sec=entry_timeout,
         )
     else:  # 'option_price' (legacy default)
         spec = BracketSpec(
             symbol=trade_symbol, strike=float(strike),
             right="C" if direction == "LONG_CALLS" else "P",
             expiry=today, qty=qty,
+            # PLACEHOLDER — gate 9.5 swaps in the marketable LMT pre-placement.
             entry_limit=float(opt["entry_limit"]),
             t1_limit=float(opt["t1"]), t2_limit=float(opt["t2"]),
             t3_limit=float(opt["t3"]), stop_limit=float(opt["stop"]),
             t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
             exit_strategy="option_price",
             dollar_loss_cap=-abs(float(os.environ.get("FEF_DOLLAR_LOSS_CAP", "1800"))),
-            use_market_entry=True,
+            entry_timeout_sec=entry_timeout,
         )
 
     # PATCH 3: Refuse to open a new parent if an active parent already exists
@@ -947,6 +968,56 @@ async def _maybe_auto_trade_locked(
         except Exception:
             logger.exception("Cross-symbol cap check failed; proceeding")
 
+    # Gate 9.5 (2026-07-16): MARKETABLE-LIMIT ENTRY. Entries were raw MKT
+    # orders; IBKR's price cap on market option orders RESTED live_order 776
+    # for 4m20s on a running ask (filled $8.10 vs ~$5.50-6.00 at signal,
+    # ~$750 hang-slippage at 3 lots). Entries are now LMT at (fresh ask +
+    # buffer: max($0.10, 2% of ask) capped $0.50, tick-rounded UP). The ask
+    # comes from the same fire-time quote gate 8 validated; stale (>10s) =
+    # one bounded re-fetch, chase-bounded so a runaway tape can't repeat the
+    # incident price at fill time; no usable ask = BLOCK (counterfactual-
+    # tagged like the other gates) — NEVER fall back to MKT. Runs LAST,
+    # after every cheap DB gate (dup-parent / cross-symbol keep their
+    # documented counterfactual populations AND no IBKR round-trip is spent
+    # on fires they'd reject), so the quote is at its freshest at placement.
+    # Paired with the 45s entry timeout (entry_timeout.py).
+    from dataclasses import replace as _dc_replace
+    from fef_sidecar.engine.entry_pricing import resolve_entry_ask
+    _right = "C" if direction == "LONG_CALLS" else "P"
+    entry_res = await resolve_entry_ask(
+        state, symbol=sym, strike=float(strike), right=_right,
+        expiry=today, opt=opt,
+    )
+    if entry_res.limit_price is None:
+        suffix = f"[NO_FRESH_QUOTE: {entry_res.error}]"
+        await _tag_signal_skip(signal_iter_id, "no_fresh_quote", suffix)
+        try:
+            from fef_sidecar.db.repository import SignalIterRepository as _Repo_nfq
+            await _Repo_nfq.write_audit_log(
+                category="auto_trade_block", actor="system",
+                summary=(
+                    f"NO_FRESH_QUOTE {direction} {sym} {strike}{_right}: "
+                    f"cannot price marketable-limit entry ({entry_res.error}) "
+                    f"— fire blocked (no MKT fallback by design)"
+                ),
+                details={
+                    "source": source, "symbol": sym, "direction": direction,
+                    "strike_rec": strike, "signal_iter_id": signal_iter_id,
+                    "quote_age_ms": entry_res.age_ms,
+                    "refetched": entry_res.refetched,
+                    "error": entry_res.error,
+                },
+                block_reason_code=BlockReason.NO_FRESH_QUOTE,
+            )
+        except Exception:
+            logger.exception("no_fresh_quote audit write failed")
+        return AutoTradeDecision(
+            False, f"no fresh quote for entry limit ({entry_res.error})",
+            BlockReason.NO_FRESH_QUOTE,
+        )
+    entry_limit_price = float(entry_res.limit_price)
+    spec = _dc_replace(spec, entry_limit=entry_limit_price)
+
     try:
         result = await place_bracket(
             state.ibkr, spec, confirm=True,
@@ -960,7 +1031,15 @@ async def _maybe_auto_trade_locked(
                 "trigger_type": trigger_type,
                 "strike_rec": strike,
                 "reasoning": (verdict_dict.get("reasoning") or "")[:200],
+                # For the entry-timeout stand-down's counterfactual tag —
+                # same signal row the other gates tag on a block.
+                "signal_iter_id": signal_iter_id,
+                "entry_ask": entry_res.ask,
+                "entry_ask_source": entry_res.source,
             },
+            # Entry-timeout monitor needs state to release the per-symbol
+            # session-cap slot on a zero-fill stand-down.
+            state=state,
         )
     except Exception as e:
         logger.exception("Auto-trade place_bracket failed")
@@ -974,11 +1053,12 @@ async def _maybe_auto_trade_locked(
         state.auto_trade_count_session += 1
         state.auto_trade_count_by_symbol[sym] = state.auto_trade_count_by_symbol.get(sym, 0) + 1
         logger.warning(
-            "AUTO-TRADE FIRED: %s %d %s %s%.0f @ $%.2f "
-            "(session total %d, %s budget %d/%d)",
+            "AUTO-TRADE FIRED: %s %d %s %s%.0f LMT $%.2f (ask $%.2f %s, "
+            "timeout %.0fs; session total %d, %s budget %d/%d)",
             direction, qty, sym,
             "C" if direction == "LONG_CALLS" else "P",
-            strike, opt["entry_limit"],
+            strike, entry_limit_price, entry_res.ask, entry_res.source,
+            entry_timeout,
             state.auto_trade_count_session,
             sym, state.auto_trade_count_by_symbol[sym], state.auto_trade_max_per_symbol,
         )

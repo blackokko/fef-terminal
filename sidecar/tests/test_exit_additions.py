@@ -122,6 +122,10 @@ def _fd_verdict(*, strike: float, underlying: float) -> dict:
             "contract_strike": strike, "right": "C", "entry_limit": 2.0,
             "delta": 0.4, "underlying_price_at_quote": underlying,
             "t1": 3.0, "t2": 4.0, "t3": 6.0, "stop": 1.0,
+            # Fresh fire-time quote — gate 9.5 (marketable-LMT entry,
+            # 2026-07-16) prices the entry from this ask without a re-fetch.
+            "bid": 1.9, "ask": 2.0,
+            "quote_ts_ms": int(__import__("time").time() * 1000),
         },
         "suggested_qty": 3,
     }

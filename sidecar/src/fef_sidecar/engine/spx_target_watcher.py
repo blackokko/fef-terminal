@@ -270,7 +270,13 @@ async def _check_dollar_loss(state, p) -> None:
             open_qty += p.spx_target_t3_qty
         if open_qty <= 0:
             return
-        pnl = (mid - p.limit_price) * open_qty * 100
+        # Entry reference: the REAL fill when synced (fill-sync stamps it
+        # within a cycle), else limit_price. 2026-07-16: limit_price on auto
+        # parents is now the marketable LMT (ask + buffer), slightly above
+        # the old raw-ask value — preferring avg_fill_price keeps the -$1800
+        # cap measured from what was actually paid, not the buffered cap.
+        _entry_ref = p.avg_fill_price if (p.avg_fill_price or 0) > 0 else p.limit_price
+        pnl = (mid - _entry_ref) * open_qty * 100
         if pnl > p.dollar_loss_cap:
             return
         # Cap breached — fire market sell. Defense in depth:

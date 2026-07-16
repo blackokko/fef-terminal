@@ -119,7 +119,77 @@ async def _active_exit_order_keys(ib) -> set[str] | None:
         return None
 
 
-def _resurrectable_for_orphan(key, parent_keys, resurrectable, spot):
+# How long after an entry-timeout CANCELLED mark a same-contract IBKR orphan
+# is still attributed to the 'cancelled but filled' race (and re-adopted)
+# rather than treated as an untracked manual trade. The race fill surfaces
+# within one reconcile interval (300s); 900s is generous.
+_CANCELLED_RESURRECT_WINDOW_SEC = float(
+    os.environ.get("FEF_CANCELLED_RESURRECT_WINDOW_SEC", "900")
+)
+
+
+# A SUBMITTED zero-fill parent whose entry BUY is still WORKING at IBKR and
+# older than this is a restart-orphaned entry (the in-process 45s timeout
+# monitor died with the process) — reconcile cancels it and stands it down.
+# Younger working entries are inside the monitor's window and are SKIPPED
+# (previously the phantom branch would have marked them CLOSED while the
+# order still worked — harmless with instant MKT fills, a real hazard with
+# resting LMT entries).
+_ENTRY_SWEEP_AGE_SEC = float(os.environ.get("FEF_ENTRY_SWEEP_AGE_SEC", "180"))
+
+
+def _working_buy_trades(ib) -> dict[int, Any]:
+    """orderId -> Trade for every non-terminal BUY order in the (already
+    refreshed) openTrades cache. Relies on _active_exit_order_keys' earlier
+    reqAllOpenOrdersAsync; on any error returns {} (callers then fall through
+    to today's phantom behavior — no worse than pre-2026-07-16)."""
+    out: dict[int, Any] = {}
+    try:
+        for trade in ib.openTrades():
+            order = getattr(trade, "order", None)
+            status = getattr(getattr(trade, "orderStatus", None), "status", "") or ""
+            if order is None or getattr(order, "action", "") != "BUY":
+                continue
+            if status in _TERMINAL_IB_STATUSES:
+                continue
+            oid = getattr(order, "orderId", None)
+            if oid is not None:
+                out[int(oid)] = trade
+    except Exception:
+        logger.exception("Failed to enumerate working BUY orders during reconcile")
+    return out
+
+
+def _row_age_sec(dt) -> float | None:
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)  # DB round-trips drop tzinfo; stored UTC
+        return (datetime.now(UTC) - dt).total_seconds()
+    except Exception:
+        return None
+
+
+def _cancelled_entry_race_candidate(p) -> bool:
+    """True iff a CANCELLED parent is the entry-timeout kind (tagged notes)
+    AND recent enough that an orphan on its contract is plausibly the late
+    fill that raced the cancel — not the user's own later manual trade."""
+    if "entry_timeout" not in (p.notes or ""):
+        return False
+    ts = getattr(p, "last_status_at", None)
+    if ts is None:
+        return False
+    try:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)  # DB round-trips drop tzinfo; stored UTC
+        return (datetime.now(UTC) - ts).total_seconds() <= _CANCELLED_RESURRECT_WINDOW_SEC
+    except Exception:
+        return False
+
+
+def _resurrectable_for_orphan(key, parent_keys, resurrectable, spot,
+                              orphan_qty: int | None = None):
     """Which resolved parent (if any) to RE-ADOPT for an orphaned IBKR position.
 
     Safety policy — re-adopt ONLY when all hold, else leave it a warned orphan:
@@ -127,12 +197,24 @@ def _resurrectable_for_orphan(key, parent_keys, resurrectable, spot):
       * a recently-resolved (CLOSED/STOPPED) parent for the SAME contract exists
         — i.e. it's our own wrongly-closed bracket, not an untracked manual trade
         we shouldn't auto-manage, AND
-      * we have a live spot to anchor the emergency stop.
+      * we have a live spot to anchor the emergency stop, AND
+      * for entry-timeout CANCELLED parents only: the orphan is no LARGER than
+        the bot's own cancelled order (review MAJOR-2). A 'cancelled but
+        filled' race fill can never exceed the bot's order size — an orphan
+        bigger than that is the USER'S manual position on a shared strike
+        (their documented 100-200-lot habit), which the bot must never adopt
+        into its sell ladder.
     Returns the parent to reopen, or None.
     """
     if key in parent_keys or not spot:
         return None
-    return resurrectable.get(key)
+    resur = resurrectable.get(key)
+    if (resur is not None
+            and getattr(resur, "status", None) == "CANCELLED"
+            and orphan_qty is not None
+            and int(orphan_qty) > int(getattr(resur, "qty", 0) or 0)):
+        return None
+    return resur
 
 
 async def reconcile_positions(state) -> dict[str, Any]:
@@ -184,19 +266,30 @@ async def reconcile_positions(state) -> dict[str, Any]:
     # management rather than left naked — the safety net for orphaning bugs like
     # the 2026-07-01 7520C phantom-fill (a tier flagged fired without selling →
     # parent CLOSED → runner dropped by every watcher). Most-recent per contract.
+    # CANCELLED added 2026-07-16: the entry-timeout watchdog marks a zero-fill
+    # entry CANCELLED after its post-cancel read — if a fill RACED that cancel
+    # and landed after the read, the position surfaces here as an orphan and
+    # this path re-adopts the CANCELLED parent (the designed backstop for the
+    # 'cancelled but filled' race; see engine/entry_timeout.py).
     async with get_session() as session:
         resolved_parents = list((await session.exec(
             select(LiveOrder)
             .where(LiveOrder.bracket_role == "parent")
             .where(LiveOrder.dry_run == False)  # noqa: E712
             .where(LiveOrder.status.in_(  # type: ignore[attr-defined]
-                ["CLOSED", "STOPPED", "STUCK", "CLOSED_EXTERNAL"]
+                ["CLOSED", "STOPPED", "STUCK", "CLOSED_EXTERNAL", "CANCELLED"]
             ))
             .order_by(LiveOrder.id.desc())  # type: ignore[attr-defined]
             .limit(100)
         )).all())
     resurrectable: dict[tuple, LiveOrder] = {}
     for p in resolved_parents:
+        if p.status == "CANCELLED" and not _cancelled_entry_race_candidate(p):
+            # CANCELLED is resurrectable ONLY for the entry-timeout race
+            # (tagged notes, recent) — a stale CANCELLED entry must never
+            # let reconcile adopt the USER'S later manual trade on the same
+            # strike (shared strikes are common; see CLAUDE.md attribution).
+            continue
         k = _position_key(p.symbol, p.strike, p.right, p.expiry)
         if k not in parent_keys and k not in resurrectable:
             resurrectable[k] = p
@@ -325,7 +418,9 @@ async def reconcile_positions(state) -> dict[str, Any]:
     for key, ib_p in ib_positions.items():
         if key in parent_keys:
             continue
-        resur = _resurrectable_for_orphan(key, parent_keys, resurrectable, spot)
+        resur = _resurrectable_for_orphan(
+            key, parent_keys, resurrectable, spot, orphan_qty=int(ib_p["qty"]),
+        )
         if resur is not None and int(ib_p["qty"]) <= 0:
             resur = None  # short remnant — never re-adopt into a long-exit ladder
         if resur is not None and (blocked := _rearm_blocked(state, resur)):
@@ -366,6 +461,26 @@ async def reconcile_positions(state) -> dict[str, Any]:
                 # would clobber the fresh emergency levels on stale-copy
                 # re-apply) must not carry over.
                 _reset_watcher_runtime_state(state, resur.id)
+                # Review MINOR-4: an entry-timeout CANCELLED parent released
+                # its per-symbol session-cap slot at stand-down. If the fill
+                # raced the cancel and we are re-adopting it, a position DOES
+                # exist — re-consume the slot so the symbol can't run
+                # max_per_symbol + 1 open positions.
+                budget_reconsumed = False
+                if resur.status == "CANCELLED" and "entry_timeout" in (resur.notes or ""):
+                    try:
+                        by_sym = getattr(state, "auto_trade_count_by_symbol", None)
+                        if isinstance(by_sym, dict):
+                            by_sym[resur.symbol] = int(by_sym.get(resur.symbol, 0)) + 1
+                        total = getattr(state, "auto_trade_count_session", None)
+                        if isinstance(total, int):
+                            state.auto_trade_count_session = total + 1
+                        budget_reconsumed = True
+                    except Exception:
+                        logger.exception(
+                            "budget re-consume failed for re-adopted parent %s",
+                            resur.id,
+                        )
                 rearmed_count += 1
                 readopted.append({
                     "contract": f"{ib_p['symbol']} {ib_p['strike']}{ib_p['right']}",
@@ -374,6 +489,7 @@ async def reconcile_positions(state) -> dict[str, Any]:
                     "parent_id": resur.id,
                     "was_status": resur.status,
                     "emergency_stop": updates.get("dynamic_stop_level"),
+                    "budget_reconsumed": budget_reconsumed,
                 })
                 continue
             except Exception:
@@ -418,23 +534,56 @@ async def reconcile_positions(state) -> dict[str, Any]:
         except Exception:
             logger.exception("Failed to resolve STUCK parent %s", db_p.id)
 
-    # Phantoms: we have, IBKR doesn't
+    # Phantoms: we have, IBKR doesn't. A parent whose entry BUY is still
+    # WORKING at the broker is NOT a phantom (2026-07-16): with resting LMT
+    # entries, an unfilled SUBMITTED parent legitimately has no position yet.
+    # Fresh ones are the in-process entry-timeout monitor's job (skip);
+    # stale ones are restart-orphaned working orders (the monitor died with
+    # the process) — cancel at the broker + stand the row down CANCELLED,
+    # mirroring the monitor's own zero-fill path (no budget release: the
+    # in-memory counters did not survive the restart either).
+    working_buys = _working_buy_trades(ib)
+    swept_entries: list[dict] = []
     for key, db_p in parent_keys.items():
-        if key not in ib_positions:
-            phantoms.append({
-                "contract": f"{db_p.symbol} {db_p.strike}{db_p.right}",
-                "parent_id": db_p.id,
-                "db_status": db_p.status,
-                "submitted_at": db_p.submitted_at.isoformat(),
-            })
-            # Mark phantom as CLOSED so the watcher stops polling it
+        if key in ib_positions:
+            continue
+        wt = working_buys.get(int(db_p.ib_order_id)) if db_p.ib_order_id is not None else None
+        if wt is not None:
+            age = _row_age_sec(getattr(db_p, "submitted_at", None))
+            if age is not None and age <= _ENTRY_SWEEP_AGE_SEC:
+                continue  # inside the entry window — monitor owns it
             try:
+                ib.cancelOrder(wt.order)
                 await SignalIterRepository.update_live_order(
-                    db_p.id, status="CLOSED",
-                    notes=f"AUTO-CLOSED on reconciliation — IBKR no longer shows this position",
+                    db_p.id, status="CANCELLED",
+                    notes=(f"{(db_p.notes or '').strip()} | entry_timeout: working "
+                           f"entry swept by reconcile (age {age if age is not None else '?'}s "
+                           f"> {_ENTRY_SWEEP_AGE_SEC:.0f}s; monitor lost, likely restart)"
+                           ).strip(" |"),
                 )
+                swept_entries.append({
+                    "contract": f"{db_p.symbol} {db_p.strike}{db_p.right}",
+                    "parent_id": db_p.id,
+                    "ib_order_id": db_p.ib_order_id,
+                    "age_sec": age,
+                })
             except Exception:
-                logger.exception("Failed to update phantom %s", db_p.id)
+                logger.exception("Failed to sweep working entry for parent %s", db_p.id)
+            continue
+        phantoms.append({
+            "contract": f"{db_p.symbol} {db_p.strike}{db_p.right}",
+            "parent_id": db_p.id,
+            "db_status": db_p.status,
+            "submitted_at": db_p.submitted_at.isoformat(),
+        })
+        # Mark phantom as CLOSED so the watcher stops polling it
+        try:
+            await SignalIterRepository.update_live_order(
+                db_p.id, status="CLOSED",
+                notes=f"AUTO-CLOSED on reconciliation — IBKR no longer shows this position",
+            )
+        except Exception:
+            logger.exception("Failed to update phantom %s", db_p.id)
 
     # Audit each finding so the user has a permanent record
     if matched:
@@ -482,6 +631,19 @@ async def reconcile_positions(state) -> dict[str, Any]:
             ),
             details={"phantoms": phantoms},
         )
+    if swept_entries:
+        await SignalIterRepository.write_audit_log(
+            category="entry_timeout", actor="system",
+            summary=(
+                f"Swept {len(swept_entries)} restart-orphaned working entry "
+                f"order(s): unfilled BUY LMT older than "
+                f"{_ENTRY_SWEEP_AGE_SEC:.0f}s with no in-process timeout "
+                f"monitor — cancelled at the broker, parent marked CANCELLED "
+                f"(fire stood down). A fill racing this cancel is re-adopted "
+                f"on the next reconcile pass."
+            ),
+            details={"swept_entries": swept_entries},
+        )
     if stuck_resolved:
         await SignalIterRepository.write_audit_log(
             category="position_reconcile", actor="system",
@@ -503,10 +665,12 @@ async def reconcile_positions(state) -> dict[str, Any]:
         "readopted_count": len(readopted),
         "orphans_count": len(orphans),
         "phantoms_count": len(phantoms),
+        "swept_entries_count": len(swept_entries),
         "matched_detail": matched,
         "readopted_detail": readopted,
         "orphans_detail": orphans,
         "phantoms_detail": phantoms,
+        "swept_entries_detail": swept_entries,
     }
 
 

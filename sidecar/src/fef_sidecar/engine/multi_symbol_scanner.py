@@ -588,6 +588,11 @@ async def _scan_one_symbol(state, symbol: str) -> None:
                     "underlying_price_at_quote": targets.underlying_price_at_quote,
                     "t1": targets.t1, "t2": targets.t2,
                     "t3": targets.t3, "stop": targets.stop,
+                    # bid/ask + quote age: the marketable-limit entry prices
+                    # off THIS ask when fresh (<=10s) — without these the
+                    # auto-trader had to re-fetch on every scanner fire.
+                    "bid": targets.bid, "ask": targets.ask,
+                    "quote_ts_ms": targets.quote_ts_ms,
                 }
         except Exception:
             logger.exception("scanner: option quote fetch failed for %s", symbol)

@@ -33,6 +33,10 @@ class OptionTargets:
     iv: float | None = None
     bid: float | None = None
     ask: float | None = None
+    # Epoch-ms of the quote this snapshot came from — the marketable-limit
+    # entry (entry_pricing.py) uses it to decide whether the fire-time ask is
+    # fresh enough (<=10s) to price the entry LMT without a re-fetch.
+    quote_ts_ms: int | None = None
 
 
 def _est(current_option: float, delta: float | None, current_spx: float, target_spx: float) -> float:
@@ -82,4 +86,18 @@ def build_option_targets(
         iv=getattr(quote, "iv", None),
         bid=quote.bid,
         ask=quote.ask,
+        quote_ts_ms=_quote_ts_ms(quote),
     )
+
+
+def _quote_ts_ms(quote: OptionQuote) -> int | None:
+    """Epoch-ms of the quote snapshot. Providers stamp timestamp with a naive
+    local datetime.now() — .timestamp() interprets naive as local time, which
+    matches the time.time() clock the freshness check compares against."""
+    try:
+        ts = getattr(quote, "timestamp", None)
+        if ts is None:
+            return None
+        return int(ts.timestamp() * 1000)
+    except Exception:
+        return None
