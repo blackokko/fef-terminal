@@ -41,7 +41,6 @@ from fef_sidecar.config_store import UIConfig
 from fef_sidecar.db import SignalIterRepository, dispose_db, init_db
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import LiveOrder
-from fef_sidecar.engine import spy_mirror as sm
 from fef_sidecar.engine import spx_target_watcher as watcher
 from fef_sidecar.engine.spy_mirror import (
     map_spy_level,
@@ -629,6 +628,84 @@ async def test_cross_symbol_cap_ignores_mirror_parents(
     d2 = await maybe_auto_trade(_gate_state(), dict(verdict))
     assert not d2.fired
     assert d2.reason_code == BlockReason.CROSS_SYMBOL_CAP_SKIP
+
+
+async def test_spx_fire_places_mirror_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Full hook wiring: a committed SPX fire through maybe_auto_trade also
+    places the SPY mirror, tagged mirror_of=<SPX parent id>, and a mirror
+    failure can never block the SPX FIRED return."""
+    from fef_sidecar.engine.auto_trader import maybe_auto_trade
+
+    monkeypatch.setattr(
+        "fef_sidecar.engine.live_trading.is_live_trading_enabled", lambda: True,
+    )
+    _patch_config(monkeypatch, auto_trade_confidence_floor="LOW")
+    _patch_expiry(monkeypatch)
+
+    calls: list = []
+
+    async def fake_place_bracket(ibkr, spec, *, confirm=False, ticket_id=None,
+                                 mirror_of=None, **kwargs):
+        calls.append((spec, mirror_of))
+        return {"ok": True, "parent_order_id": 100 + len(calls), "dry_run": True}
+
+    import fef_sidecar.engine.live_trading as lt
+    monkeypatch.setattr(lt, "place_bracket", fake_place_bracket)
+
+    async def spy_quote(contract):
+        return SimpleNamespace(bid=627.49, ask=627.51, last=627.50)
+
+    async def option_quote(contract):
+        return SimpleNamespace(bid=0.50, ask=0.55, last=0.52)
+
+    state = SimpleNamespace(
+        auto_trade_enabled=True, active_symbol="SPX",
+        auto_trade_trigger_types=["confluence", "aligned_only"],
+        auto_trade_cool_down_sec=300,
+        auto_trade_last_at_ms_by_symbol={}, auto_trade_count_by_symbol={},
+        auto_trade_max_per_symbol=2, auto_trade_qty_override=0,
+        auto_trade_last_at_ms=0, auto_trade_count_session=0,
+        last_spx_price=7500.0, last_live_tick_spx=7500.0,
+        exit_dollar_t1=1000.0, exit_dollar_t2=2500.0,
+        exit_dollar_t3=5000.0, exit_dollar_stop=-1000.0,
+        ibkr=SimpleNamespace(get_last_quote=spy_quote,
+                             get_option_quote=option_quote),
+    )
+    verdict = {
+        "direction": "LONG_CALLS", "confidence": "HIGH",
+        "reasoning": "ALIGNED LONG_CALLS — test", "aligned": True,
+        "wall_collapse_trigger": False,
+        "delta_price": 2.1, "delta_drift_m": 30.0, "fe_ratio": 1.2,
+        "drift_bias": "NEUTRAL", "strike_rec": 7540.0,
+        "t1": 7515.0, "t2": 7525.0, "t3": 7550.0, "stop": 7490.0,
+        "option_pricing": {
+            "contract_strike": 7540.0, "right": "C", "entry_limit": 5.1,
+            "delta": 0.4, "underlying_price_at_quote": 7500.0,
+            "t1": 11.1, "t2": 15.1, "t3": 25.1, "stop": 1.1,
+            "bid": 4.9, "ask": 5.1, "quote_ts_ms": int(time.time() * 1000),
+        },
+        "suggested_qty": 3,
+    }
+
+    d = await maybe_auto_trade(state, verdict)
+    assert d.fired
+
+    assert len(calls) == 2
+    spx_spec, spx_tag = calls[0]
+    spy_spec, spy_tag = calls[1]
+    assert spx_spec.symbol == "SPX" and spx_tag is None
+    assert spy_spec.symbol == "SPY"
+    assert spy_tag == 101  # the SPX parent id from the first placement
+    assert spy_spec.strike == 631.0
+    assert spy_spec.qty == 10
+    assert (spy_spec.t1_qty, spy_spec.t2_qty, spy_spec.t3_qty) == (5, 3, 2)
+    assert spy_spec.spx_stop == pytest.approx(626.5)
+    # Both budgets consumed.
+    assert state.auto_trade_count_by_symbol == {"SPX": 1, "SPY": 1}
+    # SPX fire counted once, mirror once (display counter).
+    assert state.auto_trade_count_session == 2
 
 
 # ---------------------------------------------------------------------------
