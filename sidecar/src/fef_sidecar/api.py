@@ -1186,6 +1186,16 @@ async def scanner_symbols_set(request: Request, body: dict[str, Any] = Body(...)
             )
         except Exception:
             pass
+    # Persist the enablement so a restart restores the pin instead of dropping
+    # to all-False (2026-07-17 boot-stomp fix). Only which symbols the scanner
+    # covers is persisted — NOT whether the trader is armed. Best-effort: a
+    # failed write never blocks the toggle.
+    try:
+        from fef_sidecar.config_store import (
+            load_config as _lc, merge_partial as _mp, save_config as _sc)
+        _sc(_mp(_lc(), {"scan_enabled_symbols": dict(s.scan_enabled_symbols)}))
+    except Exception:
+        logger.exception("scanner/symbols: config persist failed")
     return {
         "ok": True,
         "enabled": dict(s.scan_enabled_symbols),

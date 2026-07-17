@@ -549,6 +549,19 @@ async def lifespan(app: FastAPI):
     state = AppState.build()
     app.state.fef = state
 
+    # Restore the persisted scanner-symbol pin (2026-07-17 boot-stomp fix): the
+    # in-memory default is all-False, so without this a restart silently drops
+    # the operator's SPX pin. ARMING is intentionally NOT restored here —
+    # auto_trade_enabled stays fail-safe OFF on boot; the trader is armed only
+    # by an explicit action each session, never silently on restart.
+    try:
+        from fef_sidecar.config_store import load_config as _load_cfg
+        for _sym, _on in _load_cfg().scan_enabled_symbols.items():
+            if _sym in state.scan_enabled_symbols:
+                state.scan_enabled_symbols[_sym] = bool(_on)
+    except Exception:
+        logger.exception("startup: scanner-symbol pin restore failed")
+
     # Live QuantDataClient needs its httpx session initialized via __aenter__.
     # Mock is a no-op. Done here so all loops can call set_page_filter/fetch
     # without each one wrapping in 'async with'.

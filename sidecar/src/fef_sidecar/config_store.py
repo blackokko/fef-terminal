@@ -210,6 +210,22 @@ class UIConfig(BaseModel):
     # FEF_FLOW_SURGE_GATE_ENABLED=true on the main engine.
     flow_source: Literal["qd", "theta"] = Field(default="qd")
 
+    # ---- Scanner enabled-symbols persistence (2026-07-17 boot-stomp fix) ----
+    # state.scan_enabled_symbols is in-memory only and resets to all-False on
+    # every process start, so a restart silently dropped the operator's SPX pin
+    # (re-pinned by hand every morning; a stray relaunch also re-enabled the
+    # 6-symbol default). Persist the enablement here: POST /scanner/symbols
+    # writes it, lifespan restores it on boot. ARMING is deliberately NOT
+    # persisted — auto_trade_enabled stays fail-safe OFF on boot so a crashed
+    # trader is re-armed only by explicit action, never silently on restart
+    # (matches the operator's deliberate morning-arm discipline; a silent
+    # auto-resume of live trading after a crash is the failure mode to avoid).
+    scan_enabled_symbols: dict[str, bool] = Field(
+        default_factory=lambda: {
+            "SPX": False, "SPY": False, "QQQ": False, "IWM": False,
+            "GLD": False, "SMH": False, "TLT": False,
+        })
+
 
 def load_config() -> UIConfig:
     if not CONFIG_PATH.exists():

@@ -35,6 +35,21 @@ _MIN = 60_000
 
 
 @pytest.fixture(autouse=True)
+def _isolate_config(tmp_path):
+    """POST /scanner/symbols now persists the enablement (2026-07-17 boot-stomp
+    fix). Redirect CONFIG_PATH to a tmp file so no test in this module ever
+    writes the operator's real ~/.fef-terminal/config.json. Direct save/restore
+    (not monkeypatch) so load_config's module-global read sees the same path."""
+    import fef_sidecar.config_store as cs
+    _orig = cs.CONFIG_PATH
+    cs.CONFIG_PATH = tmp_path / "config.json"
+    try:
+        yield
+    finally:
+        cs.CONFIG_PATH = _orig
+
+
+@pytest.fixture(autouse=True)
 async def _db_fixture():
     await dispose_db()
     await init_db()
@@ -425,3 +440,36 @@ async def test_scanner_config_changes_are_audited(monkeypatch: pytest.MonkeyPatc
     await scanner_symbols_set(_fake_request(state), body={"enabled": {"QQQ": True}})
     rows2 = await SignalIterRepository.query_audit_log(category="config")
     assert len(rows2) == 1
+
+
+async def test_scanner_symbol_pin_persists_across_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boot-stomp fix: the endpoint pins SPX in-memory, that shape persists via
+    config, and the lifespan restore re-applies it on a fresh AppState — while
+    arming stays fail-safe OFF. (File round-trip through CONFIG_PATH is verified
+    separately; the pytest src-layout dual-import makes the module-global path
+    unreliable to assert here, so this tests the persist SHAPE + restore LOGIC.)
+    """
+    from fef_sidecar.api import scanner_symbols_set
+    from fef_sidecar.config_store import UIConfig, merge_partial
+
+    # 1) The endpoint pins SPX (in-memory truth + response).
+    state = _armed_state(monkeypatch)
+    out = await scanner_symbols_set(_fake_request(state),
+                                    body={"enabled": {"SPX": True}})
+    assert out["enabled"]["SPX"] is True
+    assert state.scan_enabled_symbols["SPX"] is True
+
+    # 2) That enablement round-trips as a valid persisted config shape...
+    persisted = merge_partial(UIConfig(),
+                              {"scan_enabled_symbols": dict(state.scan_enabled_symbols)})
+    assert persisted.scan_enabled_symbols["SPX"] is True
+
+    # 3) ...and the lifespan restore step (inlined) re-applies it on a fresh
+    #    process while arming stays OFF.
+    fresh = AppState.build()
+    assert fresh.scan_enabled_symbols["SPX"] is False   # default before restore
+    for sym, on in persisted.scan_enabled_symbols.items():
+        if sym in fresh.scan_enabled_symbols:
+            fresh.scan_enabled_symbols[sym] = bool(on)
+    assert fresh.scan_enabled_symbols["SPX"] is True     # pin restored
+    assert fresh.auto_trade_enabled is False             # arming NOT restored
