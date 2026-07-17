@@ -578,7 +578,7 @@ class SignalIterRepository:
         side so attribution is unambiguous.
 
         bracket_role values: 't1' / 't2' / 't3' / 'stop' / 'runner_protect'
-                             / 'dollar_cap' / 'trail_after_t1'
+                             / 'dollar_cap' / 'trail_after_t1' / 'eod_flat'
         """
         child = LiveOrder(
             ticket_id=parent.ticket_id,
@@ -587,6 +587,10 @@ class SignalIterRepository:
             strike=parent.strike,
             right=parent.right,
             expiry=parent.expiry,
+            # SPY-mirror ledger tag propagates parent -> sell children so the
+            # mirror book's EXITS are selectable without a parent join
+            # (2026-07-17 review Finding 5).
+            mirror_of=getattr(parent, "mirror_of", None),
             action="SELL",
             qty=qty,
             order_type="MKT",

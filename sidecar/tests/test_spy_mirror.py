@@ -42,6 +42,7 @@ from fef_sidecar.db import SignalIterRepository, dispose_db, init_db
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import LiveOrder
 from fef_sidecar.engine import spx_target_watcher as watcher
+from fef_sidecar.engine import spy_mirror as sm
 from fef_sidecar.engine.spy_mirror import (
     map_spy_level,
     map_spy_strike,
@@ -249,12 +250,18 @@ def test_mirror_enabled_config_read_failure_fails_safe(
 _TODAY = time.strftime("%Y%m%d")
 
 
+# Consistent fire-time pair: SPX 7500 <-> SPY 745.00 (ratio 10.067, inside
+# the [9.7, 10.6] plausibility band; SPY trades ~0.6% under SPX/10).
+_SPY_SPOT = 745.00
+
+
 def _mirror_state(**kw) -> SimpleNamespace:
     d = dict(
         auto_trade_count_by_symbol={},
         auto_trade_last_at_ms_by_symbol={},
         auto_trade_count_session=0,
         auto_trade_max_per_symbol=2,
+        active_symbol="SPX",
         last_live_tick_spx=7500.0,
         last_spx_price=7500.0,
         exit_dollar_t1=1000.0, exit_dollar_t2=2500.0,
@@ -271,13 +278,17 @@ def _mirror_kwargs(**kw) -> dict:
         spx_parent_id=42, source="auto_scanner", strategy="spx_points",
         spx_t1=7515.0, spx_t2=7525.0, spx_t3=7550.0, spx_stop=7490.0,
         entry_timeout_sec=45.0,
+        # The verdict's gate-8-validated underlying — the map's PRIMARY
+        # anchor (never the active-chart tick).
+        spx_spot_ref=7500.0,
+        spx_entry_ask=5.1,
     )
     d.update(kw)
     return d
 
 
 def _patch_expiry(monkeypatch: pytest.MonkeyPatch, expiry: str = _TODAY,
-                  today: str = _TODAY):
+                  today: str = _TODAY, hhmm: str = "10:00"):
     import fef_sidecar.engine.expiry_resolver as er
 
     async def fake_resolve(state, symbol):
@@ -285,6 +296,9 @@ def _patch_expiry(monkeypatch: pytest.MonkeyPatch, expiry: str = _TODAY,
 
     monkeypatch.setattr(er, "resolve_nearest_expiry", fake_resolve)
     monkeypatch.setattr(er, "_today_et_ymd", lambda: today)
+    # Pin the mirror's ET clock (the late-session cutoff would otherwise
+    # make these tests time-of-day dependent).
+    monkeypatch.setattr(sm, "_now_et_hhmm_ymd", lambda: (hhmm, today))
 
 
 async def _mirror_audit_rows():
@@ -354,9 +368,50 @@ async def test_skip_no_spx_spot(monkeypatch: pytest.MonkeyPatch):
     _patch_config(monkeypatch)
     _patch_expiry(monkeypatch)
     state = _mirror_state(last_live_tick_spx=0.0, last_spx_price=0.0)
-    r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
+    r = await maybe_place_spy_mirror(
+        state, **_mirror_kwargs(spx_spot_ref=None),
+    )
     assert r["skipped"] == "no_spx_spot"
     assert await _live_orders() == []
+
+
+async def test_contaminated_chart_tick_never_anchors_the_map(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Adversarial review Finding 1 (BLOCKER class): while the user charts
+    ES, last_live_tick_spx carries ES-priced values (~+0.7%). Without the
+    verdict's own underlying, the mirror must SKIP — never map off the
+    contaminated tick (which would land the strike ~0.7% low and put T1
+    below spot -> instant dump)."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+    state = _mirror_state(
+        active_symbol="ES",           # user charting ES — the 7/6 class
+        last_live_tick_spx=7561.0,    # ES-priced "SPX" tick
+        last_spx_price=7561.0,
+    )
+    r = await maybe_place_spy_mirror(
+        state, **_mirror_kwargs(spx_spot_ref=None),
+    )
+    assert r["skipped"] == "no_spx_spot"
+    assert await _live_orders() == []
+
+
+async def test_verdict_spot_ref_wins_over_chart_tick(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """With the verdict underlying present, the contaminated tick is simply
+    ignored — the map anchors on 7500 and the mirror proceeds (lands on the
+    next gate: spot fetch failure on the bare fake)."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+    state = _mirror_state(
+        active_symbol="ES", last_live_tick_spx=7561.0, last_spx_price=7561.0,
+    )
+    r = await maybe_place_spy_mirror(
+        state, **_mirror_kwargs(spx_spot_ref=7500.0),
+    )
+    assert r["skipped"] == "spot_fetch_failed"  # got PAST the spot-ref gate
 
 
 async def test_skip_spot_fetch_failure_never_raises(
@@ -385,8 +440,10 @@ async def test_skip_implausible_spot_ratio(monkeypatch: pytest.MonkeyPatch):
     _patch_expiry(monkeypatch)
 
     async def stale_quote(contract):
-        # SPY quote at 100 while SPX at 7500 -> ratio 75, way off ~10.
-        return SimpleNamespace(bid=100.0, ask=100.02, last=100.01)
+        # SPY at 700 vs SPX 7500 -> ratio 10.71, just past the tightened
+        # [9.7, 10.6] band (review Finding 1: the old [8, 13] band caught
+        # nothing subtler than a ~20% error).
+        return SimpleNamespace(bid=699.99, ask=700.01, last=700.00)
 
     state = _mirror_state(ibkr=SimpleNamespace(get_last_quote=stale_quote))
     r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
@@ -394,20 +451,53 @@ async def test_skip_implausible_spot_ratio(monkeypatch: pytest.MonkeyPatch):
     assert await _live_orders() == []
 
 
+async def test_skip_last_only_quote_prior_close_class(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Review Finding 3: the provider's `last` can silently be the PRIOR
+    SESSION CLOSE (NaN-field fallback). A quote with no bid/ask mid is
+    refused even when `last` looks plausible."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+
+    async def last_only(contract):
+        return SimpleNamespace(bid=None, ask=None, last=_SPY_SPOT)
+
+    state = _mirror_state(ibkr=SimpleNamespace(get_last_quote=last_only))
+    r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
+    assert r["skipped"] == "spot_fetch_failed"
+    assert await _live_orders() == []
+
+
+async def test_skip_late_session(monkeypatch: pytest.MonkeyPatch):
+    """Review Finding 4a: no NEW mirror within (entry timeout + margin) of
+    the 15:40 EOD flat — cutoff 15:38 at the default 45s timeout."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch, hhmm="15:38")
+    state = _mirror_state(ibkr=_working_ibkr())
+    r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
+    assert r["skipped"] == "late_session"
+    assert await _live_orders() == []
+    # One minute earlier the mirror proceeds.
+    _patch_expiry(monkeypatch, hhmm="15:37")
+    r2 = await maybe_place_spy_mirror(state, **_mirror_kwargs())
+    assert r2["ok"] is True
+
+
 async def test_skip_duplicate_spy_parent(monkeypatch: pytest.MonkeyPatch):
     _patch_config(monkeypatch)
     _patch_expiry(monkeypatch)
-    # Active SPY parent already at the mapped strike (631C, from 7540@7500
-    # on SPY 627.50).
+    # Active SPY parent already at the mapped strike (749C, from 7540@7500
+    # on SPY 745.00).
     await SignalIterRepository.write_live_order(LiveOrder(
-        symbol="SPY", strike=631.0, right="C", expiry=_TODAY,
+        symbol="SPY", strike=749.0, right="C", expiry=_TODAY,
         action="BUY", qty=10, order_type="LMT", limit_price=0.6,
         bracket_role="parent", status="FILLED", exit_strategy="spx_points",
         dry_run=False,
     ))
 
     async def spy_quote(contract):
-        return SimpleNamespace(bid=627.49, ask=627.51, last=627.50)
+        return SimpleNamespace(bid=744.99, ask=745.01, last=745.00)
 
     state = _mirror_state(ibkr=SimpleNamespace(get_last_quote=spy_quote))
     r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
@@ -419,7 +509,7 @@ async def test_skip_no_fresh_option_quote(monkeypatch: pytest.MonkeyPatch):
     _patch_expiry(monkeypatch)
 
     async def spy_quote(contract):
-        return SimpleNamespace(bid=627.49, ask=627.51, last=627.50)
+        return SimpleNamespace(bid=744.99, ask=745.01, last=745.00)
 
     async def dead_option_quote(contract):
         return SimpleNamespace(bid=None, ask=None, last=None)
@@ -432,6 +522,59 @@ async def test_skip_no_fresh_option_quote(monkeypatch: pytest.MonkeyPatch):
     assert await _live_orders() == []
 
 
+async def test_skip_premium_implausible(monkeypatch: pytest.MonkeyPatch):
+    """Review Finding 6: the mirror's chase-bound substitute — a resolved
+    SPY ask far off SPX_ask/10 (here 2.50 vs expected ~0.51) is a mismapped
+    strike or garbage quote; skip."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+
+    async def spy_quote(contract):
+        return SimpleNamespace(bid=744.99, ask=745.01, last=745.00)
+
+    async def rich_option_quote(contract):
+        return SimpleNamespace(bid=2.45, ask=2.50, last=2.48)
+
+    state = _mirror_state(ibkr=SimpleNamespace(
+        get_last_quote=spy_quote, get_option_quote=rich_option_quote,
+    ))
+    r = await maybe_place_spy_mirror(state, **_mirror_kwargs(spx_entry_ask=5.1))
+    assert r["skipped"] == "premium_implausible"
+    assert await _live_orders() == []
+
+
+async def test_skip_degenerate_dollar_ladder(monkeypatch: pytest.MonkeyPatch):
+    """Review Finding 7: the $10 clamp floor collapsing the scaled $ ladder
+    into equal targets (T2/T3 increments $0 under cumulative semantics)
+    skips the mirror instead of placing a breakeven-dumper."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+    state = _mirror_state(
+        ibkr=_working_ibkr(),
+        exit_dollar_t1=20.0, exit_dollar_t2=25.0, exit_dollar_t3=30.0,
+        exit_dollar_stop=-20.0,
+    )
+    r = await maybe_place_spy_mirror(
+        state, **_mirror_kwargs(strategy="fixed_dollar"),
+    )
+    assert r["skipped"] == "degenerate_dollar_ladder"
+    assert await _live_orders() == []
+
+
+async def test_qty_clipped_by_env_risk_cap(monkeypatch: pytest.MonkeyPatch):
+    """Review Finding 8: the mirror honors FEF_MAX_CONTRACTS_PER_TRADE at
+    SPY's 1/10 notional (cap x 10 SPY contracts)."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+    monkeypatch.setenv("FEF_MAX_CONTRACTS_PER_TRADE", "0")  # cap -> 1 SPY ct
+    state = _mirror_state(ibkr=_working_ibkr())
+    r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
+    assert r["ok"] is True
+    p = (await _live_orders())[0]
+    assert p.qty == 1
+    assert (p.spx_target_t1_qty, p.spx_target_t2_qty, p.spx_target_t3_qty) == (1, 0, 0)
+
+
 # ---------------------------------------------------------------------------
 # 6. Success path (DRY) — mapping, tagging, budget
 # ---------------------------------------------------------------------------
@@ -440,7 +583,7 @@ async def test_skip_no_fresh_option_quote(monkeypatch: pytest.MonkeyPatch):
 def _working_ibkr() -> SimpleNamespace:
     async def spy_quote(contract):
         assert contract.symbol == "SPY"
-        return SimpleNamespace(bid=627.49, ask=627.51, last=627.50)
+        return SimpleNamespace(bid=744.99, ask=745.01, last=745.00)
 
     async def option_quote(contract):
         assert contract.symbol == "SPY"
@@ -462,7 +605,7 @@ async def test_mirror_places_spy_parent_dry(monkeypatch: pytest.MonkeyPatch):
     assert len(orders) == 1
     p = orders[0]
     assert p.symbol == "SPY"
-    assert p.strike == 631.0                      # validated map, not 754
+    assert p.strike == 749.0                      # validated map, not 754
     assert p.right == "C"
     assert p.qty == 10
     assert p.expiry == _TODAY
@@ -472,13 +615,13 @@ async def test_mirror_places_spy_parent_dry(monkeypatch: pytest.MonkeyPatch):
     assert "mirror_of=42;" in p.notes
     # 50/30/20 partials at qty 10 -> 5/3/2.
     assert (p.spx_target_t1_qty, p.spx_target_t2_qty, p.spx_target_t3_qty) == (5, 3, 2)
-    # Ladder = SPY spot +/- SPX offsets / 10 (spot mid 627.50).
-    assert p.spx_target_t1 == pytest.approx(629.0)
-    assert p.spx_target_t2 == pytest.approx(630.0)
-    assert p.spx_target_t3 == pytest.approx(632.5)
-    assert p.spx_target_stop == pytest.approx(626.5)
-    assert p.entry_spx_price == pytest.approx(627.50)
-    assert p.dynamic_stop_level == pytest.approx(626.5)
+    # Ladder = SPY spot +/- SPX offsets / 10 (spot mid 745.00).
+    assert p.spx_target_t1 == pytest.approx(746.5)
+    assert p.spx_target_t2 == pytest.approx(747.5)
+    assert p.spx_target_t3 == pytest.approx(750.0)
+    assert p.spx_target_stop == pytest.approx(744.0)
+    assert p.entry_spx_price == pytest.approx(745.00)
+    assert p.dynamic_stop_level == pytest.approx(744.0)
     # Catastrophe cap at the mirror's own scale: 1800 * (10/10)/3 = 600.
     assert p.dollar_loss_cap == pytest.approx(-600.0)
     # Marketable LMT off the SPY ask: 0.55 + max(0.10, 2%) = 0.65 on pennies.
@@ -655,7 +798,7 @@ async def test_spx_fire_places_mirror_end_to_end(
     monkeypatch.setattr(lt, "place_bracket", fake_place_bracket)
 
     async def spy_quote(contract):
-        return SimpleNamespace(bid=627.49, ask=627.51, last=627.50)
+        return SimpleNamespace(bid=744.99, ask=745.01, last=745.00)
 
     async def option_quote(contract):
         return SimpleNamespace(bid=0.50, ask=0.55, last=0.52)
@@ -698,10 +841,10 @@ async def test_spx_fire_places_mirror_end_to_end(
     assert spx_spec.symbol == "SPX" and spx_tag is None
     assert spy_spec.symbol == "SPY"
     assert spy_tag == 101  # the SPX parent id from the first placement
-    assert spy_spec.strike == 631.0
+    assert spy_spec.strike == 749.0
     assert spy_spec.qty == 10
     assert (spy_spec.t1_qty, spy_spec.t2_qty, spy_spec.t3_qty) == (5, 3, 2)
-    assert spy_spec.spx_stop == pytest.approx(626.5)
+    assert spy_spec.spx_stop == pytest.approx(744.0)
     # Both budgets consumed.
     assert state.auto_trade_count_by_symbol == {"SPX": 1, "SPY": 1}
     # SPX fire counted once, mirror once (display counter).
@@ -905,27 +1048,81 @@ async def test_eod_flat_skips_parent_with_fire_in_flight(
     assert handled == set() and called == []
 
 
+async def test_watcher_sell_children_inherit_mirror_tag():
+    """Review Finding 5: the mirror book's EXITS must be selectable — sell
+    children propagate the parent's mirror_of."""
+    parent = await SignalIterRepository.write_live_order(LiveOrder(
+        symbol="SPY", strike=749.0, right="C", expiry=_TODAY,
+        action="BUY", qty=10, order_type="LMT", limit_price=0.65,
+        bracket_role="parent", status="FILLED", exit_strategy="spx_points",
+        dry_run=False, mirror_of=42,
+    ))
+    child = await SignalIterRepository.write_watcher_sell_child(
+        parent=parent, bracket_role="t1", qty=5, ib_order_id=9001,
+    )
+    assert child.mirror_of == 42
+    # Non-mirror parents keep NULL children.
+    spx_parent = await SignalIterRepository.write_live_order(LiveOrder(
+        symbol="SPX", strike=7540.0, right="C", expiry=_TODAY,
+        action="BUY", qty=3, order_type="LMT", limit_price=5.1,
+        bracket_role="parent", status="FILLED", exit_strategy="spx_points",
+        dry_run=False,
+    ))
+    spx_child = await SignalIterRepository.write_watcher_sell_child(
+        parent=spx_parent, bracket_role="stop", qty=3, ib_order_id=9002,
+    )
+    assert spx_child.mirror_of is None
+
+
+async def test_daily_review_excludes_mirror_parents():
+    """Review Finding 5: a mirrored fire must count ONCE in the daily
+    review, not twice (SPX book + its 1/10 SPY copy)."""
+    from datetime import UTC, datetime
+    from fef_sidecar.engine.daily_review import compute_daily_review
+
+    session_date = datetime.now(UTC).strftime("%Y-%m-%d")
+    spx_p = await SignalIterRepository.write_live_order(LiveOrder(
+        symbol="SPX", strike=7540.0, right="C", expiry=_TODAY,
+        action="BUY", qty=3, order_type="LMT", limit_price=5.1,
+        bracket_role="parent", status="FILLED", exit_strategy="spx_points",
+        dry_run=False,
+    ))
+    await SignalIterRepository.write_live_order(LiveOrder(
+        symbol="SPY", strike=749.0, right="C", expiry=_TODAY,
+        action="BUY", qty=10, order_type="LMT", limit_price=0.65,
+        bracket_role="parent", status="FILLED", exit_strategy="spx_points",
+        dry_run=False, mirror_of=spx_p.id,
+    ))
+    review = await compute_daily_review(session_date)
+    assert review.actual_trades_taken == 1  # the SPX fire only
+
+
 # ---------------------------------------------------------------------------
 # 9. Watcher stock-quote spot fallback
 # ---------------------------------------------------------------------------
 
 
-async def test_stock_quote_spot_fallback_resolves_spy(
-    monkeypatch: pytest.MonkeyPatch,
-):
+async def test_stock_quote_spot_fallback_resolves_spy():
+    """NON-BLOCKING (review Finding 2): the first call kicks a detached
+    refresh and returns nothing; once the refresh lands, calls serve from
+    the TTL cache without further round-trips."""
+    import asyncio
     calls = []
 
     async def spy_quote(contract):
         calls.append(contract.symbol)
-        return SimpleNamespace(bid=627.40, ask=627.60, last=627.50)
+        return SimpleNamespace(bid=744.90, ask=745.10, last=745.00)
 
     state = SimpleNamespace(ibkr=SimpleNamespace(get_last_quote=spy_quote))
+    first = await watcher._watcher_stock_quote_spot(state, "SPY")
+    assert first == (None, None)  # refresh spawned, nothing served yet
+    await asyncio.sleep(0.05)     # let the detached refresh land
     spot, src = await watcher._watcher_stock_quote_spot(state, "SPY")
-    assert spot == pytest.approx(627.50)
+    assert spot == pytest.approx(745.00)
     assert src == "ibkr_stock_quote"
-    # TTL cache: second call answers without a round-trip.
+    # TTL cache: third call answers without another round-trip.
     spot2, _ = await watcher._watcher_stock_quote_spot(state, "SPY")
-    assert spot2 == pytest.approx(627.50)
+    assert spot2 == pytest.approx(745.00)
     assert calls == ["SPY"]
 
 
@@ -934,9 +1131,8 @@ async def test_stock_quote_spot_non_stock_symbol_none():
     assert await watcher._watcher_stock_quote_spot(state, "SPX") == (None, None)
 
 
-async def test_stock_quote_spot_failure_cached(
-    monkeypatch: pytest.MonkeyPatch,
-):
+async def test_stock_quote_spot_failure_cached():
+    import asyncio
     calls = []
 
     async def broken(contract):
@@ -945,25 +1141,45 @@ async def test_stock_quote_spot_failure_cached(
 
     state = SimpleNamespace(ibkr=SimpleNamespace(get_last_quote=broken))
     assert await watcher._watcher_stock_quote_spot(state, "SPY") == (None, None)
+    await asyncio.sleep(0.05)  # refresh lands (as a cached failure)
+    assert await watcher._watcher_stock_quote_spot(state, "SPY") == (None, None)
     assert await watcher._watcher_stock_quote_spot(state, "SPY") == (None, None)
     assert len(calls) == 1  # failure TTL-cached — no hammering
 
 
-async def test_watcher_symbol_spot_uses_stock_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-):
+async def test_stock_quote_spot_refuses_last_only_quote():
+    """Review Finding 3: `last` can be the prior-session close — the watcher
+    spot must come from a bid/ask mid or not at all."""
+    import asyncio
+
+    async def last_only(contract):
+        return SimpleNamespace(bid=None, ask=None, last=745.00)
+
+    state = SimpleNamespace(ibkr=SimpleNamespace(get_last_quote=last_only))
+    await watcher._watcher_stock_quote_spot(state, "SPY")
+    await asyncio.sleep(0.05)
+    assert await watcher._watcher_stock_quote_spot(state, "SPY") == (None, None)
+
+
+async def test_watcher_symbol_spot_uses_stock_fallback():
     """Full resolution chain: active symbol SPX, no scanner snapshot, no
-    bars — a SPY mirror parent still gets a symbol-correct spot."""
+    bars — a SPY mirror parent still gets a symbol-correct spot once the
+    detached refresh lands."""
+    import asyncio
+
     async def spy_quote(contract):
-        return SimpleNamespace(bid=627.40, ask=627.60, last=627.50)
+        return SimpleNamespace(bid=744.90, ask=745.10, last=745.00)
 
     state = SimpleNamespace(
         active_symbol="SPX",
         last_scanner_verdict_by_symbol={},
         ibkr=SimpleNamespace(get_last_quote=spy_quote),
     )
-    p = SimpleNamespace(id=1, symbol="SPY", strike=631.0, right="C",
+    p = SimpleNamespace(id=1, symbol="SPY", strike=749.0, right="C",
                         expiry="20260717")
+    first = await watcher._watcher_symbol_spot(state, p, 7500.0, {})
+    assert first == (None, None)  # first cycle: refresh in flight, SKIP
+    await asyncio.sleep(0.05)
     spot, src = await watcher._watcher_symbol_spot(state, p, 7500.0, {})
-    assert spot == pytest.approx(627.50)
+    assert spot == pytest.approx(745.00)
     assert src == "ibkr_stock_quote"

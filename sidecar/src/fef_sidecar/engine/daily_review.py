@@ -177,10 +177,15 @@ async def compute_daily_review(session_date: str) -> DailyReview:
             .where(HistoricalBar.bar_size == "1 min")
         )).all())
         # Real trades from live_order parent rows whose submitted_at falls in session.
+        # SPY MIRRORS EXCLUDED (2026-07-17 adversarial review Finding 5): a
+        # mirror is the SAME fire at a second venue at 1/10 scale — counting
+        # it here double-counts every mirrored fire in wins/R/expectancy.
+        # The mirror book is its own ledger: mirror_of IS NOT NULL.
         live_parents = list((await session.exec(
             select(LiveOrder)
             .where(LiveOrder.bracket_role == "parent")
             .where(LiveOrder.dry_run == False)  # noqa: E712
+            .where(LiveOrder.mirror_of.is_(None))  # type: ignore[union-attr]
         )).all())
         live_parents = [p for p in live_parents
                         if p.submitted_at.strftime("%Y-%m-%d") == session_date]

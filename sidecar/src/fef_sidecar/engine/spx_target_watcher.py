@@ -1143,31 +1143,36 @@ _WATCHER_UNITS_RATIO = 3.0
 # symbols only — SPY/QQQ/IWM/GLD/SMH/TLT). TTL-cached on state so the 0.1s
 # poll costs at most one bounded round-trip per symbol per TTL.
 _STOCK_SPOT_TTL_MS = int(float(os.environ.get("FEF_WATCHER_STOCK_SPOT_TTL_SEC", "5")) * 1000)
+# Serve a previously-fetched quote up to this old while a refresh is in
+# flight; past it the value is too stale to gate a stop on.
+_STOCK_SPOT_SERVE_MAX_MS = 30_000
 _STOCK_SPOT_TIMEOUT_SEC = 4.0
 
 
-async def _watcher_stock_quote_spot(state, symbol: str) -> tuple[float | None, str | None]:
-    """(spot, 'ibkr_stock_quote') for a STOCK-kind symbol via a TTL-cached
-    live quote; (None, None) for non-stock symbols or on any failure
-    (failures are cached for the TTL too, so a dead feed can't be hammered
-    at poll cadence)."""
+def _stock_spot_state(state) -> tuple[dict, set, set] | None:
+    """(cache, refreshing, tasks) holders on state; None if unassignable."""
     try:
-        from fef_sidecar.ibkr.models import Contract, ContractKind
-        contract = Contract.for_symbol(symbol)
-        if contract.kind != ContractKind.STOCK:
-            return None, None
-    except Exception:
-        return None, None
-    now_ms = int(_time.time() * 1000)
-    if not hasattr(state, "_watcher_stock_spot_cache"):
-        try:
+        if not hasattr(state, "_watcher_stock_spot_cache"):
             state._watcher_stock_spot_cache = {}  # type: ignore[attr-defined]
-        except Exception:
-            return None, None
-    cached = state._watcher_stock_spot_cache.get(symbol)  # type: ignore[attr-defined]
-    if cached is not None and now_ms - cached[0] < _STOCK_SPOT_TTL_MS:
-        spot = cached[1]
-        return (spot, "ibkr_stock_quote") if spot else (None, None)
+        if not hasattr(state, "_watcher_stock_spot_refreshing"):
+            state._watcher_stock_spot_refreshing = set()  # type: ignore[attr-defined]
+        if not hasattr(state, "_watcher_stock_spot_tasks"):
+            state._watcher_stock_spot_tasks = set()  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    return (
+        state._watcher_stock_spot_cache,        # type: ignore[attr-defined]
+        state._watcher_stock_spot_refreshing,   # type: ignore[attr-defined]
+        state._watcher_stock_spot_tasks,        # type: ignore[attr-defined]
+    )
+
+
+async def _stock_spot_refresh(state, symbol: str, contract) -> None:
+    """Background refresh of one symbol's stock-quote spot. BID/ASK MID ONLY
+    — the provider's `last` can silently fall back to the PRIOR SESSION
+    CLOSE when live fields are NaN (adversarial review Finding 3); a stop
+    must never be evaluated against yesterday's close. Failures are cached
+    (as None) so a dead feed is retried at TTL cadence, not poll cadence."""
     spot: float | None = None
     try:
         import math as _m
@@ -1176,17 +1181,55 @@ async def _watcher_stock_quote_spot(state, symbol: str) -> tuple[float | None, s
         )
         bid = getattr(quote, "bid", None)
         ask = getattr(quote, "ask", None)
-        last = getattr(quote, "last", None)
         if (isinstance(bid, (int, float)) and isinstance(ask, (int, float))
                 and _m.isfinite(bid) and _m.isfinite(ask) and bid > 0 and ask > 0):
             spot = (float(bid) + float(ask)) / 2.0
-        elif isinstance(last, (int, float)) and _m.isfinite(last) and last > 0:
-            spot = float(last)
     except Exception:
-        logger.debug("watcher: stock-quote spot fetch failed for %s", symbol)
+        logger.debug("watcher: stock-quote spot refresh failed for %s", symbol)
         spot = None
-    state._watcher_stock_spot_cache[symbol] = (now_ms, spot)  # type: ignore[attr-defined]
-    return (spot, "ibkr_stock_quote") if spot else (None, None)
+    holders = _stock_spot_state(state)
+    if holders is not None:
+        cache, refreshing, _tasks = holders
+        cache[symbol] = (int(_time.time() * 1000), spot)
+        refreshing.discard(symbol)
+
+
+async def _watcher_stock_quote_spot(state, symbol: str) -> tuple[float | None, str | None]:
+    """(spot, 'ibkr_stock_quote') for a STOCK-kind symbol, NON-BLOCKING
+    (adversarial review Finding 2: the provider's snapshot quote holds an
+    unconditional ~1.5s sleep — awaiting it inline stalled the ENTIRE 0.1s
+    poll loop ~30-40% duty-cycle while a mirror was open). Always serves
+    from the TTL cache; a stale/missing entry kicks a DETACHED refresh task
+    and this call returns what it has (None on the first cycles — the
+    parent is simply skipped until the refresh lands, ~1.5-2s)."""
+    try:
+        from fef_sidecar.ibkr.models import Contract, ContractKind
+        contract = Contract.for_symbol(symbol)
+        if contract.kind != ContractKind.STOCK:
+            return None, None
+    except Exception:
+        return None, None
+    holders = _stock_spot_state(state)
+    if holders is None:
+        return None, None
+    cache, refreshing, tasks = holders
+    now_ms = int(_time.time() * 1000)
+    entry = cache.get(symbol)
+    if (entry is None or now_ms - entry[0] >= _STOCK_SPOT_TTL_MS) \
+            and symbol not in refreshing:
+        refreshing.add(symbol)
+        try:
+            task = asyncio.create_task(_stock_spot_refresh(state, symbol, contract))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        except Exception:
+            refreshing.discard(symbol)
+    if entry is None:
+        return None, None
+    spot = entry[1]
+    if spot and now_ms - entry[0] < _STOCK_SPOT_SERVE_MAX_MS:
+        return float(spot), "ibkr_stock_quote"
+    return None, None
 
 
 def _throttled(state, attr: str, key, now_ms: int,
@@ -1214,15 +1257,20 @@ async def _watcher_symbol_spot(
     (category="watcher_no_spot", once per 5 min per parent)."""
     from fef_sidecar.db.repository import SignalIterRepository
     spot, src = await _shadow_cash_spot(state, p.symbol, poll_spot, spot_cache)
-    if spot is not None and spot > 0:
+    if spot is not None and spot > 0 and src != "1min_bar":
         return float(spot), src
     # STOCK-QUOTE FALLBACK (2026-07-17): a mirror-placed SPY parent has no
     # scanner snapshot and no bar capture — resolve its spot from a
-    # TTL-cached live IBKR stock quote before giving up.
-    spot, src = await _watcher_stock_quote_spot(state, p.symbol)
+    # TTL-cached live IBKR stock quote (non-blocking; a stale cache kicks a
+    # detached refresh). Also OUTRANKS a 1-min-bar spot for STOCK symbols
+    # (review Finding 10: the bar close can be up to 10 min old — never
+    # prefer it over a <=5s quote when one is available).
+    q_spot, q_src = await _watcher_stock_quote_spot(state, p.symbol)
+    if q_spot is not None and q_spot > 0:
+        spot_cache[p.symbol] = (float(q_spot), q_src)  # per-cycle reuse
+        return float(q_spot), q_src
     if spot is not None and spot > 0:
-        spot_cache[p.symbol] = (float(spot), src)  # per-cycle reuse
-        return float(spot), src
+        return float(spot), src  # the bar spot — better than skipping
     now_ms = int(_time.time() * 1000)
     if _throttled(state, "_watcher_no_spot_log_ms", p.id, now_ms):
         try:
@@ -3372,6 +3420,36 @@ def _et_now_hhmm_ymd() -> tuple[str, str]:
     return now.strftime("%H:%M"), now.strftime("%Y%m%d")
 
 
+def _cancel_working_entry_order(state, p) -> None:
+    """Best-effort cancel of the parent's WORKING entry BUY as part of the
+    EOD flat (adversarial review Finding 4b): an unfilled/partial entry left
+    working can fill AFTER the flat has sold/parked — an unmanaged equity
+    0DTE long riding into the close, the exact disaster this guard exists to
+    prevent. Never raises; a failed cancel leaves the entry to the 45s
+    entry-timeout monitor / reconcile as before."""
+    try:
+        from fef_sidecar.ibkr.live import LiveIBKRProvider
+        if not isinstance(state.ibkr, LiveIBKRProvider) or p.ib_order_id is None:
+            return
+        if int(getattr(p, "filled_qty", 0) or 0) >= int(p.qty or 0):
+            return  # fully filled — nothing can be working
+        ib = state.ibkr._ib  # type: ignore[attr-defined]
+        for t in ib.trades():
+            if (getattr(getattr(t, "order", None), "orderId", None) == p.ib_order_id
+                    and getattr(t.order, "action", "") == "BUY"):
+                status = str(getattr(getattr(t, "orderStatus", None), "status", "") or "")
+                if status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+                    ib.cancelOrder(t.order)
+                    logger.warning(
+                        "EOD flat: cancelled WORKING entry BUY for parent %s "
+                        "(%s %s%s, ib_order_id=%s, status=%s)",
+                        p.id, p.symbol, p.strike, p.right, p.ib_order_id, status,
+                    )
+                break
+    except Exception:
+        logger.exception("EOD flat: entry-cancel failed for parent %s", p.id)
+
+
 def _eod_flat_due(p, now_hhmm: str, today_ymd: str) -> bool:
     """True iff parent p must be flattened by the assignment guard now:
     equity-class (non-SPX) option, expiring today or earlier, inside the
@@ -3411,6 +3489,27 @@ async def _eod_assignment_flat_cycle(state, parents) -> set:
         pass
     now_hhmm, today_ymd = _et_now_hhmm_ymd()
 
+    # Calendar-coverage tripwire (review Finding 9): the early-close list is
+    # hardcoded through 2026 — past that the window silently reverts to
+    # 15:40 on half days and the guard never fires before a 13:00 close.
+    # One loud row per process once the coverage year is exceeded.
+    try:
+        if (int(today_ymd[:4]) > 2026
+                and not getattr(state, "_early_close_coverage_warned", False)):
+            state._early_close_coverage_warned = True  # type: ignore[attr-defined]
+            await SignalIterRepository.write_audit_log(
+                category="spy_eod_flat", actor="system",
+                summary=(
+                    "EARLY-CLOSE CALENDAR COVERAGE EXPIRED: _EARLY_CLOSE_DATES "
+                    "in spx_target_watcher.py is hardcoded through 2026 — on a "
+                    "half day the assignment flat would run at 15:40, AFTER a "
+                    "13:00 close. Update the list before trading equity 0DTE "
+                    "mirrors this year."
+                ),
+            )
+    except Exception:
+        pass
+
     for p in parents:
         if p.id is None or not _eod_flat_due(p, now_hhmm, today_ymd):
             continue
@@ -3441,6 +3540,10 @@ async def _eod_assignment_flat_cycle(state, parents) -> set:
             try:
                 p.status = "CLOSED"
                 await SignalIterRepository.update_live_order(p.id, status="CLOSED")
+                # Cancel a still-working entry BUY first (Finding 4b): the
+                # sell below only covers what FILLED; the working remainder
+                # must not fill after the flat and ride into the close.
+                _cancel_working_entry_order(state, p)
                 placed = await _watcher_safe_sell(
                     state, p, unfired_qty, "EOD_FLAT",
                     f"{now_hhmm} ET assignment guard", outcome=outcome,

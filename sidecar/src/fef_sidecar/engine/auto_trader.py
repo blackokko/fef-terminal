@@ -1093,6 +1093,14 @@ async def _maybe_auto_trade_locked(
                     spx_t1=spx_t1, spx_t2=spx_t2, spx_t3=spx_t3,
                     spx_stop=spx_stop,
                     entry_timeout_sec=entry_timeout,
+                    # The verdict's own gate-8-validated SPX underlying — the
+                    # mirror's map anchor (NEVER the active-chart tick, which
+                    # carries ES prices on an ES chart; adversarial review
+                    # Finding 1).
+                    spx_spot_ref=opt.get("underlying_price_at_quote"),
+                    # The SPX leg's resolved fire ask — bounds the mirror
+                    # premium at ~1/10 (chase-bound substitute, Finding 6).
+                    spx_entry_ask=entry_res.ask,
                 )
             except Exception:
                 logger.exception(

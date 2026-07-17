@@ -65,9 +65,23 @@ SPX_TO_SPY_POINTS = 10.0
 # Plausibility band for spx_spot/spy_spot at fire time. The true ratio is
 # ~10.05-10.10 (SPY trades ~0.5-0.7% under SPX/10); anything outside this
 # band means one of the two spots is stale/garbage — skip the mirror rather
-# than map a strike off a broken input.
-_SPOT_RATIO_MIN = 8.0
-_SPOT_RATIO_MAX = 13.0
+# than map a strike off a broken input. TIGHTENED per adversarial review
+# (Finding 1): the old [8, 13] band passed an ES-contaminated SPX ref
+# (ratio ~12) — [9.7, 10.6] rejects anything beyond ~±4% of the true ratio
+# (a 0.7% ES basis lands at ~10.12 x 1.007 ≈ 10.17, still inside; the
+# PRIMARY defense against contamination is the verdict-spot anchor below —
+# this band is the backstop for stale-quote classes).
+_SPOT_RATIO_MIN = 9.7
+_SPOT_RATIO_MAX = 10.6
+
+# Mirror entry premium plausibility vs the SPX leg's own fire ask: the
+# validated study puts the SPY contract at ~1/9.3-1/9.4 of the SPX premium.
+# A resolved SPY ask far outside [0.4, 1.6] x (SPX ask / 10) means a
+# mismapped strike, a garbage quote, or a delayed feed — skip. Also the
+# mirror-side substitute for the chase bound resolve_entry_ask cannot apply
+# with opt={} (adversarial review Finding 6).
+_PREMIUM_RATIO_MIN = 0.4
+_PREMIUM_RATIO_MAX = 1.6
 
 # SPY spot sanity band (units guard on the stock quote itself).
 _SPY_SPOT_MIN = 50.0
@@ -247,16 +261,18 @@ async def resolve_spy_spot(state) -> tuple[float | None, str]:
         return None, f"SPY spot fetch failed: {type(e).__name__}: {e}"
     bid = getattr(quote, "bid", None)
     ask = getattr(quote, "ask", None)
-    last = getattr(quote, "last", None)
+    # BID/ASK MID ONLY (adversarial review Finding 3): the provider's `last`
+    # can silently fall back to the PRIOR SESSION CLOSE when live fields are
+    # NaN (feed hiccup/reconnect) — mapping a strike off yesterday's close is
+    # the exact garbage class this fetch must refuse. No mid -> no mirror.
     spot: float | None = None
     if (isinstance(bid, (int, float)) and isinstance(ask, (int, float))
             and math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0):
         spot = (float(bid) + float(ask)) / 2.0
-    elif isinstance(last, (int, float)) and math.isfinite(last) and last > 0:
-        spot = float(last)
     if spot is None:
         return None, (
-            f"SPY quote unusable (bid={bid!r} ask={ask!r} last={last!r})"
+            f"SPY quote has no usable bid/ask mid (bid={bid!r} ask={ask!r}; "
+            f"last is refused — prior-close fallback class)"
         )
     if not (_SPY_SPOT_MIN <= spot <= _SPY_SPOT_MAX):
         return None, f"SPY spot {spot:.2f} outside sanity band [{_SPY_SPOT_MIN:.0f}, {_SPY_SPOT_MAX:.0f}]"
@@ -279,6 +295,26 @@ async def _audit_skip(reason_code: str, summary: str, details: dict) -> None:
 
 # ---- The mirror --------------------------------------------------------------
 
+def _now_et_hhmm_ymd() -> tuple[str, str]:
+    """ET clock, delegated to the watcher's DST-correct helper (separate
+    symbol so tests can pin the mirror's clock independently)."""
+    from fef_sidecar.engine.spx_target_watcher import _et_now_hhmm_ymd
+    return _et_now_hhmm_ymd()
+
+
+def _late_session_cutoff(today_ymd: str, entry_timeout_sec: float | None) -> str:
+    """Last ET minute a NEW mirror may be placed: the session's EOD-flat
+    window start minus (entry timeout + 60s margin), min 2 minutes
+    (adversarial review Finding 4a: a mirror placed at/after ~15:39 is
+    either churned by the 15:40 flat seconds after filling, or its unfilled
+    entry races the flat's refusal/park machinery)."""
+    from fef_sidecar.engine.spx_target_watcher import _eod_flat_window
+    start, _end = _eod_flat_window(today_ymd)
+    lead_min = max(2, math.ceil(((entry_timeout_sec or 45.0) + 60.0) / 60.0))
+    total = int(start[:2]) * 60 + int(start[3:]) - lead_min
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
 async def maybe_place_spy_mirror(
     state,
     *,
@@ -293,6 +329,8 @@ async def maybe_place_spy_mirror(
     spx_t3: float | None,
     spx_stop: float | None,
     entry_timeout_sec: float | None,
+    spx_spot_ref: float | None = None,
+    spx_entry_ask: float | None = None,
 ) -> dict:
     """Place the SPY mirror of a just-committed SPX auto-trade fire.
 
@@ -301,6 +339,16 @@ async def maybe_place_spy_mirror(
     persisted SPX parent id). EVERY failure path returns {"ok": False,
     "skipped": reason} with an audit row — never raises into the SPX path
     (the caller additionally wraps in try/except as a belt).
+
+    spx_spot_ref: the verdict's own SPX underlying (option_pricing.
+    underlying_price_at_quote, gate-8-validated) — the PRIMARY anchor for
+    the strike/ladder map. The active-chart tick is only trusted as a
+    fallback when the active symbol IS SPX (adversarial review Finding 1:
+    an ES chart feeds ES-priced ticks into last_live_tick_spx — mapping off
+    it lands the strike ~0.7% low and puts T1 BELOW spot, instant-dumping
+    half the mirror).
+    spx_entry_ask: the SPX leg's resolved fire ask — bounds the mirror's
+    premium at ~1/10 (the chase-bound substitute; review Finding 6).
     """
     details_base = {
         "spx_parent_id": spx_parent_id, "source": source,
@@ -312,6 +360,16 @@ async def maybe_place_spy_mirror(
     if not enabled:
         await _audit_skip("disabled", why, details_base)
         return {"ok": False, "skipped": "disabled", "reason": why}
+
+    if spx_parent_id is None:
+        # Structural invariant (review Finding 17): an untagged mirror would
+        # poison the ledger split AND cross-symbol-block later SPX fires.
+        await _audit_skip(
+            "no_spx_parent_id",
+            "SPX fire returned no parent_order_id — refusing an untaggable "
+            "mirror", details_base,
+        )
+        return {"ok": False, "skipped": "no_spx_parent_id"}
 
     if strategy not in ("spx_points", "fixed_dollar"):
         # option_price (legacy IBKR bracket) is NOT mirrored: its children are
@@ -355,6 +413,24 @@ async def maybe_place_spy_mirror(
         await _audit_skip("ex_div", ex_why, {**details_base, "expiry": spy_expiry})
         return {"ok": False, "skipped": "ex_div", "reason": ex_why}
 
+    # Late-session cutoff (review Finding 4a): no NEW mirror within
+    # (entry timeout + margin) of the EOD assignment flat — it would be
+    # churned (buy at ask, market-sold seconds later) or its unfilled entry
+    # would race the flat's refusal machinery.
+    try:
+        now_hhmm, _now_ymd = _now_et_hhmm_ymd()
+        cutoff = _late_session_cutoff(today_ymd, entry_timeout_sec)
+    except Exception:
+        now_hhmm, cutoff = "00:00", "23:59"  # clock failure -> don't gate
+    if now_hhmm >= cutoff:
+        await _audit_skip(
+            "late_session",
+            f"{now_hhmm} ET is past the mirror cutoff {cutoff} (EOD "
+            f"assignment flat imminent — a new SPY 0DTE would be churned)",
+            details_base,
+        )
+        return {"ok": False, "skipped": "late_session"}
+
     # Per-symbol cap — SPY carries the same session budget any symbol does.
     try:
         spy_count = int(state.auto_trade_count_by_symbol.get(MIRROR_SYMBOL, 0))
@@ -368,17 +444,31 @@ async def maybe_place_spy_mirror(
         )
         return {"ok": False, "skipped": "symbol_cap"}
 
-    # SPX spot reference — the same fire-time reference the SPX leg anchored
-    # its plan on (freshest live tick, falling back to the loop price).
-    spx_spot = float(
-        getattr(state, "last_live_tick_spx", 0.0)
-        or getattr(state, "last_spx_price", 0.0)
-        or 0.0
-    )
+    # SPX spot reference — PRIMARY: the verdict's own gate-8-validated
+    # underlying (spx_spot_ref = option_pricing.underlying_price_at_quote).
+    # The active-chart tick (last_live_tick_spx / last_spx_price) is the
+    # documented 7/6 contamination class — it carries the ACTIVE symbol's
+    # price (an ES chart feeds ES-priced ~+0.7% values) — so it is only
+    # trusted as a fallback when the active symbol IS SPX (review Finding 1).
+    spx_spot = 0.0
+    spx_spot_src = "verdict_underlying"
+    if (isinstance(spx_spot_ref, (int, float)) and math.isfinite(spx_spot_ref)
+            and spx_spot_ref >= 2000.0):
+        spx_spot = float(spx_spot_ref)
+    elif str(getattr(state, "active_symbol", "") or "").upper() == "SPX":
+        spx_spot = float(
+            getattr(state, "last_live_tick_spx", 0.0)
+            or getattr(state, "last_spx_price", 0.0)
+            or 0.0
+        )
+        spx_spot_src = "active_spx_tick"
     if spx_spot < 2000.0:
         await _audit_skip(
             "no_spx_spot",
-            f"SPX spot reference {spx_spot:.2f} missing/not SPX-scale",
+            f"no trustworthy SPX spot reference (verdict underlying="
+            f"{spx_spot_ref!r}, active_symbol="
+            f"{getattr(state, 'active_symbol', '?')} — the active-chart tick "
+            f"is only trusted while charting SPX)",
             details_base,
         )
         return {"ok": False, "skipped": "no_spx_spot"}
@@ -400,6 +490,58 @@ async def maybe_place_spy_mirror(
         return {"ok": False, "skipped": "spot_ratio_implausible"}
 
     spy_strike = map_spy_strike(spx_strike, spx_spot, spy_spot)
+
+    # Env risk-cap clip (review Finding 8): the SPX gate clips its qty to
+    # FEF_MAX_CONTRACTS_PER_TRADE; the mirror honors the same knob at SPY's
+    # 1/10 notional (cap x 10 SPY contracts = the same notional ceiling).
+    try:
+        _max_contracts = int(os.environ.get("FEF_MAX_CONTRACTS_PER_TRADE", "20"))
+    except ValueError:
+        _max_contracts = 20
+    _spy_cap = max(1, _max_contracts * int(SPX_TO_SPY_POINTS))
+    if m_qty > _spy_cap:
+        logger.info("spy_mirror qty %d clipped to %d (FEF_MAX_CONTRACTS_PER_"
+                    "TRADE=%d x 10)", m_qty, _spy_cap, _max_contracts)
+        m_qty = _spy_cap
+
+    # SPY firing lock (review Finding 11): the mirror's duplicate/cap checks
+    # + placement run under the same per-symbol lock maybe_auto_trade uses,
+    # so a concurrent SPY scanner fire (if ever re-enabled) can't twin-parent
+    # the contract. Ordering is always SPX lock -> SPY lock (the scanner's
+    # SPY path never acquires SPX inside SPY), so no deadlock cycle exists.
+    import asyncio as _asyncio
+    locks = getattr(state, "auto_trade_symbol_locks", None)
+    if locks is None:
+        locks = {}
+        try:
+            state.auto_trade_symbol_locks = locks  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    spy_lock = locks.setdefault(MIRROR_SYMBOL, _asyncio.Lock())
+    async with spy_lock:
+        return await _place_mirror_locked(
+            state, details_base=details_base, direction=direction,
+            right=right, m_qty=m_qty, spx_qty=spx_qty, spy_expiry=spy_expiry,
+            spx_spot=spx_spot, spx_spot_src=spx_spot_src, spy_spot=spy_spot,
+            spot_src=spot_src, ratio=ratio, spy_strike=spy_strike,
+            strategy=strategy, spx_t1=spx_t1, spx_t2=spx_t2, spx_t3=spx_t3,
+            spx_stop=spx_stop, entry_timeout_sec=entry_timeout_sec,
+            spx_parent_id=spx_parent_id, source=source,
+            spx_strike=spx_strike, spx_entry_ask=spx_entry_ask,
+        )
+
+
+async def _place_mirror_locked(
+    state, *, details_base: dict, direction: str, right: str, m_qty: int,
+    spx_qty: int, spy_expiry: str, spx_spot: float, spx_spot_src: str,
+    spy_spot: float, spot_src: str, ratio: float, spy_strike: float,
+    strategy: str, spx_t1: float | None, spx_t2: float | None,
+    spx_t3: float | None, spx_stop: float | None,
+    entry_timeout_sec: float | None, spx_parent_id: int | None, source: str,
+    spx_strike: float, spx_entry_ask: float | None,
+) -> dict:
+    """Gate+place section of the mirror, serialized under the SPY firing
+    lock. Same fail-soft contract as maybe_place_spy_mirror."""
 
     # Duplicate-parent guard on the SPY contract (mirror of auto_trader
     # gate 10): never stack a second active parent on one contract.
@@ -452,6 +594,19 @@ async def maybe_place_spy_mirror(
         d_t2 = scale_mirror_dollars(float(state.exit_dollar_t2), n_scale)
         d_t3 = scale_mirror_dollars(float(state.exit_dollar_t3), n_scale)
         d_stop = scale_mirror_dollars(float(state.exit_dollar_stop), n_scale)
+        # Monotonic-ladder guard (review Finding 7): the $10 clamp floor can
+        # collapse a small-notional ladder into equal targets — under
+        # cumulative_realized semantics T2/T3 increments become $0 and the
+        # whole mirror dumps at ~breakeven after T1. Skip instead.
+        if not (d_t1 < d_t2 < d_t3):
+            await _audit_skip(
+                "degenerate_dollar_ladder",
+                f"scaled $ ladder not strictly increasing "
+                f"(T1/T2/T3={d_t1}/{d_t2}/{d_t3} at scale {n_scale:.4f}) — "
+                f"clamp floor collapsed the exit design",
+                details_base,
+            )
+            return {"ok": False, "skipped": "degenerate_dollar_ladder"}
 
     # Catastrophe cap at the mirror's own notional scale (~1/10 premia per
     # contract; position scale = mirror_notional_scale). Monitored by the
@@ -483,6 +638,26 @@ async def maybe_place_spy_mirror(
             {**details_base, "spy_strike": spy_strike},
         )
         return {"ok": False, "skipped": "no_fresh_quote"}
+
+    # Premium plausibility vs the SPX leg's own fire ask (review Finding 6:
+    # resolve_entry_ask has no chase bound with opt={}; the validated map
+    # puts the SPY premium at ~1/9.3-1/9.4 of SPX — a resolved ask far off
+    # that is a mismapped strike / garbage / delayed quote).
+    if (isinstance(spx_entry_ask, (int, float)) and math.isfinite(spx_entry_ask)
+            and spx_entry_ask > 0):
+        expected = float(spx_entry_ask) / SPX_TO_SPY_POINTS
+        if not (_PREMIUM_RATIO_MIN * expected
+                <= float(entry_res.ask)
+                <= _PREMIUM_RATIO_MAX * expected):
+            await _audit_skip(
+                "premium_implausible",
+                f"SPY ask {entry_res.ask:.2f} outside "
+                f"[{_PREMIUM_RATIO_MIN}, {_PREMIUM_RATIO_MAX}] x SPX ask/10 "
+                f"({expected:.2f}) — mismapped strike or bad quote",
+                {**details_base, "spy_strike": spy_strike,
+                 "spy_ask": entry_res.ask, "spx_entry_ask": spx_entry_ask},
+            )
+            return {"ok": False, "skipped": "premium_implausible"}
 
     t1_q, t2_q, t3_q = mirror_tier_split(m_qty)
     entry_limit = float(entry_res.limit_price)
@@ -571,7 +746,9 @@ async def maybe_place_spy_mirror(
                 "spy_strike": spy_strike, "spy_expiry": spy_expiry,
                 "qty": m_qty, "tier_split": [t1_q, t2_q, t3_q],
                 "entry_limit": entry_limit, "entry_ask": entry_res.ask,
-                "spx_spot": spx_spot, "spy_spot": spy_spot,
+                "spx_spot": spx_spot, "spx_spot_source": spx_spot_src,
+                "spy_spot": spy_spot, "spy_spot_source": spot_src,
+                "spx_entry_ask": spx_entry_ask,
                 "spot_ratio": round(ratio, 4),
                 "spy_t1": spy_t1, "spy_t2": spy_t2, "spy_t3": spy_t3,
                 "spy_stop": spy_stop,
