@@ -670,6 +670,23 @@ def test_eod_flat_due_window():
     ) is False
 
 
+def test_eod_flat_early_close_window():
+    """NYSE early-close sessions (13:00 ET close): the flat runs 12:40-13:15
+    instead of 15:40-16:15 — otherwise the guard would never fire before the
+    close on those days."""
+    p = SimpleNamespace(symbol="SPY", expiry="20261127")
+    # Day after Thanksgiving 2026 — early close.
+    assert watcher._eod_flat_due(p, "12:40", "20261127") is True
+    assert watcher._eod_flat_due(p, "12:39", "20261127") is False
+    assert watcher._eod_flat_due(p, "13:15", "20261127") is False
+    # Normal session: 12:41 is nowhere near the window.
+    p2 = SimpleNamespace(symbol="SPY", expiry="20260717")
+    assert watcher._eod_flat_due(p2, "12:41", "20260717") is False
+    # Christmas Eve 2026.
+    p3 = SimpleNamespace(symbol="SPY", expiry="20261224")
+    assert watcher._eod_flat_due(p3, "12:45", "20261224") is True
+
+
 def test_eod_flat_start_env_validation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("FEF_EOD_FLAT_START_ET", "15:30")
     assert watcher._eod_flat_start_et() == "15:30"

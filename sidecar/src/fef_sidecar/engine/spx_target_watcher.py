@@ -3329,6 +3329,23 @@ async def _eval_spx_points_parent(
 _EOD_FLAT_END_ET = "16:15"
 _EOD_FLAT_CHECK_INTERVAL_MS = 5_000
 
+# NYSE EARLY-CLOSE sessions (equities close 13:00 ET, equity options 13:15):
+# the normal 15:40 window would never arrive before the close, silently
+# skipping the assignment guard. On these dates the flat runs 12:40-13:15 ET
+# instead. Official NYSE 2026 holiday calendar (hardcoded through 2026, same
+# convention as event_calendar.FOMC_DATES — UPDATE for 2027+):
+#   2026-11-27 (day after Thanksgiving), 2026-12-24 (Christmas Eve).
+_EARLY_CLOSE_DATES = frozenset({"20261127", "20261224"})
+_EOD_FLAT_START_EARLY_ET = "12:40"
+_EOD_FLAT_END_EARLY_ET = "13:15"
+
+
+def _eod_flat_window(today_ymd: str) -> tuple[str, str]:
+    """[start, end) ET window for the assignment flat on this session."""
+    if today_ymd in _EARLY_CLOSE_DATES:
+        return _EOD_FLAT_START_EARLY_ET, _EOD_FLAT_END_EARLY_ET
+    return _eod_flat_start_et(), _EOD_FLAT_END_ET
+
 
 def _eod_flat_start_et() -> str:
     """Operator knob (FEF_EOD_FLAT_START_ET), validated 'HH:MM' — anything
@@ -3364,7 +3381,8 @@ def _eod_flat_due(p, now_hhmm: str, today_ymd: str) -> bool:
     expiry = str(getattr(p, "expiry", "") or "")
     if len(expiry) != 8 or not expiry.isdigit() or expiry > today_ymd:
         return False
-    return _eod_flat_start_et() <= now_hhmm < _EOD_FLAT_END_ET
+    start, end = _eod_flat_window(today_ymd)
+    return start <= now_hhmm < end
 
 
 async def _eod_assignment_flat_cycle(state, parents) -> set:
