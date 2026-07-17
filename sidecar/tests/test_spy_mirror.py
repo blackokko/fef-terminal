@@ -1147,6 +1147,40 @@ async def test_stock_quote_spot_failure_cached():
     assert len(calls) == 1  # failure TTL-cached — no hammering
 
 
+async def test_stock_quote_spot_cancelled_refresh_releases_latch():
+    """Review F-A: CancelledError skips `except Exception`, so the latch
+    release must live in a `finally` — a refresh cancelled mid-await must
+    not wedge the symbol out of all future refreshes."""
+    import asyncio
+    started = asyncio.Event()
+    calls = []
+
+    async def hang_then_serve(contract):
+        calls.append(contract.symbol)
+        started.set()
+        if len(calls) == 1:
+            await asyncio.sleep(30)  # first refresh is cancelled mid-await
+        return SimpleNamespace(bid=744.90, ask=745.10, last=745.00)
+
+    state = SimpleNamespace(ibkr=SimpleNamespace(get_last_quote=hang_then_serve))
+    assert await watcher._watcher_stock_quote_spot(state, "SPY") == (None, None)
+    await started.wait()
+    for task in list(state._watcher_stock_spot_tasks):
+        task.cancel()
+    await asyncio.sleep(0.05)
+    assert "SPY" not in state._watcher_stock_spot_refreshing  # latch released
+    # The cancelled refresh cached a failure; expire it so the next call may
+    # kick a NEW refresh — which the leaked latch would have made impossible.
+    ts_ms, cached = state._watcher_stock_spot_cache["SPY"]
+    state._watcher_stock_spot_cache["SPY"] = (0, cached)
+    await watcher._watcher_stock_quote_spot(state, "SPY")
+    await asyncio.sleep(0.05)
+    spot, src = await watcher._watcher_stock_quote_spot(state, "SPY")
+    assert spot == pytest.approx(745.00)
+    assert src == "ibkr_stock_quote"
+    assert calls == ["SPY", "SPY"]  # a second refresh actually ran
+
+
 async def test_stock_quote_spot_refuses_last_only_quote():
     """Review Finding 3: `last` can be the prior-session close — the watcher
     spot must come from a bid/ask mid or not at all."""

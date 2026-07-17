@@ -1175,23 +1175,27 @@ async def _stock_spot_refresh(state, symbol: str, contract) -> None:
     (as None) so a dead feed is retried at TTL cadence, not poll cadence."""
     spot: float | None = None
     try:
-        import math as _m
-        quote = await asyncio.wait_for(
-            state.ibkr.get_last_quote(contract), timeout=_STOCK_SPOT_TIMEOUT_SEC,
-        )
-        bid = getattr(quote, "bid", None)
-        ask = getattr(quote, "ask", None)
-        if (isinstance(bid, (int, float)) and isinstance(ask, (int, float))
-                and _m.isfinite(bid) and _m.isfinite(ask) and bid > 0 and ask > 0):
-            spot = (float(bid) + float(ask)) / 2.0
-    except Exception:
-        logger.debug("watcher: stock-quote spot refresh failed for %s", symbol)
-        spot = None
-    holders = _stock_spot_state(state)
-    if holders is not None:
-        cache, refreshing, _tasks = holders
-        cache[symbol] = (int(_time.time() * 1000), spot)
-        refreshing.discard(symbol)
+        try:
+            import math as _m
+            quote = await asyncio.wait_for(
+                state.ibkr.get_last_quote(contract), timeout=_STOCK_SPOT_TIMEOUT_SEC,
+            )
+            bid = getattr(quote, "bid", None)
+            ask = getattr(quote, "ask", None)
+            if (isinstance(bid, (int, float)) and isinstance(ask, (int, float))
+                    and _m.isfinite(bid) and _m.isfinite(ask) and bid > 0 and ask > 0):
+                spot = (float(bid) + float(ask)) / 2.0
+        except Exception:
+            logger.debug("watcher: stock-quote spot refresh failed for %s", symbol)
+            spot = None
+    finally:
+        # CancelledError bypasses `except Exception` — the latch release must
+        # be unconditional or the symbol can never refresh again (review F-A).
+        holders = _stock_spot_state(state)
+        if holders is not None:
+            cache, refreshing, _tasks = holders
+            cache[symbol] = (int(_time.time() * 1000), spot)
+            refreshing.discard(symbol)
 
 
 async def _watcher_stock_quote_spot(state, symbol: str) -> tuple[float | None, str | None]:
