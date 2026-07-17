@@ -956,6 +956,13 @@ class LiveOrder(SQLModel, table=True):
     dynamic_stop_level: float | None = None
     be_ladder_max_step_R: float = 0.0
     entry_spx_price: float | None = None
+    # SPY mirror ledger separation (2026-07-17): when this order is a SPY
+    # mirror of an SPX auto-trade fire, mirror_of = the SPX parent
+    # LiveOrder.id. NULL for every non-mirror order. EOD attribution splits
+    # the books on this column: SPX verdict window = symbol='SPX' (mirrors
+    # are symbol='SPY' AND mirror_of IS NOT NULL, so they can never leak
+    # in); SPY-mirror live-confirmation ledger = mirror_of IS NOT NULL.
+    mirror_of: int | None = Field(default=None, foreign_key="live_order.id", index=True)
 
 
 class DailyReview(SQLModel, table=True):

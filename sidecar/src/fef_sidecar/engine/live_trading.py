@@ -174,6 +174,7 @@ async def place_bracket(
     source: str = "manual_ticket",
     signal_ref: dict | None = None,
     state: object | None = None,
+    mirror_of: int | None = None,
 ) -> dict:
     """Submit a bracket order: parent BUY + 3 limit SELL children + stop SELL.
 
@@ -191,6 +192,12 @@ async def place_bracket(
     state: AppState (auto-trade callers only) — handed to the entry-timeout
     monitor so a zero-fill stand-down can release the per-symbol session-cap
     slot. None (manual path) simply skips budget release.
+    mirror_of: SPY-mirror ledger tag (2026-07-17) — the SPX parent
+    LiveOrder.id when this bracket is the SPY mirror of an SPX auto-trade
+    fire. Stamped into LiveOrder.mirror_of AND appended to notes
+    ('mirror_of=<id>;') so EOD attribution can split SPX-book (verdict
+    window) from SPY-mirror (its own live-confirmation ledger). None for
+    every non-mirror order.
 
     Bracket structure used (IBKR-compatible):
       parent     LMT BUY  qty @ entry_limit
@@ -242,6 +249,8 @@ async def place_bracket(
     _acct_class = getattr(ibkr, "account_class", "unknown") or "unknown"
     _acct_id = getattr(ibkr, "account_id", "") or ""
     _acct_tag = f"account_class={_acct_class}; account_id={_acct_id}; source={source};"
+    if mirror_of is not None:
+        _acct_tag += f" mirror_of={int(mirror_of)};"
 
     # Watcher-managed strategies (spx_points + fixed_dollar) place ONLY the
     # parent BUY; the watcher fires staged market sells from the targets stored
@@ -271,6 +280,7 @@ async def place_bracket(
         dynamic_stop_level=spec.spx_stop if spec.exit_strategy == "spx_points" else None,
         entry_spx_price=spec.entry_spx_price,
         notes=_acct_tag,
+        mirror_of=mirror_of,
     )
     parent_saved = await SignalIterRepository.write_live_order(parent)
     children_saved = []

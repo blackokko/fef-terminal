@@ -173,6 +173,9 @@ async def init_db() -> None:
             # whose premiums couldn't be established are marked unusable
             # instead of contributing $0 to the A/B aggregate.
             ("shadow_exit_outcome", "status", "TEXT DEFAULT 'ok'"),
+            # SPY mirror ledger separation (2026-07-17): SPX parent id on
+            # mirror orders; NULL on everything else.
+            ("live_order", "mirror_of", "INTEGER REFERENCES live_order(id)"),
         ]
         for table, column, type_sql in migrations:
             try:

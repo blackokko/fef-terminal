@@ -996,7 +996,11 @@ _PLAN_MIN_STOP_RATIO = 0.60
 _PLAN_UNITS_RATIO = 3.0
 # Spot sources trustworthy enough to REPAIR a cross-unit entry ref (review
 # MINOR-8): a 1-min bar can be up to 10 minutes old — never anchor to it.
-_PLAN_REPAIR_SPOT_SOURCES = ("active_tick", "scanner_snapshot", "tick_stream")
+# 'ibkr_stock_quote' (2026-07-17) is a live quote TTL-cached <=5s — fresher
+# than the scanner snapshot's 180s bound, so it qualifies.
+_PLAN_REPAIR_SPOT_SOURCES = (
+    "active_tick", "scanner_snapshot", "tick_stream", "ibkr_stock_quote",
+)
 
 
 async def _maybe_reanchor_plan(
@@ -1128,6 +1132,62 @@ async def _maybe_reanchor_plan(
 _WATCHER_SPOT_AUDIT_INTERVAL_MS = 300_000  # no-spot / units-mismatch: 1 row / 5 min
 _WATCHER_UNITS_RATIO = 3.0
 
+# --- Stock-quote spot fallback (2026-07-17, SPY mirror build) ----------------
+# A SPY mirror parent exists WITHOUT the SPY scanner being enabled (the
+# mirror is placed off the SPX signal; scanner symbol enablement is
+# untouched by design). With the scanner SPX-only pinned, _shadow_cash_spot
+# has NO source for SPY: active tick is SPX, there is no SPY scanner
+# snapshot, and no SPY 1-min bars are being captured — the parent would sit
+# unevaluated (watcher_no_spot every 5 min) until the EOD flat. Fallback:
+# a throttled live IBKR STOCK quote for the parent's own symbol (STOCK-kind
+# symbols only — SPY/QQQ/IWM/GLD/SMH/TLT). TTL-cached on state so the 0.1s
+# poll costs at most one bounded round-trip per symbol per TTL.
+_STOCK_SPOT_TTL_MS = int(float(os.environ.get("FEF_WATCHER_STOCK_SPOT_TTL_SEC", "5")) * 1000)
+_STOCK_SPOT_TIMEOUT_SEC = 4.0
+
+
+async def _watcher_stock_quote_spot(state, symbol: str) -> tuple[float | None, str | None]:
+    """(spot, 'ibkr_stock_quote') for a STOCK-kind symbol via a TTL-cached
+    live quote; (None, None) for non-stock symbols or on any failure
+    (failures are cached for the TTL too, so a dead feed can't be hammered
+    at poll cadence)."""
+    try:
+        from fef_sidecar.ibkr.models import Contract, ContractKind
+        contract = Contract.for_symbol(symbol)
+        if contract.kind != ContractKind.STOCK:
+            return None, None
+    except Exception:
+        return None, None
+    now_ms = int(_time.time() * 1000)
+    if not hasattr(state, "_watcher_stock_spot_cache"):
+        try:
+            state._watcher_stock_spot_cache = {}  # type: ignore[attr-defined]
+        except Exception:
+            return None, None
+    cached = state._watcher_stock_spot_cache.get(symbol)  # type: ignore[attr-defined]
+    if cached is not None and now_ms - cached[0] < _STOCK_SPOT_TTL_MS:
+        spot = cached[1]
+        return (spot, "ibkr_stock_quote") if spot else (None, None)
+    spot: float | None = None
+    try:
+        import math as _m
+        quote = await asyncio.wait_for(
+            state.ibkr.get_last_quote(contract), timeout=_STOCK_SPOT_TIMEOUT_SEC,
+        )
+        bid = getattr(quote, "bid", None)
+        ask = getattr(quote, "ask", None)
+        last = getattr(quote, "last", None)
+        if (isinstance(bid, (int, float)) and isinstance(ask, (int, float))
+                and _m.isfinite(bid) and _m.isfinite(ask) and bid > 0 and ask > 0):
+            spot = (float(bid) + float(ask)) / 2.0
+        elif isinstance(last, (int, float)) and _m.isfinite(last) and last > 0:
+            spot = float(last)
+    except Exception:
+        logger.debug("watcher: stock-quote spot fetch failed for %s", symbol)
+        spot = None
+    state._watcher_stock_spot_cache[symbol] = (now_ms, spot)  # type: ignore[attr-defined]
+    return (spot, "ibkr_stock_quote") if spot else (None, None)
+
 
 def _throttled(state, attr: str, key, now_ms: int,
                interval_ms: int = _WATCHER_SPOT_AUDIT_INTERVAL_MS) -> bool:
@@ -1155,6 +1215,13 @@ async def _watcher_symbol_spot(
     from fef_sidecar.db.repository import SignalIterRepository
     spot, src = await _shadow_cash_spot(state, p.symbol, poll_spot, spot_cache)
     if spot is not None and spot > 0:
+        return float(spot), src
+    # STOCK-QUOTE FALLBACK (2026-07-17): a mirror-placed SPY parent has no
+    # scanner snapshot and no bar capture — resolve its spot from a
+    # TTL-cached live IBKR stock quote before giving up.
+    spot, src = await _watcher_stock_quote_spot(state, p.symbol)
+    if spot is not None and spot > 0:
+        spot_cache[p.symbol] = (float(spot), src)  # per-cycle reuse
         return float(spot), src
     now_ms = int(_time.time() * 1000)
     if _throttled(state, "_watcher_no_spot_log_ms", p.id, now_ms):
@@ -3251,6 +3318,162 @@ async def _eval_spx_points_parent(
         await SignalIterRepository.update_live_order(p.id, status="CLOSED")
 
 
+# --- EOD assignment guard (2026-07-17, SPY mirror build) ---------------------
+# SPY (and every equity-class option the bot may manage) is AMERICAN-style,
+# PHYSICALLY settled: a 0DTE long carried into the close is auto-exercised
+# into shares (or expires against an assignment). SPX is European/cash-
+# settled and is NEVER touched by this guard. HARD RULE (never cut): flatten
+# ALL bot-managed equity-option parents expiring today from 15:40 ET. Window
+# end 16:15 ET — SPY/QQQ/IWM options trade until 16:15; past that a retry is
+# pure churn (the refusal budget parks anything still open, loudly).
+_EOD_FLAT_END_ET = "16:15"
+_EOD_FLAT_CHECK_INTERVAL_MS = 5_000
+
+
+def _eod_flat_start_et() -> str:
+    """Operator knob (FEF_EOD_FLAT_START_ET), validated 'HH:MM' — anything
+    malformed falls back to the 15:40 default (fail-safe: the guard must
+    never be silently disabled by a typo)."""
+    raw = os.environ.get("FEF_EOD_FLAT_START_ET", "15:40")
+    if (len(raw) == 5 and raw[2] == ":"
+            and raw[:2].isdigit() and raw[3:].isdigit()
+            and raw < _EOD_FLAT_END_ET):
+        return raw
+    return "15:40"
+
+
+def _et_now_hhmm_ymd() -> tuple[str, str]:
+    """('HH:MM', 'YYYYMMDD') in America/New_York (DST-correct); falls back
+    to fixed UTC-4 if zoneinfo is unavailable."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        from datetime import timedelta, timezone
+        now = datetime.now(timezone(timedelta(hours=-4)))
+    return now.strftime("%H:%M"), now.strftime("%Y%m%d")
+
+
+def _eod_flat_due(p, now_hhmm: str, today_ymd: str) -> bool:
+    """True iff parent p must be flattened by the assignment guard now:
+    equity-class (non-SPX) option, expiring today or earlier, inside the
+    [start, 16:15) ET window."""
+    if str(getattr(p, "symbol", "") or "").upper() == "SPX":
+        return False  # European/cash-settled — no assignment risk
+    expiry = str(getattr(p, "expiry", "") or "")
+    if len(expiry) != 8 or not expiry.isdigit() or expiry > today_ymd:
+        return False
+    return _eod_flat_start_et() <= now_hhmm < _EOD_FLAT_END_ET
+
+
+async def _eod_assignment_flat_cycle(state, parents) -> set:
+    """Flatten every due equity-option parent (throttled to one sweep per
+    _EOD_FLAT_CHECK_INTERVAL_MS). Returns the parent ids flattened THIS
+    cycle so the caller excludes them from tier/stop evaluation (their
+    in-memory tier flags are stale-open until the next DB re-query).
+
+    Race discipline mirrors the stop path exactly: per-parent
+    firing_parent_ids latch (an in-flight stop/tier fire wins; we retry in
+    5s), optimistic terminal latch (CLOSED) persisted BEFORE the awaited
+    sell, finally-gated refusal rollback via the shared machinery, the whole
+    fire shielded (_run_exit_fire_shielded) so cancellation can never strand
+    the latch. Sells route through _watcher_safe_sell -> safe_market_sell —
+    the 7/6 anti-short + lifetime-cap guards apply to SPY exactly as SPX."""
+    from fef_sidecar.db.repository import SignalIterRepository
+
+    handled: set = set()
+    now_ms = int(_time.time() * 1000)
+    last = getattr(state, "_eod_flat_last_check_ms", 0)
+    if now_ms - last < _EOD_FLAT_CHECK_INTERVAL_MS:
+        return handled
+    try:
+        state._eod_flat_last_check_ms = now_ms  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    now_hhmm, today_ymd = _et_now_hhmm_ymd()
+
+    for p in parents:
+        if p.id is None or not _eod_flat_due(p, now_hhmm, today_ymd):
+            continue
+        if p.id in state.firing_parent_ids:
+            continue  # stop/tier/dollar fire in flight — retry next sweep
+        if _refusal_backoff_active(state, p):
+            continue
+        # Remaining = unfired tier qty — the same computation the stop path
+        # uses. Tier fired-flags are NOT touched (they record banked
+        # partials; status is the sole resolved-marker).
+        unfired_qty = 0
+        if not p.spx_target_t1_fired and p.spx_target_t1_qty:
+            unfired_qty += p.spx_target_t1_qty
+        if not p.spx_target_t2_fired and p.spx_target_t2_qty:
+            unfired_qty += p.spx_target_t2_qty
+        if not p.spx_target_t3_fired and p.spx_target_t3_qty:
+            unfired_qty += p.spx_target_t3_qty
+        if unfired_qty <= 0:
+            continue  # fully banked — the CLOSED-sync owns it
+
+        async def _fire_eod_flat(p=p, unfired_qty=unfired_qty):
+            if p.id in state.firing_parent_ids:
+                return False
+            state.firing_parent_ids.add(p.id)
+            prior_status = p.status
+            outcome: dict = {}
+            placed = False
+            try:
+                p.status = "CLOSED"
+                await SignalIterRepository.update_live_order(p.id, status="CLOSED")
+                placed = await _watcher_safe_sell(
+                    state, p, unfired_qty, "EOD_FLAT",
+                    f"{now_hhmm} ET assignment guard", outcome=outcome,
+                )
+                if placed:
+                    try:
+                        await SignalIterRepository.write_audit_log(
+                            category="spy_eod_flat", actor="system",
+                            summary=(
+                                f"EOD FLAT: market-sold {unfired_qty}x {p.symbol} "
+                                f"{p.strike}{p.right} exp {p.expiry} at {now_hhmm} ET "
+                                f"— assignment guard (American/physical settlement; "
+                                f"never hold equity 0DTE to the close); parent "
+                                f"{p.id} closed before expiry"
+                            ),
+                            details={
+                                "parent_id": p.id, "symbol": p.symbol,
+                                "strike": p.strike, "right": p.right,
+                                "expiry": p.expiry, "qty": unfired_qty,
+                                "time_et": now_hhmm,
+                                "mirror_of": getattr(p, "mirror_of", None),
+                            },
+                        )
+                    except Exception:
+                        logger.exception(
+                            "spy_eod_flat audit write failed for parent %s", p.id,
+                        )
+            finally:
+                try:
+                    if (not placed and outcome.get("kind", "error")
+                            in _RETRYABLE_SELL_OUTCOMES):
+                        await _rollback_refused_terminal_latch(
+                            state, p, latched_status="CLOSED",
+                            prior_status=prior_status, tier_label="EOD_FLAT",
+                            outcome_kind=outcome.get("kind", "error"),
+                            ref_desc=f"{now_hhmm} ET assignment guard",
+                        )
+                finally:
+                    state.firing_parent_ids.discard(p.id)
+            return placed
+
+        try:
+            placed = await _run_exit_fire_shielded(state, _fire_eod_flat)
+        except Exception:
+            logger.exception("EOD flat fire failed for parent %s", p.id)
+            placed = False
+        if placed:
+            handled.add(p.id)
+    return handled
+
+
 async def spx_target_watcher_loop(state) -> None:
     from fef_sidecar.db.repository import SignalIterRepository
     from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
@@ -3283,6 +3506,19 @@ async def spx_target_watcher_loop(state) -> None:
                 and o.exit_strategy in ("spx_points", "fixed_dollar")
                 and o.status in ("SUBMITTED", "FILLED", "PARTIAL")
             ]
+
+            # EOD ASSIGNMENT GUARD (2026-07-17, SPY mirror build): flatten
+            # bot-managed EQUITY-option parents (SPY mirrors and any other
+            # non-SPX watcher position) expiring today, from 15:40 ET —
+            # American/physical settlement must never ride into the close.
+            # Runs FIRST so a flattened parent is excluded from this cycle's
+            # tier/stop/dollar evaluation (its in-memory flags are stale).
+            try:
+                _eod_handled = await _eod_assignment_flat_cycle(state, parents)
+                if _eod_handled:
+                    parents = [p for p in parents if p.id not in _eod_handled]
+            except Exception:
+                logger.exception("EOD assignment flat cycle failed")
 
             # EXIT SHADOW (2026-07-02, reworked 2026-07-06): simulate the
             # OTHER exit variant on every watcher-managed parent — BE-ladder

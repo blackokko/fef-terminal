@@ -924,6 +924,14 @@ async def _maybe_auto_trade_locked(
                     .where(_LO_cap.status.in_(_OPEN_PARENT_STATUSES))
                     .where(_LO_cap.right == _right_cap)
                     .where(_LO_cap.symbol.in_(_other_syms))
+                    # SPY-mirror exclusion (2026-07-17): a mirror parent is BY
+                    # DESIGN the same trade as its SPX parent at 1/10 scale —
+                    # it is deliberate duplicate exposure, not an independent
+                    # cross-symbol position. Without this, the first mirrored
+                    # fire's open SPY parent would cross-symbol-block every
+                    # subsequent same-right SPX fire (choking the verdict
+                    # window on its own mirror).
+                    .where(_LO_cap.mirror_of.is_(None))
                 )).first()
             if _open_cap is not None:
                 suffix = (
@@ -1062,5 +1070,33 @@ async def _maybe_auto_trade_locked(
             state.auto_trade_count_session,
             sym, state.auto_trade_count_by_symbol[sym], state.auto_trade_max_per_symbol,
         )
+
+        # SPY MIRROR (2026-07-17): a committed SPX fire ALSO places a SPY
+        # option mirror of the same trade — SPX signal (theta flow,
+        # validated) -> SPY vehicle at the same percentage moneyness
+        # (spot-adjusted map, spy_mapping_report.md). SPX fires ONLY (never
+        # scanner fires on other symbols), AFTER the SPX order + counters so
+        # the mirror references a persisted SPX parent. FAIL-SOFT: every
+        # mirror failure is an audit row, never an exception into this path
+        # — the SPX fire is already placed and MUST return FIRED.
+        if sym == "SPX":
+            try:
+                from fef_sidecar.engine.spy_mirror import maybe_place_spy_mirror
+                await maybe_place_spy_mirror(
+                    state,
+                    direction=direction,
+                    spx_strike=float(strike),
+                    spx_qty=qty,
+                    spx_parent_id=result.get("parent_order_id"),
+                    source=source,
+                    strategy=strategy,
+                    spx_t1=spx_t1, spx_t2=spx_t2, spx_t3=spx_t3,
+                    spx_stop=spx_stop,
+                    entry_timeout_sec=entry_timeout,
+                )
+            except Exception:
+                logger.exception(
+                    "SPY mirror placement failed (SPX fire unaffected)"
+                )
 
     return AutoTradeDecision(True, "fired", BlockReason.FIRED, order_result=result)

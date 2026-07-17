@@ -173,6 +173,24 @@ class UIConfig(BaseModel):
     impulse_flag_require_agree: bool = Field(default=True)
     impulse_flag_cooldown_sec: int = Field(default=600, ge=0, le=7200)
 
+    # ---- SPY mirror vehicle (2026-07-17) ----
+    # When the SPX auto-trade path commits a fire (all gates passed, entry
+    # placed), also place a SPY option mirror of the same trade: SPX signal
+    # (theta flow, validated) -> SPY vehicle at the SAME percentage moneyness
+    # (spot-adjusted strike map, validated 2026-07-17 spy_mapping_report.md:
+    # SPY transfers the SPX book at 1/10 scale with ~zero venue friction).
+    # Explicitly NOT the SPY scanner symbol — scanner enablement untouched.
+    # The mirror is fail-soft (any failure skips it with an audit row, never
+    # blocks the SPX fire) and rides on its OWN ledger (LiveOrder.mirror_of)
+    # so the SPX verdict window stays computable excluding mirrors.
+    # Kill switches: this flag (hot-read per fire) + FEF_SPY_MIRROR_ENABLED
+    # env (set false/0/no/off to kill regardless of config).
+    # Default ON per operator order 2026-07-17.
+    spy_mirror_enabled: bool = Field(default=True)
+    # Mirror size in SPY contracts. 10 = one SPX-contract-equivalent
+    # (validated study ratio ~1/10 premium per contract).
+    spy_mirror_qty: int = Field(default=10, ge=1, le=100)
+
     # ---- Scanner drift-input source (2026-07-15 input-parity fix) ----
     # Which flow feed supplies the SPX scanner engine's drift_cum_net_m input:
     #   'qd'    (DEFAULT) — QuantData snapshot drift, byte-identical to the

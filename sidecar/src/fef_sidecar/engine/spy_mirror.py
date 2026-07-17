@@ -1,0 +1,589 @@
+"""SPY mirror vehicle (2026-07-17).
+
+When the SPX auto-trade path commits a fire (all gates passed, SPX entry
+placed), ALSO place a SPY option mirror of the same trade at ~1/10 scale:
+**SPX signal (theta flow, validated) -> SPY vehicle.** This is explicitly
+NOT the SPY *scanner symbol* — per-ticker QD flow is the unvalidated input
+class and scanner symbol enablement is untouched by this module.
+
+Validated 2026-07-17 (scratchpad spy_mapping_report.md, pre-registered):
+the SPOT-ADJUSTED strike map puts the SPY contract at the SAME percentage
+moneyness as the validated SPX contract (entry-premium ratio ~1/9.3 calls /
+~1/9.4 puts, confound RESOLVED); SPY transfers the SPX book at 1/10 scale
+with no measurable venue friction (matched delta vs SPX/10 = +$0.53/ct OOS,
+clustered t +1.65). The study's honesty cap: "consistent with SPX/10,
+awaiting live confirmation" — THIS module is that live confirmation, on its
+own ledger (LiveOrder.mirror_of tag), never mixed into the SPX verdict
+window (which filters symbol='SPX' AND mirror_of IS NULL).
+
+Design rules:
+  * FAIL-SOFT: any failure (spot fetch, expiry, ex-div, quote, placement)
+    SKIPS the mirror with an audit row (category='spy_mirror') and never
+    touches the already-placed SPX fire.
+  * The mirror rides the SPX fire's gates + cooldown — no gates of its own
+    except: per-symbol cap (auto_trade_max_per_symbol applies to SPY),
+    duplicate-parent guard on the SPY contract, same-day-expiry check, and
+    the ex-dividend assignment guard.
+  * The SPX leg and the SPY leg are INDEPENDENT positions once placed: each
+    has its own watcher plan in its own price space, its own entry timeout,
+    its own dollar-loss cap (scaled), and its own exits. One leg stopping
+    while the other runs is by design (venue-difference measurement), not a
+    defect.
+  * Kill switches: UIConfig.spy_mirror_enabled (hot-read per fire) AND the
+    FEF_SPY_MIRROR_ENABLED env (set to false/0/no/off to kill regardless of
+    config). Any config read failure disables the mirror (a misconfiguration
+    can only PREVENT trades — the auto_trader design rule).
+
+Exit management is the existing spx_target_watcher: the mirror parent is a
+watcher-managed LiveOrder with symbol='SPY' whose plan levels live in SPY
+price space (SPY targets/stop = SPY_entry_spot +/- SPX point offsets / 10).
+The watcher's 2026-07-07 per-symbol machinery (_watcher_symbol_spot units
+guard + per-symbol spot resolution — the same path that managed the SPY 749P
+parent on 7/7) evaluates it against SPY's own spot, never the SPX tick.
+The 15:40 ET assignment guard (hard flat before SPY's physical-settlement
+expiry) lives in spx_target_watcher._eod_assignment_flat_cycle.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import os
+import time
+
+logger = logging.getLogger(__name__)
+
+MIRROR_SYMBOL = "SPY"
+
+# SPX notional / SPY notional — the share-class ratio the validated study
+# monetized at (SPY ~ SPX/10 with a ~0.5-0.7% dividend-basis offset that the
+# strike map absorbs; the LADDER offsets use the clean /10 per the study's
+# matched-friction comparator "SPX532_net/10").
+SPX_TO_SPY_POINTS = 10.0
+
+# Plausibility band for spx_spot/spy_spot at fire time. The true ratio is
+# ~10.05-10.10 (SPY trades ~0.5-0.7% under SPX/10); anything outside this
+# band means one of the two spots is stale/garbage — skip the mirror rather
+# than map a strike off a broken input.
+_SPOT_RATIO_MIN = 8.0
+_SPOT_RATIO_MAX = 13.0
+
+# SPY spot sanity band (units guard on the stock quote itself).
+_SPY_SPOT_MIN = 50.0
+_SPY_SPOT_MAX = 2000.0
+
+_SPOT_FETCH_TIMEOUT_SEC = float(os.environ.get("FEF_SPY_MIRROR_SPOT_TIMEOUT_SEC", "5"))
+
+# ---- SPY ex-dividend assignment guard --------------------------------------
+# SPY goes ex-dividend QUARTERLY on the third Friday of Mar/Jun/Sep/Dec
+# (SSgA SPDR S&P 500 ETF Trust distribution schedule; the pattern has held
+# every quarter 2020-2025 — ex-date = quarterly options expiration Friday).
+# A 0DTE SPY option expiring ON an ex-div date carries early-assignment /
+# dividend-capture risk (American exercise, physical settlement) — the
+# validated study explicitly left this OUT of scope, so the mirror SKIPS
+# those sessions entirely. 2026 third Fridays, computed + cross-checked:
+#   Mar 20, Jun 19, Sep 18, Dec 18 (all Fridays).
+# FAIL-SAFE: for years with no hardcoded entry (2027+ until updated), any
+# expiry in a quarterly month (Mar/Jun/Sep/Dec) is skipped with a loud
+# reason — if uncertain, skip and log (spec rule).
+SPY_EX_DIV_DATES: frozenset[str] = frozenset({
+    "20260320", "20260619", "20260918", "20261218",
+})
+_EX_DIV_KNOWN_YEARS: frozenset[int] = frozenset({2026})
+_EX_DIV_QUARTER_MONTHS: frozenset[int] = frozenset({3, 6, 9, 12})
+
+
+def spy_ex_div_skip(expiry_yyyymmdd: str) -> tuple[bool, str]:
+    """(skip?, reason). Fail-safe: unparseable or unknown-year quarterly
+    months are SKIPPED — never mirror into an uncertain ex-div session."""
+    e = str(expiry_yyyymmdd or "").strip()
+    if e in SPY_EX_DIV_DATES:
+        return True, f"SPY ex-dividend date {e} (quarterly distribution)"
+    try:
+        year = int(e[0:4])
+        month = int(e[4:6])
+        day = int(e[6:8])
+        if not (2020 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31):
+            raise ValueError(e)
+    except Exception:
+        return True, (
+            f"unparseable SPY expiry {e!r} — fail-safe skip (cannot rule out "
+            f"ex-div)"
+        )
+    if year not in _EX_DIV_KNOWN_YEARS and month in _EX_DIV_QUARTER_MONTHS:
+        return True, (
+            f"expiry {e} is in a quarterly ex-div month of a year with no "
+            f"hardcoded SPY ex-div dates — fail-safe skip (update "
+            f"SPY_EX_DIV_DATES in spy_mirror.py)"
+        )
+    return False, ""
+
+
+# ---- Config / kill switch ---------------------------------------------------
+
+def _env_killed() -> bool:
+    """FEF_SPY_MIRROR_ENABLED env kill switch. Unset -> config governs.
+    Set to anything not truthy -> mirror OFF regardless of config."""
+    raw = os.environ.get("FEF_SPY_MIRROR_ENABLED")
+    if raw is None:
+        return False
+    return raw.lower() not in ("true", "1", "yes", "on")
+
+
+def mirror_enabled() -> tuple[bool, str]:
+    """(enabled?, reason-when-disabled). Config read failure = DISABLED —
+    a misconfiguration may only PREVENT trades, never place extras."""
+    if _env_killed():
+        return False, "FEF_SPY_MIRROR_ENABLED env kill switch is off"
+    try:
+        from fef_sidecar.config_store import load_config
+        if not bool(load_config().spy_mirror_enabled):
+            return False, "spy_mirror_enabled=false in config"
+    except Exception:
+        logger.exception("spy_mirror config read failed — mirror disabled")
+        return False, "config read failed (fail-safe: mirror disabled)"
+    return True, ""
+
+
+def mirror_qty() -> int:
+    """Configured mirror size (default 10 = one SPX-contract-equivalent).
+    Out-of-band values fall back to the UIConfig default."""
+    try:
+        from fef_sidecar.config_store import UIConfig, load_config
+        q = int(load_config().spy_mirror_qty)
+        if 1 <= q <= 100:
+            return q
+        return int(UIConfig().spy_mirror_qty)
+    except Exception:
+        logger.exception("spy_mirror qty read failed — using default 10")
+        return 10
+
+
+# ---- Strike + ladder mapping ------------------------------------------------
+
+def map_spy_strike(spx_strike: float, spx_spot: float, spy_spot: float) -> float:
+    """THE validated spot-adjusted map (spy_mapping_report.md): the SPY
+    strike at the SAME percentage moneyness as the SPX contract —
+        SPY_strike = SPY_spot * (1 + (SPX_strike - SPX_spot)/SPX_spot)
+    rounded HALF-UP to SPY's $1 strike grid (the study's round-half-up).
+    The naive K/10 map is exactly the confound the study killed (calls
+    landed ~0.7% further OTM, puts ~2x nearer the money)."""
+    if spx_spot <= 0 or spy_spot <= 0:
+        raise ValueError(f"bad spots spx={spx_spot} spy={spy_spot}")
+    moneyness = (float(spx_strike) - float(spx_spot)) / float(spx_spot)
+    raw = float(spy_spot) * (1.0 + moneyness)
+    return float(math.floor(raw + 0.5))
+
+
+def map_spy_level(spx_level: float, spx_spot: float, spy_spot: float) -> float:
+    """A watcher plan level in SPY price space: SPY_entry_spot +/- the SPX
+    point offset / 10 (the study's matched comparator geometry). Returned at
+    cent precision — the watcher compares floats against penny spots."""
+    offset = (float(spx_level) - float(spx_spot)) / SPX_TO_SPY_POINTS
+    return round(float(spy_spot) + offset, 2)
+
+
+def mirror_tier_split(qty: int) -> tuple[int, int, int]:
+    """50/30/20 T1/T2/T3 split — the VALIDATED study's exit fractions (the
+    mini-venue + spot-adjusted studies both walked 50/30/20 by tier), which
+    is what the mirror is live-confirming. qty=10 -> (5, 3, 2).
+
+    Small-qty degeneracy handled exactly like auto_trader._tier_split
+    (0-qty tiers are the one safe skip-marker for the watcher):
+    1 -> (1,0,0); 2 -> (1,1,0). Parts always sum to qty, none negative."""
+    q = int(qty)
+    if q <= 0:
+        return (0, 0, 0)
+    if q == 1:
+        return (1, 0, 0)
+    if q == 2:
+        return (1, 1, 0)
+    t1 = max(1, round(q * 0.50))
+    t2 = max(1, round(q * 0.30))
+    t3 = q - t1 - t2
+    if t3 < 0:
+        t2 = max(1, t2 + t3)
+        t3 = q - t1 - t2
+    if t3 < 0:
+        t1 = max(1, t1 + t3)
+        t3 = q - t1 - t2
+    return (t1, t2, max(0, t3))
+
+
+def scale_mirror_dollars(x: float, scale: float) -> float:
+    """Position-level $ target scaled to the mirror's notional. Whole
+    dollars, $10 minimum magnitude, sign preserved (same convention as the
+    auto_trader's ETF $-exit scaling)."""
+    return math.copysign(max(10.0, abs(round(float(x) * scale))), float(x))
+
+
+def mirror_notional_scale(mirror_q: int, spx_qty: int) -> float:
+    """(mirror notional) / (SPX position notional) — one SPY contract is
+    ~1/10 of one SPX contract, so a 10-lot mirror of a 3-lot SPX fire is
+    (10/10)/3 = 1/3 of the SPX position's dollar scale. Used to scale the
+    fixed_dollar ladder and the catastrophe dollar_loss_cap so the mirror
+    is monitored independently AT ITS OWN SCALE."""
+    if spx_qty <= 0:
+        return 1.0 / SPX_TO_SPY_POINTS
+    return (float(mirror_q) / SPX_TO_SPY_POINTS) / float(spx_qty)
+
+
+# ---- SPY spot ---------------------------------------------------------------
+
+async def resolve_spy_spot(state) -> tuple[float | None, str]:
+    """Live SPY spot at fire time via the IBKR provider (Stock contract,
+    SMART). Prefers bid/ask mid (works on delayed data too), falls back to
+    last. (None, reason) on any failure — caller skips the mirror."""
+    try:
+        from fef_sidecar.ibkr.models import Contract
+        quote = await asyncio.wait_for(
+            state.ibkr.get_last_quote(Contract.spy_stock()),
+            timeout=_SPOT_FETCH_TIMEOUT_SEC,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        return None, f"SPY spot fetch timed out after {_SPOT_FETCH_TIMEOUT_SEC:.0f}s"
+    except Exception as e:  # noqa: BLE001 — any provider failure skips the mirror
+        return None, f"SPY spot fetch failed: {type(e).__name__}: {e}"
+    bid = getattr(quote, "bid", None)
+    ask = getattr(quote, "ask", None)
+    last = getattr(quote, "last", None)
+    spot: float | None = None
+    if (isinstance(bid, (int, float)) and isinstance(ask, (int, float))
+            and math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0):
+        spot = (float(bid) + float(ask)) / 2.0
+    elif isinstance(last, (int, float)) and math.isfinite(last) and last > 0:
+        spot = float(last)
+    if spot is None:
+        return None, (
+            f"SPY quote unusable (bid={bid!r} ask={ask!r} last={last!r})"
+        )
+    if not (_SPY_SPOT_MIN <= spot <= _SPY_SPOT_MAX):
+        return None, f"SPY spot {spot:.2f} outside sanity band [{_SPY_SPOT_MIN:.0f}, {_SPY_SPOT_MAX:.0f}]"
+    return round(spot, 4), "ibkr_stock_quote"
+
+
+# ---- Skip-audit helper -------------------------------------------------------
+
+async def _audit_skip(reason_code: str, summary: str, details: dict) -> None:
+    try:
+        from fef_sidecar.db.repository import SignalIterRepository
+        await SignalIterRepository.write_audit_log(
+            category="spy_mirror", actor="system",
+            summary=f"SPY MIRROR SKIPPED: {summary}",
+            details={"skip_reason": reason_code, **details},
+        )
+    except Exception:
+        logger.exception("spy_mirror skip-audit write failed (%s)", reason_code)
+
+
+# ---- The mirror --------------------------------------------------------------
+
+async def maybe_place_spy_mirror(
+    state,
+    *,
+    direction: str,
+    spx_strike: float,
+    spx_qty: int,
+    spx_parent_id: int | None,
+    source: str,
+    strategy: str,
+    spx_t1: float | None,
+    spx_t2: float | None,
+    spx_t3: float | None,
+    spx_stop: float | None,
+    entry_timeout_sec: float | None,
+) -> dict:
+    """Place the SPY mirror of a just-committed SPX auto-trade fire.
+
+    Called by auto_trader AFTER the SPX order placed + counters bumped, still
+    inside the SPX firing lock (ordering guarantees the mirror references a
+    persisted SPX parent id). EVERY failure path returns {"ok": False,
+    "skipped": reason} with an audit row — never raises into the SPX path
+    (the caller additionally wraps in try/except as a belt).
+    """
+    details_base = {
+        "spx_parent_id": spx_parent_id, "source": source,
+        "direction": direction, "spx_strike": spx_strike,
+        "spx_qty": spx_qty, "strategy": strategy,
+    }
+
+    enabled, why = mirror_enabled()
+    if not enabled:
+        await _audit_skip("disabled", why, details_base)
+        return {"ok": False, "skipped": "disabled", "reason": why}
+
+    if strategy not in ("spx_points", "fixed_dollar"):
+        # option_price (legacy IBKR bracket) is NOT mirrored: its children are
+        # premium-space limits which have no validated 1/10 mapping and no
+        # watcher management. Documented scope cut.
+        await _audit_skip(
+            "strategy_unsupported",
+            f"exit strategy {strategy!r} not watcher-managed — mirror only "
+            f"supports spx_points/fixed_dollar", details_base,
+        )
+        return {"ok": False, "skipped": "strategy_unsupported"}
+
+    right = "C" if direction == "LONG_CALLS" else "P"
+    m_qty = mirror_qty()
+
+    # Same-day SPY expiry (SPY lists daily expiries; the resolver asks IBKR
+    # and caches per session). A non-today nearest expiry would be a
+    # DIFFERENT trade (extra theta/vega) — skip instead.
+    try:
+        from fef_sidecar.engine.expiry_resolver import (
+            _today_et_ymd,
+            resolve_nearest_expiry,
+        )
+        today_ymd = _today_et_ymd()
+        spy_expiry = await resolve_nearest_expiry(state, MIRROR_SYMBOL)
+    except Exception as e:  # noqa: BLE001
+        await _audit_skip("expiry_resolve_failed", f"expiry resolve failed: {e}",
+                          details_base)
+        return {"ok": False, "skipped": "expiry_resolve_failed"}
+    if spy_expiry != today_ymd:
+        await _audit_skip(
+            "no_same_day_expiry",
+            f"nearest SPY expiry {spy_expiry} != today {today_ymd} — a "
+            f"non-0DTE mirror is a different trade", details_base,
+        )
+        return {"ok": False, "skipped": "no_same_day_expiry"}
+
+    # Ex-dividend assignment guard (quarterly; fail-safe skip).
+    ex_skip, ex_why = spy_ex_div_skip(spy_expiry)
+    if ex_skip:
+        await _audit_skip("ex_div", ex_why, {**details_base, "expiry": spy_expiry})
+        return {"ok": False, "skipped": "ex_div", "reason": ex_why}
+
+    # Per-symbol cap — SPY carries the same session budget any symbol does.
+    try:
+        spy_count = int(state.auto_trade_count_by_symbol.get(MIRROR_SYMBOL, 0))
+        cap = int(state.auto_trade_max_per_symbol)
+    except Exception:
+        spy_count, cap = 0, 2
+    if spy_count >= cap:
+        await _audit_skip(
+            "symbol_cap", f"SPY session cap reached ({spy_count}/{cap})",
+            details_base,
+        )
+        return {"ok": False, "skipped": "symbol_cap"}
+
+    # SPX spot reference — the same fire-time reference the SPX leg anchored
+    # its plan on (freshest live tick, falling back to the loop price).
+    spx_spot = float(
+        getattr(state, "last_live_tick_spx", 0.0)
+        or getattr(state, "last_spx_price", 0.0)
+        or 0.0
+    )
+    if spx_spot < 2000.0:
+        await _audit_skip(
+            "no_spx_spot",
+            f"SPX spot reference {spx_spot:.2f} missing/not SPX-scale",
+            details_base,
+        )
+        return {"ok": False, "skipped": "no_spx_spot"}
+
+    # SPY spot — live IBKR stock quote; fail-soft skip.
+    spy_spot, spot_src = await resolve_spy_spot(state)
+    if spy_spot is None:
+        await _audit_skip("spot_fetch_failed", spot_src, details_base)
+        return {"ok": False, "skipped": "spot_fetch_failed", "reason": spot_src}
+
+    ratio = spx_spot / spy_spot
+    if not (_SPOT_RATIO_MIN <= ratio <= _SPOT_RATIO_MAX):
+        await _audit_skip(
+            "spot_ratio_implausible",
+            f"SPX/SPY spot ratio {ratio:.2f} outside [{_SPOT_RATIO_MIN:.0f}, "
+            f"{_SPOT_RATIO_MAX:.0f}] (spx={spx_spot:.2f} spy={spy_spot:.2f}) — "
+            f"one spot is stale/garbage", details_base,
+        )
+        return {"ok": False, "skipped": "spot_ratio_implausible"}
+
+    spy_strike = map_spy_strike(spx_strike, spx_spot, spy_spot)
+
+    # Duplicate-parent guard on the SPY contract (mirror of auto_trader
+    # gate 10): never stack a second active parent on one contract.
+    try:
+        from sqlmodel import select as _sm_select
+        from fef_sidecar.db.engine import get_session as _gs
+        from fef_sidecar.db.models import LiveOrder as _LO
+        async with _gs() as session:
+            existing = (await session.exec(
+                _sm_select(_LO)
+                .where(_LO.symbol == MIRROR_SYMBOL)
+                .where(_LO.strike == float(spy_strike))
+                .where(_LO.right == right)
+                .where(_LO.expiry == spy_expiry)
+                .where(_LO.bracket_role == "parent")
+                .where(_LO.status.in_(("SUBMITTED", "FILLED", "PARTIAL")))
+            )).first()
+        if existing is not None:
+            await _audit_skip(
+                "duplicate_parent",
+                f"active parent already open at SPY {spy_strike:.0f}{right} "
+                f"(id={existing.id})",
+                {**details_base, "existing_parent_id": existing.id},
+            )
+            return {"ok": False, "skipped": "duplicate_parent"}
+    except Exception:
+        # Guard query failure: log + proceed (matches the SPX gate's own
+        # fail-open on query error; the watcher's structural guards remain).
+        logger.exception("spy_mirror duplicate-parent guard failed; proceeding")
+
+    # Ladder in SPY price space / mirror-scale dollars.
+    spy_t1 = spy_t2 = spy_t3 = spy_stop = None
+    d_t1 = d_t2 = d_t3 = d_stop = None
+    if strategy == "spx_points":
+        if any(v is None for v in (spx_t1, spx_t2, spx_t3, spx_stop)):
+            await _audit_skip(
+                "no_spx_targets",
+                f"SPX fire carried incomplete spx_points targets "
+                f"(t1={spx_t1} t2={spx_t2} t3={spx_t3} stop={spx_stop})",
+                details_base,
+            )
+            return {"ok": False, "skipped": "no_spx_targets"}
+        spy_t1 = map_spy_level(spx_t1, spx_spot, spy_spot)
+        spy_t2 = map_spy_level(spx_t2, spx_spot, spy_spot)
+        spy_t3 = map_spy_level(spx_t3, spx_spot, spy_spot)
+        spy_stop = map_spy_level(spx_stop, spx_spot, spy_spot)
+    else:  # fixed_dollar
+        n_scale = mirror_notional_scale(m_qty, spx_qty)
+        d_t1 = scale_mirror_dollars(float(state.exit_dollar_t1), n_scale)
+        d_t2 = scale_mirror_dollars(float(state.exit_dollar_t2), n_scale)
+        d_t3 = scale_mirror_dollars(float(state.exit_dollar_t3), n_scale)
+        d_stop = scale_mirror_dollars(float(state.exit_dollar_stop), n_scale)
+
+    # Catastrophe cap at the mirror's own notional scale (~1/10 premia per
+    # contract; position scale = mirror_notional_scale). Monitored by the
+    # watcher's dollar-loss check independently of the SPX leg.
+    cap_scale = mirror_notional_scale(m_qty, spx_qty)
+    loss_cap = -abs(scale_mirror_dollars(
+        float(os.environ.get("FEF_DOLLAR_LOSS_CAP", "1800")), cap_scale,
+    ))
+
+    # Marketable-limit entry off a FRESH SPY option quote (same policy as the
+    # SPX leg: LMT at ask+buffer on SPY's penny grid, 45s timeout, never MKT).
+    # Passing opt={} routes resolve_entry_ask straight to its bounded
+    # one-shot live fetch; no usable ask -> skip (fail-soft).
+    try:
+        from fef_sidecar.engine.entry_pricing import resolve_entry_ask
+        entry_res = await resolve_entry_ask(
+            state, symbol=MIRROR_SYMBOL, strike=float(spy_strike), right=right,
+            expiry=spy_expiry, opt={},
+        )
+    except Exception as e:  # noqa: BLE001
+        await _audit_skip("entry_quote_failed", f"entry ask resolve raised: {e}",
+                          details_base)
+        return {"ok": False, "skipped": "entry_quote_failed"}
+    if entry_res.limit_price is None:
+        await _audit_skip(
+            "no_fresh_quote",
+            f"no usable SPY option ask at {spy_strike:.0f}{right} "
+            f"({entry_res.error})",
+            {**details_base, "spy_strike": spy_strike},
+        )
+        return {"ok": False, "skipped": "no_fresh_quote"}
+
+    t1_q, t2_q, t3_q = mirror_tier_split(m_qty)
+    entry_limit = float(entry_res.limit_price)
+
+    from fef_sidecar.engine.live_trading import BracketSpec, place_bracket
+    spec = BracketSpec(
+        symbol=MIRROR_SYMBOL, strike=float(spy_strike), right=right,
+        expiry=spy_expiry, qty=m_qty,
+        entry_limit=entry_limit,
+        # Watcher-managed strategies place parent-only; option-price tier
+        # limits are unused filler (same convention as the SPX leg).
+        t1_limit=entry_limit, t2_limit=entry_limit,
+        t3_limit=entry_limit, stop_limit=entry_limit,
+        t1_qty=t1_q, t2_qty=t2_q, t3_qty=t3_q,
+        exit_strategy=strategy,
+        spx_t1=spy_t1, spx_t2=spy_t2, spx_t3=spy_t3, spx_stop=spy_stop,
+        d_t1=d_t1, d_t2=d_t2, d_t3=d_t3, d_stop=d_stop,
+        # BE-ladder / plan anchor in SPY points (the watcher's per-symbol
+        # spot machinery evaluates this parent against SPY's own spot).
+        entry_spx_price=float(spy_spot) if strategy == "spx_points" else None,
+        dollar_loss_cap=loss_cap,
+        entry_timeout_sec=entry_timeout_sec,
+    )
+
+    try:
+        result = await place_bracket(
+            state.ibkr, spec, confirm=True, source=source,
+            signal_ref={
+                "mirror_of": spx_parent_id,
+                "direction": direction,
+                "spx_strike": spx_strike,
+                "spx_spot": spx_spot,
+                "spy_spot": spy_spot,
+                "spy_spot_source": spot_src,
+                "entry_ask": entry_res.ask,
+                "entry_ask_source": entry_res.source,
+            },
+            state=state,
+            mirror_of=spx_parent_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("spy_mirror place_bracket failed")
+        await _audit_skip("place_error", f"place_bracket raised: {e}", details_base)
+        return {"ok": False, "skipped": "place_error"}
+
+    if not result.get("ok"):
+        await _audit_skip(
+            "place_refused",
+            f"place_bracket refused: {result.get('error', 'unknown')}",
+            {**details_base, "result": {k: result.get(k) for k in ("error", "refused_safety_gate")}},
+        )
+        return {"ok": False, "skipped": "place_refused", "result": result}
+
+    # Budget accounting — the mirror consumes a SPY session-cap slot (and the
+    # entry-timeout stand-down releases exactly this slot on a zero fill).
+    now_ms = int(time.time() * 1000)
+    try:
+        state.auto_trade_count_by_symbol[MIRROR_SYMBOL] = (
+            state.auto_trade_count_by_symbol.get(MIRROR_SYMBOL, 0) + 1
+        )
+        state.auto_trade_last_at_ms_by_symbol[MIRROR_SYMBOL] = now_ms
+        state.auto_trade_count_session += 1
+    except Exception:
+        logger.exception("spy_mirror counter bump failed")
+
+    try:
+        from fef_sidecar.db.repository import SignalIterRepository
+        ladder_desc = (
+            f"SPY T1/T2/T3/STOP={spy_t1}/{spy_t2}/{spy_t3}/{spy_stop}"
+            if strategy == "spx_points"
+            else f"$ T1/T2/T3/STOP={d_t1}/{d_t2}/{d_t3}/{d_stop}"
+        )
+        await SignalIterRepository.write_audit_log(
+            category="spy_mirror", actor="system",
+            summary=(
+                f"SPY MIRROR PLACED: BUY {m_qty} SPY {spy_strike:.0f}{right} "
+                f"LMT ${entry_limit:.2f} (mirror_of SPX parent {spx_parent_id}; "
+                f"map: SPX K{spx_strike:.0f} @ spot {spx_spot:.2f} -> SPY spot "
+                f"{spy_spot:.2f} [{spot_src}], ratio {ratio:.3f}). "
+                f"{ladder_desc}; split {t1_q}/{t2_q}/{t3_q}; "
+                f"loss cap {loss_cap:+.0f}"
+            ),
+            details={
+                **details_base,
+                "mirror_parent_id": result.get("parent_order_id"),
+                "spy_strike": spy_strike, "spy_expiry": spy_expiry,
+                "qty": m_qty, "tier_split": [t1_q, t2_q, t3_q],
+                "entry_limit": entry_limit, "entry_ask": entry_res.ask,
+                "spx_spot": spx_spot, "spy_spot": spy_spot,
+                "spot_ratio": round(ratio, 4),
+                "spy_t1": spy_t1, "spy_t2": spy_t2, "spy_t3": spy_t3,
+                "spy_stop": spy_stop,
+                "d_t1": d_t1, "d_t2": d_t2, "d_t3": d_t3, "d_stop": d_stop,
+                "dollar_loss_cap": loss_cap,
+            },
+        )
+    except Exception:
+        logger.exception("spy_mirror placed-audit write failed")
+
+    logger.warning(
+        "SPY MIRROR FIRED: %s %d SPY %s%.0f LMT $%.2f (mirror_of=%s)",
+        direction, m_qty, right, spy_strike, entry_limit, spx_parent_id,
+    )
+    return {"ok": True, "result": result, "spy_strike": spy_strike, "qty": m_qty}
