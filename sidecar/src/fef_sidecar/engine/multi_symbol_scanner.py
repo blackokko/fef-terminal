@@ -326,7 +326,7 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
         ET as _ET, theta_bias_read, theta_drift_read)
     holder = getattr(state, "theta_flow", None)
     theta_drift, theta_fresh = theta_drift_read(state)
-    theta_bias, theta_bias_fresh = theta_bias_read(state)
+    theta_bias, _ = theta_bias_read(state)
 
     qd_drift = float(inputs.drift_cum_net_m)
     sess_now, _ = _now_et_parts(now_ms)
@@ -370,7 +370,13 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
             # aligned HIGH call (fire path on theta, bias path on QD = the two
             # inputs disagreeing on sign). Gate on the bias read's OWN freshness
             # so a missing bias keeps the QD value rather than blanking it.
-            if theta_bias_fresh and theta_bias is not None:
+            # Gate the bias swap on theta_fresh (the drift gate itself), NOT a
+            # separate bias-freshness read: bias and drift come from the SAME
+            # finalized minute (both None iff no finalized minute), so an
+            # independent clock read only opens a 1-scan window where drift
+            # swaps to theta while bias stays on QD — the exact theta-drift +
+            # QD-bias mismatch this fix removes (adversarial review MINOR-1).
+            if theta_bias is not None:
                 repl["drift_bias"] = str(theta_bias)
                 bias_swap_applied = True
             out = _dc_replace(inputs, **repl)
@@ -437,6 +443,13 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
                 "spx": float(inputs.spx_price),
                 "flow_source": flow_source,
                 "swap_applied": swap_applied,
+                # Bias-swap evidence (2026-07-17 parity fix): whether the
+                # demotion/veto bias was swapped to the validated theta legs,
+                # and both feeds' bias so a disagreement is visible in the
+                # per-scan audit stream (adversarial review NOTE-2).
+                "bias_swap_applied": bias_swap_applied,
+                "theta_bias": theta_bias,
+                "qd_bias": inputs.drift_bias,
             }
             td = details["theta_drift_m"]
             summary = (
