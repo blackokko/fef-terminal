@@ -20,6 +20,7 @@ from fef_sidecar.engine.theta_flow_ingest import (
     et_iso_to_utc_ms,
     parse_quote_obj,
     parse_trade_obj,
+    theta_bias_read,
     theta_drift_read,
 )
 
@@ -206,6 +207,84 @@ def test_cumsum_fresh_per_session_starting_at_zero():
     assert b.drift_cum_net_m(m0) == 120.0 / 1e6
     assert b.drift_cum_net_m(m0 + 60_000) == (120.0 - 240.0) / 1e6
     assert b.drift_cum_net_m() == (120.0 - 240.0 + 240.0) / 1e6
+
+
+# ---------------------------------------------------------------------------
+# drift_bias — the 2026-07-17 parity fix (call/put-leg bias == strict replay)
+# ---------------------------------------------------------------------------
+
+
+def _bias_oracle(cum_call: float, cum_put: float) -> str:
+    """VERBATIM strict_replay_producer._drift_bias — the parity oracle the
+    live builder.drift_bias must match bit-for-bit."""
+    total_net = cum_call - cum_put
+    total_abs = abs(cum_call) + abs(cum_put)
+    if total_abs <= 0:
+        return "NEUTRAL"
+    if total_net > 0.15 * total_abs:
+        return "BULLISH"
+    if total_net < -0.15 * total_abs:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def test_drift_bias_none_before_first_minute():
+    b, _m0 = _builder_with_quotes()
+    assert b.drift_bias() is None
+
+
+def test_drift_bias_bullish_and_bearish_via_trades():
+    # Call buying dominates -> cum_call>0, cum_put=0 -> BULLISH
+    b, m0 = _builder_with_quotes()
+    b.ingest_trades([(m0 + 1_000, 7300.0, "C", 1.2, 2, ("cb",))])  # cbp=240
+    b.finalize(0, force=True)
+    assert b.drift_bias() == "BULLISH" == _bias_oracle(240.0, 0.0)
+    # Put buying dominates -> cum_put>0, net<0 -> BEARISH
+    b2, n0 = _builder_with_quotes()
+    b2.ingest_trades([(n0 + 1_000, 7300.0, "P", 2.4, 2, ("pb",))])  # pbp=480
+    b2.finalize(0, force=True)
+    assert b2.drift_bias() == "BEARISH" == _bias_oracle(0.0, 480.0)
+
+
+def test_drift_bias_matches_oracle_over_leg_grid():
+    """White-box: every (cbp,csp,pbp,psp) combo must equal the replay oracle,
+    including the ±15% BULLISH/BEARISH/NEUTRAL boundaries."""
+    import itertools
+    m0 = _ms("2026-06-26T09:30:00")
+    for cbp, csp, pbp, psp in itertools.product((0.0, 20.0, 130.0, 300.0), repeat=4):
+        b = ThetaFlowSessionBuilder("2026-06-26")
+        net = (cbp - csp) - (pbp - psp)
+        b.rows[m0] = ("2026-06-26", m0, cbp, csp, pbp, psp, 0, 0, 0, 0, net)
+        b._final_minutes = [m0]
+        assert b.drift_bias() == _bias_oracle(cbp - csp, pbp - psp), (
+            cbp, csp, pbp, psp)
+
+
+def test_drift_bias_respects_at_ms_cutoff():
+    b, m0 = _builder_with_quotes()
+    b.ingest_trades([
+        (m0 + 1_000, 7300.0, "C", 1.2, 3, ("c1",)),    # min0: call buy (bullish)
+        (m0 + 61_000, 7300.0, "P", 2.4, 9, ("p1",)),   # min1: heavy put buy (bearish)
+    ])
+    b.finalize(0, force=True)
+    assert b.drift_bias(m0) == "BULLISH"               # through min0 only
+    assert b.drift_bias() == "BEARISH"                 # through both minutes
+
+
+def test_theta_bias_read_freshness_gate():
+    import time
+    from types import SimpleNamespace
+    now = int(time.time() * 1000)
+    s = SimpleNamespace(theta_flow={
+        "drift_theta_bias": "BULLISH", "stale": False,
+        "last_final_minute_ms": now})
+    assert theta_bias_read(s) == ("BULLISH", True)
+    s.theta_flow["stale"] = True                        # stale -> not fresh
+    assert theta_bias_read(s) == ("BULLISH", False)
+    s.theta_flow["stale"] = False
+    s.theta_flow["last_final_minute_ms"] = now - 20 * 60_000  # too old
+    assert theta_bias_read(s)[1] is False
+    assert theta_bias_read(SimpleNamespace()) == (None, False)  # no holder
 
 
 def test_incremental_chunking_matches_full_rebuild():

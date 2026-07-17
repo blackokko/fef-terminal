@@ -399,6 +399,38 @@ class ThetaFlowSessionBuilder:
             prev = 0.0   # within the first 3 session minutes: delta from 0
         return cur - prev
 
+    def drift_bias(self, at_ms: int | None = None) -> str | None:
+        """Bias from the theta call/put legs — the EXACT strict-replay
+        ``_drift_bias``: cum_call = Σ(call_buy−call_sell), cum_put =
+        Σ(put_buy−put_sell) over finalized minutes ≤ at_ms; BULLISH/BEARISH
+        when the net exceeds 15% of the gross (|cum_call|+|cum_put|), else
+        NEUTRAL. None before the first finalized minute. This is the validated
+        construction, so the live bias-demotion input equals the backtest's
+        (2026-07-17 parity fix: the QD snapshot bias contradicted the theta
+        drift and wrongly demoted every aligned HIGH call that session)."""
+        if not self._final_minutes:
+            return None
+        if at_ms is None:
+            upto = len(self._final_minutes)
+        else:
+            upto = bisect.bisect_right(self._final_minutes, at_ms)
+            if upto == 0:
+                return None
+        cum_call = cum_put = 0.0
+        for k in range(upto):
+            row = self.rows[self._final_minutes[k]]
+            cum_call += row[2] - row[3]   # call_buy_prem − call_sell_prem
+            cum_put += row[4] - row[5]    # put_buy_prem − put_sell_prem
+        total_net = cum_call - cum_put
+        total_abs = abs(cum_call) + abs(cum_put)
+        if total_abs <= 0:
+            return "NEUTRAL"
+        if total_net > 0.15 * total_abs:
+            return "BULLISH"
+        if total_net < -0.15 * total_abs:
+            return "BEARISH"
+        return "NEUTRAL"
+
     def last_final_minute(self) -> int | None:
         return self._final_minutes[-1] if self._final_minutes else None
 
@@ -643,6 +675,7 @@ def _update_holder(state: Any, builder: ThetaFlowSessionBuilder | None, *,
         "session_date": builder.session_date if builder else None,
         "drift_theta_cum_m": builder.drift_cum_net_m() if builder else None,
         "drift_theta_d3_m": builder.drift_d3_m() if builder else None,
+        "drift_theta_bias": builder.drift_bias() if builder else None,
         "last_final_minute_ms": builder.last_final_minute() if builder else None,
         "minutes_finalized": len(builder.rows) if builder else 0,
         "trades_ingested": builder.trades_ingested if builder else 0,
@@ -668,6 +701,24 @@ def theta_drift_read(state: Any, *, max_age_min: float = 8.0) -> tuple[float | N
     last_min = holder.get("last_final_minute_ms") or 0
     age_min = (int(_time.time() * 1000) - last_min) / 60000.0
     return drift, age_min <= max_age_min
+
+
+def theta_bias_read(state: Any, *, max_age_min: float = 8.0) -> tuple[str | None, bool]:
+    """(drift_theta_bias, fresh) — the validated call/put-leg bias for the
+    demotion/veto layer, gated on the SAME freshness rule as theta_drift_read
+    so the live bias input equals the backtest's construction when fresh, and
+    callers fall back to the QD snapshot bias otherwise (fail-soft). Freshness
+    is independent of the drift read so a caller can accept one and not the
+    other, but in practice both come from the same finalized minute."""
+    holder = getattr(state, "theta_flow", None)
+    if not holder or not isinstance(holder, dict):
+        return None, False
+    bias = holder.get("drift_theta_bias")
+    if bias is None or holder.get("stale"):
+        return bias, False
+    last_min = holder.get("last_final_minute_ms") or 0
+    age_min = (int(_time.time() * 1000) - last_min) / 60000.0
+    return bias, age_min <= max_age_min
 
 
 def _now_et() -> dt.datetime:

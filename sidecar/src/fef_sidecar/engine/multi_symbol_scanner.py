@@ -322,9 +322,11 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
     except Exception:
         pass
 
-    from fef_sidecar.engine.theta_flow_ingest import ET as _ET, theta_drift_read
+    from fef_sidecar.engine.theta_flow_ingest import (
+        ET as _ET, theta_bias_read, theta_drift_read)
     holder = getattr(state, "theta_flow", None)
     theta_drift, theta_fresh = theta_drift_read(state)
+    theta_bias, theta_bias_fresh = theta_bias_read(state)
 
     qd_drift = float(inputs.drift_cum_net_m)
     sess_now, _ = _now_et_parts(now_ms)
@@ -358,9 +360,20 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
 
     out = inputs
     swap_applied = False
+    bias_swap_applied = False
     if flow_source == "theta":
         if theta_fresh and theta_drift is not None:
-            out = _dc_replace(inputs, drift_cum_net_m=float(theta_drift))
+            repl: dict[str, Any] = {"drift_cum_net_m": float(theta_drift)}
+            # Parity fix (2026-07-17): also swap the demotion/veto bias to the
+            # validated call/put-leg construction. The un-swapped QD snapshot
+            # bias contradicted the theta drift on 2026-07-17 and demoted every
+            # aligned HIGH call (fire path on theta, bias path on QD = the two
+            # inputs disagreeing on sign). Gate on the bias read's OWN freshness
+            # so a missing bias keeps the QD value rather than blanking it.
+            if theta_bias_fresh and theta_bias is not None:
+                repl["drift_bias"] = str(theta_bias)
+                bias_swap_applied = True
+            out = _dc_replace(inputs, **repl)
             swap_applied = True
         else:
             # Fail-soft fallback to the QD input — audit once per session so
