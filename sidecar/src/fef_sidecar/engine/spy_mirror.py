@@ -46,7 +46,6 @@ expiry) lives in spx_target_watcher._eod_assignment_flat_cycle.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import os
@@ -87,7 +86,27 @@ _PREMIUM_RATIO_MAX = 1.6
 _SPY_SPOT_MIN = 50.0
 _SPY_SPOT_MAX = 2000.0
 
-_SPOT_FETCH_TIMEOUT_SEC = float(os.environ.get("FEF_SPY_MIRROR_SPOT_TIMEOUT_SEC", "5"))
+# --- Non-blocking SPY spot resolution (2026-07-20 contention fix) -----------
+# The fire-time SPY spot must NEVER come from a synchronous IBKR round-trip.
+# The old resolve_spy_spot did a blocking get_last_quote on the single shared
+# IBKR connection INSIDE the SPX fire hook; it timed out ("SPY MIRROR SKIPPED:
+# SPY spot fetch timed out after 5s") whenever that connection was busy placing
+# the SPX entry (diagnosed live 2026-07-20 — NOT a data/subscription issue).
+# The spot is now resolved WITHOUT any inline IBKR call: (a) the watcher's
+# detached-refresh TTL stock-spot cache, else (b) SPY = SPX / ratio derived off
+# the SAME validated SPX underlying the SPX leg mapped its strike from.
+#
+# Derivation ratio (SPX_spot / SPY_spot). Default = the 2026-07-20 live probe
+# (SPX/SPY ~= 10.065; SPY trades ~0.6% under SPX/10 on the dividend basis).
+# Overridable via env; ALWAYS clamped to [_SPOT_RATIO_MIN, _SPOT_RATIO_MAX]
+# before use so a bad env or stale paired ratio can only skip, never misland.
+_SPY_SPX_RATIO_DEFAULT = float(os.environ.get("FEF_SPY_MIRROR_SPX_RATIO", "10.065"))
+# A recent live paired SPX+SPY observation supplies the derivation ratio until
+# this old (ms); past it, fall back to the default constant. Intraday basis
+# drift is only a few bps (spy_mapping_report.md) so a generous window is safe.
+_LIVE_RATIO_MAX_AGE_MS = int(
+    float(os.environ.get("FEF_SPY_MIRROR_RATIO_MAX_AGE_SEC", "900")) * 1000
+)
 
 # ---- SPY ex-dividend assignment guard --------------------------------------
 # SPY goes ex-dividend QUARTERLY on the third Friday of Mar/Jun/Sep/Dec
@@ -243,40 +262,114 @@ def mirror_notional_scale(mirror_q: int, spx_qty: int) -> float:
     return (float(mirror_q) / SPX_TO_SPY_POINTS) / float(spx_qty)
 
 
-# ---- SPY spot ---------------------------------------------------------------
+# ---- SPY spot (NON-BLOCKING — 2026-07-20 contention fix) --------------------
 
-async def resolve_spy_spot(state) -> tuple[float | None, str]:
-    """Live SPY spot at fire time via the IBKR provider (Stock contract,
-    SMART). Prefers bid/ask mid (works on delayed data too), falls back to
-    last. (None, reason) on any failure — caller skips the mirror."""
+def _record_live_ratio(state, spx_spot: float, spy_spot: float) -> None:
+    """Cache the live SPX/SPY ratio from a fresh PAIRED observation (a cache
+    hit alongside the current SPX underlying) so a later cold-cache fire can
+    derive off the real basis instead of the constant. Only plausible ratios
+    are stored; failures are swallowed (a dynamic-attr write must never break
+    the fire hook)."""
     try:
-        from fef_sidecar.ibkr.models import Contract
-        quote = await asyncio.wait_for(
-            state.ibkr.get_last_quote(Contract.spy_stock()),
-            timeout=_SPOT_FETCH_TIMEOUT_SEC,
+        if not (isinstance(spx_spot, (int, float)) and isinstance(spy_spot, (int, float))):
+            return
+        if spy_spot <= 0 or not math.isfinite(spx_spot) or not math.isfinite(spy_spot):
+            return
+        ratio = float(spx_spot) / float(spy_spot)
+        if _SPOT_RATIO_MIN <= ratio <= _SPOT_RATIO_MAX:
+            state._spy_mirror_live_ratio = (int(time.time() * 1000), ratio)
+    except Exception:
+        pass
+
+
+def _derivation_ratio(state) -> tuple[float, str]:
+    """(ratio, source) for the SPX->SPY spot derivation: a recent live paired
+    ratio if it is fresh AND inside the plausibility band, else the configured
+    default constant. Never raises."""
+    try:
+        rec = getattr(state, "_spy_mirror_live_ratio", None)
+        if rec is not None:
+            ts_ms, ratio = rec
+            if (int(time.time() * 1000) - int(ts_ms) <= _LIVE_RATIO_MAX_AGE_MS
+                    and _SPOT_RATIO_MIN <= float(ratio) <= _SPOT_RATIO_MAX):
+                return float(ratio), "live_paired"
+    except Exception:
+        pass
+    return _SPY_SPX_RATIO_DEFAULT, "default_const"
+
+
+async def resolve_spy_spot(state, spx_spot: float) -> tuple[float | None, str]:
+    """Resolve the fire-time SPY spot WITHOUT a synchronous IBKR round-trip.
+
+    Preference order (the mirror must NEVER block the SPX fire hook on a live
+    SPY quote — see the module note + the 2026-07-20 contention diagnosis):
+
+      (a) the watcher's detached-refresh TTL stock-spot cache
+          (`_watcher_stock_quote_spot`) — NON-BLOCKING: a stale/missing entry
+          only KICKS a background refresh and returns what it already has.
+          BID/ASK MID ONLY (the same source the watcher uses to manage the
+          mirror parent); a hit also records the live SPX/SPY ratio for (b).
+      (b) derive off the in-process validated SPX underlying (the SAME
+          spx_spot the SPX leg mapped its strike from):
+              SPY = SPX / ratio,  ratio = a fresh live paired observation if
+          available else the configured default (~10.065). Pure arithmetic —
+          no IBKR call.
+      (c) fail-soft: (None, reason). The caller skips with the existing
+          spy_mirror audit row and NEVER blocks the SPX leg. Now a RARE last
+          resort, reached only if spx_spot itself is unusable (it is already
+          validated >= 2000 upstream, so this is defense-in-depth).
+    """
+    # (a) non-blocking cache read; a stale/cold entry self-kicks a detached
+    #     refresh (so this call also helps keep the cache warm).
+    cached: float | None = None
+    csrc: str | None = None
+    try:
+        from fef_sidecar.engine.spx_target_watcher import (
+            _watcher_stock_quote_spot,
         )
-    except (TimeoutError, asyncio.TimeoutError):
-        return None, f"SPY spot fetch timed out after {_SPOT_FETCH_TIMEOUT_SEC:.0f}s"
-    except Exception as e:  # noqa: BLE001 — any provider failure skips the mirror
-        return None, f"SPY spot fetch failed: {type(e).__name__}: {e}"
-    bid = getattr(quote, "bid", None)
-    ask = getattr(quote, "ask", None)
-    # BID/ASK MID ONLY (adversarial review Finding 3): the provider's `last`
-    # can silently fall back to the PRIOR SESSION CLOSE when live fields are
-    # NaN (feed hiccup/reconnect) — mapping a strike off yesterday's close is
-    # the exact garbage class this fetch must refuse. No mid -> no mirror.
-    spot: float | None = None
-    if (isinstance(bid, (int, float)) and isinstance(ask, (int, float))
-            and math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0):
-        spot = (float(bid) + float(ask)) / 2.0
-    if spot is None:
-        return None, (
-            f"SPY quote has no usable bid/ask mid (bid={bid!r} ask={ask!r}; "
-            f"last is refused — prior-close fallback class)"
+        cached, csrc = await _watcher_stock_quote_spot(state, MIRROR_SYMBOL)
+    except Exception:  # noqa: BLE001 — any cache-path failure falls through to (b)
+        cached, csrc = None, None
+    if (isinstance(cached, (int, float)) and math.isfinite(cached)
+            and _SPY_SPOT_MIN <= cached <= _SPY_SPOT_MAX):
+        _record_live_ratio(state, spx_spot, float(cached))
+        return round(float(cached), 4), f"watcher_cache:{csrc or 'ibkr_stock_quote'}"
+
+    # (b) derive off the validated SPX underlying — no IBKR call.
+    if (isinstance(spx_spot, (int, float)) and math.isfinite(spx_spot)
+            and spx_spot > 0):
+        ratio, rsrc = _derivation_ratio(state)
+        derived = float(spx_spot) / ratio
+        if _SPY_SPOT_MIN <= derived <= _SPY_SPOT_MAX:
+            return round(derived, 4), f"spx_ratio_derived:{rsrc}:{ratio:.4f}"
+
+    # (c) fail-soft skip (rare last resort — spx_spot unusable).
+    return None, (
+        f"no non-blocking SPY spot: cache cold and spx_spot={spx_spot!r} "
+        f"is unusable for SPX/ratio derivation"
+    )
+
+
+async def warm_spy_spot_cache(state) -> None:
+    """Kick the watcher's DETACHED SPY stock-spot refresh (non-blocking) so the
+    TTL cache is warm before the first mirror fire — making resolve_spy_spot
+    path (a) the normal case rather than always deriving. Called each scan from
+    the main tick loop; cheap + idempotent (the watcher's refresh latch dedups
+    within the TTL). No-op when the mirror is disabled or the kick fails; never
+    raises and never awaits the IBKR round-trip itself."""
+    try:
+        enabled, _why = mirror_enabled()
+        if not enabled:
+            return
+        from fef_sidecar.engine.spx_target_watcher import (
+            _watcher_stock_quote_spot,
         )
-    if not (_SPY_SPOT_MIN <= spot <= _SPY_SPOT_MAX):
-        return None, f"SPY spot {spot:.2f} outside sanity band [{_SPY_SPOT_MIN:.0f}, {_SPY_SPOT_MAX:.0f}]"
-    return round(spot, 4), "ibkr_stock_quote"
+        # Returns immediately (cache read + detached create_task); we ignore
+        # the value — this call exists only to spawn/refresh the background
+        # fetch so a later fire hits path (a).
+        await _watcher_stock_quote_spot(state, MIRROR_SYMBOL)
+    except Exception:
+        logger.debug("spy_mirror cache warm kick failed", exc_info=True)
 
 
 # ---- Skip-audit helper -------------------------------------------------------
@@ -473,8 +566,13 @@ async def maybe_place_spy_mirror(
         )
         return {"ok": False, "skipped": "no_spx_spot"}
 
-    # SPY spot — live IBKR stock quote; fail-soft skip.
-    spy_spot, spot_src = await resolve_spy_spot(state)
+    # SPY spot — NON-BLOCKING (2026-07-20 fix): the watcher's detached-refresh
+    # TTL cache, else derived from the validated SPX underlying (SPY = SPX /
+    # ratio). NEVER a synchronous SPY quote round-trip inside the SPX fire hook
+    # (the diagnosed 5s-timeout-under-contention bug). Fail-soft skip is now a
+    # rare last resort (spx_spot was validated >= 2000 just above). The audit
+    # reason CODE stays "spot_fetch_failed" for monitoring/ledger continuity.
+    spy_spot, spot_src = await resolve_spy_spot(state, spx_spot)
     if spy_spot is None:
         await _audit_skip("spot_fetch_failed", spot_src, details_base)
         return {"ok": False, "skipped": "spot_fetch_failed", "reason": spot_src}

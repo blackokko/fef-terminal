@@ -1034,6 +1034,20 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     perf: dict[str, float] = {}
     t_start = _time.perf_counter()
 
+    # SPY mirror: keep the SPY stock-spot TTL cache warm each scan so the
+    # mirror's fire-time spot resolves from the watcher's detached-refresh
+    # cache (non-blocking path (a)) rather than always deriving off SPX/ratio,
+    # and so the mirror NEVER does a synchronous SPY quote round-trip inside
+    # the SPX fire hook (2026-07-20 connection-contention fix). Non-blocking
+    # (a detached refresh is kicked, not awaited) + fail-soft; no-op when the
+    # mirror is disabled. Runs before the snapshot guards so the background
+    # refresh has the whole iter to land before any fire later in it.
+    try:
+        from fef_sidecar.engine.spy_mirror import warm_spy_spot_cache
+        await warm_spy_spot_cache(state)
+    except Exception:
+        logger.debug("SPY mirror cache warm failed", exc_info=True)
+
     # SPX sanity guard — defense in depth.
     # Layer 1 (absolute bounds): catches snapshots whose price is outside
     # the active symbol's plausible range. Doesn't require a live tick, so
