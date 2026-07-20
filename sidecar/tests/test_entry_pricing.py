@@ -254,6 +254,13 @@ def _live(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.delenv("FEF_DISABLE_CONFIDENCE_FLOOR", raising=False)
     monkeypatch.delenv("FEF_ENTRY_TIMEOUT_SEC", raising=False)
+    # These tests isolate the SPX ENTRY leg. Since the 2026-07-20 non-blocking
+    # spot fix, a committed SPX fire's SPY mirror reliably fires too (it now
+    # DERIVES its spot off the SPX underlying instead of skipping on a missing
+    # live SPY quote) and would otherwise share this file's mocked place_bracket
+    # / get_option_quote, polluting the SPX-only assertions. The mirror has its
+    # own suite (test_spy_mirror.py) — disable it here.
+    monkeypatch.setenv("FEF_SPY_MIRROR_ENABLED", "false")
     import fef_sidecar.config_store as cs
     monkeypatch.setattr(cs, "load_config", lambda: UIConfig(
         auto_trade_confidence_floor="LOW", cross_symbol_cap_enabled=False,

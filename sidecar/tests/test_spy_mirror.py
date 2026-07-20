@@ -287,6 +287,19 @@ def _mirror_kwargs(**kw) -> dict:
     return d
 
 
+def _seed_spy_cache(state, spot, *, age_ms: int = 0) -> None:
+    """Seed the watcher's stock-spot TTL cache so resolve_spy_spot path (a) is
+    deterministic WITHOUT any live get_last_quote round-trip (this mirrors the
+    live outcome of the detached background warm-refresh). A fresh entry (age 0)
+    is served and never re-kicks a refresh. spot=None simulates a refresh that
+    found no usable bid/ask mid (last-only / dead feed) — path (a) misses and
+    the SPX/ratio derivation (b) takes over."""
+    now_ms = int(time.time() * 1000) - int(age_ms)
+    state._watcher_stock_spot_cache = {"SPY": (now_ms, spot)}
+    state._watcher_stock_spot_refreshing = set()
+    state._watcher_stock_spot_tasks = set()
+
+
 def _patch_expiry(monkeypatch: pytest.MonkeyPatch, expiry: str = _TODAY,
                   today: str = _TODAY, hhmm: str = "10:00"):
     import fef_sidecar.engine.expiry_resolver as er
@@ -400,9 +413,11 @@ async def test_contaminated_chart_tick_never_anchors_the_map(
 async def test_verdict_spot_ref_wins_over_chart_tick(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """With the verdict underlying present, the contaminated tick is simply
-    ignored — the map anchors on 7500 and the mirror proceeds (lands on the
-    next gate: spot fetch failure on the bare fake)."""
+    """With the verdict underlying present, the contaminated ES tick is
+    ignored — the map anchors on 7500, and the mirror derives its SPY spot off
+    that 7500 (non-blocking) and proceeds past spot resolution, landing on the
+    NEXT gate (the option-quote fetch, which the bare fake lacks)."""
+    import asyncio
     _patch_config(monkeypatch)
     _patch_expiry(monkeypatch)
     state = _mirror_state(
@@ -411,62 +426,78 @@ async def test_verdict_spot_ref_wins_over_chart_tick(
     r = await maybe_place_spy_mirror(
         state, **_mirror_kwargs(spx_spot_ref=7500.0),
     )
-    assert r["skipped"] == "spot_fetch_failed"  # got PAST the spot-ref gate
+    # Got PAST the spot-ref gate AND spot resolution (derived off 7500), so it
+    # now reaches the option-quote gate rather than skipping on spot fetch.
+    assert r["skipped"] == "no_fresh_quote"
+    await asyncio.sleep(0.05)  # drain the detached refresh kicked on cold cache
 
 
-async def test_skip_spot_fetch_failure_never_raises(
+async def test_broken_spy_quote_derives_and_places(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """The core fail-soft: SPY spot unavailable -> skip + audit, no order —
-    the SPX fire (already placed by the caller) is untouched."""
+    """2026-07-20 fix (core regression): a broken/contended SPY stock quote —
+    the exact class that timed out the OLD synchronous fetch ("SPY spot fetch
+    timed out after 5s") — no longer skips the mirror. The fire hook derives
+    the spot off the validated SPX underlying (SPY = SPX/ratio, no IBKR call)
+    and PLACES. The broken quote is only touched by the DETACHED refresh."""
+    import asyncio
     _patch_config(monkeypatch)
     _patch_expiry(monkeypatch)
 
     async def broken_quote(contract):
-        raise ConnectionError("TWS gone")
+        raise ConnectionError("TWS busy placing SPX entry")
 
-    state = _mirror_state(ibkr=SimpleNamespace(get_last_quote=broken_quote))
+    async def option_quote(contract):
+        return SimpleNamespace(bid=0.50, ask=0.55, last=0.52)
+
+    state = _mirror_state(ibkr=SimpleNamespace(
+        get_last_quote=broken_quote, get_option_quote=option_quote))
     r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
-    assert r["skipped"] == "spot_fetch_failed"
+    assert r["ok"] is True
+    p = (await _live_orders())[0]
+    assert p.symbol == "SPY" and p.right == "C" and p.strike == 749.0
     rows = await _mirror_audit_rows()
-    assert rows and rows[-1].details["skip_reason"] == "spot_fetch_failed"
-    assert await _live_orders() == []
-    # No SPY budget consumed on a skip.
-    assert state.auto_trade_count_by_symbol == {}
+    placed = [x for x in rows if "SPY MIRROR PLACED" in x.summary][0]
+    # Spot came from SPX/ratio derivation, never a live/last quote.
+    assert placed.details["spy_spot_source"].startswith("spx_ratio_derived")
+    # Let the detached (failed) refresh settle so no task is left pending.
+    await asyncio.sleep(0.05)
 
 
 async def test_skip_implausible_spot_ratio(monkeypatch: pytest.MonkeyPatch):
     _patch_config(monkeypatch)
     _patch_expiry(monkeypatch)
-
-    async def stale_quote(contract):
-        # SPY at 700 vs SPX 7500 -> ratio 10.71, just past the tightened
-        # [9.7, 10.6] band (review Finding 1: the old [8, 13] band caught
-        # nothing subtler than a ~20% error).
-        return SimpleNamespace(bid=699.99, ask=700.01, last=700.00)
-
-    state = _mirror_state(ibkr=SimpleNamespace(get_last_quote=stale_quote))
+    # A cached SPY spot (served by path (a) from the watcher's detached
+    # refresh) that is stale/garbage relative to the current SPX underlying:
+    # 700 vs 7500 -> ratio 10.71, just past the tightened [9.7, 10.6] band.
+    # The ratio guard still rejects it rather than mapping off a broken spot.
+    state = _mirror_state()
+    _seed_spy_cache(state, 700.00)
     r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
     assert r["skipped"] == "spot_ratio_implausible"
     assert await _live_orders() == []
 
 
-async def test_skip_last_only_quote_prior_close_class(
+async def test_last_only_quote_never_maps_spot_derives_instead(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Review Finding 3: the provider's `last` can silently be the PRIOR
-    SESSION CLOSE (NaN-field fallback). A quote with no bid/ask mid is
-    refused even when `last` looks plausible."""
+    """Mid-only invariant PRESERVED (review Finding 3): the provider's `last`
+    can silently be the PRIOR SESSION CLOSE, so it must never become a SPY
+    spot. The watcher's mid-only refresh caches None on a last-only/dead feed;
+    the mirror then DERIVES off the SPX underlying (SPY = SPX/ratio) rather
+    than skipping or mapping off `last`."""
     _patch_config(monkeypatch)
     _patch_expiry(monkeypatch)
-
-    async def last_only(contract):
-        return SimpleNamespace(bid=None, ask=None, last=_SPY_SPOT)
-
-    state = _mirror_state(ibkr=SimpleNamespace(get_last_quote=last_only))
+    # A cached None = the watcher refused a last-only quote (mid-only rule).
+    state = _mirror_state(ibkr=_working_ibkr())
+    _seed_spy_cache(state, None)
     r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
-    assert r["skipped"] == "spot_fetch_failed"
-    assert await _live_orders() == []
+    assert r["ok"] is True
+    p = (await _live_orders())[0]
+    assert p.strike == 749.0  # mapped off the derived spot, not any `last`
+    rows = await _mirror_audit_rows()
+    placed = [x for x in rows if "SPY MIRROR PLACED" in x.summary][0]
+    assert placed.details["spy_spot_source"].startswith("spx_ratio_derived")
 
 
 async def test_skip_late_session(monkeypatch: pytest.MonkeyPatch):
@@ -597,6 +628,9 @@ async def test_mirror_places_spy_parent_dry(monkeypatch: pytest.MonkeyPatch):
     _patch_config(monkeypatch)  # spy_mirror defaults: enabled, qty 10
     _patch_expiry(monkeypatch)
     state = _mirror_state(ibkr=_working_ibkr())
+    # Warm cache = the live primary path (a): the watcher's detached refresh
+    # has landed a fresh SPY mid (745.00) before the fire.
+    _seed_spy_cache(state, _SPY_SPOT)
 
     r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
     assert r["ok"] is True
@@ -688,6 +722,163 @@ async def test_ledger_separation_queries(monkeypatch: pytest.MonkeyPatch):
     assert len(mirror_book) == 1
     assert mirror_book[0].symbol == "SPY"
     assert mirror_book[0].mirror_of == spx_p.id
+
+
+# ---------------------------------------------------------------------------
+# 6b. Non-blocking fire-time spot resolution (2026-07-20 contention fix)
+# ---------------------------------------------------------------------------
+#
+# The mirror must resolve the fire-time SPY spot WITHOUT a synchronous IBKR
+# round-trip (the old get_last_quote timed out under connection contention
+# while the shared connection placed the SPX entry). Order: (a) watcher TTL
+# cache, (b) SPX/ratio derivation, (c) fail-soft skip.
+
+
+async def test_spot_cache_hit_path(monkeypatch: pytest.MonkeyPatch):
+    """(a) A fresh cached SPY spot (from the watcher's detached refresh) is
+    served without any live quote and anchors the strike map."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+    state = _mirror_state(ibkr=_working_ibkr())
+    _seed_spy_cache(state, 745.10)
+    r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
+    assert r["ok"] is True
+    p = (await _live_orders())[0]
+    assert p.strike == 749.0
+    rows = await _mirror_audit_rows()
+    placed = [x for x in rows if "SPY MIRROR PLACED" in x.summary][0]
+    assert placed.details["spy_spot_source"].startswith("watcher_cache")
+
+
+async def test_spot_derivation_fallback_path(monkeypatch: pytest.MonkeyPatch):
+    """(b) Cache miss -> derive SPY = SPX/ratio off the validated SPX
+    underlying, no IBKR call. 7500 / 10.065 = 745.16 -> strike 749."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+    state = _mirror_state(ibkr=_working_ibkr())
+    _seed_spy_cache(state, None)  # cache present but no usable mid -> miss
+    r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
+    assert r["ok"] is True
+    p = (await _live_orders())[0]
+    assert p.strike == 749.0
+    rows = await _mirror_audit_rows()
+    placed = [x for x in rows if "SPY MIRROR PLACED" in x.summary][0]
+    assert placed.details["spy_spot_source"] == (
+        f"spx_ratio_derived:default_const:{sm._SPY_SPX_RATIO_DEFAULT:.4f}"
+    )
+
+
+async def test_spot_cold_cache_failsoft_skip():
+    """(c) Rare last resort: cache miss AND an unusable SPX spot -> (None,
+    reason), which the caller turns into a fail-soft skip. A valid SPX spot on
+    the SAME cold cache derives instead (proving (c) is reached ONLY when the
+    SPX anchor itself is bad — it is validated >= 2000 upstream)."""
+    state = _mirror_state()
+    _seed_spy_cache(state, None)
+    spot, reason = await sm.resolve_spy_spot(state, 0.0)
+    assert spot is None and "unusable" in reason
+    # Same cold cache, valid SPX -> derivation succeeds (not path c).
+    spot2, src2 = await sm.resolve_spy_spot(state, 7500.0)
+    assert spot2 == pytest.approx(7500.0 / sm._SPY_SPX_RATIO_DEFAULT, abs=1e-3)
+    assert src2.startswith("spx_ratio_derived")
+
+
+async def test_fire_hook_never_syncs_get_last_quote(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """PROOF of the fix: a get_last_quote that NEVER returns (the contention
+    class that timed out the old code) is only ever touched by the DETACHED
+    refresh. The fire hook derives the spot and returns at once — if any
+    synchronous get_last_quote await remained, wait_for would time out."""
+    import asyncio
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+    release = asyncio.Event()
+
+    async def hanging_stock_quote(contract):
+        await release.wait()  # never completes during the fire hook
+        return SimpleNamespace(bid=744.99, ask=745.01, last=745.00)
+
+    async def option_quote(contract):
+        return SimpleNamespace(bid=0.50, ask=0.55, last=0.52)
+
+    state = _mirror_state(ibkr=SimpleNamespace(
+        get_last_quote=hanging_stock_quote, get_option_quote=option_quote))
+    # Cold cache: path (a) kicks the (hanging) detached refresh and misses;
+    # the fire hook must NOT wait for it.
+    r = await asyncio.wait_for(
+        maybe_place_spy_mirror(state, **_mirror_kwargs()), timeout=3.0)
+    assert r["ok"] is True
+    assert not release.is_set()  # the hanging quote never completed inline
+    rows = await _mirror_audit_rows()
+    placed = [x for x in rows if "SPY MIRROR PLACED" in x.summary][0]
+    assert placed.details["spy_spot_source"].startswith("spx_ratio_derived")
+    # cleanup the parked detached refresh
+    release.set()
+    for t in list(getattr(state, "_watcher_stock_spot_tasks", set())):
+        t.cancel()
+
+
+async def test_cache_hit_records_live_ratio_for_later_derivation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A cache hit records the live SPX/SPY paired ratio so a later cold-cache
+    fire derives off the real basis instead of the constant."""
+    _patch_config(monkeypatch)
+    _patch_expiry(monkeypatch)
+    state = _mirror_state(ibkr=_working_ibkr())
+    _seed_spy_cache(state, _SPY_SPOT)  # 745.00 vs SPX 7500 -> ratio 10.0671
+    r = await maybe_place_spy_mirror(state, **_mirror_kwargs())
+    assert r["ok"] is True
+    recorded = getattr(state, "_spy_mirror_live_ratio", (0, None))
+    assert recorded[1] == pytest.approx(7500.0 / _SPY_SPOT)
+    ratio, src = sm._derivation_ratio(state)
+    assert src == "live_paired" and ratio == pytest.approx(7500.0 / _SPY_SPOT)
+
+
+def test_derivation_ratio_edge_cases():
+    """Ratio helper: plausible pair recorded; implausible pair rejected; stale
+    live ratio falls back to the default constant."""
+    # Implausible pair (ratio 12.5) is NOT recorded.
+    s = SimpleNamespace()
+    sm._record_live_ratio(s, 7500.0, 600.0)
+    assert not hasattr(s, "_spy_mirror_live_ratio")
+    assert sm._derivation_ratio(s) == (sm._SPY_SPX_RATIO_DEFAULT, "default_const")
+    # Plausible pair recorded + used.
+    sm._record_live_ratio(s, 7550.0, 750.0)  # 10.0667
+    ratio, src = sm._derivation_ratio(s)
+    assert src == "live_paired" and ratio == pytest.approx(7550.0 / 750.0)
+    # A stale live ratio is ignored.
+    stale_state = SimpleNamespace(_spy_mirror_live_ratio=(
+        int(time.time() * 1000) - sm._LIVE_RATIO_MAX_AGE_MS - 5000, 10.05))
+    assert sm._derivation_ratio(stale_state) == (
+        sm._SPY_SPX_RATIO_DEFAULT, "default_const")
+
+
+async def test_warm_spy_spot_cache_kicks_refresh(monkeypatch: pytest.MonkeyPatch):
+    """warm_spy_spot_cache (called each scan from the loop) spawns the detached
+    refresh so a later fire hits path (a); a disabled mirror is a no-op."""
+    import asyncio
+    _patch_config(monkeypatch)
+    calls: list = []
+
+    async def spy_quote(contract):
+        calls.append(contract.symbol)
+        return SimpleNamespace(bid=744.90, ask=745.10, last=745.00)
+
+    state = SimpleNamespace(ibkr=SimpleNamespace(get_last_quote=spy_quote))
+    await sm.warm_spy_spot_cache(state)   # kicks the detached refresh
+    await asyncio.sleep(0.05)             # let it land in the TTL cache
+    spot, src = await watcher._watcher_stock_quote_spot(state, "SPY")
+    assert spot == pytest.approx(745.00) and src == "ibkr_stock_quote"
+    assert calls == ["SPY"]
+    # Disabled mirror: warm is a no-op (no round-trip).
+    monkeypatch.setenv("FEF_SPY_MIRROR_ENABLED", "false")
+    state2 = SimpleNamespace(ibkr=SimpleNamespace(get_last_quote=spy_quote))
+    await sm.warm_spy_spot_cache(state2)
+    await asyncio.sleep(0.02)
+    assert not hasattr(state2, "_watcher_stock_spot_cache") or \
+        state2._watcher_stock_spot_cache.get("SPY") is None
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +1023,8 @@ async def test_spx_fire_places_mirror_end_to_end(
         "suggested_qty": 3,
     }
 
+    # Warm the SPY spot cache (live path (a)) so the mirror maps off 745.00.
+    _seed_spy_cache(state, _SPY_SPOT)
     d = await maybe_auto_trade(state, verdict)
     assert d.fired
 
