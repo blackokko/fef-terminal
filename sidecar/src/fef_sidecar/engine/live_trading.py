@@ -129,6 +129,27 @@ class BracketSpec:
 
 _UNSET: object = object()
 
+_mkt_downgrade_warned = False
+
+
+def _warn_mkt_fallback_downgraded(entry_timeout_sec) -> None:
+    """Log ONCE that the chase MKT fallback was downgraded to chase-only
+    because the entry-timeout watchdog is disabled (entry_timeout_sec <= 0).
+    A market order with no watchdog can hang on IBKR's price cap (2026-07-16),
+    so with the timeout off we refuse to go naked-MKT and rest a LIMIT
+    instead. Rare (operator explicitly disabled the timeout)."""
+    global _mkt_downgrade_warned
+    if _mkt_downgrade_warned:
+        return
+    _mkt_downgrade_warned = True
+    logger.warning(
+        "entry chase: MKT fallback DOWNGRADED to chase-only because the entry "
+        "timeout is disabled (entry_timeout_sec=%s) — a market order with no "
+        "watchdog can hang on IBKR's price cap (2026-07-16). Re-enable "
+        "FEF_ENTRY_TIMEOUT_SEC>0 to restore the MKT fallback.",
+        entry_timeout_sec,
+    )
+
 
 def _spawn_entry_timeout(
     *, state, ibkr, spec: BracketSpec, parent_id: int,
@@ -382,7 +403,20 @@ async def place_bracket(
 
             from fef_sidecar.engine import entry_chase
 
+            # A MarketOrder (the chase fallback) can hang on IBKR's price cap
+            # (2026-07-16) unless the entry-timeout can cancel it. So the chase
+            # MKT fallback is allowed ONLY when the timeout is enabled
+            # (entry_timeout_sec > 0); with the timeout disabled we DOWNGRADE to
+            # chase-only — a resting LIMIT never hangs. Net invariant: the chase
+            # never places a MarketOrder without a live, positive-budget
+            # entry-timeout watchdog on it.
+            entry_tmo = spec.entry_timeout_sec
+            mkt_watchdog_ok = bool(entry_tmo and entry_tmo > 0)
             did_chase = not spec.use_market_entry and entry_chase.chase_enabled()
+            chase_mkt = (did_chase and mkt_watchdog_ok
+                         and entry_chase.chase_mkt_fallback())
+            if did_chase and entry_chase.chase_mkt_fallback() and not mkt_watchdog_ok:
+                _warn_mkt_fallback_downgraded(entry_tmo)
             chase_outcome = "static_market" if spec.use_market_entry else "static_limit"
             reposts = 0
             final_limit: float | None = None if spec.use_market_entry else spec.entry_limit
@@ -414,17 +448,24 @@ async def place_bracket(
                     return None
 
                 t0 = time.monotonic()
-                deadline = None
-                if spec.entry_timeout_sec and spec.entry_timeout_sec > 0:
-                    # Cap the chase well under the 45s ceiling so the remaining
-                    # budget handed to the entry-timeout stays healthy.
-                    deadline = t0 + min(float(spec.entry_timeout_sec),
-                                        entry_chase.chase_hard_budget_sec())
+                monitor_floor = entry_chase.chase_monitor_floor_sec()
+                if mkt_watchdog_ok:
+                    # RESERVE a monitor floor: cap the chase at
+                    # (timeout - floor) so the budget handed to the entry-timeout
+                    # (and therefore any fired MKT fallback) is ALWAYS >= floor.
+                    chase_cap = max(0.5, min(entry_chase.chase_hard_budget_sec(),
+                                             float(entry_tmo) - monitor_floor))
+                else:
+                    # Timeout disabled -> chase-only (no MKT); just bound the
+                    # chase wall-time so it can't spin.
+                    chase_cap = entry_chase.chase_hard_budget_sec()
+                deadline = t0 + chase_cap
                 cr = await entry_chase.place_entry_with_chase(
                     ib=ib, ib_contract=ib_contract, symbol=spec.symbol,
                     qty=spec.qty, initial_limit=spec.entry_limit,
                     make_limit_order=_mk_limit, make_market_order=_mk_market,
                     refetch_limit=_refetch, on_order_placed=_sync_order,
+                    mkt_fallback=chase_mkt,
                     deadline_monotonic=deadline,
                 )
                 parent_trade = cr.trade
@@ -432,16 +473,27 @@ async def place_bracket(
                 used_market = cr.used_market
                 chase_outcome = cr.outcome
                 reposts = cr.reposts
-                # The chase counts against the SAME 45s ceiling — hand the
-                # entry-timeout only the REMAINING budget.
-                if spec.entry_timeout_sec and spec.entry_timeout_sec > 0:
-                    timeout_budget = max(0.0, float(spec.entry_timeout_sec)
-                                         - (time.monotonic() - t0))
-                # Reconcile the DB entry descriptor with the order that ended up
-                # working (a re-post moved the limit; the MKT fallback changed
-                # the type). ib_order_id/perm already synced by _sync_order.
+                # Remaining budget for the entry-timeout (chase counts against
+                # the SAME ceiling). If a MKT fallback fired, FLOOR the budget to
+                # the monitor floor so the market order can NEVER rest
+                # unmonitored — the structural guard against the 7/16 hang.
+                # (used_market here implies chase_mkt, which implies
+                # mkt_watchdog_ok, so entry_tmo > 0.)
+                elapsed = time.monotonic() - t0
+                if used_market:
+                    timeout_budget = max(monitor_floor, float(entry_tmo) - elapsed)
+                elif mkt_watchdog_ok:
+                    timeout_budget = max(0.0, float(entry_tmo) - elapsed)
+                else:
+                    timeout_budget = spec.entry_timeout_sec  # <= 0 -> no-arm (chase-only)
+                # Reconcile the DB row with the order that ended up working (a
+                # re-post moved the limit; the MKT fallback changed the type).
+                # Re-stamp ib_order_id/perm here too so a silently-failed final
+                # _sync_order hook can't leave the DB on a superseded order.
                 await SignalIterRepository.update_live_order(
                     parent_saved.id,
+                    ib_order_id=parent_trade.order.orderId,
+                    ib_perm_id=parent_trade.order.permId,
                     order_type="MKT" if used_market else "LMT",
                     limit_price=final_limit,
                 )

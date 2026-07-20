@@ -148,6 +148,15 @@ def chase_hard_budget_sec() -> float:
     return max(1.0, _env_float("FEF_ENTRY_CHASE_HARD_BUDGET_SEC", 20.0))
 
 
+def chase_monitor_floor_sec() -> float:
+    """Minimum entry-timeout budget the CALLER must reserve/hand to the MKT
+    fallback so a fired market order is ALWAYS armed with a cancellable
+    watchdog — the 2026-07-16 price-cap hang can only recur on an UNMONITORED
+    MKT, so the caller keeps the chase deadline this far below the timeout and
+    floors the post-chase budget to it whenever the fallback fires."""
+    return max(1.0, _env_float("FEF_ENTRY_CHASE_MONITOR_FLOOR_SEC", 10.0))
+
+
 # ---------------------------------------------------------------------------
 # Result
 # ---------------------------------------------------------------------------
@@ -358,15 +367,24 @@ async def place_entry_with_chase(
     if outcome == "terminal":
         steps.append({"action": "external_cancel"})
         return ChaseResult(trade, current_limit, False, "external_cancel", reposts, steps)
+    if outcome == "deadline":
+        # Deadline hit during the FINAL poll — must NOT fall through to a MKT
+        # placed past the ceiling: that market order could rest with a ~0
+        # entry-timeout budget = an UNMONITORED naked MKT (the 2026-07-16
+        # hang). Leave the resting price-bounded limit for the timeout instead.
+        steps.append({"action": "deadline"})
+        return ChaseResult(trade, current_limit, False, "deadline", reposts, steps)
 
     if not do_mkt:
         # Chase-only: leave the last resting limit for the 45s timeout.
         steps.append({"action": "chase_only_rest"})
         return ChaseResult(trade, current_limit, False, "chase_exhausted_rest", reposts, steps)
 
-    # FINAL MKT FALLBACK — the ONLY naked-MKT path. Cancel + CONFIRM the
-    # working limit terminal first (never two live BUYs), then place ONE MKT.
-    # Bounded by the entry-timeout the caller arms on the returned MKT trade.
+    # FINAL MKT FALLBACK — the ONLY naked-MKT path. The caller passes do_mkt=
+    # True ONLY when it will arm a live, positive-budget entry-timeout on the
+    # returned MKT trade (see place_bracket): a market order is never left
+    # unmonitored. Cancel + CONFIRM the working limit terminal first (never two
+    # live BUYs), then place ONE MKT.
     cancelled, f_after = await _cancel_and_confirm(
         ib, trade, qty, c_wait, poll, deadline_monotonic)
     if f_after >= qty:
