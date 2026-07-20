@@ -1544,21 +1544,51 @@ async def _watcher_safe_sell(state, p, qty: int, tier_label: str, ref_desc: str,
 
 
 async def _sync_parent_fill_from_trades(state, p) -> None:
-    """Continuously sync a parent's avg_fill_price + status from the live IBKR
-    trade object (in-memory `ib.trades()`, no round-trip). FIX (2026-06-30):
-    the fill-sync only ran nightly, so a market-entry parent sat at
-    status=SUBMITTED / avg_fill_price=None for the whole session — DB P&L was
-    wrong AND fixed_dollar's $ exits had no real entry price to mark against.
+    """Continuously sync a parent's avg_fill_price + filled_qty + status from
+    the live IBKR trade object (in-memory `ib.trades()`, no round-trip). FIX
+    (2026-06-30): the fill-sync only ran nightly, so a market-entry parent sat
+    at status=SUBMITTED / avg_fill_price=None for the whole session — DB P&L
+    was wrong AND fixed_dollar's $ exits had no real entry price to mark against.
+
+    UNDERSELL FIX (2026-07-20): the old guard treated PARTIAL as a *terminal*
+    sync state and stopped re-reading orderStatus.filled the instant it saw ANY
+    fill. A market entry that fills in pieces (e.g. a SPY 10-lot filling 9 then
+    1 across two exec reports) gets caught mid-fill: filled_qty froze at 9 while
+    IBKR went on to fill all 10. The lifetime sell cap is `filled_qty or qty`,
+    so the exit sold only 9 and orphaned 1 naked contract (live: parent 790,
+    SPY 741P). filled_qty is now kept reconciled to the AUTHORITATIVE
+    orderStatus.filled until the order is genuinely done — fully filled OR the
+    broker order reaches a terminal status — so by the time any exit treats the
+    parent as closed, the cap reflects the TRUE held quantity. Invariants:
+    filled_qty is MONOTONIC (a transient low read never lowers it) and no
+    lifecycle status the exit path already advanced (STOPPED/CLOSED/FILLED) is
+    ever downgraded.
+
     Same-session fills only (cross-restart fills are handled by reconcile +
-    the nightly ibkr_execution backfill). Idempotent — returns instantly once
-    a parent is synced.
+    the nightly ibkr_execution backfill).
     """
     from fef_sidecar.db.repository import SignalIterRepository
     from fef_sidecar.ibkr.live import LiveIBKRProvider
     if not isinstance(state.ibkr, LiveIBKRProvider) or p.ib_order_id is None:
         return
-    # Already synced — nothing to do.
-    if p.avg_fill_price and p.status in ("FILLED", "PARTIAL", "STOPPED", "CLOSED"):
+    # One-shot "done" latch: only stop re-reading once the fill can no longer
+    # change. PARTIAL alone is deliberately NOT a stopping condition — that was
+    # the undersell bug. The latch is set below on fully-filled or broker-
+    # terminal, and cleared by _reset_watcher_runtime_state on re-adoption.
+    if not hasattr(state, "_watcher_fill_synced"):
+        state._watcher_fill_synced = set()  # type: ignore[attr-defined]
+    if p.id in state._watcher_fill_synced:  # type: ignore[attr-defined]
+        return
+    # A lifecycle-terminal parent is already being/has been wound down by the
+    # exit path — never touch its fill record (and stop scanning it).
+    if p.status in ("STOPPED", "CLOSED", "CLOSED_EXTERNAL", "STUCK", "CANCELLED"):
+        state._watcher_fill_synced.add(p.id)  # type: ignore[attr-defined]
+        return
+    # Fast path: already fully recorded (avg present AND the whole order filled).
+    # PARTIAL is intentionally excluded here so a mid-fill snapshot keeps syncing.
+    if (p.avg_fill_price and int(p.qty or 0) > 0
+            and int(getattr(p, "filled_qty", 0) or 0) >= int(p.qty or 0)):
+        state._watcher_fill_synced.add(p.id)  # type: ignore[attr-defined]
         return
     try:
         ib = state.ibkr._ib  # type: ignore[attr-defined]
@@ -1571,18 +1601,46 @@ async def _sync_parent_fill_from_trades(state, p) -> None:
         if trade is None:
             return
         st = trade.orderStatus
+        status_str = str(getattr(st, "status", "") or "")
         avg = float(getattr(st, "avgFillPrice", 0) or 0)
         filled = int(float(getattr(st, "filled", 0) or 0))
         if avg <= 0 or filled <= 0:
             return
-        updates: dict = {"avg_fill_price": round(avg, 4), "filled_qty": filled}
+        qty = int(p.qty or 0)
+        # MONOTONIC: a transient low/zero read can never decrease the count.
+        cur_filled = int(getattr(p, "filled_qty", 0) or 0)
+        new_filled = max(cur_filled, filled)
+        fully_filled = qty > 0 and new_filled >= qty
+        order_terminal = status_str in ("Filled", "Cancelled", "ApiCancelled", "Inactive")
+        # Status without ever DOWNGRADING a state the exit path advanced: only
+        # SUBMITTED/None gets a fresh stamp; a PARTIAL is promoted to FILLED
+        # once the order completes; everything else is left untouched.
+        new_status: str | None = None
         if p.status in ("SUBMITTED", None):
-            updates["status"] = "FILLED" if filled >= int(p.qty or 0) else "PARTIAL"
-        await SignalIterRepository.update_live_order(p.id, **updates)
-        p.avg_fill_price = updates["avg_fill_price"]
-        p.filled_qty = filled
-        if "status" in updates:
-            p.status = updates["status"]
+            new_status = "FILLED" if fully_filled else "PARTIAL"
+        elif p.status == "PARTIAL" and fully_filled:
+            new_status = "FILLED"
+        # Only write when something actually changed — a stuck/cancelled partial
+        # (9/10, remainder cancelled) is re-scanned cheaply from the in-memory
+        # trade but never re-written, and is latched off below via order_terminal.
+        updates: dict = {}
+        if new_filled != cur_filled:
+            updates["filled_qty"] = new_filled
+        if round(avg, 4) != round(float(p.avg_fill_price or 0), 4):
+            updates["avg_fill_price"] = round(avg, 4)
+        if new_status is not None and new_status != p.status:
+            updates["status"] = new_status
+        if updates:
+            await SignalIterRepository.update_live_order(p.id, **updates)
+            if "filled_qty" in updates:
+                p.filled_qty = updates["filled_qty"]
+            if "avg_fill_price" in updates:
+                p.avg_fill_price = updates["avg_fill_price"]
+            if "status" in updates:
+                p.status = updates["status"]
+        # Latch OFF further syncing only when the order can no longer change.
+        if fully_filled or order_terminal:
+            state._watcher_fill_synced.add(p.id)  # type: ignore[attr-defined]
     except Exception:
         logger.exception("parent fill-sync failed for parent %s", p.id)
 

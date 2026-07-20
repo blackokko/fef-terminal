@@ -725,10 +725,15 @@ def _reset_watcher_runtime_state(state, parent_id) -> None:
             getattr(state, attr, {}).pop(parent_id, None)
         except Exception:
             pass
-    try:
-        getattr(state, "_watcher_fill_grace_expired", set()).discard(parent_id)
-    except Exception:
-        pass
+    # Fill-sync "done" latch + grace flag belong to the previous life too: a
+    # re-adopted parent has a fresh (broker-rebased) filled_qty and must be
+    # allowed to re-sync from its new trade rather than early-returning on a
+    # stale latch (2026-07-20 undersell fix).
+    for attr in ("_watcher_fill_grace_expired", "_watcher_fill_synced"):
+        try:
+            getattr(state, attr, set()).discard(parent_id)
+        except Exception:
+            pass
 
 
 async def position_reconcile_loop(state) -> None:
