@@ -716,18 +716,88 @@ async def _place_mirror_locked(
 
     # Marketable-limit entry off a FRESH SPY option quote (same policy as the
     # SPX leg: LMT at ask+buffer on SPY's penny grid, 45s timeout, never MKT).
-    # Passing opt={} routes resolve_entry_ask straight to its bounded
-    # one-shot live fetch; no usable ask -> skip (fail-soft).
+    #
+    # STREAMING-FIRST (2026-07-21 starvation fix): open a short-lived
+    # reqMktData STREAMING subscription on the mapped SPY option and read the
+    # ask from the ticker's memory — the one-shot snapshot fetch starved at
+    # fire time (live 7/21: 6s re-fetch timeout while TWS quotes were healthy
+    # on a free connection). Fail-soft: subscribe failure OR no fresh tick
+    # within the bounded first-tick wait -> the EXISTING resolve_entry_ask
+    # path (bounded one-shot fetch), then the EXISTING no_fresh_quote skip —
+    # refusal semantics preserved exactly. The stream is ALWAYS closed here
+    # (try/finally) BEFORE place_bracket runs, so at most one subscription
+    # per contract is ever open (place_bracket's entry chase opens its own
+    # stream for the SPY leg — double-subscribing one contract on one
+    # connection can leak a market-data line on unsubscribe).
+    entry_res = None
+    _stream = None
     try:
-        from fef_sidecar.engine.entry_pricing import resolve_entry_ask
-        entry_res = await resolve_entry_ask(
-            state, symbol=MIRROR_SYMBOL, strike=float(spy_strike), right=right,
-            expiry=spy_expiry, opt={},
+        import asyncio as _aio
+
+        from fef_sidecar.engine.entry_pricing import (
+            EntryAskResolution,
+            marketable_entry_limit,
         )
-    except Exception as e:  # noqa: BLE001
-        await _audit_skip("entry_quote_failed", f"entry ask resolve raised: {e}",
-                          details_base)
-        return {"ok": False, "skipped": "entry_quote_failed"}
+        from fef_sidecar.ibkr.models import Contract as _Contract
+        from fef_sidecar.ibkr.models import ContractKind as _ContractKind
+        from fef_sidecar.ibkr.quote_stream import (
+            quote_stream_first_tick_wait_sec,
+            quote_stream_qualify_timeout_sec,
+        )
+        _opener = getattr(state.ibkr, "open_option_quote_stream", None)
+        if _opener is not None:
+            # Outer bound = the provider's own qualify bound + margin, so even
+            # a misbehaving provider cannot wedge the fire hook here.
+            _stream = await _aio.wait_for(
+                _opener(_Contract(
+                    symbol=MIRROR_SYMBOL, kind=_ContractKind.OPTION,
+                    exchange="SMART", expiry=spy_expiry,
+                    strike=float(spy_strike), right=right,
+                )),
+                timeout=quote_stream_qualify_timeout_sec() + 1.0,
+            )
+            _deadline = time.monotonic() + quote_stream_first_tick_wait_sec()
+            while True:
+                _ask = _stream.fresh_ask()
+                if _ask is not None:
+                    _age = _stream.tick_age_sec()
+                    entry_res = EntryAskResolution(
+                        ask=float(_ask),
+                        limit_price=marketable_entry_limit(
+                            MIRROR_SYMBOL, float(_ask)),
+                        source="stream",
+                        age_ms=int((_age or 0.0) * 1000),
+                        refetched=False,
+                    )
+                    break
+                if time.monotonic() >= _deadline:
+                    break  # no fresh tick in the window -> legacy fallback
+                await _aio.sleep(0.05)
+    except Exception:  # noqa: BLE001 — stream problems NEVER veto the mirror
+        logger.exception(
+            "spy_mirror quote stream failed — falling back to the snapshot "
+            "re-fetch path")
+        entry_res = None
+    finally:
+        if _stream is not None:
+            try:
+                _stream.close()
+            except Exception:  # noqa: BLE001 — close must never mask the fire
+                logger.exception("spy_mirror quote stream close failed")
+
+    # Legacy path (unchanged): bounded one-shot fetch via resolve_entry_ask
+    # (opt={} routes straight to the live re-fetch); no usable ask -> skip.
+    if entry_res is None:
+        try:
+            from fef_sidecar.engine.entry_pricing import resolve_entry_ask
+            entry_res = await resolve_entry_ask(
+                state, symbol=MIRROR_SYMBOL, strike=float(spy_strike), right=right,
+                expiry=spy_expiry, opt={},
+            )
+        except Exception as e:  # noqa: BLE001
+            await _audit_skip("entry_quote_failed", f"entry ask resolve raised: {e}",
+                              details_base)
+            return {"ok": False, "skipped": "entry_quote_failed"}
     if entry_res.limit_price is None:
         await _audit_skip(
             "no_fresh_quote",

@@ -364,12 +364,15 @@ async def place_bracket(
             }
         # Live watcher-managed: place ONLY the parent buy. Watcher handles
         # exits. The parent BUY is a marketable LMT that BOUNDED-CHASES the
-        # moving ask (entry_chase.py): cancel/re-post at the re-fetched ask up
+        # moving ask (entry_chase.py): cancel/re-post at the CURRENT ask up
         # to N times, then ONE MKT fallback — so the fast momentum entries this
         # strategy generates fill at a MKT-like rate WITHOUT the 2026-07-16
-        # naked-MKT hang. use_market_entry (manual/legacy) and the chase
-        # master-switch (FEF_ENTRY_CHASE_ENABLED=false) both bypass the chase
-        # and fall back to the original single static post.
+        # naked-MKT hang. The current ask comes from a STREAMING reqMktData
+        # subscription opened at fire-commit (2026-07-21 fix — memory reads,
+        # no fire-time snapshot round-trips), with the legacy snapshot
+        # re-fetch as the fail-soft fallback. use_market_entry (manual/legacy)
+        # and the chase master-switch (FEF_ENTRY_CHASE_ENABLED=false) both
+        # bypass the chase and fall back to the original single static post.
         try:
             from ib_async import LimitOrder, MarketOrder
             ib = ibkr._ib  # type: ignore[attr-defined]
@@ -423,106 +426,170 @@ async def place_bracket(
             used_market = bool(spec.use_market_entry)
             timeout_budget: float | None = spec.entry_timeout_sec
 
-            if not did_chase:
-                # Manual/legacy MKT entry, or chase disabled -> single static
-                # post (behaviour identical to before the chase).
-                parent_order = (_mk_market(spec.qty) if spec.use_market_entry
-                                else _mk_limit(spec.qty, spec.entry_limit))
-                parent_trade = ib.placeOrder(ib_contract, parent_order)
-                await _sync_order(parent_trade)
-            else:
-                async def _refetch() -> float | None:
-                    # A FRESH live ask -> tick-rounded marketable limit, or None
-                    # (no usable/fresh ask) -> the chase must NOT re-post stale.
-                    from fef_sidecar.engine.entry_pricing import marketable_entry_limit
-                    try:
-                        q = await asyncio.wait_for(
-                            ibkr.get_option_quote(contract),
-                            timeout=entry_chase.chase_refetch_timeout_sec(),
+            # STREAMING fire-time quote (2026-07-21 starvation fix): open a
+            # push-style reqMktData subscription for the entry contract NOW —
+            # BEFORE placing the order and before the shared connection gets
+            # busy with placement/confirms — so the chase's re-post asks are
+            # MEMORY reads off the live ticker, not request/response snapshots
+            # (live 7/21: the 1.5s chase re-fetch starved at fire time while
+            # TWS quotes were healthy on a free connection). NEVER blocks the
+            # SPX placement: the contract is already qualified so the live
+            # subscribe does zero awaited round-trips, and a hard wait_for
+            # bound + fail-soft catch guarantee that ANY subscribe problem
+            # just leaves entry_stream=None -> the chase uses the legacy
+            # re-fetch path exactly as before this fix.
+            entry_stream = None
+            if did_chase:
+                try:
+                    _opener = getattr(ibkr, "open_option_quote_stream", None)
+                    if _opener is not None:
+                        entry_stream = await asyncio.wait_for(
+                            _opener(contract, ib_contract=ib_contract),
+                            timeout=2.0,
                         )
-                    except Exception:
+                except Exception:
+                    entry_stream = None
+                    logger.exception(
+                        "entry quote stream subscribe failed for %s — chase "
+                        "will use the legacy re-fetch path", spec.symbol)
+
+            try:
+                if not did_chase:
+                    # Manual/legacy MKT entry, or chase disabled -> single static
+                    # post (behaviour identical to before the chase).
+                    parent_order = (_mk_market(spec.qty) if spec.use_market_entry
+                                    else _mk_limit(spec.qty, spec.entry_limit))
+                    parent_trade = ib.placeOrder(ib_contract, parent_order)
+                    await _sync_order(parent_trade)
+                else:
+                    async def _refetch() -> float | None:
+                        # A FRESH ask -> tick-rounded marketable limit, or None
+                        # (no usable/fresh ask) -> the chase must NOT re-post
+                        # stale. STREAM-FIRST (2026-07-21): a fresh streamed
+                        # tick is a memory read (zero round-trip). A stream
+                        # that TICKED but went stale returns None — the same
+                        # no_fresh_quote refusal a failed re-fetch produces
+                        # (never chase stale, never blind-MKT). A stream that
+                        # NEVER ticked is a dead/slow subscription: close it
+                        # and fall back to the legacy snapshot re-fetch below
+                        # for the remainder of the chase.
+                        nonlocal entry_stream
+                        from fef_sidecar.engine.entry_pricing import marketable_entry_limit
+                        if entry_stream is not None:
+                            a = entry_stream.fresh_ask()
+                            if a is not None:
+                                return marketable_entry_limit(spec.symbol, float(a))
+                            if entry_stream.ever_ticked:
+                                return None  # stale stream -> refuse (no stale chase)
+                            try:
+                                entry_stream.close()
+                            except Exception:
+                                logger.exception("dead entry quote stream close failed")
+                            entry_stream = None
+                            logger.warning(
+                                "entry quote stream never ticked for %s — "
+                                "falling back to legacy re-fetch", spec.symbol)
+                        try:
+                            q = await asyncio.wait_for(
+                                ibkr.get_option_quote(contract),
+                                timeout=entry_chase.chase_refetch_timeout_sec(),
+                            )
+                        except Exception:
+                            return None
+                        a = getattr(q, "ask", None)
+                        if isinstance(a, (int, float)) and math.isfinite(a) and a > 0:
+                            return marketable_entry_limit(spec.symbol, float(a))
                         return None
-                    a = getattr(q, "ask", None)
-                    if isinstance(a, (int, float)) and math.isfinite(a) and a > 0:
-                        return marketable_entry_limit(spec.symbol, float(a))
-                    return None
 
-                t0 = time.monotonic()
-                monitor_floor = entry_chase.chase_monitor_floor_sec()
-                if mkt_watchdog_ok:
-                    # RESERVE a monitor floor: cap the chase at
-                    # (timeout - floor) so the budget handed to the entry-timeout
-                    # (and therefore any fired MKT fallback) is ALWAYS >= floor.
-                    chase_cap = max(0.5, min(entry_chase.chase_hard_budget_sec(),
-                                             float(entry_tmo) - monitor_floor))
-                else:
-                    # Timeout disabled -> chase-only (no MKT); just bound the
-                    # chase wall-time so it can't spin.
-                    chase_cap = entry_chase.chase_hard_budget_sec()
-                deadline = t0 + chase_cap
-                cr = await entry_chase.place_entry_with_chase(
-                    ib=ib, ib_contract=ib_contract, symbol=spec.symbol,
-                    qty=spec.qty, initial_limit=spec.entry_limit,
-                    make_limit_order=_mk_limit, make_market_order=_mk_market,
-                    refetch_limit=_refetch, on_order_placed=_sync_order,
-                    mkt_fallback=chase_mkt,
-                    deadline_monotonic=deadline,
+                    t0 = time.monotonic()
+                    monitor_floor = entry_chase.chase_monitor_floor_sec()
+                    if mkt_watchdog_ok:
+                        # RESERVE a monitor floor: cap the chase at
+                        # (timeout - floor) so the budget handed to the entry-timeout
+                        # (and therefore any fired MKT fallback) is ALWAYS >= floor.
+                        chase_cap = max(0.5, min(entry_chase.chase_hard_budget_sec(),
+                                                 float(entry_tmo) - monitor_floor))
+                    else:
+                        # Timeout disabled -> chase-only (no MKT); just bound the
+                        # chase wall-time so it can't spin.
+                        chase_cap = entry_chase.chase_hard_budget_sec()
+                    deadline = t0 + chase_cap
+                    cr = await entry_chase.place_entry_with_chase(
+                        ib=ib, ib_contract=ib_contract, symbol=spec.symbol,
+                        qty=spec.qty, initial_limit=spec.entry_limit,
+                        make_limit_order=_mk_limit, make_market_order=_mk_market,
+                        refetch_limit=_refetch, on_order_placed=_sync_order,
+                        mkt_fallback=chase_mkt,
+                        deadline_monotonic=deadline,
+                    )
+                    parent_trade = cr.trade
+                    final_limit = cr.limit_price
+                    used_market = cr.used_market
+                    chase_outcome = cr.outcome
+                    reposts = cr.reposts
+                    # Remaining budget for the entry-timeout (chase counts against
+                    # the SAME ceiling). If a MKT fallback fired, FLOOR the budget to
+                    # the monitor floor so the market order can NEVER rest
+                    # unmonitored — the structural guard against the 7/16 hang.
+                    # (used_market here implies chase_mkt, which implies
+                    # mkt_watchdog_ok, so entry_tmo > 0.)
+                    elapsed = time.monotonic() - t0
+                    if used_market:
+                        timeout_budget = max(monitor_floor, float(entry_tmo) - elapsed)
+                    elif mkt_watchdog_ok:
+                        timeout_budget = max(0.0, float(entry_tmo) - elapsed)
+                    else:
+                        timeout_budget = spec.entry_timeout_sec  # <= 0 -> no-arm (chase-only)
+                    # Reconcile the DB row with the order that ended up working (a
+                    # re-post moved the limit; the MKT fallback changed the type).
+                    # Re-stamp ib_order_id/perm here too so a silently-failed final
+                    # _sync_order hook can't leave the DB on a superseded order.
+                    await SignalIterRepository.update_live_order(
+                        parent_saved.id,
+                        ib_order_id=parent_trade.order.orderId,
+                        ib_perm_id=parent_trade.order.permId,
+                        order_type="MKT" if used_market else "LMT",
+                        limit_price=final_limit,
+                    )
+
+                entry_desc = ("MARKET (chase fallback)" if (used_market and did_chase)
+                              else "MARKET" if used_market
+                              else f"LMT @ ${final_limit:.2f}")
+                _chase_meta = {"outcome": chase_outcome, "reposts": reposts,
+                               "used_market": used_market, "final_limit": final_limit}
+                await SignalIterRepository.write_audit_log(
+                    category="order", actor=audit_actor,
+                    summary=f"{audit_prefix}PLACED {spec.exit_strategy} entry: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}. {_exits_desc}",
+                    details={"parent_order_id": parent_saved.id, "exit_strategy": spec.exit_strategy,
+                             "order_type": "MKT" if used_market else "LMT",
+                             "entry_timeout_sec": spec.entry_timeout_sec,
+                             "entry_chase": _chase_meta,
+                             "source": source, "signal_ref": signal_ref},
                 )
-                parent_trade = cr.trade
-                final_limit = cr.limit_price
-                used_market = cr.used_market
-                chase_outcome = cr.outcome
-                reposts = cr.reposts
-                # Remaining budget for the entry-timeout (chase counts against
-                # the SAME ceiling). If a MKT fallback fired, FLOOR the budget to
-                # the monitor floor so the market order can NEVER rest
-                # unmonitored — the structural guard against the 7/16 hang.
-                # (used_market here implies chase_mkt, which implies
-                # mkt_watchdog_ok, so entry_tmo > 0.)
-                elapsed = time.monotonic() - t0
-                if used_market:
-                    timeout_budget = max(monitor_floor, float(entry_tmo) - elapsed)
-                elif mkt_watchdog_ok:
-                    timeout_budget = max(0.0, float(entry_tmo) - elapsed)
-                else:
-                    timeout_budget = spec.entry_timeout_sec  # <= 0 -> no-arm (chase-only)
-                # Reconcile the DB row with the order that ended up working (a
-                # re-post moved the limit; the MKT fallback changed the type).
-                # Re-stamp ib_order_id/perm here too so a silently-failed final
-                # _sync_order hook can't leave the DB on a superseded order.
-                await SignalIterRepository.update_live_order(
-                    parent_saved.id,
+                _spawn_entry_timeout(
+                    state=state, ibkr=ibkr, spec=spec,
+                    parent_id=parent_saved.id,
                     ib_order_id=parent_trade.order.orderId,
-                    ib_perm_id=parent_trade.order.permId,
-                    order_type="MKT" if used_market else "LMT",
-                    limit_price=final_limit,
+                    parent_trade=parent_trade, source=source,
+                    signal_ref=signal_ref, child_ids=(),
+                    timeout_override=timeout_budget,
+                    limit_override=(None if used_market else final_limit),
                 )
-
-            entry_desc = ("MARKET (chase fallback)" if (used_market and did_chase)
-                          else "MARKET" if used_market
-                          else f"LMT @ ${final_limit:.2f}")
-            _chase_meta = {"outcome": chase_outcome, "reposts": reposts,
-                           "used_market": used_market, "final_limit": final_limit}
-            await SignalIterRepository.write_audit_log(
-                category="order", actor=audit_actor,
-                summary=f"{audit_prefix}PLACED {spec.exit_strategy} entry: BUY {spec.qty} {spec.symbol} {spec.strike}{spec.right} {entry_desc}. {_exits_desc}",
-                details={"parent_order_id": parent_saved.id, "exit_strategy": spec.exit_strategy,
-                         "order_type": "MKT" if used_market else "LMT",
-                         "entry_timeout_sec": spec.entry_timeout_sec,
-                         "entry_chase": _chase_meta,
-                         "source": source, "signal_ref": signal_ref},
-            )
-            _spawn_entry_timeout(
-                state=state, ibkr=ibkr, spec=spec,
-                parent_id=parent_saved.id,
-                ib_order_id=parent_trade.order.orderId,
-                parent_trade=parent_trade, source=source,
-                signal_ref=signal_ref, child_ids=(),
-                timeout_override=timeout_budget,
-                limit_override=(None if used_market else final_limit),
-            )
-            return {"ok": True, "dry_run": False, "parent_order_id": parent_saved.id,
-                    "exit_strategy": spec.exit_strategy, "entry_chase": _chase_meta}
+                return {"ok": True, "dry_run": False, "parent_order_id": parent_saved.id,
+                        "exit_strategy": spec.exit_strategy, "entry_chase": _chase_meta}
+            finally:
+                # UNSUBSCRIBE on EVERY resolution path — fill, cancel,
+                # timeout/deadline, no_fresh_quote rest, MKT fallback AND any
+                # exception (the outer except below still sees the original
+                # error). close() is idempotent and never raises; the belt
+                # try/except keeps a hostile duck-typed handle from masking
+                # the placement result. Subscriptions are therefore strictly
+                # chase-lived (seconds), 1-2 per fire.
+                if entry_stream is not None:
+                    try:
+                        entry_stream.close()
+                    except Exception:
+                        logger.exception("entry quote stream close failed")
         except Exception as e:
             logger.exception("watcher-managed parent submission failed")
             await SignalIterRepository.update_live_order(parent_saved.id, status="REJECTED", notes=str(e))

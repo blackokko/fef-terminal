@@ -21,6 +21,11 @@ import time
 from collections.abc import AsyncIterator
 from datetime import datetime
 
+from fef_sidecar.ibkr.quote_stream import (
+    QuoteStreamBase,
+    quote_stream_qualify_timeout_sec,
+)
+
 
 def _is_nan(x) -> bool:
     try:
@@ -91,6 +96,49 @@ def _bar_from_ib(b) -> Bar:
         close=float(b.close),
         volume=float(b.volume or 0),
     )
+
+
+class LiveOptionQuoteStream(QuoteStreamBase):
+    """Streaming reqMktData handle for ONE option contract (2026-07-21
+    fire-time starvation fix — see ibkr/quote_stream.py for the receipts).
+
+    ib_async pushes ticks into the Ticker in-place; this handle stamps the
+    LOCAL monotonic time of every update that carries a usable ask, so
+    `fresh_ask()` is a zero-round-trip memory read with an honest tick age.
+    Deliberately NOT seeded from the Ticker's residual fields at attach time
+    — a previously-cancelled subscription on the same contract leaves values
+    of unknown age on the shared Ticker object, and faking those as 'fresh
+    now' could let the chase re-post off an old price. Only ticks that
+    arrive on THIS subscription count."""
+
+    def __init__(self, ib, ib_contract, ticker) -> None:
+        super().__init__()
+        self._ib = ib
+        self._ib_contract = ib_contract
+        self._ticker = ticker
+        ticker.updateEvent += self._on_update
+
+    def _on_update(self, ticker, *_args) -> None:
+        # Live fields first; delayed fields (market data type 3) as fallback
+        # — same acceptance policy as get_option_quote.
+        ask = ticker.ask
+        if not (isinstance(ask, (int, float)) and ask == ask and ask > 0):
+            ask = getattr(ticker, "delayedAsk", None)
+        bid = ticker.bid
+        if not (isinstance(bid, (int, float)) and bid == bid and bid > 0):
+            bid = getattr(ticker, "delayedBid", None)
+        self._stamp(bid, ask)
+
+    def _do_close(self) -> None:
+        try:
+            self._ticker.updateEvent -= self._on_update
+        except Exception:
+            logger.debug("quote stream: updateEvent detach failed", exc_info=True)
+        # cancelMktData is keyed by contract; if another subscription was
+        # opened meanwhile this cancels one line — callers keep at most ONE
+        # subscription per contract open at a time (see live_trading /
+        # spy_mirror wiring) precisely so this stays unambiguous.
+        self._ib.cancelMktData(self._ib_contract)
 
 
 class LiveIBKRProvider:
@@ -565,6 +613,49 @@ class LiveIBKRProvider:
             iv=iv,
             underlying_price=underlying,
         )
+
+    async def open_option_quote_stream(
+        self,
+        contract: Contract,
+        *,
+        ib_contract=None,
+        qualify_timeout_sec: float | None = None,
+    ) -> LiveOptionQuoteStream:
+        """Open a STREAMING (snapshot=False) reqMktData subscription for a
+        fire-time option quote and return a memory-read handle (2026-07-21
+        starvation fix — see ibkr/quote_stream.py).
+
+        `ib_contract`: an ALREADY-QUALIFIED ib_async contract. When given
+        (the entry-chase path — place_bracket qualified it moments earlier),
+        this method does ZERO awaited round-trips: reqMktData is a
+        synchronous client-side send and the ticks flow push-style. When
+        None (the SPY-mirror path), the qualify round-trip is bounded by
+        `qualify_timeout_sec` (default FEF_QUOTE_STREAM_QUALIFY_TIMEOUT_SEC).
+
+        Raises immediately when not connected — deliberately NO reconnect
+        backoff here (fire-time; the caller is fail-soft and falls back to
+        the legacy snapshot re-fetch path). The caller MUST close() the
+        returned handle in a finally on every resolution path.
+        """
+        ib = self._ib
+        if ib is None or not ib.isConnected():
+            raise ConnectionError(
+                "IBKR not connected — cannot open a fire-time quote stream"
+            )
+        if ib_contract is None:
+            t = (quote_stream_qualify_timeout_sec()
+                 if qualify_timeout_sec is None else max(0.1, float(qualify_timeout_sec)))
+            ib_contract = _to_ib_contract(contract)
+            await asyncio.wait_for(ib.qualifyContractsAsync(ib_contract), timeout=t)
+        # Same delayed-data enablement as the snapshot path (idempotent).
+        if not getattr(self, "_market_data_type_set", False):
+            try:
+                ib.reqMarketDataType(3)  # 3 = delayed (free)
+                self._market_data_type_set = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        ticker = ib.reqMktData(ib_contract, "", False, False)  # streaming
+        return LiveOptionQuoteStream(ib, ib_contract, ticker)
 
     async def get_account_summary(self) -> AccountSummary | None:
         """Pulls accountSummary + reqPnL streaming + positions via ib_async.

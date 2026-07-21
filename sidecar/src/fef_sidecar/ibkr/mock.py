@@ -11,6 +11,36 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 
 from fef_sidecar.ibkr.models import AccountSummary, Bar, Contract, ContractKind, OptionQuote, Quote
+from fef_sidecar.ibkr.quote_stream import QuoteStreamBase
+
+
+class MockOptionQuoteStream(QuoteStreamBase):
+    """Mock counterpart of LiveOptionQuoteStream (2026-07-21 streaming
+    fire-time quotes). Tests drive it directly:
+
+      * `push_quote(bid, ask)` — a tick 'arrives' now (stamps freshness);
+        call between chase iterations to simulate the ask moving while the
+        subscription streams.
+      * `rewind_tick_age(sec)` — age the last tick backwards to simulate a
+        stale stream (no fresh tick -> consumers must refuse, not chase).
+      * `close_count` — asserts unsubscribe ran on every resolution path
+        (close() is idempotent; the count must end at exactly 1).
+    """
+
+    def __init__(self, contract: Contract | None = None) -> None:
+        super().__init__()
+        self.contract = contract
+        self.close_count = 0
+
+    def push_quote(self, bid: float | None, ask: float | None) -> None:
+        self._stamp(bid, ask)
+
+    def rewind_tick_age(self, sec: float) -> None:
+        if self._last_tick_mono is not None:
+            self._last_tick_mono -= float(sec)
+
+    def _do_close(self) -> None:
+        self.close_count += 1
 
 
 def _default_spx_5_15_bars() -> list[Bar]:
@@ -359,6 +389,31 @@ class MockIBKRProvider:
             delta=delta,
             underlying_price=spx,
         )
+
+    async def open_option_quote_stream(
+        self,
+        contract: Contract,
+        *,
+        ib_contract=None,
+        qualify_timeout_sec: float | None = None,
+    ) -> MockOptionQuoteStream:
+        """Mock streaming subscription: seeds one fresh tick from the same
+        synthetic pricing model get_option_quote uses, then updates only via
+        push_quote (tests) — mirroring the live handle's memory-read
+        semantics. Handles are recorded in `opened_streams` so tests can
+        assert subscribe/unsubscribe pairing."""
+        if not self._connected:
+            await self.connect()
+        stream = MockOptionQuoteStream(contract)
+        try:
+            q = await self.get_option_quote(contract)
+            stream.push_quote(q.bid, q.ask)
+        except Exception:
+            pass  # never-ticked handle — consumers fall back (fail-soft)
+        if not hasattr(self, "opened_streams"):
+            self.opened_streams: list[MockOptionQuoteStream] = []  # type: ignore[attr-defined]
+        self.opened_streams.append(stream)
+        return stream
 
     async def ping(self) -> bool:
         return self._connected
