@@ -830,6 +830,30 @@ async def _place_mirror_locked(
     t1_q, t2_q, t3_q = mirror_tier_split(m_qty)
     entry_limit = float(entry_res.limit_price)
 
+    # ENTRY ORDER TYPE (2026-07-22 operator revert — see UIConfig.
+    # spx_entry_order_type): the mirror follows the SPX book's setting.
+    # "market" -> static MKT via the existing use_market_entry path (SPY
+    # fills trivially on its penny grid; no chase, no chase-side stream) —
+    # the ask resolution + premium-plausibility gate above still ran, so a
+    # mismapped strike can never be market-bought blind; entry_limit becomes
+    # informational. Same no-naked-MKT invariant as the SPX leg: timeout
+    # disabled -> stay on chase_limit behavior.
+    _use_mkt = False
+    try:
+        from fef_sidecar.config_store import load_config as _load_cfg_entry
+        _use_mkt = _load_cfg_entry().spx_entry_order_type == "market"
+    except Exception:
+        logger.exception(
+            "spx_entry_order_type config read failed — mirror using chase_limit")
+    if _use_mkt and not (entry_timeout_sec and entry_timeout_sec > 0):
+        _use_mkt = False
+        logger.warning(
+            "spy_mirror: spx_entry_order_type='market' DOWNGRADED to "
+            "chase_limit (entry timeout disabled: %s) — no MKT without the "
+            "watchdog (2026-07-16 invariant).", entry_timeout_sec,
+        )
+    _entry_desc = ("MKT" if _use_mkt else f"LMT ${entry_limit:.2f}")
+
     from fef_sidecar.engine.live_trading import BracketSpec, place_bracket
     spec = BracketSpec(
         symbol=MIRROR_SYMBOL, strike=float(spy_strike), right=right,
@@ -847,6 +871,7 @@ async def _place_mirror_locked(
         # spot machinery evaluates this parent against SPY's own spot).
         entry_spx_price=float(spy_spot) if strategy == "spx_points" else None,
         dollar_loss_cap=loss_cap,
+        use_market_entry=_use_mkt,
         entry_timeout_sec=entry_timeout_sec,
     )
 
@@ -902,7 +927,7 @@ async def _place_mirror_locked(
             category="spy_mirror", actor="system",
             summary=(
                 f"SPY MIRROR PLACED: BUY {m_qty} SPY {spy_strike:.0f}{right} "
-                f"LMT ${entry_limit:.2f} (mirror_of SPX parent {spx_parent_id}; "
+                f"{_entry_desc} (mirror_of SPX parent {spx_parent_id}; "
                 f"map: SPX K{spx_strike:.0f} @ spot {spx_spot:.2f} -> SPY spot "
                 f"{spy_spot:.2f} [{spot_src}], ratio {ratio:.3f}). "
                 f"{ladder_desc}; split {t1_q}/{t2_q}/{t3_q}; "
@@ -928,7 +953,7 @@ async def _place_mirror_locked(
         logger.exception("spy_mirror placed-audit write failed")
 
     logger.warning(
-        "SPY MIRROR FIRED: %s %d SPY %s%.0f LMT $%.2f (mirror_of=%s)",
-        direction, m_qty, right, spy_strike, entry_limit, spx_parent_id,
+        "SPY MIRROR FIRED: %s %d SPY %s%.0f %s (mirror_of=%s)",
+        direction, m_qty, right, spy_strike, _entry_desc, spx_parent_id,
     )
     return {"ok": True, "result": result, "spy_strike": spy_strike, "qty": m_qty}
