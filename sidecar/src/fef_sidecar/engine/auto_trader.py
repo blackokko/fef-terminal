@@ -1024,7 +1024,38 @@ async def _maybe_auto_trade_locked(
             BlockReason.NO_FRESH_QUOTE,
         )
     entry_limit_price = float(entry_res.limit_price)
-    spec = _dc_replace(spec, entry_limit=entry_limit_price)
+
+    # ENTRY ORDER TYPE (2026-07-22 operator revert — full history on
+    # UIConfig.spx_entry_order_type): "market" rides the EXISTING static-MKT
+    # path — use_market_entry=True makes place_bracket's did_chase False, so
+    # chase + streaming stay fully dormant (no subscription is even opened)
+    # and _mk_market places the parent; the 45s entry-timeout watchdog arms
+    # via the existing non-chase derivation (full budget, limit_price=None).
+    # NEVER a naked MKT: with the timeout disabled (entry_timeout <= 0) we
+    # refuse static-MKT and keep chase_limit behavior — the same
+    # no-MKT-without-watchdog invariant the chase fallback enforces (the
+    # 7/16 hang was a MKT with no watchdog; that combination stays
+    # unreachable from this path). Gate 9.5 above still ran either way, so
+    # "market" fires keep the fresh-quote block + the resolved ask in the
+    # audit/signal_ref; entry_limit_price becomes informational on the row.
+    _use_mkt = False
+    try:
+        from fef_sidecar.config_store import load_config as _load_cfg_entry
+        _use_mkt = _load_cfg_entry().spx_entry_order_type == "market"
+    except Exception:
+        logger.exception(
+            "spx_entry_order_type config read failed — using chase_limit")
+    if _use_mkt and not (entry_timeout and entry_timeout > 0):
+        _use_mkt = False
+        logger.warning(
+            "spx_entry_order_type='market' DOWNGRADED to chase_limit for this "
+            "fire: entry timeout is disabled (entry_timeout_sec=%s) and a "
+            "market order with no watchdog can hang on IBKR's price cap "
+            "(2026-07-16). Re-enable FEF_ENTRY_TIMEOUT_SEC>0 to restore MKT "
+            "entries.", entry_timeout,
+        )
+    spec = _dc_replace(spec, entry_limit=entry_limit_price,
+                       use_market_entry=_use_mkt)
 
     try:
         result = await place_bracket(
@@ -1061,11 +1092,14 @@ async def _maybe_auto_trade_locked(
         state.auto_trade_count_session += 1
         state.auto_trade_count_by_symbol[sym] = state.auto_trade_count_by_symbol.get(sym, 0) + 1
         logger.warning(
-            "AUTO-TRADE FIRED: %s %d %s %s%.0f LMT $%.2f (ask $%.2f %s, "
+            "AUTO-TRADE FIRED: %s %d %s %s%.0f %s (ask $%.2f %s, "
             "timeout %.0fs; session total %d, %s budget %d/%d)",
             direction, qty, sym,
             "C" if direction == "LONG_CALLS" else "P",
-            strike, entry_limit_price, entry_res.ask, entry_res.source,
+            strike,
+            (f"MKT (ref ${entry_limit_price:.2f})" if _use_mkt
+             else f"LMT ${entry_limit_price:.2f}"),
+            entry_res.ask, entry_res.source,
             entry_timeout,
             state.auto_trade_count_session,
             sym, state.auto_trade_count_by_symbol[sym], state.auto_trade_max_per_symbol,

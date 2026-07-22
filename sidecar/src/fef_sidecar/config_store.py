@@ -210,6 +210,40 @@ class UIConfig(BaseModel):
     # FEF_FLOW_SURGE_GATE_ENABLED=true on the main engine.
     flow_source: Literal["qd", "theta"] = Field(default="qd")
 
+    # ---- SPX auto-trade entry order type (2026-07-22 operator decision) ----
+    # "just go back to market orders on SPX. order hangup is just what will
+    # come with it." — operator, reverting the entry-order arc:
+    #   7/16: raw MKT entry hung 4m20s on IBKR's price cap (live_order 776,
+    #         filled $8.10 vs ~$5.50-6.00 at signal) -> marketable-LMT era.
+    #   7/20: static marketable LMT missed momentum fires (1-of-5 SPX HIGH)
+    #         -> bounded chase; 7/21: chase re-fetch starved at fire time ->
+    #         streaming fire-time quotes. Net across the three limit-era
+    #         sessions: 2-of-8 momentum fires filled — the hang was solved
+    #         but the entry stopped doing its job (filling on momentum).
+    # "market" (DEFAULT): auto-trade entries ride the EXISTING static-MKT
+    #         path (BracketSpec.use_market_entry=True): no chase, no
+    #         streaming subscription, _mk_market places the parent. The
+    #         hang risk is accepted AND BOUNDED: the 45s entry-timeout
+    #         watchdog (entry_timeout.py — did not exist on 7/16) arms on
+    #         the MKT parent via the existing non-chase derivation and
+    #         cancels a rested order. If the operator disables the timeout
+    #         (FEF_ENTRY_TIMEOUT_SEC<=0) the auto-trader REFUSES the naked
+    #         MKT and downgrades to chase_limit behavior — the same
+    #         no-unwatched-MKT invariant the chase's fallback enforces.
+    # "chase_limit": the 7/20-7/21 behavior, kept dormant (not removed):
+    #         marketable LMT + bounded chase + streaming quote + MKT
+    #         fallback under the same watchdog.
+    # Scope: the AUTO-TRADE entry path — scanner/main-loop fires AND the
+    # SPY mirror (SPY fills trivially at MKT on its penny grid). Manual
+    # tickets untouched. Gate 9.5 (fresh-quote resolution) still runs under
+    # "market": a fire with no usable quote stays BLOCKED (NO_FRESH_QUOTE)
+    # and the resolved ask still feeds the audit trail + the mirror's
+    # premium-plausibility bound; the marketable limit becomes informational
+    # (stored on the row, not sent). Hot-read at fire time via load_config().
+    spx_entry_order_type: Literal["market", "chase_limit"] = Field(
+        default="market",
+    )
+
     # ---- Scanner enabled-symbols persistence (2026-07-17 boot-stomp fix) ----
     # state.scan_enabled_symbols is in-memory only and resets to all-False on
     # every process start, so a restart silently dropped the operator's SPX pin

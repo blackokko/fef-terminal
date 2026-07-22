@@ -10,9 +10,12 @@ Contract under test:
     <=10s old; stale/unstamped -> exactly ONE re-fetch; still unusable ->
     the fire is BLOCKED (NO_FRESH_QUOTE) with counterfactual tagging like
     the other gates — NEVER a silent fall back to MKT.
-  - The auto-trader passes the marketable limit into BracketSpec with
-    use_market_entry=False and entry_timeout_sec=45 (see test_entry_timeout
-    for the watchdog itself).
+  - Under spx_entry_order_type="chase_limit" the auto-trader passes the
+    marketable limit into BracketSpec with use_market_entry=False and
+    entry_timeout_sec=45 (see test_entry_timeout for the watchdog itself).
+    Under the 2026-07-22 default "market" the SAME resolution runs (fresh-
+    quote block preserved) but the limit is informational — that mode's
+    wiring is covered in test_market_entry.py.
 """
 
 from __future__ import annotations
@@ -322,6 +325,15 @@ def _capture_place_bracket(monkeypatch: pytest.MonkeyPatch, captured: dict):
 async def test_fire_uses_marketable_limit_not_market(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """spx_entry_order_type='chase_limit' preserves the limit-era wiring
+    byte-identically (assertions unchanged from before the 2026-07-22
+    'market' revert — the new default's wiring lives in
+    test_market_entry.py)."""
+    import fef_sidecar.config_store as cs
+    monkeypatch.setattr(cs, "load_config", lambda: UIConfig(
+        auto_trade_confidence_floor="LOW", cross_symbol_cap_enabled=False,
+        spx_entry_order_type="chase_limit",
+    ))
     captured: dict = {}
     _capture_place_bracket(monkeypatch, captured)
     state = _state()
