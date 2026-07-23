@@ -79,6 +79,12 @@ class AppState:
     # instead of the up-to-15s-stale QuantData snapshot price.
     last_live_tick_spx: float = 0.0
     last_live_tick_ms: int = 0
+    # Which symbol's feed last wrote last_live_tick_spx / last_spx_price
+    # (2026-07-23 incident review MAJOR-2): consumers that trust the "active
+    # tick" for a symbol must check this stamp — after a /config/symbol flip
+    # the cached value belongs to the PREVIOUS symbol until the new stream's
+    # first print lands.
+    last_live_tick_symbol: str | None = None
     last_iter_num: int = 0
     last_verdict: dict[str, object] = field(default_factory=dict)
     last_snapshot: object | None = None  # cached MarketSnapshot for FEF to consume
@@ -466,3 +472,17 @@ def _make_engine(
         ),
         threshold_scale=threshold_scale,
     )
+
+
+def reset_active_tick_state(state: "AppState") -> None:
+    """Zero the active-chart tick cache on a /config/symbol switch
+    (2026-07-23 incident review MAJOR-2): the cached last_live_tick_spx /
+    last_spx_price belong to the PREVIOUS symbol — serving them as the new
+    symbol's "active tick" is exactly how a frozen ES 7473.75 became the SPX
+    spot and fired a false T1. Zeroed, the poll loop idles on spot<=0 and the
+    per-symbol scanner-snapshot resolution takes over until the new streams'
+    first prints land (which also re-stamp last_live_tick_symbol)."""
+    state.last_live_tick_spx = 0.0
+    state.last_spx_price = 0.0
+    state.last_live_tick_ms = 0
+    state.last_live_tick_symbol = None

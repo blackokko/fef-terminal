@@ -448,6 +448,67 @@ async def _tag_signal_skip(
         )
 
 
+# Scanner-verdict freshness bound for the entry-ref fallback — matches the
+# watcher's _shadow_cash_spot scanner_snapshot freshness window.
+_ENTRY_REF_VERDICT_MAX_AGE_MS = 180_000
+
+
+def _entry_spx_ref(state, sym: str, opt: dict | None) -> float | None:
+    """SYMBOL-CORRECT entry spot reference for a spx_points parent
+    (2026-07-23 incident B): the old `entry_spx_price=state.last_spx_price`
+    stamped the ACTIVE-CHART tick — an ES morning put ES-priced ~7473/7485/
+    7464 entry refs (+~35pt vs cash) on every SPX parent, which (a) made
+    _maybe_reanchor_plan rewrite CORRECT put plans onto the polluted anchor
+    and (b) silently inflated the call BE-ladder risk ~4x, disabling every
+    step (parent 796 rode to the full stop, -$1,770).
+
+    Preference order (freshest symbol-correct source wins):
+      1. option_pricing.underlying_price_at_quote — gate-8-validated, the
+         same anchor the SPY mirror trusts as PRIMARY;
+      2. the scanner's own per-symbol verdict spot (<=180s old) — the SAME
+         value the plan's T1/T2/T3/stop were built from;
+      3. the active-chart tick, ONLY when the active symbol IS this symbol;
+      4. None — the watcher's plan-sanity/BE-ladder paths treat a missing
+         entry ref as "nothing to validate yet", which is strictly safer
+         than a cross-symbol one.
+    """
+    try:
+        u = float((opt or {}).get("underlying_price_at_quote") or 0)
+        if u > 0:
+            return u
+    except (TypeError, ValueError):
+        pass
+    try:
+        v = (getattr(state, "last_scanner_verdict_by_symbol", None) or {}).get(sym)
+        if v:
+            ts = int(v.get("timestamp_ms") or 0)
+            px = float(v.get("spx_price") or 0.0)
+            if px > 0 and (ts == 0
+                           or int(time.time() * 1000) - ts <= _ENTRY_REF_VERDICT_MAX_AGE_MS):
+                return px
+    except (TypeError, ValueError):
+        pass
+    if getattr(state, "active_symbol", None) == sym:
+        px = getattr(state, "last_spx_price", 0) or 0
+        if px > 0:
+            return float(px)
+    # One-shot visibility (review m4): a None entry ref disables the parent's
+    # BE ladder + plan-sanity validation — safe, but never silent.
+    if not getattr(state, "_entry_ref_none_logged", False):
+        try:
+            state._entry_ref_none_logged = True
+        except Exception:
+            pass
+        logger.warning(
+            "_entry_spx_ref: no symbol-correct entry spot for %s (no gate-8 "
+            "underlying, scanner spot stale/absent, active chart is a "
+            "different symbol) — parent placed with entry_spx_price=None; "
+            "BE ladder disabled for it",
+            sym,
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class AutoTradeDecision:
     fired: bool
@@ -824,7 +885,9 @@ async def _maybe_auto_trade_locked(
             t1_qty=t1_qty, t2_qty=t2_qty, t3_qty=t3_qty,
             exit_strategy="spx_points",
             spx_t1=spx_t1, spx_t2=spx_t2, spx_t3=spx_t3, spx_stop=spx_stop,
-            entry_spx_price=state.last_spx_price,
+            # SYMBOL-CORRECT entry ref (2026-07-23 incident B) — never the
+            # raw active-chart tick on a cross-symbol chart. See _entry_spx_ref.
+            entry_spx_price=_entry_spx_ref(state, sym, opt),
             dollar_loss_cap=-abs(float(os.environ.get("FEF_DOLLAR_LOSS_CAP", "1800"))),
             entry_timeout_sec=entry_timeout,
         )

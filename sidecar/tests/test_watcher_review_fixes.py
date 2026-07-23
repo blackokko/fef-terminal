@@ -409,9 +409,11 @@ async def test_fire_deadline_cancels_wedged_sell_parent_stays_managed(monkeypatc
 
 
 async def test_watchdog_deferral_is_age_bounded() -> None:
-    """A wedged fire must not freeze the watchdog: deferral applies only
-    while the youngest tracked fire is younger than the deadline+slack —
-    older (or untracked) fires let a deliberately-dead OTHER loop respawn."""
+    """2026-07-23 rework (exit-wedge review m1): fires now carry their own
+    deadline/rollback in a detached wrapper, so the watchdog NEVER defers
+    the whole pass — young in-flight fires are simply left alone (not
+    cancelled) while loop dead/stale checks always proceed; over-age fires
+    are escalated separately (audited + cancelled once)."""
     from fef_sidecar.engine.loop_watchdog import (
         _watchdog_check_once,
         heartbeat,
@@ -427,15 +429,21 @@ async def test_watchdog_deferral_is_age_bounded() -> None:
     spawn_supervised(state, "victim", dies, cadence_sec=0.01, stale_after_sec=3600)
     await asyncio.sleep(0.05)          # victim is dead and needs a respawn
 
-    # Young in-flight fire -> deferred.
+    # Young in-flight fire: the fire is left alone but the dead loop is
+    # STILL respawned (no whole-pass deferral anymore).
     state.firing_parent_ids = {1}
     state._watcher_fire_started_mono = {object(): _time.monotonic()}
-    assert await _watchdog_check_once(state) == []
-
-    # Fire older than deadline+slack (the wedge) -> checks proceed.
-    state._watcher_fire_started_mono = {object(): _time.monotonic() - 3600.0}
     actions = await _watchdog_check_once(state)
     assert "respawned:victim" in actions
+    assert "cancelled_wedged_fire" not in actions
+
+    # Fire older than deadline+slack (the wedge) -> checks proceed too (a
+    # bare object() handle is skipped by the escalation, never cancelled).
+    state._watcher_fire_started_mono = {object(): _time.monotonic() - 3600.0}
+    await asyncio.sleep(0.05)          # respawned victim died again
+    actions = await _watchdog_check_once(state)
+    assert "respawned:victim" in actions
+    assert "cancelled_wedged_fire" not in actions
 
     # firing id leaked with NO tracked fire -> also proceeds (next pass).
     state._watcher_fire_started_mono = {}
