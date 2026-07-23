@@ -188,62 +188,54 @@ async def _watchdog_check_once(state: Any, *, now: float | None = None) -> list[
     hbs = getattr(state, "loop_heartbeats", {}) or {}
     if now is None:
         now = time.monotonic()
-    # BLOCKER-1 (2026-07-07 review): never cancel/respawn tasks while an exit
-    # fire is in flight — cancellation mid-sell is exactly how an optimistic
-    # latch gets stranded. AGE-BOUNDED (re-review N1): defer only while the
-    # youngest tracked fire is younger than the fire deadline + slack — a
-    # wedge past that is exactly what the watchdog exists for, and an
-    # unconditional deferral would freeze respawns of EVERY loop (bar/tick
-    # streams included) for as long as the wedge lasts. No tracked fires
-    # (leaked firing id) also proceeds.
-    if getattr(state, "firing_parent_ids", None):
-        starts = getattr(state, "_watcher_fire_started_mono", None) or {}
-        if starts:
-            defer_max = float(os.environ.get("FEF_WATCHDOG_FIRE_DEFER_MAX_SEC", "45"))
-            now_mono = time.monotonic()
-            youngest_age = min(now_mono - t0 for t0 in starts.values())
-            if youngest_age < defer_max:
-                return actions
-            # WEDGED-FIRE ESCALATION (2026-07-23 exit-wedge incident): a fire
-            # older than the deferral bound has outlived its own deadline —
-            # its parent sits behind the firing latch, silently skipped by
-            # every watcher path. Audit LOUDLY (once per fire task) and
-            # cancel the over-age fire: every fire's finally-gated rollback +
-            # cap release make cancellation safe (the same guarantee the 30s
-            # FIRE DEADLINE relies on), and cancelling releases the latch so
-            # the parent returns to management instead of waiting for the
-            # 300s reconcile sweep.
-            warned = getattr(state, "_watchdog_wedged_fire_warned", None)
-            if warned is None:
-                warned = set()
-                try:
-                    state._watchdog_wedged_fire_warned = warned
-                except Exception:
-                    pass
-            for task, t0 in list(starts.items()):
-                age = now_mono - t0
-                _done = getattr(task, "done", None)
-                _cancel = getattr(task, "cancel", None)
-                if (age < defer_max or not callable(_cancel)
-                        or (callable(_done) and _done())):
-                    continue
-                if id(task) not in warned:
-                    warned.add(id(task))
-                    await _write_watchdog_audit(
-                        f"EXIT FIRE WEDGED: an in-flight exit fire has run "
-                        f"{age:.0f}s (> {defer_max:.0f}s deferral bound) — "
-                        f"cancelling it; the fire's own rollback keeps the "
-                        f"parent managed. Parents behind the firing latch: "
-                        f"{sorted(getattr(state, 'firing_parent_ids', []) or [])}",
-                        details={"fire_age_sec": round(age, 1),
-                                 "defer_max_sec": defer_max,
-                                 "firing_parent_ids": sorted(
-                                     getattr(state, "firing_parent_ids", []) or []
-                                 )},
-                        category="loop_watchdog",
-                    )
-                _cancel()
-                actions.append("cancelled_wedged_fire")
+    # WEDGED-FIRE HANDLING (2026-07-23 exit-wedge incident, reworked per
+    # review m1): fires carry their own deadline + finally-gated rollback in
+    # a detached wrapper (spx_target_watcher._fire_with_inline_budget), so a
+    # loop respawn can no longer strand a fire mid-sell — the old BLOCKER-1
+    # whole-pass deferral is obsolete and was actively harmful: it deferred
+    # EVERY staleness check exactly when fires wedged. Young in-flight fires
+    # are simply left alone; a fire older than the bound is audited LOUDLY
+    # and cancelled ONCE (m2: never re-cancelled — its rollback may be
+    # mid-write). Cancellation is safe: every fire's finally-gated rollback +
+    # cap release are the same guarantee the 30s FIRE DEADLINE relies on,
+    # and it releases the firing latch instead of waiting for the 300s
+    # reconcile sweep. Loop dead/stale checks below ALWAYS run.
+    starts = getattr(state, "_watcher_fire_started_mono", None) or {}
+    if starts:
+        defer_max = float(os.environ.get("FEF_WATCHDOG_FIRE_DEFER_MAX_SEC", "45"))
+        now_mono = time.monotonic()
+        warned = getattr(state, "_watchdog_wedged_fire_warned", None)
+        if warned is None:
+            warned = set()
+            try:
+                state._watchdog_wedged_fire_warned = warned
+            except Exception:
+                pass
+        for task, t0 in list(starts.items()):
+            age = now_mono - t0
+            _done = getattr(task, "done", None)
+            _cancel = getattr(task, "cancel", None)
+            if (age < defer_max or not callable(_cancel)
+                    or (callable(_done) and _done())):
+                continue
+            if id(task) in warned:
+                continue  # m2: already cancelled once — leave its rollback alone
+            warned.add(id(task))
+            await _write_watchdog_audit(
+                f"EXIT FIRE WEDGED: an in-flight exit fire has run "
+                f"{age:.0f}s (> {defer_max:.0f}s bound) — "
+                f"cancelling it; the fire's own rollback keeps the "
+                f"parent managed. Parents behind the firing latch: "
+                f"{sorted(getattr(state, 'firing_parent_ids', []) or [])}",
+                details={"fire_age_sec": round(age, 1),
+                         "defer_max_sec": defer_max,
+                         "firing_parent_ids": sorted(
+                             getattr(state, "firing_parent_ids", []) or []
+                         )},
+                category="loop_watchdog",
+            )
+            _cancel()
+            actions.append("cancelled_wedged_fire")
     for spec in list(reg.values()):
         if spec.cancelled or spec.completed:
             continue

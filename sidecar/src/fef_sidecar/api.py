@@ -141,6 +141,12 @@ async def set_symbol(request: Request, body: dict[str, str] = Body(...)) -> dict
     prev_symbol = s.active_symbol
     s.active_symbol = symbol
     s.last_snapshot = None  # force a fresh QuantData fetch on the new symbol
+    # MAJOR-2 (2026-07-23 incident review): the cached active tick belongs to
+    # the PREVIOUS symbol — zero it so nothing serves an ES print as "SPX"
+    # while the new streams (re)subscribe. The poll loop idles on spot<=0 and
+    # the per-symbol scanner-snapshot spot resolution takes over meanwhile.
+    from fef_sidecar.state import reset_active_tick_state
+    reset_active_tick_state(s)
     # AUDIT the switch (2026-07-23 exit-wedge incident): symbol flips gate
     # which price feed the watcher trusts as the "active tick" AND respawn
     # every supervised loop — an unaudited flip made the incident's active-

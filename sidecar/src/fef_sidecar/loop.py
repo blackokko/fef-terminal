@@ -1880,6 +1880,10 @@ async def bar_stream_loop(state: AppState) -> None:
                     pending = None
                     last_bar_mono = _t.monotonic()
                     state.last_spx_price = bar.close
+                    # Provenance stamp (2026-07-23 review MAJOR-2) — bar
+                    # closes write last_spx_price too; stamp the source
+                    # symbol so active-tick consumers can verify it.
+                    state.last_live_tick_symbol = symbol
                     # Persist bar for historical chart + backtest replay
                     try:
                         await SignalIterRepository.write_bar(
@@ -2606,6 +2610,11 @@ async def tick_stream_loop(state: AppState) -> None:
                     state.last_spx_price = quote.last
                     state.last_live_tick_spx = quote.last
                     state.last_live_tick_ms = int(quote.timestamp.timestamp() * 1000)
+                    # Provenance stamp (2026-07-23 review MAJOR-2): consumers
+                    # gating on the "active tick" must be able to verify WHICH
+                    # symbol's feed wrote it (a post-flip stale value belongs
+                    # to the previous symbol).
+                    state.last_live_tick_symbol = symbol
                     event = TickEvent(
                         timestamp_ms=int(quote.timestamp.timestamp() * 1000),
                         spx_price=quote.last, bar=None,

@@ -812,13 +812,18 @@ async def _run_exit_fire_shielded(state, fire_factory):
         task.cancel()
         try:
             from fef_sidecar.db.repository import SignalIterRepository
-            await SignalIterRepository.write_audit_log(
-                category="spx_watcher", actor="system",
-                summary=(
-                    f"FIRE DEADLINE: an exit fire exceeded {deadline:.0f}s "
-                    f"(wedged broker call?) — cancelled; the fire's rollback "
-                    f"keeps the parent managed and the backoff schedules a retry"
+            # Bounded (review m3): a wedged DB must not turn the deadline
+            # handler itself into the next unbounded await.
+            await asyncio.wait_for(
+                SignalIterRepository.write_audit_log(
+                    category="spx_watcher", actor="system",
+                    summary=(
+                        f"FIRE DEADLINE: an exit fire exceeded {deadline:.0f}s "
+                        f"(wedged broker call?) — cancelled; the fire's rollback "
+                        f"keeps the parent managed and the backoff schedules a retry"
+                    ),
                 ),
+                timeout=5.0,
             )
         except Exception:
             pass
@@ -870,6 +875,26 @@ async def _fire_with_inline_budget(state, p, fire_factory, tier_label: str):
     survives caller cancellation and always resolves the fire one way or the
     other."""
     if p.id is not None and _fire_handoff_inflight(state, p.id):
+        # Review m3: a stuck wrapper silently refusing fires must be visible
+        # — one throttled row per parent per interval, bounded write.
+        now_ms = int(_time.time() * 1000)
+        if _throttled(state, "_watcher_fire_refused_log_ms", p.id, now_ms,
+                      interval_ms=_FIRE_HANDOFF_LOG_INTERVAL_MS):
+            try:
+                from fef_sidecar.db.repository import SignalIterRepository
+                await asyncio.wait_for(
+                    SignalIterRepository.write_audit_log(
+                        category="spx_watcher", actor="system",
+                        summary=(
+                            f"FIRE REFUSED (in-flight): {tier_label} for parent "
+                            f"{p.id} {p.symbol} {p.strike}{p.right} — a handed-off "
+                            f"fire wrapper is still running; retry when it resolves"
+                        ),
+                    ),
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
         return None
     if not hasattr(state, "_watcher_fire_handoff"):
         try:
@@ -898,15 +923,18 @@ async def _fire_with_inline_budget(state, p, fire_factory, tier_label: str):
                       interval_ms=_FIRE_HANDOFF_LOG_INTERVAL_MS):
             try:
                 from fef_sidecar.db.repository import SignalIterRepository
-                await SignalIterRepository.write_audit_log(
-                    category="spx_watcher", actor="system",
-                    summary=(
-                        f"FIRE HANDOFF: {tier_label} fire for parent {p.id} "
-                        f"{p.symbol} {p.strike}{p.right} exceeded the "
-                        f"{_FIRE_INLINE_BUDGET_SEC:.1f}s inline budget — loop "
-                        f"continues; fire runs detached under its own "
-                        f"deadline/rollback"
+                await asyncio.wait_for(
+                    SignalIterRepository.write_audit_log(
+                        category="spx_watcher", actor="system",
+                        summary=(
+                            f"FIRE HANDOFF: {tier_label} fire for parent {p.id} "
+                            f"{p.symbol} {p.strike}{p.right} exceeded the "
+                            f"{_FIRE_INLINE_BUDGET_SEC:.1f}s inline budget — loop "
+                            f"continues; fire runs detached under its own "
+                            f"deadline/rollback"
+                        ),
                     ),
+                    timeout=5.0,
                 )
             except Exception:
                 pass
@@ -1119,6 +1147,43 @@ _PLAN_REPAIR_SPOT_SOURCES = (
 # spot and the watcher's first evaluation is seconds-scale (<0.1% even on
 # 2026-07-23's violent tape), so 0.25% cleanly separates the two.
 _PLAN_ENTRY_MAX_DEV = float(os.environ.get("FEF_PLAN_ENTRY_MAX_DEV", "0.0025"))
+# The same-scale repair may only run at GENUINE ARM TIME (review MAJOR-1):
+# the plan-sanity memo is process-local, so a restart / reconcile re-adoption
+# re-evaluates every open parent — and any parent legitimately moved >0.25%
+# since entry would otherwise trip the repair, rebasing its risk and (worse)
+# rewinding a ratcheted ladder. Bound = age since submitted_at.
+_PLAN_ENTRY_REPAIR_MAX_AGE_SEC = float(
+    os.environ.get("FEF_PLAN_ENTRY_REPAIR_MAX_AGE_SEC", "120")
+)
+
+
+def _plan_freshly_armed(p) -> bool:
+    """True iff the parent still looks GENUINELY freshly armed — the only
+    state in which the same-scale entry repair is allowed (review MAJOR-1):
+    no BE-ladder ratchet, no tier banked, dynamic stop still at the plan
+    stop, and the row younger than _PLAN_ENTRY_REPAIR_MAX_AGE_SEC. Unknown
+    age fails CLOSED (no repair — the stored entry is left alone, which at
+    worst reproduces the pre-repair behavior)."""
+    if (p.be_ladder_max_step_R or 0) > 0:
+        return False
+    if p.spx_target_t1_fired or p.spx_target_t2_fired or p.spx_target_t3_fired:
+        return False
+    dyn = p.dynamic_stop_level
+    if (dyn is not None and p.spx_target_stop is not None
+            and abs(float(dyn) - float(p.spx_target_stop)) > 1e-6):
+        return False
+    sub = getattr(p, "submitted_at", None)
+    if sub is None:
+        return False
+    try:
+        from datetime import UTC as _UTC
+        from datetime import datetime as _dt
+        if sub.tzinfo is None:
+            sub = sub.replace(tzinfo=_UTC)  # DB round-trips drop tzinfo; stored UTC
+        age = (_dt.now(_UTC) - sub).total_seconds()
+    except Exception:
+        return False
+    return age <= _PLAN_ENTRY_REPAIR_MAX_AGE_SEC
 
 
 async def _maybe_reanchor_plan(
@@ -1179,6 +1244,7 @@ async def _maybe_reanchor_plan(
         "be_ladder_max_step_R": p.be_ladder_max_step_R,
     }
     updates: dict = {}
+    same_scale_repair = False
     ratio = entry / float(sym_spot)
     entry_repaired = ratio > _PLAN_UNITS_RATIO or ratio < 1.0 / _PLAN_UNITS_RATIO
     if entry_repaired:
@@ -1190,7 +1256,8 @@ async def _maybe_reanchor_plan(
             return False
         entry = float(sym_spot)
         updates["entry_spx_price"] = entry
-    elif abs(entry - float(sym_spot)) / float(sym_spot) > _PLAN_ENTRY_MAX_DEV:
+    elif (abs(entry - float(sym_spot)) / float(sym_spot) > _PLAN_ENTRY_MAX_DEV
+          and _plan_freshly_armed(p)):
         # SAME-SCALE POLLUTION (2026-07-23 incident B): an ES-priced
         # entry_spx_price on an SPX parent sits ~0.3-0.7% above cash — far
         # under the 3x units ratio, so the cross-unit branch never sees it.
@@ -1202,12 +1269,18 @@ async def _maybe_reanchor_plan(
         # (parent 796 rode to the full -10pt stop, -$1,770). Threshold =
         # _PLAN_ENTRY_MAX_DEV (0.25% — the live deviation was 0.477%, and
         # legitimate verdict->first-eval drift is well under 0.1%). Repair
-        # requires the same fresh-provenance gate as the cross-unit branch.
+        # requires the same fresh-provenance gate as the cross-unit branch,
+        # AND runs only at GENUINE ARM TIME (_plan_freshly_armed — review
+        # MAJOR-1): an aged/ratcheted/banked parent re-evaluated after a
+        # restart or re-adoption keeps its stored entry untouched, so a
+        # legitimately-moved position is never rebased and a gapped-through
+        # stop fires immediately instead of being rewritten.
         if spot_src not in _PLAN_REPAIR_SPOT_SOURCES:
             return False
         entry = float(sym_spot)
         updates["entry_spx_price"] = entry
         entry_repaired = True
+        same_scale_repair = True
     scale = _price_scale(float(sym_spot))
     expected_stop = _PLAN_EXPECTED_STOP_PTS * scale
     sign = 1.0 if p.right == "C" else -1.0
@@ -1232,9 +1305,13 @@ async def _maybe_reanchor_plan(
             if not keep:
                 updates[fld] = entry + sign * exp_off
     # Ladder state derived from a bad entry/stop is garbage — reset it to
-    # the (possibly new) plan stop in both violation modes.
-    updates["dynamic_stop_level"] = updates.get("spx_target_stop", stop)
-    updates["be_ladder_max_step_R"] = 0.0
+    # the (possibly new) plan stop. EXCEPTION (review MAJOR-1): a same-scale
+    # entry repair whose plan is otherwise CLEAN (stop_ok) never touches
+    # ladder state — the arm-time gate guarantees it is at baseline anyway,
+    # and an unconditional reset here is exactly the rewind hazard.
+    if not (same_scale_repair and stop_ok):
+        updates["dynamic_stop_level"] = updates.get("spx_target_stop", stop)
+        updates["be_ladder_max_step_R"] = 0.0
     await SignalIterRepository.update_live_order(p.id, **updates)
     for k, v in updates.items():
         setattr(p, k, v)
@@ -2133,7 +2210,15 @@ async def _shadow_cash_spot(
     result: tuple[float | None, str | None] = (None, None)
     active = getattr(state, "active_symbol", symbol)
     if active == symbol and poll_spot and poll_spot > 0:
-        result = (float(poll_spot), "active_tick")
+        # PROVENANCE GATE (2026-07-23 review MAJOR-2): active_symbol says the
+        # USER is charting this symbol, but the cached tick may still belong
+        # to the PREVIOUS symbol right after a /config/symbol flip (the
+        # incident's frozen ES 7473.75 served as "SPX" for 60+s). Trust the
+        # tick only when its source-symbol stamp matches (None = unstamped
+        # legacy/test states — trusted for backward compatibility).
+        tick_sym = getattr(state, "last_live_tick_symbol", None)
+        if tick_sym is None or tick_sym == symbol:
+            result = (float(poll_spot), "active_tick")
     if result[0] is None:
         try:
             v = (getattr(state, "last_scanner_verdict_by_symbol", None) or {}).get(symbol)

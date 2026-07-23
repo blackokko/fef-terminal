@@ -25,8 +25,9 @@ Fixes under test:
   (A3) watchdog wedged-fire escalation (loop_watchdog._watchdog_check_once
        cancels + audits fires older than the deferral bound);
   (B1) symbol-correct entry ref (auto_trader._entry_spx_ref);
-  (B2) same-scale entry-pollution repair in _maybe_reanchor_plan (0.5%
-       deviation -> repair entry to the symbol-correct spot, plan preserved);
+  (B2) same-scale entry-pollution repair in _maybe_reanchor_plan (0.25%
+       deviation -> repair entry to the symbol-correct spot, plan preserved;
+       ARM-TIME ONLY per review MAJOR-1 — aged/ratcheted parents untouched);
   (B3) tick fast-path drops events without an explicit symbol=="SPX" label;
        bar TickEvents are now labeled.
 """
@@ -52,6 +53,8 @@ from fef_sidecar.engine.spx_target_watcher import (
     _fire_with_inline_budget,
     _maybe_reanchor_plan,
     _qualified_ib_contract,
+    _shadow_cash_spot,
+    _watcher_symbol_spot,
 )
 from fef_sidecar.events import TickEvent
 from fef_sidecar.ibkr.live import LiveIBKRProvider
@@ -68,22 +71,24 @@ async def _db_fixture():
 
 
 class HangingQualifyIB:
-    """qualifyContractsAsync pends forever (the hung CDS-farm signature);
-    positions()/placeOrder behave normally so a fire that gets PAST qualify
-    would place."""
+    """qualifyContractsAsync pends forever by default (the hung CDS-farm
+    signature); pass hang=False for a healthy broker. positions()/placeOrder
+    behave normally so a fire that gets PAST qualify places."""
 
     def __init__(self, symbol="SPX", strike=7445.0, right="C", expiry=EXPIRY,
-                 long_qty=3) -> None:
+                 long_qty=3, hang=True) -> None:
         self._symbol, self._strike = symbol, strike
         self._right, self._expiry = right, expiry
         self.long_qty = long_qty
         self.placed: list[tuple[str, int]] = []
         self.qualify_calls = 0
+        self._do_hang = hang
         self._hang = asyncio.Event()
 
     async def qualifyContractsAsync(self, *contracts):
         self.qualify_calls += 1
-        await self._hang.wait()  # never set — pends until cancelled
+        if self._do_hang:
+            await self._hang.wait()  # pends until released/cancelled
         return list(contracts)
 
     def positions(self):
@@ -328,8 +333,9 @@ async def test_watchdog_cancels_and_audits_overage_fire() -> None:
 
 
 async def test_watchdog_still_defers_for_young_fires() -> None:
-    """The pre-existing deferral behavior is preserved for healthy in-flight
-    fires (younger than the bound)."""
+    """Young in-flight fires are left alone (never cancelled) — review m1:
+    the old whole-pass deferral is gone (loop checks proceed regardless),
+    but a healthy fire under the age bound is never escalated."""
     hang = asyncio.Event()
 
     async def _live_fire():
@@ -445,7 +451,7 @@ async def test_reanchor_repairs_polluted_call_entry_reviving_be_ladder() -> None
 
 
 async def test_reanchor_leaves_clean_entry_untouched() -> None:
-    """A sane entry ref (within 0.5% of the symbol spot) is not repaired and
+    """A sane entry ref (within 0.25% of the symbol spot) is not repaired and
     the parent is not re-anchored — no false positives on ordinary drift."""
     state = _state(_live_provider(HangingQualifyIB()))
     p = await _insert_parent(**_796_call_plan(entry=7436.75))
@@ -553,4 +559,128 @@ async def test_tick_watcher_ignores_unlabeled_and_wrong_symbol_events() -> None:
             await task
         except (asyncio.CancelledError, Exception):
             pass
+    await _drain()
+
+# ---------------------------------------------------------------------------
+# Review MAJOR-1: same-scale repair is ARM-TIME ONLY
+# ---------------------------------------------------------------------------
+
+
+async def test_repair_refused_for_ratcheted_parent_after_restart() -> None:
+    """MAJOR-1(a): the plan-sanity memo is process-local, so a restart
+    re-evaluates every open parent. A healthy RATCHETED call legitimately
+    >0.25% above entry must NOT be repaired: entry stays, the ratcheted
+    dynamic stop is never rewound, the ladder step is never reset."""
+    from datetime import UTC, datetime, timedelta
+    state = _state(_live_provider(HangingQualifyIB()), active_symbol="ES")
+    plan = _796_call_plan(entry=7436.75)
+    plan.update(dynamic_stop_level=7446.75, be_ladder_max_step_R=1.5,
+                spx_target_t1_fired=True)
+    p = await _insert_parent(
+        **plan, submitted_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    ok = await _maybe_reanchor_plan(state, p, 7458.0, "scanner_snapshot")
+    assert ok
+    assert p.entry_spx_price == 7436.75         # NOT rebased
+    assert p.dynamic_stop_level == 7446.75      # ratchet NOT rewound
+    assert p.be_ladder_max_step_R == 1.5        # ladder NOT reset
+    assert p.spx_target_stop == 7426.75         # plan untouched
+    rows = await SignalIterRepository.query_audit_log(category="plan_reanchored")
+    assert rows == []
+    row = await _db_parent(p.id)
+    assert row.dynamic_stop_level == 7446.75 and row.be_ladder_max_step_R == 1.5
+    await _drain()
+
+
+async def test_gapped_through_stop_fires_immediately_after_restart() -> None:
+    """MAJOR-1(b): a put that gapped THROUGH its stop while the process was
+    down (entry now >0.25% from spot, row aged past the arm window) must
+    STOP IMMEDIATELY on re-evaluation — its plan is never rewritten onto
+    the current spot."""
+    from datetime import UTC, datetime, timedelta
+    fake = HangingQualifyIB("SPX", 7500.0, "P", EXPIRY, long_qty=3, hang=False)
+    state = _state(_live_provider(fake), active_symbol="ES")
+    state.runner_protect_enabled = False
+    p = await _insert_parent(
+        strike=7500.0, right="P",
+        entry_spx_price=7530.0,
+        spx_target_t1=7515.0, spx_target_t2=7505.0, spx_target_t3=7480.0,
+        spx_target_stop=7540.0, dynamic_stop_level=7540.0,
+        submitted_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    # Spot gapped to 7560 — through the put stop, 0.40% above entry.
+    await _eval_spx_points_parent(state, p, 7560.0, spot_src="scanner_snapshot")
+    assert p.entry_spx_price == 7530.0          # NOT rebased
+    assert p.spx_target_stop == 7540.0          # plan NOT rewritten
+    assert fake.placed == [("SELL", 3)]         # stopped immediately
+    assert p.status == "STOPPED"
+    row = await _db_parent(p.id)
+    assert row.status == "STOPPED"
+    reanchors = await SignalIterRepository.query_audit_log(category="plan_reanchored")
+    assert reanchors == []
+    await _drain()
+
+
+# (MAJOR-1(c): the original arm-time repairs are covered above by
+# test_reanchor_repairs_polluted_put_entry_and_preserves_plan and
+# test_reanchor_repairs_polluted_call_entry_reviving_be_ladder — freshly
+# inserted parents pass the arm-time gate.)
+
+
+# ---------------------------------------------------------------------------
+# Review MAJOR-2: symbol flip can never serve a cross-symbol tick
+# ---------------------------------------------------------------------------
+
+
+def test_reset_active_tick_state_zeroes_the_cache() -> None:
+    """set_symbol calls this on every switch: the previous symbol's cached
+    prints must never survive into the new symbol's active-tick trust."""
+    from fef_sidecar.state import reset_active_tick_state
+    s = SimpleNamespace(last_live_tick_spx=7473.75, last_spx_price=7473.75,
+                        last_live_tick_ms=123456, last_live_tick_symbol="ES")
+    reset_active_tick_state(s)
+    assert s.last_live_tick_spx == 0.0
+    assert s.last_spx_price == 0.0
+    assert s.last_live_tick_ms == 0
+    assert s.last_live_tick_symbol is None
+
+
+async def test_shadow_cash_spot_rejects_mismatched_tick_stamp() -> None:
+    """Branch-1 (active tick) is gated on the tick's SOURCE-SYMBOL stamp:
+    an ES-stamped print is never served as SPX cash even while
+    active_symbol == 'SPX' (the incident's frozen 7473.75)."""
+    state = SimpleNamespace(active_symbol="SPX", last_live_tick_symbol="ES",
+                            last_scanner_verdict_by_symbol={})
+    spot, src = await _shadow_cash_spot(state, "SPX", 7473.75, {})
+    assert spot is None and src is None      # nothing trustworthy — skip
+
+    # Matching stamp (or the new stream's first print) IS trusted.
+    state2 = SimpleNamespace(active_symbol="SPX", last_live_tick_symbol="SPX",
+                             last_scanner_verdict_by_symbol={})
+    spot2, src2 = await _shadow_cash_spot(state2, "SPX", 7436.5, {})
+    assert (spot2, src2) == (7436.5, "active_tick")
+
+
+async def test_frozen_cross_symbol_tick_never_fires_false_t1() -> None:
+    """Incident A end-to-end replay: active_symbol just flipped ES->SPX, the
+    tick cache still holds the frozen ES print 7473.75 (stamped 'ES'). The
+    watcher must resolve the scanner snapshot (cash 7436.75) instead and
+    T1 (7451.75) must NOT fire."""
+    fake = HangingQualifyIB()
+    state = _state(_live_provider(fake), active_symbol="SPX")
+    state.last_live_tick_spx = 7473.75
+    state.last_spx_price = 7473.75
+    state.last_live_tick_symbol = "ES"       # provenance: pre-flip ES stream
+    state.last_scanner_verdict_by_symbol = {
+        "SPX": {"spx_price": 7436.75,
+                "timestamp_ms": int(_time.time() * 1000) - 5_000},
+    }
+    p = await _insert_parent(**_796_call_plan(entry=7436.75))
+
+    spot, src = await _watcher_symbol_spot(state, p, 7473.75, {})
+    assert (spot, src) == (7436.75, "scanner_snapshot")
+
+    await _eval_spx_points_parent(state, p, spot, spot_src=src)
+    assert fake.qualify_calls == 0 and fake.placed == []
+    assert p.spx_target_t1_fired is False
     await _drain()

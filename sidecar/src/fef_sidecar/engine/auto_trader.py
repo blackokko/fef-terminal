@@ -492,6 +492,20 @@ def _entry_spx_ref(state, sym: str, opt: dict | None) -> float | None:
         px = getattr(state, "last_spx_price", 0) or 0
         if px > 0:
             return float(px)
+    # One-shot visibility (review m4): a None entry ref disables the parent's
+    # BE ladder + plan-sanity validation — safe, but never silent.
+    if not getattr(state, "_entry_ref_none_logged", False):
+        try:
+            state._entry_ref_none_logged = True
+        except Exception:
+            pass
+        logger.warning(
+            "_entry_spx_ref: no symbol-correct entry spot for %s (no gate-8 "
+            "underlying, scanner spot stale/absent, active chart is a "
+            "different symbol) — parent placed with entry_spx_price=None; "
+            "BE ladder disabled for it",
+            sym,
+        )
     return None
 
 
