@@ -378,7 +378,14 @@ async def place_bracket(
             ib = ibkr._ib  # type: ignore[attr-defined]
             from fef_sidecar.ibkr.live import _to_ib_contract
             ib_contract = _to_ib_contract(contract)
-            await ib.qualifyContractsAsync(ib_contract)
+            # BOUNDED (2026-07-23 exit-wedge incident): a hung TWS
+            # contract-details farm leaves an unbounded qualify pending
+            # forever. Failing the entry fast is safe — no order exists yet
+            # and the caller's except path audits the abort.
+            await asyncio.wait_for(
+                ib.qualifyContractsAsync(ib_contract),
+                timeout=float(os.environ.get("FEF_ENTRY_QUALIFY_TIMEOUT_SEC", "8.0")),
+            )
 
             def _mk_limit(q: int, px: float):
                 o = LimitOrder("BUY", q, px, transmit=True)

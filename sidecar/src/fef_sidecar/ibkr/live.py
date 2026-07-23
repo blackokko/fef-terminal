@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime
@@ -886,7 +887,15 @@ class LiveIBKRProvider:
         assert self._ib is not None
 
         ib_contract = _to_ib_contract(contract)
-        await self._ib.qualifyContractsAsync(ib_contract)
+        # BOUNDED (2026-07-23 exit-wedge incident): this qualify runs on every
+        # (re)subscribe — a hung contract-details farm used to pend it forever,
+        # freezing state.last_live_tick_spx at the LAST symbol's final print
+        # (an ES 7473.75 served as the "SPX" active tick for 60+s). A timeout
+        # raises into the stream loop's except path, which retries/reconnects.
+        await asyncio.wait_for(
+            self._ib.qualifyContractsAsync(ib_contract),
+            timeout=float(os.environ.get("FEF_STREAM_QUALIFY_TIMEOUT_SEC", "10.0")),
+        )
 
         ticker = self._ib.reqMktData(ib_contract, "", False, False)
         queue: asyncio.Queue[Quote] = asyncio.Queue()

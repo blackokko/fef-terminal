@@ -1899,6 +1899,11 @@ async def bar_stream_loop(state: AppState) -> None:
                             "close": bar.close,
                             "volume": bar.volume,
                         },
+                        # 2026-07-23 incident B: an UNLABELED bar TickEvent
+                        # for the active (ES) chart was consumed by the SPX
+                        # stop tick-watcher as an SPX tick (its old default
+                        # treated missing symbol as "SPX"). Always label.
+                        symbol=symbol,
                         prior_close=state.prior_close_by_symbol.get(symbol),
                     )
                     await state.broadcaster.publish(event)

@@ -200,9 +200,50 @@ async def _watchdog_check_once(state: Any, *, now: float | None = None) -> list[
         starts = getattr(state, "_watcher_fire_started_mono", None) or {}
         if starts:
             defer_max = float(os.environ.get("FEF_WATCHDOG_FIRE_DEFER_MAX_SEC", "45"))
-            youngest_age = min(time.monotonic() - t0 for t0 in starts.values())
+            now_mono = time.monotonic()
+            youngest_age = min(now_mono - t0 for t0 in starts.values())
             if youngest_age < defer_max:
                 return actions
+            # WEDGED-FIRE ESCALATION (2026-07-23 exit-wedge incident): a fire
+            # older than the deferral bound has outlived its own deadline —
+            # its parent sits behind the firing latch, silently skipped by
+            # every watcher path. Audit LOUDLY (once per fire task) and
+            # cancel the over-age fire: every fire's finally-gated rollback +
+            # cap release make cancellation safe (the same guarantee the 30s
+            # FIRE DEADLINE relies on), and cancelling releases the latch so
+            # the parent returns to management instead of waiting for the
+            # 300s reconcile sweep.
+            warned = getattr(state, "_watchdog_wedged_fire_warned", None)
+            if warned is None:
+                warned = set()
+                try:
+                    state._watchdog_wedged_fire_warned = warned
+                except Exception:
+                    pass
+            for task, t0 in list(starts.items()):
+                age = now_mono - t0
+                _done = getattr(task, "done", None)
+                _cancel = getattr(task, "cancel", None)
+                if (age < defer_max or not callable(_cancel)
+                        or (callable(_done) and _done())):
+                    continue
+                if id(task) not in warned:
+                    warned.add(id(task))
+                    await _write_watchdog_audit(
+                        f"EXIT FIRE WEDGED: an in-flight exit fire has run "
+                        f"{age:.0f}s (> {defer_max:.0f}s deferral bound) — "
+                        f"cancelling it; the fire's own rollback keeps the "
+                        f"parent managed. Parents behind the firing latch: "
+                        f"{sorted(getattr(state, 'firing_parent_ids', []) or [])}",
+                        details={"fire_age_sec": round(age, 1),
+                                 "defer_max_sec": defer_max,
+                                 "firing_parent_ids": sorted(
+                                     getattr(state, "firing_parent_ids", []) or []
+                                 )},
+                        category="loop_watchdog",
+                    )
+                _cancel()
+                actions.append("cancelled_wedged_fire")
     for spec in list(reg.values()):
         if spec.cancelled or spec.completed:
             continue

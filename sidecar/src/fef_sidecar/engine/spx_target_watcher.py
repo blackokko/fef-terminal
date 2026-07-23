@@ -40,11 +40,26 @@ import time as _time
 logger = logging.getLogger(__name__)
 
 
+# Bound on the fire-path contract qualify (2026-07-23 exit-wedge incident):
+# qualifyContractsAsync is a contract-details request — when the TWS CDS farm
+# wedges, the future can pend FOREVER while order placement keeps working on
+# the same connection (reqId-path vs orderId-path asymmetry). Unbounded, each
+# wedged fire ate the full 30s FIRE DEADLINE (and, pre-handoff, stalled the
+# whole poll loop with it). Bounded, a wedged qualify fails the attempt in
+# seconds and lands on the normal refusal/backoff retry machinery.
+_QUALIFY_TIMEOUT_SEC = float(os.environ.get("FEF_WATCHER_QUALIFY_TIMEOUT_SEC", "8.0"))
+
+
 async def _qualified_ib_contract(state, p):
     """Cached IB option-contract lookup. qualifyContractsAsync round-trips
     to IBKR (~50-300ms) — caching it cuts that latency to ~0 for every
     market-sell after the first. Cache key = (symbol, strike, right,
-    expiry). Cache lives on `state` and is hot for the sidecar lifetime."""
+    expiry). Cache lives on `state` and is hot for the sidecar lifetime.
+
+    The qualify await is BOUNDED (_QUALIFY_TIMEOUT_SEC): a hung
+    contract-details farm raises TimeoutError here instead of pending
+    forever — callers treat it like any other pre-placement error
+    (refusal rollback + backoff retry)."""
     from fef_sidecar.ibkr.live import _to_ib_contract
     from fef_sidecar.ibkr.models import Contract, ContractKind
     if not hasattr(state, "_qualified_ib_contracts"):
@@ -60,7 +75,9 @@ async def _qualified_ib_contract(state, p):
     )
     ic = _to_ib_contract(opt_contract)
     ib = state.ibkr._ib  # type: ignore[attr-defined]
-    await ib.qualifyContractsAsync(ic)
+    await asyncio.wait_for(
+        ib.qualifyContractsAsync(ic), timeout=_QUALIFY_TIMEOUT_SEC,
+    )
     state._qualified_ib_contracts[key] = ic  # type: ignore[attr-defined]
     return ic
 
@@ -253,11 +270,17 @@ async def _check_dollar_loss(state, p) -> None:
     from fef_sidecar.ibkr.live import LiveIBKRProvider
     from fef_sidecar.ibkr.models import Contract, ContractKind
     try:
-        opt_quote = await state.ibkr.get_option_quote(Contract(
-            symbol=p.symbol, kind=ContractKind.OPTION,
-            exchange="CBOE" if p.symbol == "SPX" else "SMART",
-            expiry=p.expiry, strike=p.strike, right=p.right,
-        ))
+        # BOUNDED (2026-07-23 exit-wedge hardening): an unbounded quote on a
+        # sell-capable path + the in-flight latch would silently disable this
+        # parent's dollar-cap checks for as long as the broker wedges.
+        opt_quote = await asyncio.wait_for(
+            state.ibkr.get_option_quote(Contract(
+                symbol=p.symbol, kind=ContractKind.OPTION,
+                exchange="CBOE" if p.symbol == "SPX" else "SMART",
+                expiry=p.expiry, strike=p.strike, right=p.right,
+            )),
+            timeout=6.0,
+        )
         mid = opt_quote.mid
         if mid is None or mid <= 0:
             return
@@ -802,6 +825,94 @@ async def _run_exit_fire_shielded(state, fire_factory):
         return None
 
 
+# Inline budget for exit fires (2026-07-23 exit-wedge incident): the poll
+# loop used to await _run_exit_fire_shielded INLINE, so ONE parent's wedged
+# broker call froze stop/tier detection for EVERY parent for the full 30s
+# FIRE DEADLINE — twice in a row live. Fires still run inline in the healthy
+# case (sub-second; preserves the existing same-cycle ordering guarantees and
+# test semantics); a fire exceeding this budget is handed off DETACHED — the
+# wrapper task carries the 30s deadline + finally-gated rollback with it, so
+# loop cancellation (symbol-switch respawn, the incident's second-order
+# hazard) can never orphan a wedged fire without its deadline again.
+_FIRE_INLINE_BUDGET_SEC = float(os.environ.get("FEF_FIRE_INLINE_BUDGET_SEC", "2.0"))
+# Throttle for the handoff audit row (one per parent per interval).
+_FIRE_HANDOFF_LOG_INTERVAL_MS = 60_000
+
+
+def _fire_handoff_inflight(state, parent_id) -> bool:
+    """True while a handed-off (detached) fire wrapper for this parent is
+    still running — callers must not start another fire for the parent."""
+    handoff = getattr(state, "_watcher_fire_handoff", None) or {}
+    task = handoff.get(parent_id)
+    return task is not None and not task.done()
+
+
+async def _fire_with_inline_budget(state, p, fire_factory, tier_label: str):
+    """Run one exit fire through _run_exit_fire_shielded, awaiting it inline
+    only up to _FIRE_INLINE_BUDGET_SEC.
+
+      * Healthy fire (qualify cached or fast, order placed): completes inline
+        — identical semantics to the pre-2026-07-23 code.
+      * Wedged fire: after the budget the WRAPPER keeps running detached
+        (strongly referenced on state._watcher_fire_handoff); its own 30s
+        deadline cancels the wedged sell and the fire's finally-gated
+        rollback/backoff keep the parent managed. The caller returns None and
+        the loop continues — other parents' exits are never frozen.
+      * Single-flight per parent: while a handed-off wrapper is in flight,
+        further fire attempts for the SAME parent are refused here (sync
+        check, no coroutine created), on top of the firing_parent_ids latch
+        inside every fire body.
+
+    Loop-cancellation safety (the incident's silent-leak class): the deadline
+    used to live in the CALLER's await — a /config/symbol respawn cancelling
+    the poll loop mid-deadline left the shielded fire running with NO deadline
+    and the firing latch held. The wrapper task now owns the deadline, so it
+    survives caller cancellation and always resolves the fire one way or the
+    other."""
+    if p.id is not None and _fire_handoff_inflight(state, p.id):
+        return None
+    if not hasattr(state, "_watcher_fire_handoff"):
+        try:
+            state._watcher_fire_handoff = {}  # type: ignore[attr-defined]
+        except Exception:
+            # attr-frozen state (unit-test fakes) — fall back to inline await.
+            return await _run_exit_fire_shielded(state, fire_factory)
+    handoff: dict = state._watcher_fire_handoff  # type: ignore[attr-defined]
+    task = asyncio.ensure_future(_run_exit_fire_shielded(state, fire_factory))
+    if p.id is not None:
+        handoff[p.id] = task
+
+        def _cleanup(t, pid=p.id) -> None:
+            if handoff.get(pid) is t:
+                handoff.pop(pid, None)
+
+        task.add_done_callback(_cleanup)
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(task), timeout=_FIRE_INLINE_BUDGET_SEC,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        # Handed off — the wrapper's own deadline/rollback owns it now.
+        now_ms = int(_time.time() * 1000)
+        if _throttled(state, "_watcher_fire_handoff_log_ms", p.id, now_ms,
+                      interval_ms=_FIRE_HANDOFF_LOG_INTERVAL_MS):
+            try:
+                from fef_sidecar.db.repository import SignalIterRepository
+                await SignalIterRepository.write_audit_log(
+                    category="spx_watcher", actor="system",
+                    summary=(
+                        f"FIRE HANDOFF: {tier_label} fire for parent {p.id} "
+                        f"{p.symbol} {p.strike}{p.right} exceeded the "
+                        f"{_FIRE_INLINE_BUDGET_SEC:.1f}s inline budget — loop "
+                        f"continues; fire runs detached under its own "
+                        f"deadline/rollback"
+                    ),
+                )
+            except Exception:
+                pass
+        return None
+
+
 async def _rollback_refused_terminal_latch(
     state, p, *, latched_status: str, prior_status: str,
     tier_label: str, outcome_kind: str | None, ref_desc: str,
@@ -1001,6 +1112,13 @@ _PLAN_UNITS_RATIO = 3.0
 _PLAN_REPAIR_SPOT_SOURCES = (
     "active_tick", "scanner_snapshot", "tick_stream", "ibkr_stock_quote",
 )
+# SAME-SCALE entry-pollution threshold (2026-07-23 incident B): an ES-priced
+# entry ref on an SPX parent sits ~0.3-0.7% above cash (the futures basis) —
+# far under the 3x units ratio, and today's live deviation (0.477%) slipped
+# just UNDER the shadow guard's 0.5%. Legitimate drift between the verdict
+# spot and the watcher's first evaluation is seconds-scale (<0.1% even on
+# 2026-07-23's violent tape), so 0.25% cleanly separates the two.
+_PLAN_ENTRY_MAX_DEV = float(os.environ.get("FEF_PLAN_ENTRY_MAX_DEV", "0.0025"))
 
 
 async def _maybe_reanchor_plan(
@@ -1072,6 +1190,24 @@ async def _maybe_reanchor_plan(
             return False
         entry = float(sym_spot)
         updates["entry_spx_price"] = entry
+    elif abs(entry - float(sym_spot)) / float(sym_spot) > _PLAN_ENTRY_MAX_DEV:
+        # SAME-SCALE POLLUTION (2026-07-23 incident B): an ES-priced
+        # entry_spx_price on an SPX parent sits ~0.3-0.7% above cash — far
+        # under the 3x units ratio, so the cross-unit branch never sees it.
+        # For PUTS the polluted entry put the CORRECT scanner stop "on the
+        # wrong side" and this function then rewrote a healthy plan onto the
+        # bad anchor (parent 799: entry 7464.50 vs cash 7429.04 -> stop
+        # 7439.04 -> 7474.5, instant T1/T2 + 3-rung BE burst); for CALLS it
+        # silently inflated the ladder risk ~4x and disabled every BE step
+        # (parent 796 rode to the full -10pt stop, -$1,770). Threshold =
+        # _PLAN_ENTRY_MAX_DEV (0.25% — the live deviation was 0.477%, and
+        # legitimate verdict->first-eval drift is well under 0.1%). Repair
+        # requires the same fresh-provenance gate as the cross-unit branch.
+        if spot_src not in _PLAN_REPAIR_SPOT_SOURCES:
+            return False
+        entry = float(sym_spot)
+        updates["entry_spx_price"] = entry
+        entry_repaired = True
     scale = _price_scale(float(sym_spot))
     expected_stop = _PLAN_EXPECTED_STOP_PTS * scale
     sign = 1.0 if p.right == "C" else -1.0
@@ -1667,11 +1803,15 @@ async def _check_fixed_dollar(state, p) -> None:
         entry_px = p.avg_fill_price
         if not entry_px or entry_px <= 0:
             return
-        opt_quote = await state.ibkr.get_option_quote(Contract(
-            symbol=p.symbol, kind=ContractKind.OPTION,
-            exchange="CBOE" if p.symbol == "SPX" else "SMART",
-            expiry=p.expiry, strike=p.strike, right=p.right,
-        ))
+        # BOUNDED (2026-07-23 exit-wedge hardening) — see _check_dollar_loss.
+        opt_quote = await asyncio.wait_for(
+            state.ibkr.get_option_quote(Contract(
+                symbol=p.symbol, kind=ContractKind.OPTION,
+                exchange="CBOE" if p.symbol == "SPX" else "SMART",
+                expiry=p.expiry, strike=p.strike, right=p.right,
+            )),
+            timeout=6.0,
+        )
         mid = opt_quote.mid
         if mid is None or mid <= 0:
             return
@@ -3236,7 +3376,7 @@ async def _eval_spx_points_parent(
                         finally:
                             state.firing_parent_ids.discard(p.id)
 
-                await _run_exit_fire_shielded(state, _fire_stop)
+                await _fire_with_inline_budget(state, p, _fire_stop, "STOP")
             return  # nothing else to do on this parent
 
     # Runner protect — BACKTESTED semantics (2026-07-08 fix). The live
@@ -3318,7 +3458,9 @@ async def _eval_spx_points_parent(
                         finally:
                             state.firing_parent_ids.discard(p.id)
 
-                await _run_exit_fire_shielded(state, _fire_runner)
+                await _fire_with_inline_budget(
+                    state, p, _fire_runner, "RUNNER_PROTECT",
+                )
 
     async def _fire_tier(label: str, flag_field: str, at_field: str, qty: int) -> None:
         # OPTIMISTIC LATCH (2026-07-06): flag BEFORE the awaited sell; revert
@@ -3379,10 +3521,10 @@ async def _eval_spx_points_parent(
             or (not is_long_calls and spot <= p.spx_target_t1)
         )
         if t1_hit:
-            await _run_exit_fire_shielded(state, lambda: _fire_tier(
+            await _fire_with_inline_budget(state, p, lambda: _fire_tier(
                 "T1", "spx_target_t1_fired", "spx_target_t1_at_spx",
                 p.spx_target_t1_qty,
-            ))
+            ), "T1")
 
     # T2
     if not p.spx_target_t2_fired and p.spx_target_t2 is not None and p.spx_target_t2_qty:
@@ -3391,10 +3533,10 @@ async def _eval_spx_points_parent(
             or (not is_long_calls and spot <= p.spx_target_t2)
         )
         if t2_hit:
-            await _run_exit_fire_shielded(state, lambda: _fire_tier(
+            await _fire_with_inline_budget(state, p, lambda: _fire_tier(
                 "T2", "spx_target_t2_fired", "spx_target_t2_at_spx",
                 p.spx_target_t2_qty,
-            ))
+            ), "T2")
 
     # T3
     if not p.spx_target_t3_fired and p.spx_target_t3 is not None and p.spx_target_t3_qty:
@@ -3403,10 +3545,10 @@ async def _eval_spx_points_parent(
             or (not is_long_calls and spot <= p.spx_target_t3)
         )
         if t3_hit:
-            await _run_exit_fire_shielded(state, lambda: _fire_tier(
+            await _fire_with_inline_budget(state, p, lambda: _fire_tier(
                 "T3", "spx_target_t3_fired", "spx_target_t3_at_spx",
                 p.spx_target_t3_qty,
-            ))
+            ), "T3")
 
     # (Runner protect moved ABOVE the tier checks — 2026-07-08 fix. See the
     # block after the stop check: plan-level anchor + retrace buffer, never
@@ -3648,7 +3790,9 @@ async def _eod_assignment_flat_cycle(state, parents) -> set:
             return placed
 
         try:
-            placed = await _run_exit_fire_shielded(state, _fire_eod_flat)
+            placed = await _fire_with_inline_budget(
+                state, p, _fire_eod_flat, "EOD_FLAT",
+            )
         except Exception:
             logger.exception("EOD flat fire failed for parent %s", p.id)
             placed = False
@@ -3843,11 +3987,13 @@ async def spx_stop_tick_watcher_loop(state) -> None:
                 spot = float(getattr(event, "spx_price", 0) or 0)
                 if spot <= 0:
                     continue
-                symbol = getattr(event, "symbol", None) or "SPX"
-                # Only act on the symbol the user is actively trading. The
-                # tick stream sometimes carries multi-symbol ticks when the
-                # scanner has secondary subscriptions; filter to whichever
-                # is the active SPX-style symbol.
+                # SYMBOL TRUST (2026-07-23 incident B): an event WITHOUT an
+                # explicit symbol is UNTRUSTED, never assumed SPX — the bar
+                # stream published the ACTIVE chart's (ES) bar closes as
+                # unlabeled TickEvents and the old `or "SPX"` default walked
+                # an ES-priced 7464.25 into parent 799's stop evaluation
+                # (STOP/TICK at "SPX 7464.25" while cash sat at ~7429).
+                symbol = getattr(event, "symbol", None)
                 if symbol != "SPX":
                     continue
 
@@ -4149,4 +4295,6 @@ async def _tick_check_parent_stop(state, p, spot: float, symbol: str) -> bool:
             finally:
                 state.firing_parent_ids.discard(p.id)
 
-    return await _run_exit_fire_shielded(state, _fire_tick_stop)
+    return bool(await _fire_with_inline_budget(
+        state, p, _fire_tick_stop, "STOP/TICK",
+    ))

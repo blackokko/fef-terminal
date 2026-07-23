@@ -138,8 +138,26 @@ async def set_symbol(request: Request, body: dict[str, str] = Body(...)) -> dict
     if symbol == s.active_symbol:
         return {"ok": True, "active_symbol": s.active_symbol, "changed": False}
 
+    prev_symbol = s.active_symbol
     s.active_symbol = symbol
     s.last_snapshot = None  # force a fresh QuantData fetch on the new symbol
+    # AUDIT the switch (2026-07-23 exit-wedge incident): symbol flips gate
+    # which price feed the watcher trusts as the "active tick" AND respawn
+    # every supervised loop — an unaudited flip made the incident's active-
+    # symbol timeline unreconstructable from the DB. Best-effort.
+    try:
+        from fef_sidecar.db.repository import SignalIterRepository as _Repo_sym
+        await _Repo_sym.write_audit_log(
+            category="config_change", actor="user",
+            summary=(
+                f"ACTIVE SYMBOL SWITCHED {prev_symbol} -> {symbol} — data "
+                f"loops respawn; active-tick trust and bar/tick capture now "
+                f"follow {symbol}"
+            ),
+            details={"prev_symbol": prev_symbol, "new_symbol": symbol},
+        )
+    except Exception:
+        logger.exception("active-symbol switch audit failed")
     # Reset the regime detector window — samples carry the previous
     # symbol's `spx_price`, and mixing TLT (~$82) with SPX (~$7400) breaks
     # range-based regime calculations (e.g. OPEN_DRIVE rationale shows
