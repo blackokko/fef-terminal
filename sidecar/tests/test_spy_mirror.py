@@ -288,12 +288,12 @@ def _mirror_kwargs(**kw) -> dict:
 
 
 def _seed_spy_cache(state, spot, *, age_ms: int = 0) -> None:
-    """Seed the watcher's stock-spot TTL cache so resolve_spy_spot path (a) is
+    """Seed the watcher's stock-spot TTL cache so resolve_spy_spot is
     deterministic WITHOUT any live get_last_quote round-trip (this mirrors the
     live outcome of the detached background warm-refresh). A fresh entry (age 0)
     is served and never re-kicks a refresh. spot=None simulates a refresh that
-    found no usable bid/ask mid (last-only / dead feed) — path (a) misses and
-    the SPX/ratio derivation (b) takes over."""
+    found no usable bid/ask mid (last-only / dead feed) — under fresh-or-skip
+    (2026-07-27) that means the mirror leg SKIPS (no derivation fallback)."""
     now_ms = int(time.time() * 1000) - int(age_ms)
     state._watcher_stock_spot_cache = {"SPY": (now_ms, spot)}
     state._watcher_stock_spot_refreshing = set()

@@ -217,8 +217,23 @@ def _resurrectable_for_orphan(key, parent_keys, resurrectable, spot,
     return resur
 
 
+_RECONCILE_LOCK = asyncio.Lock()
+
+
 async def reconcile_positions(state) -> dict[str, Any]:
-    """Walk IBKR positions ↔ LiveOrder parents. Return counts + lists."""
+    """Walk IBKR positions ↔ LiveOrder parents. Return counts + lists.
+
+    Serialized under a module lock (2026-07-27 review MAJOR-2): four entrants
+    exist — boot pass, 300s periodic loop, manual POST /admin, and the
+    watcher's fill-grace kick — and an overlapped double-run's re-adoption
+    interleave could re-clear tier latches / pop the lifetime-sold oversell
+    cap for a parent the watcher just acted on. The lock costs nothing in the
+    common case and removes the class."""
+    async with _RECONCILE_LOCK:
+        return await _reconcile_positions_locked(state)
+
+
+async def _reconcile_positions_locked(state) -> dict[str, Any]:
     from fef_sidecar.ibkr.live import LiveIBKRProvider
 
     if not isinstance(state.ibkr, LiveIBKRProvider):

@@ -58,6 +58,23 @@ async def _db_fixture():
     await dispose_db()
 
 
+@pytest.fixture(autouse=True)
+def _stub_grace_reconcile(monkeypatch: pytest.MonkeyPatch):
+    """The 2026-07-27 fill-grace kick spawns a REAL reconcile_positions task
+    on grace expiry. This module's FakeIB intentionally lacks isConnected/
+    openTrades — today the task dies on AttributeError (swallowed by the
+    kick's done-callback), but if a richer fake ever lands here a real
+    reconcile would walk the test DB mid-test and phantom-close the very
+    SUBMITTED parents under assertion. Stub it to a no-op; the dedicated
+    kick test overrides with its own counting fake."""
+    import fef_sidecar.engine.position_reconcile as pr
+
+    async def _noop_reconcile(state):
+        return {}
+
+    monkeypatch.setattr(pr, "reconcile_positions", _noop_reconcile)
+
+
 class FakeIB:
     """Fill-lag IBKR stub: positions() reports whatever long qty the test
     sets (0 = the just-filled entry has not propagated yet); placeOrder

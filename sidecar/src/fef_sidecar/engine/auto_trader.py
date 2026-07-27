@@ -573,6 +573,21 @@ async def _maybe_auto_trade_locked(
     signal_iter_id: int | None = None,
 ) -> AutoTradeDecision:
 
+    # FIRE-COMMIT WARM KICK (2026-07-27 fresh-or-skip MAJOR-1): the mirror's
+    # plan anchor now requires a SPY quote <= ~10s old, but the periodic warm
+    # sites run at 120s (main loop) / 60s (scanner) cadence — without a kick
+    # HERE the mirror would skip ~85-92% of fires on a healthy feed. Kicking
+    # the detached refresh at commit-top gives it the whole gate+ask+placement
+    # runway (~4-10s on market entries) to land before the mirror hook reads
+    # the cache. Non-blocking (create_task inside), fail-soft, no-op when the
+    # mirror is disabled or sym != SPX.
+    if sym == "SPX":
+        try:
+            from fef_sidecar.engine.spy_mirror import warm_spy_spot_cache
+            await warm_spy_spot_cache(state)
+        except Exception:
+            logger.exception("fire-commit SPY warm kick failed (mirror may skip)")
+
     # Gate 2: live trading env
     from fef_sidecar.engine.live_trading import is_live_trading_enabled
     if not is_live_trading_enabled():

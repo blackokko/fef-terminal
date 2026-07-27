@@ -279,9 +279,9 @@ async def resolve_spy_spot(state, spx_spot: float) -> tuple[float | None, str]:
     carries +/-1-2.5 SPY points of anchor error against a ladder whose whole
     1R is ~1.0 point — a derived anchor can place the stop AT the live market
     (parent 837, stopped 14s after entry). A fire with no fresh SPY quote
-    SKIPS the mirror leg; the SPX leg is never affected. spx_spot is kept as
-    a parameter for the caller's ratio-plausibility backstop, not for
-    derivation.
+    SKIPS the mirror leg; the SPX leg is never affected. spx_spot is unused
+    (kept only for caller signature stability); the caller runs its own
+    ratio-plausibility backstop with its own locals.
     """
     _ = spx_spot  # anchor derivation removed 2026-07-27 (fresh-or-skip)
     cached: float | None = None
@@ -307,12 +307,17 @@ async def resolve_spy_spot(state, spx_spot: float) -> tuple[float | None, str]:
 
 
 async def warm_spy_spot_cache(state) -> None:
-    """Kick the watcher's DETACHED SPY stock-spot refresh (non-blocking) so the
-    TTL cache is warm before the first mirror fire — making resolve_spy_spot
-    path (a) the normal case rather than always deriving. Called each scan from
-    the main tick loop; cheap + idempotent (the watcher's refresh latch dedups
-    within the TTL). No-op when the mirror is disabled or the kick fails; never
-    raises and never awaits the IBKR round-trip itself."""
+    """Kick the watcher's DETACHED SPY stock-spot refresh (non-blocking).
+
+    Under fresh-or-skip (2026-07-27) this is LOAD-BEARING, not a nicety: a
+    fresh cache entry is the ONLY anchor the mirror accepts — no warm kick
+    landing within _MIRROR_SPOT_MAX_AGE_MS of the fire means the mirror leg
+    skips. Call sites: fire-commit top of _maybe_auto_trade_locked (the one
+    that matters — gives the refresh the gate+placement runway), the scanner
+    loop, and the 120s main loop (belts). Cheap + idempotent (the watcher's
+    refresh latch dedups within the TTL). No-op when the mirror is disabled
+    or the kick fails; never raises and never awaits the IBKR round-trip
+    itself."""
     try:
         enabled, _why = mirror_enabled()
         if not enabled:

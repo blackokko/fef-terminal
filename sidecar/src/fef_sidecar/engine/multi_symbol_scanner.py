@@ -1500,6 +1500,15 @@ async def multi_symbol_scanner_loop(state) -> None:
     while True:
         _wd_beat(state, "multi-symbol-scanner")
         try:
+            # SPY-mirror warm (2026-07-27 fresh-or-skip): baseline cache
+            # freshness between fires — the load-bearing kick is the
+            # fire-commit one in auto_trader; this is the belt. Non-blocking,
+            # TTL-latch-deduped, no-op when the mirror is disabled.
+            try:
+                from fef_sidecar.engine.spy_mirror import warm_spy_spot_cache
+                await warm_spy_spot_cache(state)
+            except Exception:
+                logger.debug("scanner SPY warm kick failed", exc_info=True)
             enabled = [
                 s for s, on in state.scan_enabled_symbols.items() if on
             ]
