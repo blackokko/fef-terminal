@@ -1116,6 +1116,45 @@ async def _entry_fill_grace_pending(state, p) -> bool:
             )
         except Exception:
             pass
+        # GHOST FAST-PATH (2026-07-27, parent 834): an entry that TWS killed
+        # without a fill report leaves a SUBMITTED parent the fail-open path
+        # then "manages" (BE-ladder on a position that does not exist) until
+        # the 300s reconcile loop phantom-closes it. Kick ONE detached
+        # reconcile now — it either phantom-closes the ghost (order dead, no
+        # position) or adopts the real fill; both end the ambiguity in
+        # seconds instead of minutes. Once per parent (gated by the expired
+        # set above); failures fall back to the periodic loop.
+        try:
+            from fef_sidecar.engine.position_reconcile import (
+                reconcile_positions,
+            )
+            holder = getattr(state, "_watcher_grace_reconcile_tasks", None)
+            if holder is None:
+                holder = set()
+                state._watcher_grace_reconcile_tasks = holder  # type: ignore[attr-defined]
+            # Coalesce: simultaneous grace expiries (e.g. an SPX leg and its
+            # mirror) share one reconcile pass — one walks ALL parents.
+            if not any(not t.done() for t in holder):
+                task = asyncio.create_task(reconcile_positions(state))
+                holder.add(task)
+
+                def _grace_reconcile_done(t, _holder=holder):
+                    _holder.discard(t)
+                    if t.cancelled():
+                        return
+                    exc = t.exception()
+                    if exc is not None:
+                        logger.warning(
+                            "fill-grace reconcile pass failed: %r — periodic "
+                            "loop remains the backstop", exc,
+                        )
+
+                task.add_done_callback(_grace_reconcile_done)
+        except Exception:
+            logger.exception(
+                "fill-grace reconcile kick failed for parent %s — periodic "
+                "loop remains the backstop", p.id,
+            )
     return False
 
 
@@ -1411,14 +1450,22 @@ async def _stock_spot_refresh(state, symbol: str, contract) -> None:
             refreshing.discard(symbol)
 
 
-async def _watcher_stock_quote_spot(state, symbol: str) -> tuple[float | None, str | None]:
+async def _watcher_stock_quote_spot(
+    state, symbol: str, *, max_age_ms: int | None = None,
+) -> tuple[float | None, str | None]:
     """(spot, 'ibkr_stock_quote') for a STOCK-kind symbol, NON-BLOCKING
     (adversarial review Finding 2: the provider's snapshot quote holds an
     unconditional ~1.5s sleep — awaiting it inline stalled the ENTIRE 0.1s
     poll loop ~30-40% duty-cycle while a mirror was open). Always serves
     from the TTL cache; a stale/missing entry kicks a DETACHED refresh task
     and this call returns what it has (None on the first cycles — the
-    parent is simply skipped until the refresh lands, ~1.5-2s)."""
+    parent is simply skipped until the refresh lands, ~1.5-2s).
+
+    max_age_ms: optional TIGHTER serve bound than _STOCK_SPOT_SERVE_MAX_MS
+    (never looser — the effective bound is the min of the two). The mirror's
+    fire-time plan anchor passes ~10s here (2026-07-27 fresh-or-skip): a plan
+    whose 1R is ~1 SPY point cannot be anchored on a 30s-old quote in a fast
+    tape. Exit evaluation keeps the default 30s bound."""
     try:
         from fef_sidecar.ibkr.models import Contract, ContractKind
         contract = Contract.for_symbol(symbol)
@@ -1444,7 +1491,11 @@ async def _watcher_stock_quote_spot(state, symbol: str) -> tuple[float | None, s
     if entry is None:
         return None, None
     spot = entry[1]
-    if spot and now_ms - entry[0] < _STOCK_SPOT_SERVE_MAX_MS:
+    serve_bound = _STOCK_SPOT_SERVE_MAX_MS
+    if max_age_ms is not None:
+        # Tighter-only: a caller can narrow freshness, never widen it.
+        serve_bound = min(serve_bound, max(0, int(max_age_ms)))
+    if spot and now_ms - entry[0] < serve_bound:
         return float(spot), "ibkr_stock_quote"
     return None, None
 
