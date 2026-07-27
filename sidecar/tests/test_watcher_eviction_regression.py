@@ -58,6 +58,23 @@ async def _db_fixture():
     await dispose_db()
 
 
+@pytest.fixture(autouse=True)
+def _stub_grace_reconcile(monkeypatch: pytest.MonkeyPatch):
+    """The 2026-07-27 fill-grace kick spawns a REAL reconcile_positions task
+    on grace expiry. This module's FakeIB intentionally lacks isConnected/
+    openTrades — today the task dies on AttributeError (swallowed by the
+    kick's done-callback), but if a richer fake ever lands here a real
+    reconcile would walk the test DB mid-test and phantom-close the very
+    SUBMITTED parents under assertion. Stub it to a no-op; the dedicated
+    kick test overrides with its own counting fake."""
+    import fef_sidecar.engine.position_reconcile as pr
+
+    async def _noop_reconcile(state):
+        return {}
+
+    monkeypatch.setattr(pr, "reconcile_positions", _noop_reconcile)
+
+
 class FakeIB:
     """Fill-lag IBKR stub: positions() reports whatever long qty the test
     sets (0 = the just-filled entry has not propagated yet); placeOrder
@@ -300,6 +317,57 @@ async def test_grace_fails_open_after_timeout_with_audit() -> None:
     assert any("ENTRY_FILL_GRACE expired" in r.summary for r in rows)
     retries = await SignalIterRepository.query_audit_log(category="watcher_refusal_retry")
     assert len(retries) == 1
+    await _drain()
+
+
+async def test_grace_expiry_kicks_one_reconcile_coalesced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-07-27 ghost fast-path (parent 834): grace expiry kicks ONE
+    detached reconcile pass so a TWS-killed entry is phantom-closed in
+    seconds, not at the 300s loop's leisure. Coalesced: a second parent
+    expiring while the pass is in flight does not spawn another; a parent
+    expiring after it completes kicks a fresh one; re-evaluating an
+    already-expired parent never re-kicks (the once-set gates it)."""
+    import fef_sidecar.engine.position_reconcile as pr
+
+    calls: list[int] = []
+    gate = asyncio.Event()
+
+    async def fake_reconcile(state):
+        calls.append(1)
+        await gate.wait()
+        return {}
+
+    monkeypatch.setattr(pr, "reconcile_positions", fake_reconcile)
+
+    fake = FakeIB("SPX", 7510.0, "P", EXPIRY, long_qty=0)
+    state = _state(_live_provider(fake))
+    old = datetime.now(UTC) - timedelta(seconds=600)
+    p1 = await _insert_parent(
+        status="SUBMITTED", filled_qty=0, avg_fill_price=None,
+        submitted_at=old, **_sane_put_plan(),
+    )
+    p2 = await _insert_parent(
+        strike=7505.0, status="SUBMITTED", filled_qty=0, avg_fill_price=None,
+        submitted_at=old, **_sane_put_plan(),
+    )
+
+    await _eval_spx_points_parent(state, p1, 7541.0)
+    assert calls == [1]                    # kick fired for the first expiry
+    await _eval_spx_points_parent(state, p2, 7541.0)
+    assert calls == [1]                    # coalesced — first pass in flight
+    gate.set()
+    await asyncio.sleep(0.05)              # let the pass finish
+    await _eval_spx_points_parent(state, p1, 7541.0)
+    assert calls == [1]                    # once-set: no re-kick per parent
+    p3 = await _insert_parent(
+        strike=7500.0, status="SUBMITTED", filled_qty=0, avg_fill_price=None,
+        submitted_at=old, **_sane_put_plan(),
+    )
+    await _eval_spx_points_parent(state, p3, 7541.0)
+    assert calls == [1, 1]                 # idle again — fresh expiry kicks
+    gate.set()
     await _drain()
 
 

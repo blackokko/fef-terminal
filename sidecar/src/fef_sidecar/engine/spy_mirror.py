@@ -86,26 +86,27 @@ _PREMIUM_RATIO_MAX = 1.6
 _SPY_SPOT_MIN = 50.0
 _SPY_SPOT_MAX = 2000.0
 
-# --- Non-blocking SPY spot resolution (2026-07-20 contention fix) -----------
-# The fire-time SPY spot must NEVER come from a synchronous IBKR round-trip.
-# The old resolve_spy_spot did a blocking get_last_quote on the single shared
-# IBKR connection INSIDE the SPX fire hook; it timed out ("SPY MIRROR SKIPPED:
-# SPY spot fetch timed out after 5s") whenever that connection was busy placing
-# the SPX entry (diagnosed live 2026-07-20 — NOT a data/subscription issue).
-# The spot is now resolved WITHOUT any inline IBKR call: (a) the watcher's
-# detached-refresh TTL stock-spot cache, else (b) SPY = SPX / ratio derived off
-# the SAME validated SPX underlying the SPX leg mapped its strike from.
+# --- Non-blocking SPY spot resolution (2026-07-20 contention fix; -----------
+# --- 2026-07-27 fresh-or-skip) -----------------------------------------------
+# The fire-time SPY spot must NEVER come from a synchronous IBKR round-trip
+# (the 7/20 diagnosis: a blocking get_last_quote inside the fire hook starved
+# on the busy shared connection). It must ALSO never come from a derived
+# SPX/ratio value (the 7/27 incident): the plan ladder's whole 1R is ~1.0 SPY
+# point, while the SPX->SPY ratio's error budget — constant-vs-true drift
+# (10.065 configured vs ~10.03 observed = 2+ points at SPY 738) or a
+# "live paired" ratio recorded off an earlier moment — is +/-1-2.5 points.
+# All three 7/27 mirrors anchored via derivation; parent 837's stop was born
+# AT the live market and stopped 14s after entry (receipts: spy_mirror audit
+# rows spy_spot_source=spx_ratio_derived:*, live_order 837 entry ref 737.2569
+# = 7420.49/10.065 exactly, vs real SPY ~738.3).
 #
-# Derivation ratio (SPX_spot / SPY_spot). Default = the 2026-07-20 live probe
-# (SPX/SPY ~= 10.065; SPY trades ~0.6% under SPX/10 on the dividend basis).
-# Overridable via env; ALWAYS clamped to [_SPOT_RATIO_MIN, _SPOT_RATIO_MAX]
-# before use so a bad env or stale paired ratio can only skip, never misland.
-_SPY_SPX_RATIO_DEFAULT = float(os.environ.get("FEF_SPY_MIRROR_SPX_RATIO", "10.065"))
-# A recent live paired SPX+SPY observation supplies the derivation ratio until
-# this old (ms); past it, fall back to the default constant. Intraday basis
-# drift is only a few bps (spy_mapping_report.md) so a generous window is safe.
-_LIVE_RATIO_MAX_AGE_MS = int(
-    float(os.environ.get("FEF_SPY_MIRROR_RATIO_MAX_AGE_SEC", "900")) * 1000
+# FRESH-OR-SKIP: the ONLY acceptable anchor is the watcher's TTL stock-spot
+# cache with an entry no older than _MIRROR_SPOT_MAX_AGE_MS. No fresh entry ->
+# the mirror leg is SKIPPED for that fire (fail-closed at birth, audited).
+# warm_spy_spot_cache keeps the cache hot from the scan loop, so skips mark
+# exactly the moments the SPY quote could not be trusted.
+_MIRROR_SPOT_MAX_AGE_MS = int(
+    float(os.environ.get("FEF_SPY_MIRROR_SPOT_MAX_AGE_SEC", "10")) * 1000
 )
 
 # ---- SPY ex-dividend assignment guard --------------------------------------
@@ -262,101 +263,61 @@ def mirror_notional_scale(mirror_q: int, spx_qty: int) -> float:
     return (float(mirror_q) / SPX_TO_SPY_POINTS) / float(spx_qty)
 
 
-# ---- SPY spot (NON-BLOCKING — 2026-07-20 contention fix) --------------------
-
-def _record_live_ratio(state, spx_spot: float, spy_spot: float) -> None:
-    """Cache the live SPX/SPY ratio from a fresh PAIRED observation (a cache
-    hit alongside the current SPX underlying) so a later cold-cache fire can
-    derive off the real basis instead of the constant. Only plausible ratios
-    are stored; failures are swallowed (a dynamic-attr write must never break
-    the fire hook)."""
-    try:
-        if not (isinstance(spx_spot, (int, float)) and isinstance(spy_spot, (int, float))):
-            return
-        if spy_spot <= 0 or not math.isfinite(spx_spot) or not math.isfinite(spy_spot):
-            return
-        ratio = float(spx_spot) / float(spy_spot)
-        if _SPOT_RATIO_MIN <= ratio <= _SPOT_RATIO_MAX:
-            state._spy_mirror_live_ratio = (int(time.time() * 1000), ratio)
-    except Exception:
-        pass
-
-
-def _derivation_ratio(state) -> tuple[float, str]:
-    """(ratio, source) for the SPX->SPY spot derivation: a recent live paired
-    ratio if it is fresh AND inside the plausibility band, else the configured
-    default constant. Never raises."""
-    try:
-        rec = getattr(state, "_spy_mirror_live_ratio", None)
-        if rec is not None:
-            ts_ms, ratio = rec
-            if (int(time.time() * 1000) - int(ts_ms) <= _LIVE_RATIO_MAX_AGE_MS
-                    and _SPOT_RATIO_MIN <= float(ratio) <= _SPOT_RATIO_MAX):
-                return float(ratio), "live_paired"
-    except Exception:
-        pass
-    return _SPY_SPX_RATIO_DEFAULT, "default_const"
-
+# ---- SPY spot (NON-BLOCKING, FRESH-OR-SKIP — 2026-07-27) --------------------
 
 async def resolve_spy_spot(state, spx_spot: float) -> tuple[float | None, str]:
-    """Resolve the fire-time SPY spot WITHOUT a synchronous IBKR round-trip.
+    """Resolve the fire-time SPY spot: the watcher's detached-refresh TTL
+    stock-spot cache with an entry no older than _MIRROR_SPOT_MAX_AGE_MS —
+    or nothing.
 
-    Preference order (the mirror must NEVER block the SPX fire hook on a live
-    SPY quote — see the module note + the 2026-07-20 contention diagnosis):
+    NON-BLOCKING (the 2026-07-20 contention rule): a stale/missing entry only
+    KICKS a background refresh and this call returns what qualifies right now.
+    BID/ASK MID ONLY — the same source the watcher uses to manage the mirror
+    parent, so plan birth and plan management share one ruler.
 
-      (a) the watcher's detached-refresh TTL stock-spot cache
-          (`_watcher_stock_quote_spot`) — NON-BLOCKING: a stale/missing entry
-          only KICKS a background refresh and returns what it already has.
-          BID/ASK MID ONLY (the same source the watcher uses to manage the
-          mirror parent); a hit also records the live SPX/SPY ratio for (b).
-      (b) derive off the in-process validated SPX underlying (the SAME
-          spx_spot the SPX leg mapped its strike from):
-              SPY = SPX / ratio,  ratio = a fresh live paired observation if
-          available else the configured default (~10.065). Pure arithmetic —
-          no IBKR call.
-      (c) fail-soft: (None, reason). The caller skips with the existing
-          spy_mirror audit row and NEVER blocks the SPX leg. Now a RARE last
-          resort, reached only if spx_spot itself is unusable (it is already
-          validated >= 2000 upstream, so this is defense-in-depth).
+    NO DERIVED FALLBACK (the 2026-07-27 incident rule): SPX/ratio derivation
+    carries +/-1-2.5 SPY points of anchor error against a ladder whose whole
+    1R is ~1.0 point — a derived anchor can place the stop AT the live market
+    (parent 837, stopped 14s after entry). A fire with no fresh SPY quote
+    SKIPS the mirror leg; the SPX leg is never affected. spx_spot is unused
+    (kept only for caller signature stability); the caller runs its own
+    ratio-plausibility backstop with its own locals.
     """
-    # (a) non-blocking cache read; a stale/cold entry self-kicks a detached
-    #     refresh (so this call also helps keep the cache warm).
+    _ = spx_spot  # anchor derivation removed 2026-07-27 (fresh-or-skip)
     cached: float | None = None
-    csrc: str | None = None
     try:
         from fef_sidecar.engine.spx_target_watcher import (
             _watcher_stock_quote_spot,
         )
-        cached, csrc = await _watcher_stock_quote_spot(state, MIRROR_SYMBOL)
-    except Exception:  # noqa: BLE001 — any cache-path failure falls through to (b)
-        cached, csrc = None, None
+        cached, _csrc = await _watcher_stock_quote_spot(
+            state, MIRROR_SYMBOL, max_age_ms=_MIRROR_SPOT_MAX_AGE_MS,
+        )
+    except Exception:  # noqa: BLE001 — any cache-path failure means no anchor
+        cached = None
     if (isinstance(cached, (int, float)) and math.isfinite(cached)
             and _SPY_SPOT_MIN <= cached <= _SPY_SPOT_MAX):
-        _record_live_ratio(state, spx_spot, float(cached))
-        return round(float(cached), 4), f"watcher_cache:{csrc or 'ibkr_stock_quote'}"
-
-    # (b) derive off the validated SPX underlying — no IBKR call.
-    if (isinstance(spx_spot, (int, float)) and math.isfinite(spx_spot)
-            and spx_spot > 0):
-        ratio, rsrc = _derivation_ratio(state)
-        derived = float(spx_spot) / ratio
-        if _SPY_SPOT_MIN <= derived <= _SPY_SPOT_MAX:
-            return round(derived, 4), f"spx_ratio_derived:{rsrc}:{ratio:.4f}"
-
-    # (c) fail-soft skip (rare last resort — spx_spot unusable).
+        return round(float(cached), 4), (
+            f"ibkr_stock_quote:fresh<={_MIRROR_SPOT_MAX_AGE_MS // 1000}s"
+        )
     return None, (
-        f"no non-blocking SPY spot: cache cold and spx_spot={spx_spot!r} "
-        f"is unusable for SPX/ratio derivation"
+        f"no SPY stock quote fresher than {_MIRROR_SPOT_MAX_AGE_MS // 1000}s "
+        f"in the watcher cache — refusing a derived/stale anchor for a plan "
+        f"whose 1R is ~1 SPY point (fresh-or-skip, 2026-07-27)"
     )
 
 
 async def warm_spy_spot_cache(state) -> None:
-    """Kick the watcher's DETACHED SPY stock-spot refresh (non-blocking) so the
-    TTL cache is warm before the first mirror fire — making resolve_spy_spot
-    path (a) the normal case rather than always deriving. Called each scan from
-    the main tick loop; cheap + idempotent (the watcher's refresh latch dedups
-    within the TTL). No-op when the mirror is disabled or the kick fails; never
-    raises and never awaits the IBKR round-trip itself."""
+    """Kick the watcher's DETACHED SPY stock-spot refresh (non-blocking).
+
+    Under fresh-or-skip (2026-07-27) this is LOAD-BEARING, not a nicety: a
+    fresh cache entry is the ONLY anchor the mirror accepts — no warm kick
+    landing within _MIRROR_SPOT_MAX_AGE_MS of the fire means the mirror leg
+    skips. Call sites: fire-commit top of _maybe_auto_trade_locked (the one
+    that matters — gives the refresh the gate+placement runway), the scanner
+    loop, and the 120s main loop (belts). Cheap + idempotent (the watcher's
+    refresh latch dedups within the TTL). No-op when the mirror is disabled
+    or the kick fails; never raises and never awaits the IBKR round-trip
+    itself."""
     try:
         enabled, _why = mirror_enabled()
         if not enabled:
@@ -566,12 +527,13 @@ async def maybe_place_spy_mirror(
         )
         return {"ok": False, "skipped": "no_spx_spot"}
 
-    # SPY spot — NON-BLOCKING (2026-07-20 fix): the watcher's detached-refresh
-    # TTL cache, else derived from the validated SPX underlying (SPY = SPX /
-    # ratio). NEVER a synchronous SPY quote round-trip inside the SPX fire hook
-    # (the diagnosed 5s-timeout-under-contention bug). Fail-soft skip is now a
-    # rare last resort (spx_spot was validated >= 2000 just above). The audit
-    # reason CODE stays "spot_fetch_failed" for monitoring/ledger continuity.
+    # SPY spot — NON-BLOCKING + FRESH-OR-SKIP (2026-07-27): the watcher's
+    # detached-refresh TTL cache with an entry <= _MIRROR_SPOT_MAX_AGE_MS old,
+    # or the mirror leg SKIPS. NEVER a synchronous quote round-trip inside the
+    # fire hook (2026-07-20), and NEVER a derived SPX/ratio anchor (2026-07-27:
+    # derivation error exceeds the ladder's 1R — parent 837 was born with its
+    # stop at the live market). The audit reason CODE stays
+    # "spot_fetch_failed" for monitoring/ledger continuity.
     spy_spot, spot_src = await resolve_spy_spot(state, spx_spot)
     if spy_spot is None:
         await _audit_skip("spot_fetch_failed", spot_src, details_base)
