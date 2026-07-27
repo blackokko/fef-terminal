@@ -829,6 +829,33 @@ async def test_fire_hook_never_syncs_get_last_quote(
         t.cancel()
 
 
+async def test_fire_commit_warm_kick_spx_only(monkeypatch: pytest.MonkeyPatch):
+    """Round-2 review NIT-1: the LOAD-BEARING fire-commit warm kick at the top
+    of _maybe_auto_trade_locked must fire for SPX evaluations (even ones that
+    then block on gates) and never for other symbols — without it the mirror
+    regresses to the ~8% cache-hit regime (silent decommission). Pinned here
+    so a refactor that moves/deletes the kick or breaks the SPX guard fails a
+    test instead of only a comment."""
+    from fef_sidecar.engine.auto_trader import maybe_auto_trade
+
+    kicks: list[str] = []
+
+    async def fake_warm(state):
+        kicks.append("kick")
+
+    monkeypatch.setattr(sm, "warm_spy_spot_cache", fake_warm)
+    monkeypatch.delenv("FEF_LIVE_TRADING", raising=False)  # gate 2 blocks after the kick
+
+    state = SimpleNamespace(auto_trade_enabled=True, active_symbol="SPX")
+    d = await maybe_auto_trade(state, {"direction": "WAIT"}, symbol="SPX",
+                               source="auto_scanner")
+    assert d.fired is False and kicks == ["kick"]  # kick ran, gates blocked
+
+    d2 = await maybe_auto_trade(state, {"direction": "WAIT"}, symbol="QQQ",
+                                source="auto_scanner")
+    assert d2.fired is False and kicks == ["kick"]  # non-SPX: no kick
+
+
 async def test_watcher_stock_quote_spot_max_age_param():
     """The watcher cache read's max_age_ms bound: tighter-only. An entry aged
     15s serves at the default 30s bound, is refused at a 10s bound, and a

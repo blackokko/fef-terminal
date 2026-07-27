@@ -217,6 +217,12 @@ def _resurrectable_for_orphan(key, parent_keys, resurrectable, spot,
     return resur
 
 
+# Py3.12 nuance: an UNCONTENDED acquire never binds an event loop, which is
+# why per-test event loops tolerate this module-level lock; the first
+# CONTENDED acquire binds one permanently (cross-loop contention then raises
+# RuntimeError — loud, not corrupting). Production is single-loop; keep it
+# module-level so all four entrants (boot, periodic, manual POST, watcher
+# fill-grace kick) share one serialization point.
 _RECONCILE_LOCK = asyncio.Lock()
 
 
