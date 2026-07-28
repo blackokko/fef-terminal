@@ -433,7 +433,8 @@ async def test_reanchor_repairs_polluted_call_entry_reviving_be_ladder() -> None
     """Parent 796 replay: ES-priced entry 7473.0 inflated the call ladder
     risk to 46.25pt (vs 10.25 real) — no BE step ever armed and the parent
     rode to the full stop (-$1,770 live). With the repair, risk is computed
-    from the cash entry and the 0.5R step ratchets the stop as designed."""
+    from the cash entry and the FIRST ladder rung (0.6R on the 2026-07-28
+    schedule) ratchets the stop as designed."""
     state = _state(_live_provider(HangingQualifyIB()), active_symbol="ES")
     p = await _insert_parent(**_796_call_plan(entry=7473.0))
 
@@ -442,10 +443,10 @@ async def test_reanchor_repairs_polluted_call_entry_reviving_be_ladder() -> None
     assert p.entry_spx_price == 7436.75
     assert p.spx_target_stop == 7426.75           # plan preserved
 
-    # Next cycle at cash 7442.25 (13:40:45 live value): mfe = 5.5pt on a
-    # 10pt risk -> the 0.5R BE step must ratchet the stop to entry.
-    await _eval_spx_points_parent(state, p, 7442.25)
-    assert p.be_ladder_max_step_R == 0.5
+    # Next cycle at cash 7443.25 (+6.5pt on a 10pt risk = 0.65R): the
+    # first rung (0.6R arm on the 2026-07-28 schedule) ratchets to entry.
+    await _eval_spx_points_parent(state, p, 7443.25)
+    assert p.be_ladder_max_step_R == 0.6
     assert p.dynamic_stop_level == pytest.approx(7436.75)
     await _drain()
 

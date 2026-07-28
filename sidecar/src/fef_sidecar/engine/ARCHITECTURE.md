@@ -58,8 +58,8 @@ lives, and the side-systems (regime, scanner, exit watcher, BE ladder).
    │  spx_target_watcher_loop (every 0.5s):                    │
    │     - Check stop (uses dynamic_stop_level if BE ladder    │
    │       has ratcheted it)                                    │
-   │     - BE ladder ratchets stop on MFE crossings:            │
-   │         +0.5R → BE (entry), +1R → +0.5R, +1.5R → +1R       │
+   │     - BE ladder ratchets stop on MFE crossings (2026-07-28  │
+   │       schedule): +0.6R → BE (entry), +1.2R → +0.5R         │
    │     - Fire T1/T2/T3 market sells on SPX cross              │
    │     - RUNNER_PROTECT exits remaining qty if SPX retraces   │
    │       to T1 fill level after T1 fires                      │

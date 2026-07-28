@@ -95,7 +95,8 @@ def _walk_be_applied(direction: str, entry_spx: float, t1: float, t2: float | No
     risk = abs(entry_spx - stop)
     if risk <= 0:
         return 0.0
-    BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+    from fef_sidecar.engine.spx_target_watcher import _BE_LADDER_STEPS
+    BE_LADDER = _BE_LADDER_STEPS  # shared live schedule (2026-07-28 adoption)
     dyn_stop = stop
     mfe_r_max = 0.0
     tiers_hit: list[str] = []

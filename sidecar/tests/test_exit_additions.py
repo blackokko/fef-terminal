@@ -365,10 +365,10 @@ async def test_shadow_full_target_run_dollar_math() -> None:
 
 
 async def test_shadow_be_ratchet_trails_stop_hand_math() -> None:
-    """MFE 1.6R ratchets straight to the 1.5R rung (stop -> entry+1.0R =
-    7450); the retrace to 7449 stops the runners there. Hand math:
-    shadow $ = (6-5)*100 - (5-4)*100*2 = -$100; realized_R =
-    1/3*1.6 + 2/3*0.9 = 1.1333."""
+    """MFE 1.6R ratchets to the 1.2R rung (2026-07-28 schedule: stop ->
+    entry+0.5R = 7445); the retrace to 7444.0 stops the runners there.
+    Hand math: shadow $ = (6-5)*100 - (5-4)*100*2 = -$100; realized_R =
+    1/3*1.6 + 2/3*0.4 = 0.8."""
     state = _shadow_state([6.0, 4.0])
     p = _fake_parent(id=2)
 
@@ -376,22 +376,22 @@ async def test_shadow_be_ratchet_trails_stop_hand_math() -> None:
     sh = state.shadow_be_ladder[2]
     await _shadow_be_ladder_cycle(state, [p], 7456.0)   # T1 + ratchet to lock 1.0R
     await _settle_tasks()
-    assert sh["be_step"] == pytest.approx(1.5)
-    assert sh["be_lock_R"] == pytest.approx(1.0)
-    assert sh["dyn_stop"] == pytest.approx(7450.0)
+    assert sh["be_step"] == pytest.approx(1.2)
+    assert sh["be_lock_R"] == pytest.approx(0.5)
+    assert sh["dyn_stop"] == pytest.approx(7445.0)
 
-    await _shadow_be_ladder_cycle(state, [p], 7449.0)   # trail stop hit
+    await _shadow_be_ladder_cycle(state, [p], 7444.0)   # trail stop hit
     await _settle_tasks()
     assert sh["done"] and sh["exit_reason"] == "trail"
 
-    await _shadow_be_ladder_cycle(state, [], 7449.0)    # real close -> finalize
+    await _shadow_be_ladder_cycle(state, [], 7444.0)    # real close -> finalize
     rows = await _outcome_rows()
     assert len(rows) == 1
     r = rows[0]
     assert r.exit_reason == "trail"
     assert r.variant_params["shadow_dollars"] == pytest.approx(-100.0)
     # (row stores realized_r rounded to 4 decimals)
-    assert r.realized_r == pytest.approx(1.0 / 3 * 1.6 + 2.0 / 3 * 0.9, abs=1e-4)
+    assert r.realized_r == pytest.approx(1.0 / 3 * 1.6 + 2.0 / 3 * 0.4, abs=1e-4)
     assert r.actual_realized_pnl is None                # no real banked $ known
     audits = await SignalIterRepository.query_audit_log(category="shadow_exit")
     assert "would have made -$100 vs real n/a" in audits[0].summary

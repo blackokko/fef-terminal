@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time as _time
 
@@ -1400,6 +1401,66 @@ _STOCK_SPOT_TTL_MS = int(float(os.environ.get("FEF_WATCHER_STOCK_SPOT_TTL_SEC", 
 _STOCK_SPOT_SERVE_MAX_MS = 30_000
 _STOCK_SPOT_TIMEOUT_SEC = 4.0
 
+# ---- BE ladder rung schedule -------------------------------------------------
+# Each tuple: (trigger_R, new_stop_at_R_from_entry).
+#
+# DEFAULT CHANGED 2026-07-28 (rung_sweep_LOCK.md, operator-adopted): the
+# 181-cell pre-registered sweep on the validated N=1435 tick harness found
+# arms 0.6R/1.2R/1.8R with locks 0/0.5R/0.5R beats the old 0.5/1.0/1.5 ->
+# 0/0.5/1.0 schedule by +$22.95/ct OOS (session-clustered t=+3.36; rank
+# persistence rho=0.97 across the grid; all five adoption gates + the
+# operator's metric panel {Sharpe/Sortino/expectancy/monthly/annual/maxDD}
+# passed). Mechanism: later arming + gentler locking stops choking T2+
+# winners (+83% banked on winners OOS); the accepted cost is a worse
+# dead-zone (+5..+15pt peaks give back more). The third rung's lock equals
+# the second's, so on the LIVE path the strict-improvement stop guard means
+# the 1.8R entry never moves the stop, never records be_step=1.8, and never
+# audit-logs (review MINOR-2 — live be_step caps at 1.2; the shadow/api
+# walkers record steps unconditionally, so their 1.8 vs live 1.2 telemetry
+# divergence at MFE>=1.8R is expected and stop-identical). Retained as
+# three entries for parser/geometry clarity and replay parity.
+#
+# Env override: FEF_BE_LADDER_STEPS="trig:lock,trig:lock,..." (R units).
+# Invalid values fall back to the DEFAULT (fail-safe: a misconfig may only
+# run the adopted schedule, never a broken one) with one warning. The old
+# schedule, for rollback: "0.5:0,1.0:0.5,1.5:1.0". Consumers: the live
+# ladder in _eval_spx_points_parent, _SHADOW_BE_LADDER (contract: same
+# rungs as live), and api._BE_LADDER (replay tools).
+_BE_LADDER_DEFAULT = [(0.6, 0.0), (1.2, 0.5), (1.8, 0.5)]
+
+
+def _parse_be_ladder(raw: str | None) -> list[tuple[float, float]]:
+    """Parse the env rung schedule; validate (finite, positive triggers,
+    strictly increasing, 0 <= lock <= trigger, locks non-decreasing);
+    anything invalid -> the adopted default, logged once."""
+    if not raw:
+        return list(_BE_LADDER_DEFAULT)
+    try:
+        steps: list[tuple[float, float]] = []
+        for part in raw.split(","):
+            trig_s, lock_s = part.strip().split(":")
+            trig, lock = float(trig_s), float(lock_s)
+            if not (math.isfinite(trig) and math.isfinite(lock)):
+                raise ValueError(part)
+            if trig <= 0 or lock < 0 or lock > trig:
+                raise ValueError(part)
+            steps.append((trig, lock))
+        if not steps:
+            raise ValueError("empty")
+        for (t1, l1), (t2, l2) in zip(steps, steps[1:]):
+            if t2 <= t1 or l2 < l1:
+                raise ValueError(f"non-monotone {t1}:{l1} -> {t2}:{l2}")
+        return steps
+    except Exception:
+        logger.warning(
+            "FEF_BE_LADDER_STEPS=%r invalid — using the adopted default %s",
+            raw, _BE_LADDER_DEFAULT,
+        )
+        return list(_BE_LADDER_DEFAULT)
+
+
+_BE_LADDER_STEPS = _parse_be_ladder(os.environ.get("FEF_BE_LADDER_STEPS"))
+
 
 def _stock_spot_state(state) -> tuple[dict, set, set] | None:
     """(cache, refreshing, tasks) holders on state; None if unassignable."""
@@ -2175,9 +2236,11 @@ async def _safe_persist_execs(state) -> None:
 # ---------------------------------------------------------------------------
 
 _SHADOW_VARIANT_LABEL = "be_ladder_shadow"
-# Same rungs as the live watcher BE_LADDER + api._BE_LADDER:
-# (trigger_R_of_MFE, locked_stop_R_from_entry)
-_SHADOW_BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+# CONTRACT: same rungs as the live watcher ladder + api._BE_LADDER —
+# shared object since 2026-07-28, so the adopted schedule (and any env
+# override) applies everywhere by construction; the copy-divergence bug
+# class is unrepresentable. (trigger_R_of_MFE, locked_stop_R_from_entry)
+_SHADOW_BE_LADDER = _BE_LADDER_STEPS
 
 # Fixed-dollar shadow spec (2026-07-06 flip): the user's live ladder —
 # cumulative-realized semantics, SPX-notional dollars, ETF-scaled per symbol
@@ -3306,12 +3369,9 @@ async def _shadow_be_ladder_cycle(state, parents, spot: float) -> None:
             await _shadow_finalize(state, lsh, f_spot or 0.0)
 
 
-# Default BE ladder. Configurable per-deployment via env if needed.
-# Each tuple: (trigger_R, new_stop_at_R_from_entry)
-# 0.5R reached -> stop to entry (BE)
-# 1.0R reached -> stop to +0.5R (locks half)
-# 1.5R reached -> stop to +1.0R (locks 1R)
-_BE_LADDER_STEPS = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+# BE ladder rung schedule: _BE_LADDER_STEPS — defined with the top
+# constants (before its first consumer _SHADOW_BE_LADDER); see the
+# adoption note there (2026-07-28 rung_sweep, operator-adopted winner).
 
 # Tick-age threshold for stale-data warnings (audit-logged). If the cached
 # tick hasn't refreshed in this long, the IBKR tick stream is likely stalled

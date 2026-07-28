@@ -320,6 +320,31 @@ async def test_grace_fails_open_after_timeout_with_audit() -> None:
     await _drain()
 
 
+async def test_legacy_ratcheted_parent_never_rewinds_under_new_schedule() -> None:
+    """2026-07-28 rung adoption deploy-day safety (review MINOR-4), through
+    the REAL eval loop: a put parent restarted mid-flight with the OLD
+    schedule's 1.5R step recorded and its stop ratcheted to entry-1.0R must
+    be a pure no-op under the new table — the 1.8R rung's 0.5R lock computes
+    a WORSE stop and the forward-only guard must block it: no stop move, no
+    step change, no audit row, every 0.1s cycle."""
+    fake = FakeIB("SPX", 7510.0, "P", EXPIRY, long_qty=3)
+    state = _state(_live_provider(fake))
+    p = await _insert_parent(
+        entry_spx_price=7530.28,
+        spx_target_t1=7515.28, spx_target_t2=7505.28, spx_target_t3=7480.28,
+        spx_target_stop=7540.28,
+        dynamic_stop_level=7520.28,      # old 1.5R step's lock (entry - 1.0R)
+        be_ladder_max_step_R=1.5,        # legacy marker from the old table
+    )
+    # Deep in profit (MFE 2.0R) — past every new arm including 1.8R.
+    await _eval_spx_points_parent(state, p, 7510.28)
+    assert p.dynamic_stop_level == pytest.approx(7520.28)   # never rewound
+    assert p.be_ladder_max_step_R == 1.5                    # never re-stamped
+    rows = await SignalIterRepository.query_audit_log(category="spx_watcher")
+    assert not any("BE LADDER" in r.summary for r in rows)  # zero audit spam
+    await _drain()
+
+
 async def test_grace_expiry_kicks_one_reconcile_coalesced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

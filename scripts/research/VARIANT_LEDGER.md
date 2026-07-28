@@ -43,7 +43,8 @@ Status codes:
 | 50/30/20 partial scale-out (T1=1R, T2=2R, T3=3R) | 2026-05-18 | ACTIVE | engine_change `split_50_30_20`, `t1_anchored_1r_t2_anchored_2r` | live every session |
 | 85/10/5 partial split (runner protector v1) | 2026-05-18 | SUPERSEDED | replaced same day by 50/30/20 after MFE analysis showed 80% reach 2R | commit `8bbdfdf` |
 | Original hard T1/T2/T3 (no partials) | pre-2026-05-18 | SUPERSEDED | replaced by 85/10/5 then 50/30/20 | commit `218ea7f` (Options A+C picker) |
-| BE-ladder step-stop [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)] | 2026-05-18 | ACTIVE | engine_change `be_ladder_step_stop` (SPX-units) | live every session |
+| BE-ladder step-stop [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)] | 2026-05-18 | SUPERSEDED 2026-07-28 | replaced by the rung-sweep winner (181-cell prereg, +$22.95/ct OOS t=+3.36) | rung_sweep_report.md |
+| BE-ladder step-stop [(0.6, 0.0), (1.2, 0.5), (1.8, 0.5)] | 2026-07-28 | ACTIVE | engine_change `be_ladder_rung_sweep_2026_07_28`; env FEF_BE_LADDER_STEPS; NOTE: be_ladder_shadow aggregates must date-split at 2026-07-29 (label unchanged across cutover) | rung_sweep_LOCK.md |
 | 1.5R T1 anchor (replaced by 1.0R) | 2026-05-18 | SUPERSEDED | shipped in `88cb408` then reverted same day to 1R in `b6fc72b` | commit `88cb408` |
 | Auto-trade market entry | 2026-05-18 | ACTIVE | engine_change `auto_trade_market_entry` | live every session |
 | SPX target watcher 0.5s interval | 2026-05-18 | ACTIVE | engine_change `spx_watcher_interval_0p5s` | live |

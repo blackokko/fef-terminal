@@ -158,11 +158,18 @@ async def test_wait_signal_records_unsigned_mfe() -> None:
 
 
 def test_be_step_proxy_mfe_mapping() -> None:
+    """Bands derive from the LIVE rung table (2026-07-28 schedule: arms
+    0.6/1.2/1.8) — pins the post-flip inputs parents actually record, the
+    exact stale-pin failure the round-1 review caught."""
     assert _be_step_to_option_mfe(0) == 0.0
+    assert _be_step_to_option_mfe(0.6) == 0.30   # rung 1 (live records 0.6)
+    assert _be_step_to_option_mfe(1.2) == 0.60   # rung 2
+    assert _be_step_to_option_mfe(1.8) == 1.00   # rung 3
+    assert _be_step_to_option_mfe(2.5) == 1.50   # beyond the ladder
+    # Legacy parents (pre-flip DB rows) still band sanely:
     assert _be_step_to_option_mfe(0.5) == 0.30
     assert _be_step_to_option_mfe(1.0) == 0.60
     assert _be_step_to_option_mfe(1.5) == 1.00
-    assert _be_step_to_option_mfe(2.0) == 1.50
 
 
 def test_counterfactual_clean_stop_returns_unchanged() -> None:

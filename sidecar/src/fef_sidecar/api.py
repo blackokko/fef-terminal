@@ -2717,11 +2717,16 @@ async def backtest_full_pipeline(
         }
 
 
-# BE ladder rungs — shared with spx_target_watcher / daily_review. Each
-# tuple is (MFE trigger R, LOCKED stop R). When MFE reaches the trigger the
-# stop RATCHETS up to the locked level. A stop that fires after ratcheting
-# therefore banks the LOCKED R (0.0/0.5/1.0), NOT the trigger (0.5/1.0/1.5).
-_BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+# BE ladder rungs — IMPORTED from spx_target_watcher since 2026-07-28 so
+# every replay/analysis path runs the SAME schedule as the live ladder
+# (the adopted rung-sweep winner + any env override) by construction.
+# Each tuple is (MFE trigger R, LOCKED stop R). When MFE reaches the
+# trigger the stop RATCHETS to the locked level; a stop that fires after
+# ratcheting banks the LOCKED R, not the trigger. NOTE for historical
+# replays: sessions before 2026-07-29 traded the old 0.5:0/1.0:0.5/1.5:1.0
+# schedule — replaying them through today's rungs is a what-if, not a
+# reconstruction (set FEF_BE_LADDER_STEPS to the old string to reconstruct).
+from fef_sidecar.engine.spx_target_watcher import _BE_LADDER_STEPS as _BE_LADDER
 # 50/30/20 scale-out shares — same split daily_review + the auto-trader use.
 _T1_SHARE, _T2_SHARE, _T3_SHARE = 0.5, 0.3, 0.2
 
@@ -2756,8 +2761,8 @@ def _walk_be_ladder_exit(*, entry_spx, t1, t2, t3, stop, is_long,
     r_t3 = abs(t3 - entry_spx) / risk_r
 
     dyn_stop = stop
-    be_step = 0.0      # highest ladder TRIGGER reached (0.5/1.0/1.5)
-    be_lock_R = 0.0    # LOCKED stop level in R (0.0/0.5/1.0)
+    be_step = 0.0      # highest ladder TRIGGER reached (schedule-defined; 0.6/1.2/1.8 since 2026-07-28)
+    be_lock_R = 0.0    # LOCKED stop level in R (0/0.5/0.5 on the adopted schedule)
     t1_fired = t2_fired = t3_fired = False
     stop_hit_flag = False
     dyn_stop_at_hit = None
