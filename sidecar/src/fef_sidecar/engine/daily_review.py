@@ -31,10 +31,10 @@ def _trace_outcome(start_ms: int, spx_entry: float, t1: float, t2: float,
                    bars: list, window_min: int = 60) -> dict:
     """Walk forward 1-min bars and trace where SPX touched targets/stops.
 
-    Tracks DYNAMIC STOP modeling the CURRENT engine's BE ladder:
-      - At +0.5R MFE: stop moves to entry SPX (locked 0R)
-      - At +1.0R MFE: stop moves to entry + 0.5R (locked +0.5R)
-      - At +1.5R MFE: stop moves to entry + 1.0R (locked +1.0R)
+    Tracks DYNAMIC STOP modeling the CURRENT engine's BE ladder (the
+    shared spx_target_watcher._BE_LADDER_STEPS table — 2026-07-28 adopted
+    schedule: +0.6R MFE -> stop to entry; +1.2R -> entry +0.5R; the 1.8R
+    entry is stop-inert since its lock equals the second rung's).
     Stop hits register against the CURRENT dynamic stop, not the original.
 
     `out["dyn_stop_at_hit"]` is the dynamic-stop level when stop fired.
@@ -45,7 +45,8 @@ def _trace_outcome(start_ms: int, spx_entry: float, t1: float, t2: float,
     out = {"t1": None, "t2": None, "t3": None, "stop": None, "mfe": 0.0,
            "dyn_stop_at_hit": None}
     risk = abs(spx_entry - stop) or 1.0
-    BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+    from fef_sidecar.engine.spx_target_watcher import _BE_LADDER_STEPS
+    BE_LADDER = _BE_LADDER_STEPS  # shared live schedule (2026-07-28 adoption)
     dyn_stop = stop
     mfe_r_max = 0.0
 

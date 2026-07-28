@@ -23,11 +23,13 @@ add to realized PnL, independent of any signal-strength change.
 Approximation method: we don't have continuous option-price paths
 persisted, so we use BE step reached as a proxy for option MFE:
 
-    BE step 0.0R     → option never went positive
-    BE step 0.5R     → option likely peaked ~+30% (conservative)
-    BE step 1.0R     → option likely peaked ~+60%
-    BE step 1.5R     → option likely peaked ~+100%
-    BE step ≥2.0R    → option likely peaked ~+150%
+    BE step 0.0R          → option never went positive
+    BE step at rung 1     → option likely peaked ~+30% (conservative)
+    BE step at rung 2     → option likely peaked ~+60%
+    BE step at rung 3     → option likely peaked ~+100%
+    BE step beyond ladder → option likely peaked ~+150%
+    (rung triggers come from the shared live table — 0.6/1.2/1.8 since
+    2026-07-28; legacy rows recorded 0.5/1.0/1.5 and band the same way)
 
 The relationship between SPX-points-R and option-price-percent depends
 on delta, gamma, theta, vol — which we DO capture in
@@ -153,15 +155,22 @@ def _apply_friction(
 
 
 def _be_step_to_option_mfe(be_step: float | None) -> float:
-    """Map BE step reached (SPX R-multiple) to estimated option-price MFE."""
+    """Map BE step reached (SPX R-multiple) to estimated option-price MFE.
+
+    BANDS DERIVED FROM THE LIVE RUNG TABLE (2026-07-28 review MAJOR-1): the
+    old hardcoded 0.5/1.0/1.5 edges silently mis-banded parents recorded
+    under the adopted 0.6/1.2/1.8 schedule one band too high (2x MFE
+    overstatement in the counterfactual panel from the first post-flip
+    trade). Rung 1/2/3 calibrate to ~+30%/+60%/+100% option MFE; beyond
+    the last rung ~+150%. Deriving from the shared table means a future
+    schedule change cannot re-break this mapping."""
     if be_step is None or be_step <= 0:
         return 0.0
-    if be_step <= 0.5:
-        return 0.30
-    if be_step <= 1.0:
-        return 0.60
-    if be_step <= 1.5:
-        return 1.00
+    from fef_sidecar.engine.spx_target_watcher import _BE_LADDER_STEPS
+    mfe_by_rung = (0.30, 0.60, 1.00)
+    for (trig_R, _lock), mfe in zip(_BE_LADDER_STEPS, mfe_by_rung):
+        if be_step <= trig_R:
+            return mfe
     return 1.50
 
 
@@ -760,8 +769,9 @@ def _walk_outcome_current_be(direction: str, entry_spx: float,
     """Simulate trade outcome under the CURRENT (broken) BE ladder.
 
     Models: at +0.5R MFE, the SPX stop moves to entry. At +1.0R MFE,
-    stop moves to entry + 0.5R. Tier hits at T1/T2/T3 fire partial
-    exits (1/3 each). Stop hit closes remaining.
+    stop ratchets per the shared live rung table (0.6R->entry,
+    1.2R->entry+0.5R on the 2026-07-28 schedule). Tier hits at T1/T2/T3
+    fire partial exits (1/3 each). Stop hit closes remaining.
 
     Returns (tiers_hit, r_multiple).
     """
@@ -771,7 +781,8 @@ def _walk_outcome_current_be(direction: str, entry_spx: float,
 
     # BE ladder thresholds: at this MFE in R, move dyn stop to this point in R.
     # Matches engine.spx_target_watcher's actual ladder.
-    BE_LADDER = [(0.5, 0.0), (1.0, 0.5), (1.5, 1.0)]
+    from fef_sidecar.engine.spx_target_watcher import _BE_LADDER_STEPS
+    BE_LADDER = _BE_LADDER_STEPS  # shared live schedule (2026-07-28 adoption)
     tiers_hit: list[str] = []
     dyn_stop = stop
     mfe_r_max = 0.0  # signed: positive = favorable
@@ -1051,9 +1062,10 @@ async def simulate_cooldown_interval(
         "note": (
             "Per-symbol cooldown filter applied to actual today's signals; "
             "outcomes computed per-DEDUP-setup (unified util, 5-min window). "
-            "Two exit strategies simulated: current BE ladder (models +0.5R "
-            "MFE → stop-to-entry) and B+C+D (option-T1 at ~0.5R MFE + "
-            "trailing peak 15%). Use total_R to compare."
+            "Two exit strategies simulated: current BE ladder (first rung "
+            "arms at +0.6R MFE → stop-to-entry; 2026-07-28 schedule) and "
+            "B+C+D (option-T1 at ~0.5R MFE + trailing peak 15%). Use "
+            "total_R to compare."
         ),
     }
 

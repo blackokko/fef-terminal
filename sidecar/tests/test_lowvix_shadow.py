@@ -592,8 +592,8 @@ async def test_lo_day_two_shadows_exact_m06_arithmetic_and_two_rows(
     fixed_dollar_shadow AND the lowvix_shrink_shadow; the lo-VIX levels are
     the hand-built m=0.6 plan (7449/7455/7470/7434 from 7455/7465/7490/7430
     anchored at 7440); the walk banks T1 at 7449 (BE-ladder ratchets to
-    +1.0R = 7446), trails out at 7446, and finalize writes TWO
-    ShadowExitOutcome rows for ONE parent."""
+    +0.5R = 7443 on the 2026-07-28 schedule), trails out at 7443, and
+    finalize writes TWO ShadowExitOutcome rows for ONE parent."""
     _patch_lo_vix(monkeypatch, True)
     state = _const_quote_state(6.0)
     p = _spx_parent()
@@ -620,15 +620,15 @@ async def test_lo_day_two_shadows_exact_m06_arithmetic_and_two_rows(
     await _shadow_be_ladder_cycle(state, [p], 7449.0)       # scaled T1 touch
     await _settle_tasks()
     assert lsh["tier_fired"] == [True, False, False]
-    # risk = |7440-7434| = 6; MFE 9/6 = 1.5R -> ratchet locks +1.0R = 7446.
-    assert lsh["be_step"] == pytest.approx(1.5)
-    assert lsh["dyn_stop"] == pytest.approx(7446.0)
+    # risk = |7440-7434| = 6; MFE 9/6 = 1.5R -> 1.2R rung locks +0.5R = 7443.
+    assert lsh["be_step"] == pytest.approx(1.2)
+    assert lsh["dyn_stop"] == pytest.approx(7443.0)
 
-    await _shadow_be_ladder_cycle(state, [p], 7446.0)       # trail stop
+    await _shadow_be_ladder_cycle(state, [p], 7443.0)       # trail stop
     await _settle_tasks()
     assert lsh["done"] and lsh["exit_reason"] == "trail"
 
-    await _shadow_be_ladder_cycle(state, [], 7446.0)        # real close
+    await _shadow_be_ladder_cycle(state, [], 7443.0)        # real close
     await _settle_tasks()
     assert state.shadow_be_ladder == {} and state.shadow_lowvix == {}
 
@@ -639,8 +639,8 @@ async def test_lo_day_two_shadows_exact_m06_arithmetic_and_two_rows(
         "fixed_dollar_shadow", "lowvix_shrink_shadow",
     }
     lv = next(r for r in rows if r.variant_label == "lowvix_shrink_shadow")
-    # R math: T1 slice 1.5R (1/3) + trail residual 1.0R (2/3) = 1.1667.
-    assert lv.realized_r == pytest.approx(1.0 / 3 * 1.5 + 2.0 / 3 * 1.0, abs=1e-4)
+    # R math: T1 slice 1.5R (1/3) + trail residual 0.5R (2/3) = 0.8333.
+    assert lv.realized_r == pytest.approx(1.0 / 3 * 1.5 + 2.0 / 3 * 0.5, abs=1e-4)
     assert lv.peak_r == pytest.approx(1.5, abs=1e-6)
     assert lv.exit_reason == "trail"
     assert lv.status == "ok"

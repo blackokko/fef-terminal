@@ -396,7 +396,7 @@ export function CounterfactualPanel() {
               </tbody>
             </table>
             <div className="muted small" style={{ marginTop: 4, fontStyle: "italic" }}>
-              Per dedup setup. BE = current ladder (+0.5R → stop-to-entry).
+              Per dedup setup. BE = current ladder (+0.6R → stop-to-entry; 2026-07-28 schedule).
               B+C+D = option-T1 + trail 15% from peak.
             </div>
           </>

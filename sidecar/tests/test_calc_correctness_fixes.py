@@ -59,7 +59,7 @@ class _Sig:
 # Fix 3 + 4 — BE-stop scoring (THE critical one): LOCKED R, not the trigger
 # ===========================================================================
 def test_be_stop_breakeven_scratch_scores_locked_zero_not_trigger():
-    """A trade that pokes to +0.5R (arming the first ladder rung, which LOCKS
+    """A trade that pokes to +0.6R (arming the first ladder rung, which LOCKS
     the stop at breakeven = 0.0R) then reverses through it must score 0.0R —
     NOT the +0.5R ladder TRIGGER. This is the leak that turned breakeven
     scratches into phantom wins and flipped tournament boards."""
@@ -67,9 +67,9 @@ def test_be_stop_breakeven_scratch_scores_locked_zero_not_trigger():
 
     # entry 7400, stop 7390 (risk 10 → 1R = 10pt). Targets far so no tier hits.
     path = [
-        # (ts, open, high, low, close): high 7405 = +0.5R arms rung → lock 0.0R,
+        # (ts, open, high, low, close): high 7406 = +0.6R arms rung → lock 0.0R,
         # stop ratchets to 7400. low 7402 stays above it (no stop yet).
-        (1, 7404, 7405, 7402, 7404),
+        (1, 7404, 7406, 7402, 7404),
         # reverse: low 7399 <= locked stop 7400 → BE stop fires at breakeven.
         (2, 7401, 7401, 7399, 7400),
     ]
@@ -77,26 +77,26 @@ def test_be_stop_breakeven_scratch_scores_locked_zero_not_trigger():
         entry_spx=7400, t1=7430, t2=7440, t3=7450, stop=7390,
         is_long=True, path_items=path, apply_be_ladder=True,
     )
-    assert out["be_step"] == 0.5           # trigger reached
+    assert out["be_step"] == 0.6           # trigger reached
     assert out["be_lock_R"] == 0.0         # but the LOCK is breakeven
     assert out["outcome"] == "BE_STOP_0.0R"
     assert out["realized_R"] == pytest.approx(0.0)   # NOT +0.5 (the old bug)
 
 
 def test_be_stop_locks_half_r_not_one_r_trigger():
-    """Poke to +1.0R (arms the 2nd rung → LOCKS +0.5R) then reverse into the
-    locked stop. Must score +0.5R (locked), not +1.0R (the trigger)."""
+    """Poke to +1.2R (arms the 2nd rung → LOCKS +0.5R) then reverse into the
+    locked stop. Must score +0.5R (locked), not +1.2R (the trigger)."""
     from fef_sidecar.api import _walk_be_ladder_exit
 
     path = [
-        (1, 7408, 7410, 7407, 7408),   # +1.0R via high 7410 → lock 0.5R, stop→7405
+        (1, 7408, 7412, 7407, 7408),   # +1.2R via high 7412 → lock 0.5R, stop→7405
         (2, 7404, 7404, 7404, 7404),   # low 7404 <= 7405 → BE stop at +0.5R
     ]
     out = _walk_be_ladder_exit(
         entry_spx=7400, t1=7430, t2=7440, t3=7450, stop=7390,
         is_long=True, path_items=path, apply_be_ladder=True,
     )
-    assert out["be_step"] == 1.0
+    assert out["be_step"] == 1.2
     assert out["be_lock_R"] == 0.5
     assert out["outcome"] == "BE_STOP_0.5R"
     assert out["realized_R"] == pytest.approx(0.5)   # locked, not the 1.0 trigger
@@ -120,7 +120,7 @@ def test_partials_banked_before_stop_produce_positive_r():
     from fef_sidecar.api import _walk_be_ladder_exit
 
     path = [
-        (1, 7409, 7410, 7406, 7409),   # high 7410 = T1 (+1R) AND arms lock 0.5R
+        (1, 7409, 7412, 7406, 7409),   # high 7412 = T1 (+1R) AND arms 1.2R rung (lock 0.5R)
         (2, 7404, 7404, 7404, 7404),   # residual stops at 7405 (=+0.5R)
     ]
     out = _walk_be_ladder_exit(
@@ -138,7 +138,8 @@ def test_full_t3_uses_actual_per_tier_r_not_hardcoded_295():
     from fef_sidecar.api import _walk_be_ladder_exit
 
     # targets at +1R/+2R/+3R → 0.5*1 + 0.3*2 + 0.2*3 = 1.7. low stays above the
-    # ratcheted stop (7410) so the marched-up bar takes all three tiers.
+    # ratcheted stop (7405 on the 2026-07-28 schedule) so the marched-up bar
+    # takes all three tiers.
     path = [(1, 7400, 7431, 7411, 7430)]
     out = _walk_be_ladder_exit(
         entry_spx=7400, t1=7410, t2=7420, t3=7430, stop=7390,
@@ -163,7 +164,7 @@ def test_puts_be_stop_locked_r_symmetric():
 
     # entry 7400, stop 7410 (risk 10). Favorable = DOWN.
     path = [
-        (1, 7396, 7398, 7395, 7396),   # low 7395 = +0.5R → lock breakeven, stop→7400
+        (1, 7396, 7398, 7394, 7396),   # low 7394 = +0.6R → lock breakeven, stop→7400
         (2, 7399, 7401, 7399, 7400),   # high 7401 >= 7400 → BE stop at breakeven
     ]
     out = _walk_be_ladder_exit(
@@ -190,7 +191,7 @@ def test_backtest_compute_integration_breakeven_not_phantom_win():
                 "option_pricing": {"entry_limit": 5.0}},
     )
     bars = [
-        _Bar(entry_ms + 60_000, 7404, 7405, 7402, 7404),   # +0.5R → lock breakeven
+        _Bar(entry_ms + 60_000, 7404, 7406, 7402, 7404),   # +0.6R → lock breakeven
         _Bar(entry_ms + 120_000, 7401, 7401, 7399, 7400),  # reverse into BE stop
     ]
     res = _backtest_compute(
@@ -401,8 +402,8 @@ def test_outcome_r_banks_partials_before_stop():
 
     start_ms = 1_000_000
     bars = [
-        # T1 (7410) fires; MFE 7411 arms the ladder lock at +0.5R (stop→7405).
-        _Bar(start_ms + 60_000, 7405, 7411, 7406, 7409),
+        # T1 (7410) fires; MFE 7412 arms the 1.2R rung (lock +0.5R, stop→7405).
+        _Bar(start_ms + 60_000, 7405, 7412, 7406, 7409),
         # residual stops at the locked 7405 (=+0.5R), not the raw -1R stop.
         _Bar(start_ms + 120_000, 7402, 7402, 7389, 7395),
     ]
