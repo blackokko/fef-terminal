@@ -778,8 +778,10 @@ class LiveIBKRProvider:
         updates and 'AllLast' for every trade print. Trade aggressor is
         classified via Lee-Ready (1991) based on the latest known BBO.
 
-        Note: SPX is an INDEX — it has no trade tape. For microstructure on
-        an SPX-related instrument, use SPY (the ETF proxy).
+        Note: SPX is an INDEX — it has no trade tape. The microstructure
+        loop maps SPX (and SPY) to ES futures via its MICRO_PROXY table
+        (futures lead cash; consolidated CME book) — see loop.py. This
+        docstring previously said "use SPY"; stale since the proxy map.
         """
         import time as _time
 

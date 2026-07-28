@@ -96,6 +96,18 @@ def classify_trade(price: float, bid: float | None, ask: float | None) -> Litera
 
 
 def push_quote(state: MicrostructureState, q: QuoteUpdate) -> None:
+    """Append a quote to the rolling window.
+
+    ZERO/NEGATIVE-SIDED QUOTES REJECTED (2026-07-28 hygiene fix): IBKR
+    BidAsk ticks occasionally carry a 0 bid or ask (one-sided prints).
+    Before this guard they flowed straight into compute_ofi — a 0 bid reads
+    as "bid collapsed below prior" (spurious -prev.bid_size bearish spike)
+    and the next real quote reads as a bullish jump — and into
+    compute_microprice off a 0 price. Capture rows before 2026-07-28 carry
+    this contamination (incidence quantified in exec_env_report.md);
+    rejecting at this choke point protects every feeder (live + mock)."""
+    if q.bid <= 0 or q.ask <= 0 or q.bid_size < 0 or q.ask_size < 0:
+        return
     state.quotes.append(q)
     state.last_quote = q
     _evict_old(state, q.timestamp_ms)
@@ -131,14 +143,23 @@ def compute_ofi(state: MicrostructureState) -> float:
         if prev is None:
             prev = q
             continue
-        # Bid side contribution
+        # Bid side contribution (canonical CKS eq. ΔW: bid up = buyers
+        # pressing = +new size; bid down = buyers retreating = -prior size).
         if q.bid > prev.bid:
             ofi += q.bid_size
         elif q.bid < prev.bid:
             ofi -= prev.bid_size
         else:
             ofi += (q.bid_size - prev.bid_size)
-        # Ask side contribution (note: sign flipped — ask up = bearish)
+        # Ask side contribution (canonical CKS -ΔV): an ask RETREATING UP is
+        # BULLISH (+prior size — sellers pulling away); an ask PRESSING DOWN
+        # is BEARISH (-new size); more size parked at an unchanged ask is
+        # bearish. NOTE (2026-07-28 adjudication): the previous comment here
+        # read "ask up = bearish" — the COMMENT was backwards, the code has
+        # always matched Cont/Kukanov/Stoikov (2014); verified branch-by-
+        # branch against the paper, pinned by test_microstructure_formulas.
+        # This comment error is the likely origin of the 2026-05-21 audit's
+        # "OFI sign bug" flag.
         if q.ask > prev.ask:
             ofi += prev.ask_size
         elif q.ask < prev.ask:
