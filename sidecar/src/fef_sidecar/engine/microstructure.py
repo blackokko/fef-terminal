@@ -11,8 +11,12 @@ Based on established academic + practitioner-validated concepts:
     below-bid = aggressive sell. Aggregated as a percentage over a
     rolling window.
 
-  - Microprice: Stoikov (2018). Volume-weighted midpoint, better than
-    naive (bid+ask)/2 at predicting where price actually settles next.
+  - Microprice: the IMBALANCE-WEIGHTED MID — mp = (bid*ask_size +
+    ask*bid_size)/(bid_size+ask_size) — better than naive (bid+ask)/2 at
+    predicting where price settles next. ATTRIBUTION NOTE (2026-07-28
+    adjudication): this is NOT Stoikov (2018)'s "micro-price", which is a
+    distinct Markov-chain estimator his paper contrasts AGAINST this
+    weighted mid; citing him here invited a false "formula broken" flag.
     The deviation of last-trade from microprice is a directional pressure
     signal.
 
@@ -96,6 +100,21 @@ def classify_trade(price: float, bid: float | None, ask: float | None) -> Litera
 
 
 def push_quote(state: MicrostructureState, q: QuoteUpdate) -> None:
+    """Append a quote to the rolling window.
+
+    ZERO/NEGATIVE-SIDED QUOTES REJECTED (2026-07-28 hygiene fix): IBKR
+    BidAsk ticks occasionally carry a 0 bid or ask (one-sided prints).
+    Before this guard they flowed straight into compute_ofi — a 0 bid reads
+    as "bid collapsed below prior" (spurious -prev.bid_size bearish spike)
+    and the next real quote reads as a bullish jump — and into
+    compute_microprice off a 0 price. Capture rows before 2026-07-28 carry
+    this contamination (incidence quantified in the 2026-07-28 exec-env
+    profile, research scratchpad Q4 — not a repo doc);
+    rejecting at this choke point protects every feeder (live + mock;
+    the standalone capture script's micro_push had the same hole).
+    Positive-form predicate so NaN also fails (review NIT-2)."""
+    if not (q.bid > 0 and q.ask > 0 and q.bid_size >= 0 and q.ask_size >= 0):
+        return
     state.quotes.append(q)
     state.last_quote = q
     _evict_old(state, q.timestamp_ms)
@@ -115,13 +134,17 @@ def _evict_old(state: MicrostructureState, now_ms: int) -> None:
 
 
 def compute_ofi(state: MicrostructureState) -> float:
-    """OFI per Cont/Kukanov/Stoikov:
+    """OFI per Cont/Kukanov/Stoikov (2014), exact rule per transition:
 
-      for each pair of consecutive quotes:
-        if bid increased OR bid_size increased at same bid: +bid_size_change
-        if bid decreased OR bid_size decreased at same bid: -bid_size_change
-        same logic flipped for ask
-      sum over window = OFI
+      bid up:   +NEW bid size        (buyers pressing)
+      bid down: -PRIOR bid size      (buyers retreating)
+      bid flat: +(new - prior) bid size
+      ask up:   +PRIOR ask size      (sellers retreating = BULLISH)
+      ask down: -NEW ask size        (sellers pressing = bearish)
+      ask flat: -(new - prior) ask size
+      OFI = sum over the window. (Precise restatement 2026-07-28 — the old
+      paraphrase here was loose enough to mis-read; see the adjudication
+      note at the ask branch below.)
     """
     if len(state.quotes) < 2:
         return 0.0
@@ -131,14 +154,23 @@ def compute_ofi(state: MicrostructureState) -> float:
         if prev is None:
             prev = q
             continue
-        # Bid side contribution
+        # Bid side contribution (canonical CKS eq. ΔW: bid up = buyers
+        # pressing = +new size; bid down = buyers retreating = -prior size).
         if q.bid > prev.bid:
             ofi += q.bid_size
         elif q.bid < prev.bid:
             ofi -= prev.bid_size
         else:
             ofi += (q.bid_size - prev.bid_size)
-        # Ask side contribution (note: sign flipped — ask up = bearish)
+        # Ask side contribution (canonical CKS -ΔV): an ask RETREATING UP is
+        # BULLISH (+prior size — sellers pulling away); an ask PRESSING DOWN
+        # is BEARISH (-new size); more size parked at an unchanged ask is
+        # bearish. NOTE (2026-07-28 adjudication): the previous comment here
+        # read "ask up = bearish" — the COMMENT was backwards, the code has
+        # always matched Cont/Kukanov/Stoikov (2014); verified branch-by-
+        # branch against the paper, pinned by test_microstructure_formulas.
+        # This comment error is the likely origin of the 2026-05-21 audit's
+        # "OFI sign bug" flag.
         if q.ask > prev.ask:
             ofi += prev.ask_size
         elif q.ask < prev.ask:
@@ -172,8 +204,8 @@ def compute_microprice(quote: QuoteUpdate | None) -> float | None:
       mp = (bid * ask_size + ask * bid_size) / (bid_size + ask_size)
 
     Note the cross-weighting — the more size sits at one side, the more
-    the microprice pulls toward the OTHER side (because the heavy side
-    is the resistance).
+    the microprice pulls toward the OTHER side (the heavy side pins
+    price on its own side of the book; the thin side yields first).
     """
     if quote is None:
         return None

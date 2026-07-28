@@ -2388,9 +2388,12 @@ async def microstructure_loop(state: AppState) -> None:
     FEF_MICRO_INTERVAL_SEC (default 0.5s).
 
     Live mode (LiveIBKRProvider): subscribes to reqTickByTickData on the
-    active symbol's underlying (uses SPY when active_symbol == SPX since
-    SPX is an index without a trade tape). Real bid/ask/trade events
-    feed the OFI/AVI/microprice calculations.
+    MICRO_PROXY of the active symbol (SPX/SPY -> ES futures, QQQ -> NQ,
+    IWM -> RTY — futures lead cash; SPX itself is an index with no tape;
+    see the proxy table below). Real bid/ask/trade events feed the
+    OFI/AVI/microprice calculations. (Docstring corrected 2026-07-28 —
+    it previously said "uses SPY", contradicting the proxy map fifty
+    lines down; the exact stale-doc class the adjudication fixed.)
 
     Mock mode: synthesizes plausible quote + trade events around the
     current price anchor so the UI populates without a live feed.
