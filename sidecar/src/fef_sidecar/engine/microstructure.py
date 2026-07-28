@@ -11,8 +11,12 @@ Based on established academic + practitioner-validated concepts:
     below-bid = aggressive sell. Aggregated as a percentage over a
     rolling window.
 
-  - Microprice: Stoikov (2018). Volume-weighted midpoint, better than
-    naive (bid+ask)/2 at predicting where price actually settles next.
+  - Microprice: the IMBALANCE-WEIGHTED MID — mp = (bid*ask_size +
+    ask*bid_size)/(bid_size+ask_size) — better than naive (bid+ask)/2 at
+    predicting where price settles next. ATTRIBUTION NOTE (2026-07-28
+    adjudication): this is NOT Stoikov (2018)'s "micro-price", which is a
+    distinct Markov-chain estimator his paper contrasts AGAINST this
+    weighted mid; citing him here invited a false "formula broken" flag.
     The deviation of last-trade from microprice is a directional pressure
     signal.
 
@@ -104,9 +108,12 @@ def push_quote(state: MicrostructureState, q: QuoteUpdate) -> None:
     as "bid collapsed below prior" (spurious -prev.bid_size bearish spike)
     and the next real quote reads as a bullish jump — and into
     compute_microprice off a 0 price. Capture rows before 2026-07-28 carry
-    this contamination (incidence quantified in exec_env_report.md);
-    rejecting at this choke point protects every feeder (live + mock)."""
-    if q.bid <= 0 or q.ask <= 0 or q.bid_size < 0 or q.ask_size < 0:
+    this contamination (incidence quantified in the 2026-07-28 exec-env
+    profile, research scratchpad Q4 — not a repo doc);
+    rejecting at this choke point protects every feeder (live + mock;
+    the standalone capture script's micro_push had the same hole).
+    Positive-form predicate so NaN also fails (review NIT-2)."""
+    if not (q.bid > 0 and q.ask > 0 and q.bid_size >= 0 and q.ask_size >= 0):
         return
     state.quotes.append(q)
     state.last_quote = q
@@ -127,13 +134,17 @@ def _evict_old(state: MicrostructureState, now_ms: int) -> None:
 
 
 def compute_ofi(state: MicrostructureState) -> float:
-    """OFI per Cont/Kukanov/Stoikov:
+    """OFI per Cont/Kukanov/Stoikov (2014), exact rule per transition:
 
-      for each pair of consecutive quotes:
-        if bid increased OR bid_size increased at same bid: +bid_size_change
-        if bid decreased OR bid_size decreased at same bid: -bid_size_change
-        same logic flipped for ask
-      sum over window = OFI
+      bid up:   +NEW bid size        (buyers pressing)
+      bid down: -PRIOR bid size      (buyers retreating)
+      bid flat: +(new - prior) bid size
+      ask up:   +PRIOR ask size      (sellers retreating = BULLISH)
+      ask down: -NEW ask size        (sellers pressing = bearish)
+      ask flat: -(new - prior) ask size
+      OFI = sum over the window. (Precise restatement 2026-07-28 — the old
+      paraphrase here was loose enough to mis-read; see the adjudication
+      note at the ask branch below.)
     """
     if len(state.quotes) < 2:
         return 0.0
@@ -193,8 +204,8 @@ def compute_microprice(quote: QuoteUpdate | None) -> float | None:
       mp = (bid * ask_size + ask * bid_size) / (bid_size + ask_size)
 
     Note the cross-weighting — the more size sits at one side, the more
-    the microprice pulls toward the OTHER side (because the heavy side
-    is the resistance).
+    the microprice pulls toward the OTHER side (the heavy side pins
+    price on its own side of the book; the thin side yields first).
     """
     if quote is None:
         return None
