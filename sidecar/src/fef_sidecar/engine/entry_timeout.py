@@ -107,6 +107,121 @@ def _ib_status(trade) -> str:
         return ""
 
 
+def _broker_messages(trade) -> list[dict]:
+    """Broker-side reasons attached to THIS order, newest last.
+
+    WHY (2026-07-29): the bot lost two HIGH fires on the FOMC session with no
+    recoverable reason — both went MKT, both sat, both hit the 45s timeout, and
+    every diagnostic we owned said only "unfilled". The reason WAS present the
+    whole time: ib_async's wrapper.error() appends a TradeLogEntry(time, status,
+    message, errorCode) to `trade.log` for any order-scoped error or warning,
+    and a TWS API precaution (e.g. the price-based volatility risk warning)
+    arrives as a WARNING that also flips orderStatus.status to
+    'ValidationError'. Because 'ValidationError' is in ib_async's ActiveStates,
+    trade.isActive() stays True and the order looks merely unfilled — so
+    reading only status/filled discards the diagnosis.
+
+    We deliberately do NOT register a global ib.errorEvent handler: ib_async has
+    already done that bookkeeping per-Trade, so reading trade.log needs no
+    handler lifecycle, cannot leak a callback, and cannot race the reqId->order
+    mapping. Purely additive and read-only — this function never mutates the
+    trade, never cancels, and never raises (an unparseable log yields []).
+    """
+    try:
+        entries = list(getattr(trade, "log", None) or ())
+    except Exception:
+        logger.exception("entry timeout: broker-message read failed")
+        return []
+    out: list[dict] = []
+    for e in entries:
+        # PER-ENTRY guard (review MINOR-1): one unparseable entry must not
+        # discard the messages already collected — the old loop-level try
+        # returned [] and the caller then asserted "no broker message".
+        try:
+            code = int(getattr(e, "errorCode", 0) or 0)
+            if code == 0:
+                # Ordinary status transitions; also drops Fill/Modify entries,
+                # which carry text but no error code (review MINOR-5).
+                continue
+            out.append({
+                "errorCode": code,
+                "status": str(getattr(e, "status", "") or ""),
+                "message": str(getattr(e, "message", "") or "")[:300],
+            })
+        except Exception:
+            continue
+    # Bound the MESSAGES, not the raw entries (review MAJOR-2a): slicing the
+    # raw log first meant ~25 trailing status transitions could push the only
+    # real reason out of the window. CONFIRMED by execution in review.
+    return out[-20:]
+
+
+# Codes that are OUR OWN doing and therefore carry no diagnosis. 202 is TWS's
+# ack of the cancel THIS module just requested; because the cancel-confirm loop
+# spins until the status is terminal and the 202 handler is what makes it
+# terminal, a 202 is present on essentially EVERY stand-down and is always the
+# NEWEST entry. Taking msgs[-1] therefore reported our own cancel instead of the
+# reason (review MAJOR-1 — the defect that defeated this feature's purpose).
+_SELF_INFLICTED_CODES = frozenset({202})
+
+
+def _primary_broker_reason(msgs: list[dict]) -> dict | None:
+    """The most DIAGNOSTIC message, not the newest.
+
+    Priority: (1) a ValidationError — that is the shape a TWS API precaution
+    takes, and the case this feature exists for; (2) the newest message that is
+    not self-inflicted; (3) nothing, when the only messages are our own cancel
+    ack (reported as such rather than dressed up as a reason)."""
+    if not msgs:
+        return None
+    for m in msgs:
+        if m.get("status") == "ValidationError":
+            return m
+    for m in reversed(msgs):
+        if m.get("errorCode") not in _SELF_INFLICTED_CODES:
+            return m
+    return None
+
+
+def _broker_reason_tag(msgs: list[dict]) -> str:
+    """One-line ' | broker: ...' suffix for the parent row's notes, so the
+    reason is visible on the order itself and not only in audit details.
+    Empty when the only broker traffic was our own cancel ack — a noisy
+    ' | broker: Cancelled 202' on every stand-down inverts signal-to-noise."""
+    m = _primary_broker_reason(msgs)
+    if m is None:
+        return ""
+    return (f" | broker: {m.get('status') or 'msg'} {m.get('errorCode')}: "
+            f"{str(m.get('message') or '')[:140]}")
+
+
+def _broker_summary_clause(msgs: list[dict]) -> str:
+    """Audit-summary clause for the stand-down. OBSERVATIONAL ONLY.
+
+    The first draft asserted "no broker message -> the order was accepted and
+    simply did not fill". Review MAJOR-2 confirmed that conclusion is reachable
+    AND false: ib_async only attaches errors to a Trade when reqId != -1, so
+    TWS/server connectivity (1100/1101/1102) and market-data-farm (2103/2105/
+    2157) faults never land in trade.log at all — and those are exactly the
+    faults that leave a marketable order sitting. A TWS client-side precaution
+    dialog can also block transmission with no API error whatsoever. So an empty
+    log means WE SAW NOTHING, not THE ORDER WAS FINE."""
+    m = _primary_broker_reason(msgs)
+    if m is not None:
+        return (f" BROKER SAID: {m.get('status') or 'msg'} "
+                f"{m.get('errorCode')}: {str(m.get('message') or '')[:160]}")
+    if msgs:
+        codes = ",".join(str(x.get("errorCode")) for x in msgs)
+        return (f" No diagnostic broker message — the only order-scoped traffic "
+                f"was our own cancel ack (code(s) {codes}); no rejection reason "
+                f"was recorded.")
+    return (" No order-scoped broker message in trade.log. This does NOT prove "
+            "the order was accepted: connectivity (1100/1101/1102) and "
+            "market-data-farm (2103/2105/2157) errors arrive with reqId=-1 and "
+            "never attach to a Trade, and a TWS client-side precaution dialog "
+            "can block transmission with no API error at all.")
+
+
 def _avg_fill_price(trade) -> float | None:
     try:
         avg = float(getattr(trade.orderStatus, "avgFillPrice", 0) or 0)
@@ -341,8 +456,10 @@ async def entry_timeout_monitor(
             # ZERO-FILL STAND-DOWN. ATOMIC guarded write (UPDATE ... WHERE
             # status='SUBMITTED' AND filled_qty=0): if the watcher fill-sync
             # raced us to FILLED/PARTIAL, the guard misses and we fail safe.
+            broker_msgs = _broker_messages(trade)
             tag = (f"entry_timeout: unfilled after {t_out:.0f}s — cancelled, "
-                   f"fire stood down (limit {limit_price})")
+                   f"fire stood down (limit {limit_price})"
+                   f"{_broker_reason_tag(broker_msgs)}")
             if not await _mark_cancelled_if_unfilled(parent_id, tag):
                 row = await _load_parent_row(parent_id)
                 await _audit(
@@ -389,13 +506,19 @@ async def entry_timeout_monitor(
                     f"{signal_iter_id} (scoreable as a withheld fire). If a "
                     f"late fill raced this cancel, reconcile re-adopts the "
                     f"CANCELLED parent with an emergency stop."
+                    + _broker_summary_clause(broker_msgs)
                 ),
                 details={"outcome": "cancelled_stand_down", "qty": qty,
                          "limit_price": limit_price, "budget_released": released,
                          "signal_iter_id": signal_iter_id,
-                         "ib_status": final_status},
+                         "ib_status": final_status,
+                         # The whole point of this row: WHY we got no fill.
+                         "broker_messages": broker_msgs,
+                         "saw_validation_error": any(
+                             m["status"] == "ValidationError" for m in broker_msgs)},
             )
-            return {"outcome": "cancelled_stand_down", "budget_released": released}
+            return {"outcome": "cancelled_stand_down", "budget_released": released,
+                    "broker_messages": broker_msgs}
 
         # Cancel not confirmed inside the wait (status still active/unknown).
         # FAIL SAFE: leave the row SUBMITTED — a late fill is picked up by the

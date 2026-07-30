@@ -43,8 +43,17 @@ class RealisticFillConfig:
     # legs only.
     latency_drag_pct: float = 0.05   # 5% conservative; real could be more
 
-    # IBKR Pro commissions for SPX options. $0.65/leg × 2 legs = $1.30 RT.
-    commission_per_contract_rt: float = 1.30
+    # IBKR commissions for SPX options, MEASURED 2026-07-29 (was 1.30). Same
+    # correction as counterfactual.FrictionModel.commission_per_contract_rt —
+    # see the full derivation, arithmetic and CAVEATS there (paper account;
+    # sample dominated by manual >=100-lot orders; rate is size-invariant at
+    # $1.28028/side so neither biases the value). $0.65 was the FIXED-tier rate;
+    # these fills price at the TIERED all-in rate. 2 x 1.28028 = 2.56056.
+    # NOTE (review MINOR-6): sidecar/scripts/research/backtest/exits.py and
+    # h6_edge_drag.py still use COMMISSION_RT = 1.30, and slippage.py /
+    # db/models.py TournamentRun still default to 0.65/side. Those are OUT OF
+    # SCOPE here and now disagree with this constant — they need their own pass.
+    commission_per_contract_rt: float = 2.56
 
 
 async def replay_session(session_date: str, cfg: RealisticFillConfig | None = None) -> dict:

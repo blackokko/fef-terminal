@@ -1513,10 +1513,11 @@ async def _stock_spot_refresh(state, symbol: str, contract) -> None:
 
 async def _watcher_stock_quote_spot(
     state, symbol: str, *, max_age_ms: int | None = None,
+    wait_for_refresh_sec: float = 0.0,
 ) -> tuple[float | None, str | None]:
-    """(spot, 'ibkr_stock_quote') for a STOCK-kind symbol, NON-BLOCKING
-    (adversarial review Finding 2: the provider's snapshot quote holds an
-    unconditional ~1.5s sleep — awaiting it inline stalled the ENTIRE 0.1s
+    """(spot, 'ibkr_stock_quote') for a STOCK-kind symbol, NON-BLOCKING BY
+    DEFAULT (adversarial review Finding 2: the provider's snapshot quote holds
+    an unconditional ~1.5s sleep — awaiting it inline stalled the ENTIRE 0.1s
     poll loop ~30-40% duty-cycle while a mirror was open). Always serves
     from the TTL cache; a stale/missing entry kicks a DETACHED refresh task
     and this call returns what it has (None on the first cycles — the
@@ -1526,7 +1527,32 @@ async def _watcher_stock_quote_spot(
     (never looser — the effective bound is the min of the two). The mirror's
     fire-time plan anchor passes ~10s here (2026-07-27 fresh-or-skip): a plan
     whose 1R is ~1 SPY point cannot be anchored on a 30s-old quote in a fast
-    tape. Exit evaluation keeps the default 30s bound."""
+    tape. Exit evaluation keeps the default 30s bound.
+
+    wait_for_refresh_sec: bounded wait for a qualifying entry to LAND before
+    serving. DEFAULT 0.0 preserves the non-blocking contract exactly — the
+    0.1s poll loop and every existing caller are unchanged.
+
+    WHY it exists (2026-07-29): the SPY mirror placed 0 orders across 7/28-7/29,
+    and THREE of those six skips were this spot race (the other three: two SPY
+    option-ask starvations, one correct late-session refusal — review MAJOR-1
+    corrected an earlier "0-for-6" overstatement here). Mechanism, measured: the
+    periodic warm sites run at 60s (scanner) / 120s (main loop),
+    but this cache is only refreshed when someone READS it, and the mirror
+    rejects anything older than 10s. So for ~50 of every 60 seconds the entry
+    is already too stale for the mirror, leaving it wholly dependent on the
+    fire-commit warm kick landing inside the placement runway. That runway was
+    sized (~4-10s) against the marketable-limit + chase entry path; the 7/22
+    revert to static MarketOrder deleted it (live 7/29: SPX placed and mirror
+    read the cache in the SAME SECOND -> skip). Two individually-correct
+    changes that broke each other.
+
+    The FIRE path can afford to wait where the poll loop cannot: the mirror
+    runs ONCE per fire and only AFTER the SPX parent is already submitted, so
+    a bounded wait here costs the mirror leg latency and never delays the SPX
+    entry. Waiting (rather than widening the 10s bound) keeps the freshness
+    guarantee the 7/27 incident bought — a 30s-old anchor can still put the
+    stop AT the live market."""
     try:
         from fef_sidecar.ibkr.models import Contract, ContractKind
         contract = Contract.for_symbol(symbol)
@@ -1549,13 +1575,54 @@ async def _watcher_stock_quote_spot(
             task.add_done_callback(tasks.discard)
         except Exception:
             refreshing.discard(symbol)
-    if entry is None:
-        return None, None
-    spot = entry[1]
     serve_bound = _STOCK_SPOT_SERVE_MAX_MS
     if max_age_ms is not None:
         # Tighter-only: a caller can narrow freshness, never widen it.
         serve_bound = min(serve_bound, max(0, int(max_age_ms)))
+
+    # BOUNDED WAIT — opt-in, fire path only (see docstring). Polls the cache
+    # rather than awaiting a task handle, so it works whether THIS call kicked
+    # the refresh or another caller's in-flight one is already running. Exits
+    # the instant a qualifying entry lands; never exceeds the deadline.
+    if wait_for_refresh_sec and wait_for_refresh_sec > 0:
+        # t0 lets us detect that a refresh RESOLVED, whether it succeeded or
+        # failed. _stock_spot_refresh caches failures as (now_ms, None) by
+        # design, so "a newer timestamp than when we started waiting" means the
+        # answer is IN and waiting longer cannot help (review MAJOR-2: without
+        # this the loop burned the whole bound on a NaN/dead feed, and burned it
+        # having kicked NO refresh at all when the stale-but-inside-TTL entry
+        # suppressed the kick — confirmed by execution, plus +19% suite time).
+        t0_ms = int(_time.time() * 1000)
+        deadline = _time.monotonic() + float(wait_for_refresh_sec)
+        while True:
+            e = cache.get(symbol)
+            if e is not None:
+                if e[1] and int(_time.time() * 1000) - e[0] < serve_bound:
+                    break                   # qualifying entry present
+                if e[0] > t0_ms:
+                    break                   # refresh resolved (and failed)
+            # NOTHING IN FLIGHT -> waiting cannot possibly help. This is the
+            # case my own first fix missed and a new test caught: a cached
+            # FAILURE (ts, None) that is younger than the TTL suppresses the
+            # kick above, so there is no refresh to wait for and the loop would
+            # spin the entire bound having made ZERO provider calls. Failures
+            # are cached deliberately (dead feeds retry at TTL cadence, not poll
+            # cadence — see _stock_spot_refresh), so the right move is to give
+            # up NOW, not to hammer the provider. Same early exit covers an
+            # operator raising FEF_WATCHER_STOCK_SPOT_TTL_SEC above the caller's
+            # max_age_ms (review MINOR-5): the wait goes inert rather than
+            # costly.
+            if symbol not in refreshing:
+                break
+            if _time.monotonic() >= deadline:
+                break                       # give up; fall through to serve/None
+            await asyncio.sleep(0.05)
+        entry = cache.get(symbol)
+        now_ms = int(_time.time() * 1000)
+
+    if entry is None:
+        return None, None
+    spot = entry[1]
     if spot and now_ms - entry[0] < serve_bound:
         return float(spot), "ibkr_stock_quote"
     return None, None

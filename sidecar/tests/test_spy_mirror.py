@@ -794,15 +794,36 @@ async def test_spot_stale_cache_skips_fresh_boundary():
     assert spot3 is None
 
 
-async def test_fire_hook_never_syncs_get_last_quote(
+async def test_fire_hook_stock_quote_wait_is_BOUNDED(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """PROOF the 2026-07-20 non-blocking rule survives fresh-or-skip: a
-    get_last_quote that NEVER returns (the contention class) is only ever
-    touched by the DETACHED refresh. The fire hook returns AT ONCE — now with
-    a SKIP (cold cache -> no anchor) instead of a derived placement. If any
-    synchronous get_last_quote await remained, wait_for would time out."""
+    """AMENDED 2026-07-29 (was test_fire_hook_never_syncs_get_last_quote,
+    which asserted the fire hook returns AT ONCE).
+
+    WHY THE INVARIANT CHANGED — flagged for adversarial review, do not
+    re-tighten without reading this:
+      * The 2026-07-20 contention finding is about the WATCHER'S 0.1s EXIT-POLL
+        loop: awaiting the provider's ~1.5s snapshot inline stalled it to
+        ~30-40% duty cycle. That rationale is real and UNCHANGED — every
+        poll-loop caller still passes wait_for_refresh_sec=0.0 (pinned by
+        test_default_is_still_nonblocking_on_a_cold_cache).
+      * The old test generalised that rule onto the FIRE hook, which runs ONCE
+        per fire and only AFTER the SPX parent is already submitted. Blocking
+        there cannot delay the SPX entry, cannot touch the poll loop, and only
+        costs the secondary mirror leg its own latency.
+      * Enforcing 'at once' there had a measured cost: the mirror went 0-for-6
+        across 7/28-7/29 because the fire-and-forget warm kick was sized for the
+        retired limit+chase runway and the static-MKT path gave it ~0s. An
+        invariant that silently decommissions the leg is not a safety property.
+
+    The invariant is now BOUNDED, not IMMEDIATE:
+      * the hook may wait up to _MIRROR_SPOT_WAIT_SEC for a qualifying quote,
+      * it must NEVER wait unboundedly on a hung provider,
+      * a hung provider still yields the fresh-or-skip refusal and NO order,
+      * the provider call itself is still only ever awaited inside the DETACHED
+        refresh task (nothing inline in the hook's own frame)."""
     import asyncio
+    import time as _t
     _patch_config(monkeypatch)
     _patch_expiry(monkeypatch)
     release = asyncio.Event()
@@ -816,13 +837,20 @@ async def test_fire_hook_never_syncs_get_last_quote(
 
     state = _mirror_state(ibkr=SimpleNamespace(
         get_last_quote=hanging_stock_quote, get_option_quote=option_quote))
-    # Cold cache: the read kicks the (hanging) detached refresh, misses, and
-    # the fire hook must return immediately with the fresh-or-skip refusal.
+    bound = sm._MIRROR_SPOT_WAIT_SEC
+    t0 = _t.monotonic()
+    # Hard ceiling = the bound + generous scheduling margin. A regression that
+    # reintroduces an UNBOUNDED inline await still fails this test.
     r = await asyncio.wait_for(
-        maybe_place_spy_mirror(state, **_mirror_kwargs()), timeout=3.0)
+        maybe_place_spy_mirror(state, **_mirror_kwargs()), timeout=bound + 3.0)
+    elapsed = _t.monotonic() - t0
     assert r["skipped"] == "spot_fetch_failed"
     assert not release.is_set()  # the hanging quote never completed inline
     assert await _live_orders() == []
+    assert elapsed >= bound * 0.5, (
+        f"returned in {elapsed:.2f}s — the bounded wait did not engage, so the "
+        f"0-for-6 race is still live")
+    assert elapsed < bound + 2.0, f"wait exceeded its bound: {elapsed:.2f}s"
     # cleanup the parked detached refresh
     release.set()
     for t in list(getattr(state, "_watcher_stock_spot_tasks", set())):
