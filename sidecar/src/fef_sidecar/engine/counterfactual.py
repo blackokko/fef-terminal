@@ -82,7 +82,27 @@ class FrictionModel:
       - WORST: heavy slippage + adverse selection + latency drag
     """
 
-    commission_per_contract_rt: float = 1.30   # $0.65 × 2 (entry + exit)
+    # MEASURED 2026-07-29 from the PAPER account's own fills (was 1.30).
+    # What changed: the old 1.30 doubled a per-side $0.65 correctly, but $0.65 is
+    # IBKR's FIXED-tier rate and these fills price at the TIERED all-in rate
+    # (base + CBOE index-option exchange fee + regulatory pass-throughs). So the
+    # old value was wrong ONCE, on the rate — not twice. (An earlier draft of
+    # this comment claimed a side/round-trip confusion too; review MAJOR-3
+    # showed main already had the convention right.)
+    # Derivation: 315 SPX ibkr_execution rows with commission > 0 ->
+    # sum(commission)/sum(shares) = $1.280406/side, and the exact modal rate is
+    # $1.28028/side, IDENTICAL across every order-size bucket from 6 to 720
+    # contracts. commission is per-execution-row and equals shares x rate (not
+    # cumulative), and there is no per-order minimum or per-fill fee, so a 3-lot
+    # with a 3-way scale-out (4 fill events) pays 3 x RT — exactly the shape
+    # _apply_friction computes. 2 x 1.28028 = 2.56056 -> 2.56.
+    # CAVEATS, stated because they are real: (1) this is a PAPER account
+    # (DUM098107) — IBKR's simulated commission, not a live invoice; (2) 94% of
+    # the sampled contracts are >=100-lot orders, i.e. the operator's MANUAL
+    # trades rather than bot fills, which violates the project's bot-attribution
+    # rule (review MAJOR-4). It does not bias the number only because the rate is
+    # size-invariant; at the bot's own 10-20 lot size it is the same $1.28028.
+    commission_per_contract_rt: float = 2.56   # 2 x $1.28028 (entry + exit)
 
     # Per-contract extra slippage on top of what paper already shows.
     realistic_entry_slip: float = 0.10  # $0.10/contract worse than paper

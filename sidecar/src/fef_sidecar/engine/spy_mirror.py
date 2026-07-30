@@ -108,6 +108,39 @@ _SPY_SPOT_MAX = 2000.0
 _MIRROR_SPOT_MAX_AGE_MS = int(
     float(os.environ.get("FEF_SPY_MIRROR_SPOT_MAX_AGE_SEC", "10")) * 1000
 )
+# Bounded wait for a qualifying quote to LAND (2026-07-29). The freshness bound
+# above stays at 10s — this closes the RACE against it, it does not relax it.
+#
+# SIZING (review MINOR-3): the bound must STRICTLY DOMINATE one provider attempt,
+# else a slow-but-alive feed is permanently starved AND pays the full wait. The
+# watcher's provider timeout is 4.0s (_STOCK_SPOT_TIMEOUT_SEC), so 3.0s was a
+# dead band — a fetch resolving at 3.1s wrote a perfectly good spot the fire had
+# already given up on. 4.5s covers one full attempt plus scheduling margin. The
+# cost is NOT paid in the common case: the loop breaks the instant the refresh
+# resolves either way, so a healthy ~1.5s feed waits ~1.5s and a dead feed
+# returns at the provider timeout, not at this bound.
+# CLAMPED (review MINOR-4): an unvalidated env value could block the fire hook
+# for minutes (600 -> 10 min holding the SPX lock) or raise at import.
+def _mirror_spot_wait_sec() -> float:
+    raw = os.environ.get("FEF_SPY_MIRROR_SPOT_WAIT_SEC")
+    if raw is None:
+        return 4.5
+    try:
+        v = float(raw)
+        if not math.isfinite(v):
+            raise ValueError(raw)
+    except Exception:
+        logger.warning(
+            "FEF_SPY_MIRROR_SPOT_WAIT_SEC=%r invalid — using 4.5s", raw)
+        return 4.5
+    # 0 (or negative) is a legitimate kill-switch back to the racing behaviour;
+    # anything positive is clamped to a sane ceiling.
+    if v <= 0:
+        return 0.0
+    return min(v, 10.0)
+
+
+_MIRROR_SPOT_WAIT_SEC = _mirror_spot_wait_sec()
 
 # ---- SPY ex-dividend assignment guard --------------------------------------
 # SPY goes ex-dividend QUARTERLY on the third Friday of Mar/Jun/Sep/Dec
@@ -291,6 +324,26 @@ async def resolve_spy_spot(state, spx_spot: float) -> tuple[float | None, str]:
         )
         cached, _csrc = await _watcher_stock_quote_spot(
             state, MIRROR_SYMBOL, max_age_ms=_MIRROR_SPOT_MAX_AGE_MS,
+            # 2026-07-29: WAIT for the refresh instead of racing it. The
+            # fire-and-forget warm kick was sized against the retired
+            # limit+chase entry runway; on the static-MKT path the mirror read
+            # this cache 41-52 MS after the SPX submit (measured on parents 853,
+            # 856, 860), and a ~1.5s refresh cannot land in 50ms.
+            # SCOPE OF THE EVIDENCE (review MAJOR-1 — the first draft of this
+            # comment overstated it as "6-for-6"): of the 6 SPX fires on
+            # 7/28-7/29, THREE skipped on this spot race, TWO on the separate
+            # SPY option-ask starvation (untouched by this fix — see ask_diag),
+            # and ONE was a correct late-session refusal. So this fix addresses
+            # 3 of 6, not 6 of 6, and the total spot_fetch_failed population is
+            # N=4 all-time (7/20 plus those three).
+            # This is the ONE call site that waits —
+            # the watcher's 0.1s exit-poll callers keep the default 0.0, so the
+            # contention finding this cache was built for still holds. Safe to
+            # block here: the SPX parent is already submitted by the time the
+            # mirror hook runs, so the cost is mirror latency, never SPX entry
+            # latency. Bound < the 4.0s provider timeout so a dead feed cannot
+            # stall the hook longer than one refresh attempt.
+            wait_for_refresh_sec=_MIRROR_SPOT_WAIT_SEC,
         )
     except Exception:  # noqa: BLE001 — any cache-path failure means no anchor
         cached = None
@@ -693,6 +746,22 @@ async def _place_mirror_locked(
     # connection can leak a market-data line on unsubscribe).
     entry_res = None
     _stream = None
+    # ---- ASK-PATH DIAGNOSTICS (2026-07-29) -----------------------------------
+    # The 7/21 streaming-first fix targeted exactly this starvation, and it
+    # STILL starved live on 7/29 (739P and 739C, plus 743P on 7/28). We cannot
+    # tell which leg is failing — did the subscription open? did it ever tick?
+    # did the one-shot fallback time out? — because none of it was recorded.
+    # This dict is observation ONLY: it changes no control flow, gates nothing,
+    # and is attached to whatever audit row this ask path produces (success or
+    # skip). Fixing blind is how the 7/21 attempt failed; measure first.
+    ask_diag: dict = {
+        "stream_opener_present": False, "stream_opened": False,
+        "stream_ever_ticked": False, "stream_poll_count": 0,
+        "stream_wait_ms": None, "stream_error": None,
+        "fallback_ran": False, "fallback_source": None,
+        "fallback_error": None, "resolved_source": None,
+    }
+    _ask_t0 = time.monotonic()
     try:
         import asyncio as _aio
 
@@ -707,6 +776,7 @@ async def _place_mirror_locked(
             quote_stream_qualify_timeout_sec,
         )
         _opener = getattr(state.ibkr, "open_option_quote_stream", None)
+        ask_diag["stream_opener_present"] = _opener is not None
         if _opener is not None:
             # Outer bound = the provider's own qualify bound + margin, so even
             # a misbehaving provider cannot wedge the fire hook here.
@@ -718,9 +788,11 @@ async def _place_mirror_locked(
                 )),
                 timeout=quote_stream_qualify_timeout_sec() + 1.0,
             )
+            ask_diag["stream_opened"] = _stream is not None
             _deadline = time.monotonic() + quote_stream_first_tick_wait_sec()
             while True:
                 _ask = _stream.fresh_ask()
+                ask_diag["stream_poll_count"] += 1
                 if _ask is not None:
                     _age = _stream.tick_age_sec()
                     entry_res = EntryAskResolution(
@@ -735,12 +807,34 @@ async def _place_mirror_locked(
                 if time.monotonic() >= _deadline:
                     break  # no fresh tick in the window -> legacy fallback
                 await _aio.sleep(0.05)
-    except Exception:  # noqa: BLE001 — stream problems NEVER veto the mirror
+            # ever_ticked separates "subscription is dead" from "ticking but
+            # every ask was stale". CAVEAT (review MINOR): QuoteStreamBase sets
+            # _last_tick_mono only in _stamp(), which RETURNS EARLY when an
+            # update carries no usable ASK — so a live subscription streaming
+            # bid-only/askless updates also reports False, indistinguishable
+            # from dead. For an edge-of-book 0DTE SPY option that askless case
+            # is arguably THE failure mode being hunted, so read False as
+            # "no usable ask ever arrived", NOT as "the stream was dead".
+            try:
+                ask_diag["stream_ever_ticked"] = bool(
+                    getattr(_stream, "ever_ticked", False))
+            except Exception:  # noqa: BLE001 — diagnostics never veto a fire
+                pass
+    except Exception as _se:  # noqa: BLE001 — stream problems NEVER veto the mirror
+        # Log FIRST (review MINOR): formatting the exception before logging made
+        # this handler the one new raise site on the path — a __str__ that raises
+        # would replace the handler and lose the audit row. logger.exception
+        # swallows formatting errors internally via handleError.
         logger.exception(
             "spy_mirror quote stream failed — falling back to the snapshot "
             "re-fetch path")
+        try:
+            ask_diag["stream_error"] = f"{type(_se).__name__}: {_se}"[:200]
+        except Exception:  # noqa: BLE001
+            ask_diag["stream_error"] = "unformattable exception"
         entry_res = None
     finally:
+        ask_diag["stream_wait_ms"] = int((time.monotonic() - _ask_t0) * 1000)
         if _stream is not None:
             try:
                 _stream.close()
@@ -750,22 +844,27 @@ async def _place_mirror_locked(
     # Legacy path (unchanged): bounded one-shot fetch via resolve_entry_ask
     # (opt={} routes straight to the live re-fetch); no usable ask -> skip.
     if entry_res is None:
+        ask_diag["fallback_ran"] = True
         try:
             from fef_sidecar.engine.entry_pricing import resolve_entry_ask
             entry_res = await resolve_entry_ask(
                 state, symbol=MIRROR_SYMBOL, strike=float(spy_strike), right=right,
                 expiry=spy_expiry, opt={},
             )
+            ask_diag["fallback_source"] = getattr(entry_res, "source", None)
         except Exception as e:  # noqa: BLE001
+            ask_diag["fallback_error"] = f"{type(e).__name__}: {e}"[:200]
             await _audit_skip("entry_quote_failed", f"entry ask resolve raised: {e}",
-                              details_base)
+                              {**details_base, "ask_diag": ask_diag})
             return {"ok": False, "skipped": "entry_quote_failed"}
+    ask_diag["resolved_source"] = getattr(entry_res, "source", None)
     if entry_res.limit_price is None:
         await _audit_skip(
             "no_fresh_quote",
             f"no usable SPY option ask at {spy_strike:.0f}{right} "
             f"({entry_res.error})",
-            {**details_base, "spy_strike": spy_strike},
+            # ask_diag is THE point of this row: which leg starved.
+            {**details_base, "spy_strike": spy_strike, "ask_diag": ask_diag},
         )
         return {"ok": False, "skipped": "no_fresh_quote"}
 
@@ -909,6 +1008,13 @@ async def _place_mirror_locked(
                 "spy_stop": spy_stop,
                 "d_t1": d_t1, "d_t2": d_t2, "d_t3": d_t3, "d_stop": d_stop,
                 "dollar_loss_cap": loss_cap,
+                # Review MAJOR: without ask_diag on the SUCCESS row every
+                # recorded sample is a failure, so there is no base rate and
+                # "the stream never ticks for anybody" (wiring bug) cannot be
+                # separated from "it ticks except on skips" (contract/market
+                # bug) — opposite fixes. stream_wait_ms/poll_count on a HEALTHY
+                # resolution is the most informative number here.
+                "ask_diag": ask_diag,
             },
         )
     except Exception:
