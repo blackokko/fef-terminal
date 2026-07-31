@@ -15,12 +15,14 @@ attempts to reconnect with exponential backoff up to `max_reconnect_attempts`.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import math
 import os
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime
+from typing import Any, NamedTuple
 
 from fef_sidecar.ibkr.quote_stream import (
     QuoteStreamBase,
@@ -82,6 +84,141 @@ def _to_ib_contract(c: Contract):
         return Option(c.symbol, c.expiry, c.strike, c.right, c.exchange,
                       currency=c.currency, tradingClass=trading_class)
     raise ValueError(f"Unsupported contract kind: {c.kind}")
+
+
+# ---------------------------------------------------------------------------
+# Process-lifetime qualified-contract cache (2026-07-30 mirror-starvation fix)
+# ---------------------------------------------------------------------------
+# RECEIPT, stated precisely (review MINOR corrected an earlier overstatement):
+# the SPY mirror placed zero orders 7/28-7/29, but the six skips split THREE
+# fresh-or-skip spot race (fixed separately 7/29) / TWO this qualify timeout /
+# ONE correct late-session refusal. With the spot race fixed, the qualify became
+# the BINDING constraint, and 2026-07-30 shows it inside a single session:
+#   09:45  stream_opened=false  stream_wait_ms=3000  TimeoutError   -> SKIP
+#   10:48  stream_opened=true   stream_wait_ms=141   3 polls        -> PLACED
+# Same code, same day, 20x spread — the CDS farm was busy ~2s after the SPX
+# entry queued a DIFFERENT contract on it, and idle an hour later. That is the
+# whole defect: open_option_quote_stream re-qualified the mapped SPY option on
+# EVERY fire against a 3.0s budget, the tightest qualify in the repo.
+# NOTE the cache below is NOT what fixes that (review MAJOR): the mirror fires
+# at most twice a session, expiry rolls daily, and the strike moves with the SPX
+# fire — a session replay measured 0 hits / 4 fires, and the two 7/29 failures
+# (739P, 739C) are different keys the cache could not have served. The 3.0->8.0
+# budget change is the fix. The cache is cheap insurance against repeat strikes
+# and a place to hang qualify telemetry; to make it earn its keep, pre-qualify
+# the mapped strike at warm time (warm_spy_spot_cache already runs off the fire
+# path).
+#
+# An option's conId NEVER changes, so re-qualifying the same
+# (symbol, expiry, strike, right) is pure waste. PATTERN FOLLOWED:
+# engine/spx_target_watcher._qualified_ib_contract — cached lookup keyed on the
+# contract identity plus a BOUNDED qualify await, exactly as that module's
+# 2026-07-23 exit-wedge comment prescribes. The one deliberate difference is
+# scope: the watcher hangs its cache on `state` (it only ever serves watcher
+# fires), while this one is module-level so every option-quote consumer in this
+# module shares ONE cache rather than each growing its own.
+_QUALIFIED_OPTION_CONTRACTS: dict[tuple, Any] = {}
+
+# Growth bound. Keys are per (symbol, expiry, strike, right, exchange,
+# currency), so normal use adds a handful per session; the cap exists only so a
+# pathological caller cannot grow this without limit. At the cap we STOP
+# inserting (no eviction, no churn) — the cache is a latency optimisation and
+# never a correctness dependency, so degrading to "always re-qualify" is safe.
+_QUALIFIED_CACHE_MAX = 4096
+
+
+class QualifiedContract(NamedTuple):
+    """A qualified ib_async contract plus qualify telemetry.
+
+    `cached` / `elapsed_ms` are OBSERVATION ONLY — they gate nothing; the
+    mirror copies them into its ask_diag audit row so the next live fire
+    proves whether the qualify was the thing starving it."""
+
+    contract: Any
+    cached: bool
+    elapsed_ms: int
+
+
+def _qualify_cache_key(c: Contract) -> tuple | None:
+    """Cache identity of an option, or None when the contract is malformed.
+
+    A missing strike/expiry/right must reach `_to_ib_contract` and raise the
+    SAME ValueError it always has — never a new TypeError out of this key."""
+    if c.strike is None or not c.expiry or not c.right:
+        return None
+    return (c.symbol, c.expiry, float(c.strike), c.right, c.exchange, c.currency)
+
+
+def _is_qualified(ib_contract) -> bool:
+    """True once IBKR has stamped a real conId on the contract.
+
+    This is the ONLY honest success signal: qualifyContractsAsync does not
+    raise on an unknown / ambiguous contract — it logs and returns a None slot,
+    leaving the contract object un-populated."""
+    try:
+        return int(getattr(ib_contract, "conId", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def clear_qualified_contract_cache() -> None:
+    """Drop every cached qualify. For tests only — no live path calls this: a
+    conId is stable across reconnects and expiries, so there is nothing to
+    invalidate (the expiry is part of the key)."""
+    _QUALIFIED_OPTION_CONTRACTS.clear()
+
+
+async def qualified_option_contract(
+    ib, contract: Contract, *, timeout_sec: float,
+) -> QualifiedContract:
+    """Qualify an OPTION contract, reusing a process-lifetime cached result.
+
+    Bounded by `timeout_sec` (asyncio.TimeoutError propagates to the caller —
+    the fail-soft handling stays where it already is). Cache semantics:
+
+      * ONLY successful qualifies are cached (conId > 0). A timeout, an
+        exception, or an unknown/ambiguous contract caches NOTHING, so a
+        transient CDS outage can never permanently poison a strike — the next
+        call simply retries the round-trip.
+      * Options only. A ContFuture qualifies to the CURRENT front month, which
+        rolls; caching that would serve a dead contract after the roll. Non
+        options take the plain bounded-qualify path with no caching at all.
+      * Callers get a COPY of the cached contract. hash/eq on an ib_async
+        Contract are conId-based, so a copy is indistinguishable to
+        reqMktData / cancelMktData / placeOrder bookkeeping, but no consumer
+        can mutate the shared template (qualify writes THROUGH the object it
+        is handed).
+
+    No locking (the sidecar's event loop is single-threaded): two concurrent
+    first-callers for one strike simply both round-trip and the last write
+    wins — the writes are identical, so that is a wasted request, not a bug.
+    """
+    if contract.kind is not ContractKind.OPTION:
+        t0 = time.monotonic()
+        ic = _to_ib_contract(contract)
+        await asyncio.wait_for(ib.qualifyContractsAsync(ic), timeout=timeout_sec)
+        return QualifiedContract(ic, False, int((time.monotonic() - t0) * 1000))
+
+    key = _qualify_cache_key(contract)
+    cached = _QUALIFIED_OPTION_CONTRACTS.get(key) if key is not None else None
+    if cached is not None:
+        return QualifiedContract(copy.copy(cached), True, 0)
+
+    t0 = time.monotonic()
+    ic = _to_ib_contract(contract)
+    await asyncio.wait_for(ib.qualifyContractsAsync(ic), timeout=timeout_sec)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    if (key is not None and _is_qualified(ic)
+            and len(_QUALIFIED_OPTION_CONTRACTS) < _QUALIFIED_CACHE_MAX):
+        _QUALIFIED_OPTION_CONTRACTS[key] = copy.copy(ic)
+    # An un-qualified contract is still RETURNED, unchanged from today's
+    # behaviour. CORRECTION (review MINOR): the caller does NOT then "subscribe
+    # and let its freshness gate refuse" — ib_async's reqMktData -> startTicker
+    # keys tickers by hash(contract) == conId, which RAISES ValueError at
+    # conId 0. In production the mirror's blanket except catches that and falls
+    # through to the snapshot path, so behaviour is identical to main; but the
+    # subscribe never happens. Only the caching is withheld here.
+    return QualifiedContract(ic, False, elapsed_ms)
 
 
 def _bar_from_ib(b) -> Bar:
@@ -630,8 +767,11 @@ class LiveIBKRProvider:
         (the entry-chase path — place_bracket qualified it moments earlier),
         this method does ZERO awaited round-trips: reqMktData is a
         synchronous client-side send and the ticks flow push-style. When
-        None (the SPY-mirror path), the qualify round-trip is bounded by
-        `qualify_timeout_sec` (default FEF_QUOTE_STREAM_QUALIFY_TIMEOUT_SEC).
+        None (the SPY-mirror path), the qualify goes through the shared
+        process-lifetime cache (`qualified_option_contract`) and any actual
+        round-trip is bounded by `qualify_timeout_sec` (default
+        FEF_QUOTE_STREAM_QUALIFY_TIMEOUT_SEC, 8.0s — matching the entry and
+        watcher paths after the 2026-07-30 mirror starvation).
 
         Raises immediately when not connected — deliberately NO reconnect
         backoff here (fire-time; the caller is fail-soft and falls back to
@@ -643,11 +783,13 @@ class LiveIBKRProvider:
             raise ConnectionError(
                 "IBKR not connected — cannot open a fire-time quote stream"
             )
+        qualify_cached: bool | None = None
+        qualify_ms: int | None = None
         if ib_contract is None:
             t = (quote_stream_qualify_timeout_sec()
                  if qualify_timeout_sec is None else max(0.1, float(qualify_timeout_sec)))
-            ib_contract = _to_ib_contract(contract)
-            await asyncio.wait_for(ib.qualifyContractsAsync(ib_contract), timeout=t)
+            q = await qualified_option_contract(ib, contract, timeout_sec=t)
+            ib_contract, qualify_cached, qualify_ms = q.contract, q.cached, q.elapsed_ms
         # Same delayed-data enablement as the snapshot path (idempotent).
         if not getattr(self, "_market_data_type_set", False):
             try:
@@ -656,7 +798,13 @@ class LiveIBKRProvider:
             except Exception:
                 pass
         ticker = ib.reqMktData(ib_contract, "", False, False)  # streaming
-        return LiveOptionQuoteStream(ib, ib_contract, ticker)
+        stream = LiveOptionQuoteStream(ib, ib_contract, ticker)
+        # Telemetry only (never read by control flow): the mirror copies these
+        # into ask_diag so the next live fire shows whether the qualify was
+        # served from cache and how long the round-trip actually took.
+        stream.qualify_cached = qualify_cached
+        stream.qualify_ms = qualify_ms
+        return stream
 
     async def get_account_summary(self) -> AccountSummary | None:
         """Pulls accountSummary + reqPnL streaming + positions via ib_async.

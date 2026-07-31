@@ -72,8 +72,33 @@ def quote_stream_qualify_timeout_sec() -> float:
     """Bound on the contract-qualify round-trip when the caller did NOT hand
     in an already-qualified contract (the mirror path). The SPX chase path
     always passes its pre-qualified contract, so subscribing there does zero
-    awaited round-trips."""
-    return max(0.5, _env_float("FEF_QUOTE_STREAM_QUALIFY_TIMEOUT_SEC", 3.0))
+    awaited round-trips.
+
+    8.0s since 2026-07-30 (was 3.0s). qualifyContractsAsync is a
+    contract-details request against the slow, rate-limited TWS CDS farm, and
+    the mirror hook asks for its SPY contract ~2s after the SPX entry queued a
+    different one — it waits behind that request. 3.0s was the tightest budget
+    of ANY qualify in the repo (entry 8.0s, watcher 8.0s, price stream 10.0s).
+    This matches the entry/watcher budget.
+
+    SCOPE OF THE CLAIM (review MINOR — an earlier draft of this comment said it
+    "starved every mirror fire from 7/28 on", which overstates it): of the six
+    mirror skips on 7/28-29, THREE were the fresh-or-skip spot race (fixed
+    separately on 7/29), TWO were this qualify timeout, and ONE was a correct
+    late-session refusal. What IS established is that with the spot race fixed,
+    the qualify became the BINDING constraint — 2026-07-30 09:45 shows
+    stream_opened=false / stream_wait_ms=3000 / stream_error=TimeoutError, and
+    the 10:48 fire on the same session opened in 141ms once the CDS farm was
+    idle. Same code, same day, 20x spread: the budget is the variable.
+
+    CEILING (review MINOR): clamped to 15.0s. The floor has always been 0.5s but
+    there was NO upper bound, so FEF_QUOTE_STREAM_QUALIFY_TIMEOUT_SEC=600 would
+    hold the SPX firing lock for ten minutes. The sibling fire-hook knob
+    (spy_mirror._mirror_spot_wait_sec) was given exactly this clamp by the
+    previous commit's reviewer for exactly this reason; this knob is on the SAME
+    hook and now carries a 2.7x larger default, so it needs the same guard.
+    Non-numeric/NaN falls back to the default via _env_float."""
+    return min(15.0, max(0.5, _env_float("FEF_QUOTE_STREAM_QUALIFY_TIMEOUT_SEC", 8.0)))
 
 
 def _valid_price(v: object) -> float | None:
@@ -99,6 +124,13 @@ class QuoteStreamBase:
         self._last_bid: float | None = None
         self._last_tick_mono: float | None = None
         self._closed = False
+        # Qualify telemetry, stamped by the transport when IT did the contract
+        # lookup (None = the caller handed in a pre-qualified contract, or the
+        # transport doesn't qualify at all). OBSERVATION ONLY — nothing reads
+        # these to make a decision; the mirror copies them into its ask_diag
+        # audit row (2026-07-30 qualify-cache fix).
+        self.qualify_cached: bool | None = None
+        self.qualify_ms: int | None = None
 
     # -- producer side (transport) ------------------------------------------
     def _stamp(self, bid: object, ask: object) -> None:

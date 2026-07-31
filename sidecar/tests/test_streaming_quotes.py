@@ -116,7 +116,9 @@ def test_stamp_requires_usable_ask():
 def test_stream_env_knobs(monkeypatch: pytest.MonkeyPatch):
     assert qs.quote_stream_max_age_sec() == pytest.approx(2.0)
     assert qs.quote_stream_first_tick_wait_sec() == pytest.approx(2.0)
-    assert qs.quote_stream_qualify_timeout_sec() == pytest.approx(3.0)
+    # 8.0 since 2026-07-30 (was 3.0 — starved every mirror fire from 7/28 on).
+    # See test_qualify_cache.py for the budget's own tests.
+    assert qs.quote_stream_qualify_timeout_sec() == pytest.approx(8.0)
     monkeypatch.setenv("FEF_QUOTE_STREAM_MAX_AGE_SEC", "0.5")
     monkeypatch.setenv("FEF_QUOTE_STREAM_FIRST_TICK_WAIT_SEC", "0.1")
     monkeypatch.setenv("FEF_QUOTE_STREAM_QUALIFY_TIMEOUT_SEC", "1.5")
