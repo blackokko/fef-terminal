@@ -754,10 +754,19 @@ async def _place_mirror_locked(
     # This dict is observation ONLY: it changes no control flow, gates nothing,
     # and is attached to whatever audit row this ask path produces (success or
     # skip). Fixing blind is how the 7/21 attempt failed; measure first.
+    #
+    # 2026-07-30: that measurement paid off — it named the qualify. The mirror
+    # opener re-qualified the SPY contract on every fire under a 3.0s budget
+    # (the tightest in the repo) against the same TWS contract-details farm the
+    # SPX entry had queued ~2s earlier. qualify_cached / qualify_ms record the
+    # NEW shared cache's outcome (None = the transport never reached the
+    # qualify, e.g. it raised, or it doesn't qualify at all) so the next live
+    # fire proves whether raising the budget + caching actually fixed it.
     ask_diag: dict = {
         "stream_opener_present": False, "stream_opened": False,
         "stream_ever_ticked": False, "stream_poll_count": 0,
         "stream_wait_ms": None, "stream_error": None,
+        "qualify_cached": None, "qualify_ms": None,
         "fallback_ran": False, "fallback_source": None,
         "fallback_error": None, "resolved_source": None,
     }
@@ -789,6 +798,13 @@ async def _place_mirror_locked(
                 timeout=quote_stream_qualify_timeout_sec() + 1.0,
             )
             ask_diag["stream_opened"] = _stream is not None
+            # Recorded IMMEDIATELY after the open (not after the poll loop) so
+            # the qualify outcome survives any later failure on this path.
+            try:
+                ask_diag["qualify_cached"] = getattr(_stream, "qualify_cached", None)
+                ask_diag["qualify_ms"] = getattr(_stream, "qualify_ms", None)
+            except Exception:  # noqa: BLE001 — diagnostics never veto a fire
+                pass
             _deadline = time.monotonic() + quote_stream_first_tick_wait_sec()
             while True:
                 _ask = _stream.fresh_ask()
