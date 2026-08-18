@@ -787,33 +787,67 @@ export function ChartPane() {
       dn1: LineData[]; dn2: LineData[]; dn3: LineData[];
     } = { mid: [], up1: [], up2: [], up3: [], dn1: [], dn2: [], dn3: [] };
 
+    // ⚠ REPAINT FIX (2026-08-11). The original code fitted ONE line across all n
+    // loaded bars and drew it over every bar, so each new bar moved every
+    // historical band value. Measured by `tospane` (research archive), replaying
+    // these exact presets bar by bar:
+    //
+    //   preset     ±2σ drift (median)  = % of band width   P(really at 2σ | shown at 2σ)
+    //   5D·5m      31.85 pts           37%                 47.2%
+    //   10D·30m    49.90 pts           38%                 49.5%
+    //   6mo·1D     152.4 pts           35%                 51.1%
+    //
+    // The drawn slope disagreed in SIGN with the live one 21–28% of the time, the
+    // live σ ran 0.68–0.74× the finished σ, and only 10–16% of the ±2σ touches that
+    // actually happened stayed visible. Scoring signals off the finished line gave
+    // +19..+85 pts/signal and t≥3 in 43 of 46 cells — 0 of 46 scored honestly.
+    // Matched random walks reproduced ALL of it: the repaint was the estimator, not
+    // the market. Server-side twin: engine/technical.stddev_channel_rolling().
+    //
+    // Now each bar is fitted on its OWN trailing window, so the invariant holds:
+    //     band[i] depends only on closes[0..i]
+    // Successive points are therefore NOT collinear — this is a curve, not a line.
+    // Set SD_CHANNEL_FULL_RANGE = true to restore the old (repainting) look.
+    const SD_CHANNEL_FULL_RANGE = false;
+    const SD_CHANNEL_LOOKBACK = 0;  // 0 = expand to all prior bars; >0 = fixed trailing window
+
     if (closes.length >= 2) {
       const n = closes.length;
-      const xbar = (n - 1) / 2;  // mean of 0..n-1
-      let ybar = 0;
-      for (let i = 0; i < n; i++) ybar += closes[i];
-      ybar /= n;
-      let sxx = 0, sxy = 0;
-      for (let i = 0; i < n; i++) {
-        const dx = i - xbar;
-        const dy = closes[i] - ybar;
-        sxx += dx * dx;
-        sxy += dx * dy;
-      }
-      const m = sxx !== 0 ? sxy / sxx : 0;
-      const intercept = ybar - m * xbar;
-      // Residual stddev — population N (matches TOS convention)
-      let ssq = 0;
-      for (let i = 0; i < n; i++) {
-        const pred = m * i + intercept;
-        const e = closes[i] - pred;
-        ssq += e * e;
-      }
-      const sd_ = Math.sqrt(ssq / n);
-      // Build the 7 parallel lines across every bar
+      const fitAt = (endIdx: number): { y: number; sd: number } => {
+        // Fit closes[lo..endIdx] and evaluate at endIdx. Centered OLS for the same
+        // numerical reason as before; population-N residual σ to match TOS.
+        const lo = SD_CHANNEL_FULL_RANGE
+          ? 0
+          : SD_CHANNEL_LOOKBACK > 0
+            ? Math.max(0, endIdx - SD_CHANNEL_LOOKBACK + 1)
+            : 0;
+        const hi = SD_CHANNEL_FULL_RANGE ? n - 1 : endIdx;
+        const w = hi - lo + 1;
+        if (w < 2) return { y: closes[endIdx], sd: 0 };
+        const xbar = (w - 1) / 2;
+        let ybar = 0;
+        for (let j = 0; j < w; j++) ybar += closes[lo + j];
+        ybar /= w;
+        let sxx = 0, sxy = 0;
+        for (let j = 0; j < w; j++) {
+          const dx = j - xbar;
+          const dy = closes[lo + j] - ybar;
+          sxx += dx * dx;
+          sxy += dx * dy;
+        }
+        const m = sxx !== 0 ? sxy / sxx : 0;
+        const intercept = ybar - m * xbar;
+        let ssq = 0;
+        for (let j = 0; j < w; j++) {
+          const e = closes[lo + j] - (m * j + intercept);
+          ssq += e * e;
+        }
+        return { y: m * (endIdx - lo) + intercept, sd: Math.sqrt(ssq / w) };
+      };
+
       for (let i = 0; i < n; i++) {
         const t = times[i];
-        const y = m * i + intercept;
+        const { y, sd: sd_ } = fitAt(i);
         channelData.mid.push({ time: t, value: y });
         channelData.up1.push({ time: t, value: y + sd_ });
         channelData.up2.push({ time: t, value: y + 2 * sd_ });

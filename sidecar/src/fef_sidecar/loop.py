@@ -1365,9 +1365,10 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
         logger.exception("Regime gate check failed")
 
     # Spread recommendation — TA-driven entries (EMA 8/21 cross + pullback
-    # engulfing on StdDev channel) with delta-targeted strikes (<=0.15 delta,
-    # >=$0.70 premium). Reads cached 30-min bars; refreshes them at most
-    # every 25 minutes per symbol. Independent of FEF direction.
+    # engulfing on StdDev channel) with delta-targeted strikes (short strike
+    # NEAREST spread_delta_max, net credit above the credit/width floor).
+    # Reads cached 30-min bars; refreshes them at most every 25 minutes per
+    # symbol. Independent of FEF direction.
     try:
         from fef_sidecar.engine.spread_recommender import recommend_from_bars
         from fef_sidecar.engine.spread_entry import SpreadEntryTrigger  # noqa: F401
@@ -1390,6 +1391,20 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
                 symbol=state.active_symbol,
                 expiry=today_ymd,
                 spot=inputs.spx_price,
+                # Structure comes from AppState so every axis is tunable without a
+                # code change. Defaults are the measured-best values -- see state.py
+                # for what each one is worth and which study measured it.
+                width=state.spread_width,
+                delta_max=state.spread_delta_max,
+                premium_min=state.spread_premium_min,
+                puts_only=state.spread_puts_only,
+                require_gate=state.spread_require_gate,
+                # Strike-selection guards added after the 2026-08-12
+                # 0.0329-delta pick. See state.py for what each refuses.
+                delta_floor_frac=state.spread_delta_floor_frac,
+                min_quote_coverage=state.spread_min_quote_coverage,
+                min_credit_width_ratio=state.spread_min_credit_width_ratio,
+                min_net_credit=state.spread_min_net_credit,
             )
             event.verdict["spread_recommendation"] = {
                 "kind": spread_rec.kind,
@@ -1409,6 +1424,14 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
                     spread_rec.trigger_signature
                     and spread_rec.trigger_signature != state.last_spread_trigger_signature
                 ),
+                # Provenance, so a consumer can tell a live recommendation from a
+                # stale one. `last_spread_recommendation` is NOT updated when the
+                # bar fetch returns empty (documented best-effort []) and is never
+                # session-reset, so without these a Monday PCS could be sold on
+                # Tuesday after a gap — at max loss on entry. Review finding B2.
+                "session_date": today_ymd,
+                "as_of_ms": int(_time.time() * 1000),
+                "symbol": state.active_symbol,
             }
             if spread_rec.trigger_signature:
                 state.last_spread_trigger_signature = spread_rec.trigger_signature
@@ -1458,6 +1481,48 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
                 pass
     except Exception:
         logger.exception("Auto-trade evaluation failed")
+
+    # Spread auto-trade — the wire from recommendation to order. Entirely
+    # independent of the directional auto-trader above: different structure,
+    # different exit path (spread_exit_watcher), its own enable flag, its own
+    # once-per-session dedupe. Defensive for the same reason as the block above —
+    # an auto-trade fault must never break the iteration pipeline.
+    try:
+        from fef_sidecar.engine.spread_auto_trader import maybe_auto_trade_spread
+        spread_decision = await maybe_auto_trade_spread(
+            state, state.last_spread_recommendation, source="auto_main",
+        )
+        # Record every decision so GET /spread_auto_trade/status can answer
+        # "why didn't it fire?" without hand-querying signal_log.db (2026-08-17).
+        # Diagnostics only — no gate reads these back.
+        state.spread_auto_trade_last_reason = spread_decision.reason
+        state.spread_auto_trade_last_reason_code = spread_decision.reason_code
+        state.spread_auto_trade_last_eval_at_ms = int(_time.time() * 1000)
+        if spread_decision.fired:
+            state.spread_auto_trade_count_session += 1
+            logger.info("spread_auto_trade fired: %s", spread_decision.reason)
+        elif (
+            state.spread_auto_trade_enabled
+            and spread_decision.reason_code not in ("disabled", "rec_none", "no_rec")
+        ):
+            # Enabled and there WAS something to trade, but a gate blocked it.
+            # Surface it the same way the directional path does.
+            try:
+                await SignalIterRepository.write_audit_log(
+                    category="spread_auto_trade_block", actor="system",
+                    summary=f"BLOCKED spread: {spread_decision.reason}",
+                    details={
+                        "source": "auto_main",
+                        "reason": spread_decision.reason,
+                        "reason_code": spread_decision.reason_code,
+                        "recommendation": state.last_spread_recommendation,
+                    },
+                    block_reason_code=spread_decision.reason_code,
+                )
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Spread auto-trade evaluation failed")
 
     # IMPROVEMENTS #R: evaluate user-defined patterns against this iter
     t0 = _time.perf_counter()

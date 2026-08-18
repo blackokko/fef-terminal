@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+from sqlmodel import or_, select
 
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import (
@@ -614,6 +614,71 @@ class SignalIterRepository:
             stmt = select(LiveOrder).order_by(LiveOrder.submitted_at.desc()).limit(limit)  # type: ignore[attr-defined]
             if status is not None:
                 stmt = stmt.where(LiveOrder.status == status)
+            return list((await session.exec(stmt)).all())
+
+    # Statuses that do NOT consume the once-per-session budget, because they
+    # represent an order that never reached the broker and left no position and
+    # no exposure. Everything else — including DRY_RUN and any status not listed
+    # here — counts, so the deny-list fails CLOSED against future status values.
+    #
+    # ⚠ 2026-08-12: the fully status-blind version counted parent 927, which our
+    # OWN FEF_ALLOW_CREDIT_SPREADS gate had refused and marked REJECTED before
+    # anything was transmitted, as "already placed today". One self-refused
+    # attempt burned the entire session and produced 104 `already_today` blocks.
+    # DRY_RUN must keep counting (a rehearsal has to exercise the same guard the
+    # live path does — that was the 2026-08-11 finding); a refusal must not.
+    SPREAD_DEDUPE_IGNORED_STATUSES = ("REJECTED", "CANCELLED", "CANCELED")
+
+    @staticmethod
+    async def spread_parents_since(since: "datetime") -> list[LiveOrder]:
+        """Every credit-spread PARENT submitted at/after `since` that still
+        counts against the one-per-session budget.
+
+        Time-bounded rather than the usual `limit=N` recency window. The spread
+        auto-trader's once-per-session guarantee was previously in-memory (lost
+        on restart) and, when it did consult the DB, used
+        `query_live_orders(limit=200)` — a recency window that an older parent
+        falls out of on a busy day, plus a status filter that omitted DRY_RUN.
+        Both let a second order through on a day that already had one
+        (adversarial review, 2026-08-11).
+
+        Near-status-blind: every status counts EXCEPT the ones in
+        `SPREAD_DEDUPE_IGNORED_STATUSES`, and even those still count if the
+        order carries a broker identifier. See that constant for the incident
+        that required the change.
+
+        ⚠ WHY THE BROKER-ID TERM EXISTS. Excluding REJECTED is only safe for
+        orders that never reached IBKR. `place_credit_spread` wraps
+        `ib.placeOrder` and the DB write that follows it in ONE try/except, and
+        marks the parent REJECTED on any exception — so a submission that
+        SUCCEEDED but whose bookkeeping write failed is recorded as REJECTED
+        while the order is live at the broker. Under a plain status exclusion
+        the session would reopen and a second spread could go out on top of a
+        real position. Any row that got an `ib_order_id` or `ib_perm_id`
+        therefore keeps consuming the budget regardless of status. (The gate
+        refusal this whole change is about never reaches `placeOrder`, so it
+        has neither id and is still correctly excluded.)
+        """
+        ignored = SignalIterRepository.SPREAD_DEDUPE_IGNORED_STATUSES
+        async with get_session() as session:
+            stmt = (
+                select(LiveOrder)
+                .where(LiveOrder.exit_strategy == "spread_premium")  # type: ignore[attr-defined]
+                .where(LiveOrder.bracket_role == "parent")  # type: ignore[attr-defined]
+                .where(LiveOrder.submitted_at >= since)  # type: ignore[attr-defined]
+                # Count the row unless it is BOTH an ignored status AND never
+                # made it to the broker. A NULL status is unknown, not refused —
+                # `notin_` alone evaluates NULL and silently drops the row,
+                # which would fail OPEN — so it is listed explicitly.
+                .where(
+                    or_(
+                        LiveOrder.status.is_(None),  # type: ignore[attr-defined]
+                        LiveOrder.status.notin_(ignored),  # type: ignore[attr-defined]
+                        LiveOrder.ib_order_id.is_not(None),  # type: ignore[attr-defined]
+                        LiveOrder.ib_perm_id.is_not(None),  # type: ignore[attr-defined]
+                    )
+                )
+            )
             return list((await session.exec(stmt)).all())
 
     @staticmethod

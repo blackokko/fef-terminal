@@ -56,6 +56,30 @@ def stddev_channel(closes: list[float]) -> list[ChannelPoint]:
     Uses the centered formula (subtract mean before solving) for numerical
     stability — same approach as the chart's StandardDevChannel. Returns
     one ChannelPoint per input bar.
+
+    ⚠ THIS IS THE FULL-RANGE (REPAINTING) FORM. It fits ONE line across every
+    bar passed in, so every returned point depends on data that arrived AFTER
+    that bar. Only ``result[-1]`` is honest at decision time.
+
+    ``engine/spread_entry.py`` uses ``channel[-1]`` and is therefore correct.
+    ANY caller that reads a middle index over a historical series is reading a
+    lookahead — use ``stddev_channel_rolling`` instead.
+
+    Measured 2026-08-11 (`tospane`, archive), replaying the terminal's own
+    presets bar by bar and comparing the as-drawn line to the line as it stood
+    at the time:
+
+      preset      ±2σ drift (median)   as % of band width   P(was at 2σ | shown at 2σ)
+      5D·5m       31.85 pts            37%                  47.2%
+      10D·30m     49.90 pts            38%                  49.5%
+      6mo·1D      152.4 pts            35%                  51.1%
+
+    The displayed slope disagrees in SIGN with the live one 21–28% of the time,
+    the live σ runs 0.68–0.74× the finished σ, and only 10–16% of the ±2σ touches
+    that actually occurred are still visible afterwards. Scoring signals off the
+    finished line yields +19 to +85 pts/signal and t≥3 in 43 of 46 cells; scored
+    honestly it is 0 of 46. **Matched random walks reproduce all of it — the
+    repaint is the estimator, not the market.**
     """
     n = len(closes)
     if n < 3:
@@ -88,6 +112,82 @@ def stddev_channel(closes: list[float]) -> list[ChannelPoint]:
         )
         for i in xs
     ]
+
+
+def stddev_channel_rolling(
+    closes: list[float], lookback: int
+) -> list[ChannelPoint]:
+    """NON-REPAINTING standard-deviation channel.
+
+    Each bar's channel value is fitted on that bar's OWN trailing window
+    ``closes[i-lookback+1 : i+1]`` — i.e. exactly what the chart could have
+    drawn at that bar, using no future information. Successive points are
+    therefore NOT collinear: this traces a curve, not one straight line.
+
+    This is the honest counterpart to :func:`stddev_channel`, which fits a
+    single line across the whole array and consequently moves every historical
+    band value as new bars arrive (see that function's docstring for the
+    measured size — median 31.85–152.4 pts of drift, 35–38% of band width).
+
+    Bars before ``lookback`` are fitted on however much history exists (minimum
+    3); their values are still causal, just noisier. ``closes[:i+1]`` is never
+    exceeded, so the guarantee holds at every index:
+
+        result[i] depends only on closes[:i+1]
+
+    Args:
+        closes: bar closes, oldest first.
+        lookback: trailing window length. Use the preset's own length —
+            5D·5m ≈ 390, 10D·30m ≈ 130, 6mo·1D ≈ 126.
+
+    Returns:
+        One ChannelPoint per input bar, same shape as :func:`stddev_channel`.
+    """
+    n = len(closes)
+    if lookback < 3:
+        raise ValueError(f"lookback must be >= 3, got {lookback}")
+    if n == 0:
+        return []
+
+    out: list[ChannelPoint] = []
+    for i in range(n):
+        lo = max(0, i - lookback + 1)
+        window = closes[lo : i + 1]
+        m = len(window)
+        if m < 3:
+            c = closes[i]
+            out.append(
+                ChannelPoint(center=c, upper_1=c, upper_2=c, upper_3=c,
+                             lower_1=c, lower_2=c, lower_3=c)
+            )
+            continue
+
+        # Centered OLS — same formula as stddev_channel, same numerical care.
+        mean_x = (m - 1) / 2.0
+        mean_y = sum(window) / m
+        num = sum((j - mean_x) * (window[j] - mean_y) for j in range(m))
+        den = sum((j - mean_x) ** 2 for j in range(m))
+        slope = num / den if den > 0 else 0.0
+        intercept = mean_y - slope * mean_x
+
+        # Population-N residual sigma, matching the TOS convention the chart uses.
+        ssq = sum((window[j] - (slope * j + intercept)) ** 2 for j in range(m))
+        sigma = math.sqrt(ssq / m)
+
+        # Evaluate at the window's LAST bar — the bar we are reporting.
+        center = slope * (m - 1) + intercept
+        out.append(
+            ChannelPoint(
+                center=center,
+                upper_1=center + sigma,
+                upper_2=center + 2 * sigma,
+                upper_3=center + 3 * sigma,
+                lower_1=center - sigma,
+                lower_2=center - 2 * sigma,
+                lower_3=center - 3 * sigma,
+            )
+        )
+    return out
 
 
 def is_bullish_engulfing(prev_bar: Bar, curr_bar: Bar) -> bool:

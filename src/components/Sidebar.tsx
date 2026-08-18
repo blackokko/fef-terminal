@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { AccountScorecardPanel } from "../panels/AccountScorecardPanel";
 import { AutoTradePanel } from "../panels/AutoTradePanel";
+import { SpreadAutoTradePanel } from "../panels/SpreadAutoTradePanel";
 import { CalendarPanel } from "../panels/CalendarPanel";
 import { ScannerPanel } from "../panels/ScannerPanel";
 import { VerdictTimelinePanel } from "../panels/VerdictTimelinePanel";
@@ -78,6 +79,12 @@ export function Sidebar() {
                 post-capitulation logic now lives in the Market Regime panel's
                 Expected-move tile. Code kept at panels/PhaseDetectorPanel.tsx. */}
             <Safe name="AutoTrade"><AutoTradePanel /></Safe>
+            {/* Separate bot, separate switch (2026-08-17). The directional bot
+                above buys 0DTE options on a verdict; this one sells a put
+                vertical on a structure. Sitting adjacent so the two arming
+                states are visible together — before this existed, the spread
+                module could only be armed by relaunching the process. */}
+            <Safe name="SpreadAutoTrade"><SpreadAutoTradePanel /></Safe>
             <Safe name="Scanner"><ScannerPanel /></Safe>
             <Safe name="LiveExecution"><LiveExecutionPanel /></Safe>
             <Safe name="LivePositions"><LivePositionsPanel /></Safe>

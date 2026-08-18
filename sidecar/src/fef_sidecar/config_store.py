@@ -24,6 +24,14 @@ class UIConfig(BaseModel):
     wall_proximity_pts: float = Field(default=5.0, ge=1.0, le=30.0)
     wall_collapse_pct: float = Field(default=0.20, ge=0.05, le=0.80)
     wall_collapse_floor_m: float = Field(default=5.0, ge=0.0, le=1000.0)
+    # Added 2026-07-30 with the Research-tab teardown. This knob previously
+    # had NO config path: the only way to change it was the Strategy Presets
+    # panel, whose apply handler wrote engine._absorption_fe_min directly
+    # (api.py). Retiring presets would have left it env-var/restart-only, so
+    # it moves here — the canonical, audited, validated change path. Default
+    # 5.0 matches the FEFEngine ctor and the Preset model, so existing
+    # installs see no behaviour change on upgrade.
+    absorption_fe_ratio_min: float = Field(default=5.0, ge=0.5, le=50.0)
     default_qty: int = Field(default=15, ge=1, le=100)
     audio_alerts: bool = Field(default=True)
 

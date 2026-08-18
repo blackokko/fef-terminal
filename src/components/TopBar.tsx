@@ -11,48 +11,26 @@ const connectionColor: Record<string, string> = {
   error: "var(--color-red)",
 };
 
-const stateColor: Record<string, string> = {
-  GREEN: "var(--color-green)",
-  AMBER: "var(--color-amber)",
-  RED: "var(--color-red)",
-  NO_DATA: "var(--color-text-muted)",
-};
-
-function ModelStatePill() {
-  const [state, setState] = useState<string>("NO_DATA");
-  const [expectancy, setExpectancy] = useState<number | null>(null);
-
-  useEffect(() => {
-    const refresh = async () => {
-      try {
-        const r = await fetch("http://127.0.0.1:8765/tuning/recommendations?status=OPEN");
-        if (!r.ok) return;
-        const recs = await r.json();
-        const sm = recs.find((x: any) => x.kind === "STATE_OF_MODEL");
-        if (sm) {
-          setState(sm.backing_data?.state ?? "NO_DATA");
-          setExpectancy(sm.backing_data?.expectancy_avg_r ?? null);
-        }
-      } catch {}
-    };
-    void refresh();
-    const id = window.setInterval(refresh, 60000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  return (
-    <span title={`Model state — last 5 sessions avg expectancy ${expectancy != null ? expectancy.toFixed(2) + "R" : "—"}`}
-          style={{
-            display: "inline-block", padding: "2px 8px", marginLeft: 6,
-            borderRadius: 3, fontSize: 10, fontWeight: 700,
-            fontFamily: "var(--font-mono)",
-            background: stateColor[state],
-            color: state === "AMBER" ? "var(--color-bg)" : "white",
-          }}>
-      MDL {state}
-    </span>
-  );
-}
+// [REMOVED 2026-07-30] ModelStatePill — the "MDL GREEN/AMBER/RED" pill.
+//
+// It rendered a traffic-light verdict on the strategy from the STATE_OF_MODEL
+// tuning recommendation, scored in average expectancy R over 5 sessions.
+// Three independent reasons it had to go, any one of which would be enough:
+//
+//   1. Its data source no longer exists. The tuning recommender was removed
+//      from the nightly chain in this same deploy, so the pill would have
+//      frozen on its last value and gone on displaying it indefinitely — the
+//      worst failure mode for a status indicator.
+//   2. Its unit is not trustworthy. R->$ conversion in this project was
+//      overstated ~7x (it assumed ATM delta 0.50 where live strikes ran
+//      ~0.09), so an expectancy-in-R verdict is not a P&L statement.
+//   3. Its verdict is settled and it is negative. E4 measured the strategy at
+//      -$48.72/ct across 1,435 fires (t=-3.80), negative in all five years,
+//      with 0 of 181 grid cells positive out-of-sample. A pill capable of
+//      showing GREEN on that is not a status indicator, it is a mood light.
+//
+// Deliberately not replaced. The honest per-session number is broker-confirmed
+// P&L, which the TodayPnL pill beside this one already shows.
 
 function TodayPnLPill({ ibkrDailyPnl }: { ibkrDailyPnl: number | null | undefined }) {
   const [estimate, setEstimate] = useState<number | null>(null);
@@ -186,7 +164,6 @@ export function TopBar({ screen = "trading", onScreenChange }: TopBarProps = {})
             ? `#${lastIter.iter_num} ${displayDirection(lastIter.verdict.direction)}`
             : "—"}
         </span>
-        <ModelStatePill />
       </div>
 
       <div className="topbar-section">

@@ -437,20 +437,44 @@ async def _audit_data_integrity(session_date: str) -> dict:
 
 
 async def nightly_scheduler(state) -> None:
-    """Sleeps until the configured hour each day, then runs the nightly
-    data hygiene + analytics chain in this order:
+    """Nightly DATA HYGIENE + COLLECTOR chain. Despite living in a module
+    named auto_walk_forward, this task no longer runs any optimisation —
+    see the removal note at steps 4/6 below. It is misnamed for historical
+    reasons; the module keeps its name only because renaming it would
+    churn imports for no behavioural gain.
+
+    Runs, in order:
       1. Persist today's IBKR fills (no UI hit required)
       2. Backfill live_order.filled_qty / avg_fill_price
       3. Data integrity audit (logs anomalies)
-      4. Auto walk-forward sweep
-      5. compute_daily_review (now consumes fresh IBKR + live_order data)
-      6. Tuning recommender
+      4. [REMOVED 2026-07-30 — was the auto walk-forward sweep]
+      5. compute_daily_review (consumes the fresh IBKR + live_order data)
+      6. [REMOVED 2026-07-30 — was the tuning recommender]
+      7. Shadow exit replay
+      8. Option-chain backfill from QuantData
+      9+ forward-shadow scorers
 
-    The hygiene steps (1-3) ensure the analytics steps (4-6) always
-    operate on up-to-date data even if no UI session triggered the
-    write-throughs during the trading day."""
-    target_hour = int(os.environ.get("FEF_AUTO_WALKFORWARD_HOUR", "22"))
-    logger.info("Nightly scheduler started (will run at %02d:00 UTC daily)", target_hour)
+    Steps 1-3 are what make everything after them trustworthy: they ensure
+    the later steps operate on up-to-date data even when no UI session
+    triggered the write-throughs during the trading day. That is why this
+    task must never be disabled wholesale to stop the retired optimiser —
+    doing so would silently take IBKR fill persistence and daily_review
+    with it.
+
+    SCHEDULE: target_hour is interpreted in UTC. The default 22 therefore
+    fires at 18:00 ET during EDT and 17:00 ET during EST — NOT "10pm" as
+    the retired Research panel's help text used to claim."""
+    # FEF_AUTO_WALKFORWARD_HOUR is a legacy name (no walk-forward remains).
+    # The new name wins; the old one is still honoured so an existing
+    # environment does not silently change schedule under the operator.
+    _hour_env = os.environ.get("FEF_NIGHTLY_HOUR_UTC")
+    if _hour_env is None:
+        _hour_env = os.environ.get("FEF_AUTO_WALKFORWARD_HOUR", "22")
+    target_hour = int(_hour_env)
+    logger.info(
+        "Nightly scheduler started (fires %02d:00 UTC daily = %02d:00 ET in EDT)",
+        target_hour, (target_hour - 4) % 24,
+    )
     while True:
         now = datetime.now(UTC)
         target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
@@ -462,9 +486,11 @@ async def nightly_scheduler(state) -> None:
         try:
             await asyncio.sleep(sleep_seconds)
 
-            from datetime import timezone as _tz, timedelta as _td
-            et = _tz(_td(hours=-4))
-            session_date = datetime.now(et).strftime("%Y-%m-%d")
+            # DST-AWARE (2026-07-30). Was a hardcoded UTC-4, i.e. EDT
+            # year-round, which mislabels the session date in winter. Same
+            # defect class the clockflow study found in historical_bar.
+            from zoneinfo import ZoneInfo
+            session_date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
             # 1. Persist today's IBKR fills (no-op if already current)
             try:
@@ -485,20 +511,37 @@ async def nightly_scheduler(state) -> None:
             except Exception:
                 logger.exception("Nightly: data integrity audit failed")
 
-            # 4. Walk-forward sweep
-            try:
-                await run_auto_walk_forward(state)
-            except Exception:
-                logger.exception("Nightly: auto_walk_forward failed")
+            # 4. [REMOVED 2026-07-30] Walk-forward sweep.
+            # 6. [REMOVED 2026-07-30] Tuning recommender.
+            #
+            # Both were retired with the Research-tab teardown. They were not
+            # merely unused-by-the-UI; they were actively misleading. The
+            # sweep's "optimal" wall_proximity came back 3, then 5, then 8 on
+            # consecutive sessions searching the same four knobs — noise
+            # rendered as a recommendation. Each run also wrote an
+            # engine_change row (category="auto_walk_forward", actor="system"),
+            # polluting the one audit trail we use to answer "did something
+            # change underneath this session?".
+            #
+            # The deeper reason they cannot be repaired in place: a nightly
+            # job cannot carry the discipline that makes a parameter search
+            # trustworthy — no pre-registered lock, no control, no train/test
+            # split, no multiple-comparison correction, no record of how many
+            # cells were searched. See fef-research-archive/RESEARCH_REGISTRY.md
+            # section K0 and RESEARCH_TAB_TEARDOWN.md.
+            #
+            # DO NOT "restore the nightly optimizer" without reading those.
+            # Steps 1/2/3/5 below are data hygiene and stay — daily_review in
+            # particular is the one figure the 2026-07-01 audit still trusts,
+            # and killing this task wholesale would have taken IBKR fill
+            # persistence down with it.
 
-            # 5. Daily review (now using fresh IBKR + live_order data) + 6. tuning
+            # 5. Daily review (uses the fresh IBKR + live_order data above)
             try:
                 from fef_sidecar.engine.daily_review import compute_daily_review
-                from fef_sidecar.engine.tuning_runner import run_tuning_recommendations
                 await compute_daily_review(session_date)
-                await run_tuning_recommendations()
             except Exception:
-                logger.exception("Nightly: daily_review / tuning compute failed")
+                logger.exception("Nightly: daily_review compute failed")
 
             # 7. Shadow exit replay — compute counterfactual outcomes for
             # every registered exit variant against today's live entries.

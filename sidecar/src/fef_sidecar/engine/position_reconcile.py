@@ -282,6 +282,32 @@ async def _reconcile_positions_locked(state) -> dict[str, Any]:
         for p in open_parents
     }
 
+    # A credit spread writes ONE parent row, at the SHORT strike. Its LONG wing is
+    # a real IBKR position with no row of its own, so it lands in the orphan sweep
+    # below — and the warning tells the operator to call /admin/sweep_orphans,
+    # which would CLOSE the long leg and leave the short one NAKED. That is the
+    # single worst outcome available in this file, and it is reachable by
+    # following the software's own advice (adversarial review, 2026-08-11).
+    #
+    # The long wing is not an orphan: it is managed, by spread_exit_watcher, via
+    # the parent at the short strike. Register its key so it is never swept and
+    # never re-adopted into a single-leg exit ladder.
+    spread_leg_keys: set[str] = set()
+    for p in open_parents:
+        if getattr(p, "exit_strategy", None) != "spread_premium":
+            continue
+        long_strike = getattr(p, "spread_long_strike", None)
+        if long_strike is None:
+            continue
+        spread_leg_keys.add(
+            _position_key(p.symbol, float(long_strike), p.right, p.expiry)
+        )
+    if spread_leg_keys:
+        logger.info(
+            "reconcile: protecting %d credit-spread long leg(s) from the orphan sweep",
+            len(spread_leg_keys),
+        )
+
     # Also pull recently-RESOLVED parents (CLOSED / STOPPED) so an orphaned IBKR
     # position whose parent was wrongly marked resolved can be RE-ADOPTED into
     # management rather than left naked — the safety net for orphaning bugs like
@@ -438,6 +464,11 @@ async def _reconcile_positions_locked(state) -> dict[str, Any]:
     # manual trades, or no spot to anchor a stop).
     for key, ib_p in ib_positions.items():
         if key in parent_keys:
+            continue
+        if key in spread_leg_keys:
+            # Long wing of an open credit spread — managed via its short-strike
+            # parent by spread_exit_watcher. Sweeping or re-adopting it nakeds
+            # the short leg. Never an orphan.
             continue
         resur = _resurrectable_for_orphan(
             key, parent_keys, resurrectable, spot, orphan_qty=int(ib_p["qty"]),
