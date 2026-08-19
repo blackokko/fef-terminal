@@ -211,30 +211,89 @@ def is_bearish_engulfing(prev_bar: Bar, curr_bar: Bar) -> bool:
     return prev_green and curr_red and body_engulfs
 
 
-def touches_lower_band(bar: Bar, point: ChannelPoint, tolerance_pts: float = 0.5) -> str | None:
+# Band-touch tolerance, expressed in units of the channel's OWN residual sigma
+# rather than index points (2026-08-19).
+#
+# ⚠ WHY THIS IS NOT A CONSTANT IN POINTS ANY MORE. It used to be `0.5` points,
+# which is only meaningful because this path has so far run on SPX alone.
+# Measured on real 65-bar / 30-min channels (the exact shape the credit-spread
+# recommender builds — "30 mins", "5 D"):
+#     SPX  median sigma 24.39 pts  ->  0.50 pts = 0.0205 sigma  ( 2.1% of 1 sigma)
+#     QQQ  median sigma  2.74 pts  ->  0.50 pts = 0.1826 sigma  (18.3% of 1 sigma)
+# The same constant is 8.9x LOOSER on QQQ than on SPX, and looser still on a
+# cheaper symbol. `multi_symbol_scanner` already scans six symbols; the first
+# time this detector is pointed at one of them the band test would silently
+# become a far more permissive rule with no code change to blame it on.
+#
+# 0.02 sigma is chosen to REPRODUCE the current SPX behaviour (measured 0.0205),
+# so this is a portability fix and not a threshold change: SPX results before and
+# after are the same to within a hundredth of a sigma.
+DEFAULT_BAND_TOLERANCE_SIGMA = 0.02
+
+
+def _band_tolerance(
+    point: ChannelPoint, tolerance_sigma: float, tolerance_pts: float | None
+) -> float:
+    """Absolute tolerance in price units for this channel point.
+
+    `tolerance_pts` overrides when given (callers with a genuine absolute
+    requirement, and tests that need an exact edge). Otherwise scale by the
+    channel's own residual sigma, recovered from the band spacing.
+
+    A degenerate channel (flat series -> sigma 0) falls back to an exact
+    comparison rather than a fabricated width; 0.0 is the honest tolerance for
+    a channel with no dispersion, and it fails CLOSED (fewer touches).
+    """
+    if tolerance_pts is not None:
+        return tolerance_pts
+    sigma = point.upper_1 - point.center
+    if not (sigma > 0):
+        return 0.0
+    return tolerance_sigma * sigma
+
+
+def touches_lower_band(
+    bar: Bar,
+    point: ChannelPoint,
+    tolerance_sigma: float = DEFAULT_BAND_TOLERANCE_SIGMA,
+    tolerance_pts: float | None = None,
+) -> str | None:
     """If the bar's LOW pierces or touches lower STD1 / STD2 (within
     tolerance), return which band ('STD1' / 'STD2' / 'STD3'). Otherwise None.
 
     Pick the deepest band the low reached — STD3 wins over STD2 wins over STD1.
+
+    Tolerance is in units of the channel's residual sigma; pass `tolerance_pts`
+    to force an absolute width. See DEFAULT_BAND_TOLERANCE_SIGMA.
     """
-    if bar.low <= point.lower_3 + tolerance_pts:
+    tol = _band_tolerance(point, tolerance_sigma, tolerance_pts)
+    if bar.low <= point.lower_3 + tol:
         return "STD3"
-    if bar.low <= point.lower_2 + tolerance_pts:
+    if bar.low <= point.lower_2 + tol:
         return "STD2"
-    if bar.low <= point.lower_1 + tolerance_pts:
+    if bar.low <= point.lower_1 + tol:
         return "STD1"
     return None
 
 
-def touches_upper_band(bar: Bar, point: ChannelPoint, tolerance_pts: float = 0.5) -> str | None:
+def touches_upper_band(
+    bar: Bar,
+    point: ChannelPoint,
+    tolerance_sigma: float = DEFAULT_BAND_TOLERANCE_SIGMA,
+    tolerance_pts: float | None = None,
+) -> str | None:
     """If the bar's HIGH reaches/pierces upper STD1 / STD2 / STD3, return
     the band tag. Otherwise None.
+
+    Tolerance is in units of the channel's residual sigma; pass `tolerance_pts`
+    to force an absolute width. See DEFAULT_BAND_TOLERANCE_SIGMA.
     """
-    if bar.high >= point.upper_3 - tolerance_pts:
+    tol = _band_tolerance(point, tolerance_sigma, tolerance_pts)
+    if bar.high >= point.upper_3 - tol:
         return "STD3"
-    if bar.high >= point.upper_2 - tolerance_pts:
+    if bar.high >= point.upper_2 - tol:
         return "STD2"
-    if bar.high >= point.upper_1 - tolerance_pts:
+    if bar.high >= point.upper_1 - tol:
         return "STD1"
     return None
 
