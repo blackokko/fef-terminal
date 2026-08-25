@@ -29,7 +29,6 @@ from typing import Any
 from fef_sidecar.config_store import load_config
 from fef_sidecar.db.repository import SignalIterRepository
 from fef_sidecar.engine import FEFEngine
-from fef_sidecar.engine.fef import snapshot_to_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +97,8 @@ def _quarantine_engine_window(engine) -> bool:
 async def _reject_scanner_input_glitch(state, symbol: str, spot, engine=None) -> bool:
     """Input-boundary price sanity guard for one scanner engine (2026-07-06).
 
-    A race on the shared QuantData page filter (set_page_filter mutates
+    A race on the shared QuantData page filter (feed removed 2026-08-25;
+    set_page_filter mutated
     client._ticker; every sub-fetch reads it at request time) let the GLD
     scan fetch an SPX-priced snapshot → "[SCANNER GLD] ALIGNED — ΔPrice
     +7147.15pts". The race itself is closed by loop._qd_scope_lock; this
@@ -477,157 +477,23 @@ async def _apply_flow_source_and_shadow(state, inputs, engine):
     return out
 
 
-async def _scan_one_symbol(state, symbol: str) -> None:
-    """Run one FEF iter for the given symbol. Broadcasts an IterEvent
-    with symbol field set so the FE can route to the right per-symbol UI.
-    """
-    # Lazy-create the per-symbol engine
-    if symbol not in state.scanner_engines:
-        state.scanner_engines[symbol] = _make_engine_for(symbol)
-    engine = state.scanner_engines[symbol]
-
-    # Fetch QuantData snapshot for this symbol. Temporarily flip the page
-    # filter; the global poll will reset it next cycle. HOLD THE SCOPE LOCK
-    # across set+fetch (2026-07-06): set_page_filter mutates the shared
-    # client's _ticker and every sub-fetch reads it at request time, so an
-    # unlocked pair interleaved with the main poll's set_page_filter fetched
-    # SPX-priced data into this symbol's snapshot (the GLD +7147pt glitch).
-    try:
-        from fef_sidecar.loop import _qd_scope_lock
-        async with _qd_scope_lock(state.quantdata):
-            await state.quantdata.set_page_filter(ticker=symbol)
-            snap = await state.quantdata.fetch_market_snapshot()
-    except Exception as e:
-        logger.warning("scanner: QuantData fetch failed for %s: %s", symbol, e)
-        return
-    if snap is None:
-        return
-
-    inputs = snapshot_to_inputs(snap)
-
-    # PER-SYMBOL PRICE SANITY GUARD (2026-07-06): reject cross-symbol
-    # contamination at the input boundary BEFORE any consumption — no
-    # engine.push, no verdict cache, no impulse flag, no trade path. The
-    # engine is passed so the guard can also validate/quarantine its
-    # history window (reference-pollution extension, 19:07 residual).
-    if await _reject_scanner_input_glitch(
-        state, symbol, inputs.spx_price, engine=engine,
-    ):
-        return
-
-    # Drift-input source selection + flow_shadow evidence row (2026-07-15
-    # input-parity fix). SPX only; with the default flow_source='qd' this
-    # returns `inputs` untouched — behavior byte-identical to before.
-    if symbol == "SPX":
-        try:
-            inputs = await _apply_flow_source_and_shadow(state, inputs, engine)
-        except Exception:
-            logger.exception("scanner: flow-source/shadow hook failed — QD input used")
-
-    verdict = engine.push(inputs)
-
-    # Cache the verdict for the FE Scanner panel (it polls /scanner/symbols).
-    # We do NOT broadcast IterEvent from the scanner — that would push the
-    # other symbol's walls / max-pain / drift onto the active chart since
-    # the chart subscribes to ALL iter events. The user wants scanner work
-    # to stay in the background, not pollute the chart.
-    state.last_scanner_verdict_by_symbol[symbol] = {
-        "direction": verdict.direction.value,
-        "confidence": verdict.confidence.value,
-        "reasoning": verdict.reasoning,
-        "spx_price": inputs.spx_price,
-        "strike_rec": verdict.strike_rec,
-        "timestamp_ms": int(_time.time() * 1000),
-    }
-
-    # IMPULSE ATTENTION FLAG — advisory only (validated 2026-07-02 as
-    # decision-support; whipsaws as an auto-trigger). Evaluated on EVERY
-    # scan, WAIT verdicts included — the verdict carries delta_price /
-    # delta_drift_m regardless of direction. Never trades.
-    try:
-        await maybe_impulse_flag(
-            state, symbol, spot=inputs.spx_price,
-            delta_price=verdict.delta_price,
-            delta_drift_m=verdict.delta_drift_m,
-            # Real drift context for the advisory row (the values the engine
-            # actually consumed this scan — post flow_source selection).
-            drift_cum_net_m=inputs.drift_cum_net_m,
-            drift_bias=inputs.drift_bias,
-        )
-    except Exception:
-        logger.exception("scanner: impulse flag evaluation failed for %s", symbol)
-
-    # Build a verdict dict for the auto-trader (not broadcast — local only).
-    verdict_dict = {
-        "direction": verdict.direction.value,
-        "confidence": verdict.confidence.value,
-        "reasoning": verdict.reasoning,
-        "strike_rec": verdict.strike_rec,
-        "t1": verdict.t1, "t2": verdict.t2, "t3": verdict.t3,
-        "stop": verdict.stop,
-        "delta_price": verdict.delta_price,
-        "delta_drift_m": verdict.delta_drift_m,
-        "fe_ratio": verdict.fe_ratio,
-        # Bias at verdict time — the auto-trader's wall-collapse re-grade
-        # needs it to mirror fef.py's demotion exactly at gate time.
-        "drift_bias": inputs.drift_bias,
-        "aligned": verdict.aligned,
-        "absorption": verdict.absorption,
-        "wall_proximity_skip": verdict.wall_proximity_skip,
-        "wall_collapse_trigger": verdict.wall_collapse_trigger,
-        "nearest_wall_strike": verdict.nearest_wall_strike,
-        "nearest_wall_distance": verdict.nearest_wall_distance,
-        "nearest_wall_family": verdict.nearest_wall_family,
-        "secondary_scores": verdict.secondary_scores,
-        "scanner_symbol": symbol,
-    }
-    # Auto-trader needs option_pricing to pass gate 8. Fetch the option
-    # quote for the scanner-recommended strike here (same path as the
-    # main iter loop's _maybe_fetch_option_targets does for SPX).
-    if verdict.direction.value in ("LONG_CALLS", "LONG_PUTS") and verdict.strike_rec:
-        try:
-            from fef_sidecar.engine.option_targets import build_option_targets
-            from fef_sidecar.engine.expiry_resolver import resolve_nearest_expiry
-            from fef_sidecar.ibkr.models import Contract, ContractKind
-            # Per-symbol nearest-expiry resolution. Fixes the bug where
-            # GLD/SMH/TLT (no 0DTE) and SPY/QQQ/IWM on Tu/Th silently
-            # failed Gate 8 because today's expiry didn't exist.
-            expiry = await resolve_nearest_expiry(state, symbol)
-            right = "C" if verdict.direction.value == "LONG_CALLS" else "P"
-            opt_contract = Contract(
-                symbol=symbol, kind=ContractKind.OPTION,
-                exchange="CBOE" if symbol == "SPX" else "SMART",
-                expiry=expiry, strike=verdict.strike_rec, right=right,
-            )
-            quote = await state.ibkr.get_option_quote(opt_contract)
-            targets = build_option_targets(
-                quote=quote, current_spx=inputs.spx_price,
-                spx_t1=verdict.t1, spx_t2=verdict.t2,
-                spx_t3=verdict.t3, spx_stop=verdict.stop,
-            )
-            if targets is not None:
-                verdict_dict["option_pricing"] = {
-                    "contract_strike": targets.contract_strike,
-                    "right": targets.right,
-                    "entry_limit": targets.entry_limit,
-                    "delta": targets.delta,
-                    "underlying_price_at_quote": targets.underlying_price_at_quote,
-                    "t1": targets.t1, "t2": targets.t2,
-                    "t3": targets.t3, "stop": targets.stop,
-                    # bid/ask + quote age: the marketable-limit entry prices
-                    # off THIS ask when fresh (<=10s) — without these the
-                    # auto-trader had to re-fetch on every scanner fire.
-                    "bid": targets.bid, "ask": targets.ask,
-                    "quote_ts_ms": targets.quote_ts_ms,
-                }
-        except Exception:
-            logger.exception("scanner: option quote fetch failed for %s", symbol)
-
-    if symbol in OPTION_SYMBOLS:
-        await handle_actionable_scanner_verdict(
-            state, symbol, spot=inputs.spx_price, verdict_dict=verdict_dict,
-            inputs=inputs,
-        )
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED — `_scan_one_symbol`
+# deleted. It was the scanner's driver: set_page_filter(symbol) ->
+# fetch_market_snapshot() -> snapshot_to_inputs() -> engine.push() -> verdict
+# cache / impulse flag / handle_actionable_scanner_verdict. The vendor snapshot
+# was its ONLY input and `snapshot_to_inputs` has no other producer, so the
+# multi-symbol FEF scanner stops. `multi_symbol_scanner_loop` (below) is deleted
+# with it and main.spawn_data_loops no longer starts a scanner task.
+#
+# The rest of this module is INTENTIONALLY LEFT IN PLACE and is still test
+# covered, but has no production caller any more:
+#   _reject_scanner_input_glitch / _polluted_window_refs / _quarantine_engine_window
+#   _make_engine_for / _apply_flow_source_and_shadow / _chop_gate_context
+#   maybe_impulse_flag / handle_actionable_scanner_verdict / _tag_high_bypass
+# Deleting them would take ~1,300 lines and seven test modules with it — that is
+# a separate call for the operator, not a side effect of removing a data vendor.
+# GET/POST /scanner/symbols still work (they read/write state.scan_enabled_symbols,
+# which nothing consumes now).
 
 
 # Structured block code for bias-veto skips (same rationale as
@@ -1485,41 +1351,6 @@ def _today_et() -> str:
     return datetime.now(et).strftime("%Y-%m-%d")
 
 
-async def multi_symbol_scanner_loop(state) -> None:
-    """Background loop. Every FEF_SCAN_INTERVAL_SEC, iterates through
-    enabled symbols and runs a scan for each. Skips disabled symbols
-    and never touches the active chart symbol's primary loop.
-    """
-    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
-    interval = float(os.environ.get("FEF_SCAN_INTERVAL_SEC", "60"))
-    logger.info("multi-symbol scanner loop starting (interval=%.1fs)", interval)
-
-    # Wait a few seconds for the main fef_tick_loop's warmup to settle
-    await asyncio.sleep(15)
-
-    while True:
-        _wd_beat(state, "multi-symbol-scanner")
-        try:
-            # SPY-mirror warm (2026-07-27 fresh-or-skip): baseline cache
-            # freshness between fires — the load-bearing kick is the
-            # fire-commit one in auto_trader; this is the belt. Non-blocking,
-            # TTL-latch-deduped, no-op when the mirror is disabled.
-            try:
-                from fef_sidecar.engine.spy_mirror import warm_spy_spot_cache
-                await warm_spy_spot_cache(state)
-            except Exception:
-                logger.debug("scanner SPY warm kick failed", exc_info=True)
-            enabled = [
-                s for s, on in state.scan_enabled_symbols.items() if on
-            ]
-            for symbol in enabled:
-                try:
-                    await _scan_one_symbol(state, symbol)
-                    await asyncio.sleep(0.5)  # spread QD load
-                except Exception:
-                    logger.exception("scanner: %s scan failed", symbol)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("multi-symbol scanner loop iteration failed")
-        await asyncio.sleep(interval)
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED —
+# `multi_symbol_scanner_loop` deleted. It looped enabled symbols calling
+# `_scan_one_symbol` (above), whose only input was the vendor snapshot.

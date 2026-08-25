@@ -214,7 +214,10 @@ def get_flow_snapshot_at(
     symbol: str = "SPX",
     tolerance_seconds: int = 30,
 ) -> dict[str, Any] | None:
-    """Get the QuantData flow snapshot closest to a given timestamp.
+    """Get the flow snapshot closest to a given timestamp.
+
+    [REMOVED 2026-08-25] QuantData subscription CANCELLED — flow_snapshot is a
+    READ-ONLY historical table now; no rows exist after that date.
 
     Useful for: 'what did the order flow look like at the moment of this
     trade entry?' — find the closest snapshot within tolerance_seconds.

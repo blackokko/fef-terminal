@@ -2378,8 +2378,15 @@ async def _shadow_cash_spot(
     Preference order (freshest trustworthy source wins):
       1. the polled tick, ONLY when state.active_symbol == symbol (then it
          IS the symbol's own cash tick — SPX maps to the CBOE cash index),
-      2. the scanner's per-symbol QuantData snapshot spot (cash, ~60s
-         cadence; state.last_scanner_verdict_by_symbol[symbol]),
+      2. the scanner's per-symbol snapshot spot (cash, ~60s cadence;
+         state.last_scanner_verdict_by_symbol[symbol]).
+         [REMOVED 2026-08-25] QuantData subscription CANCELLED — the
+         multi-symbol scanner that filled this dict is deleted, so this tier
+         is now ALWAYS EMPTY and resolution falls through to (3). Real but
+         not silent: shadow spot for a non-active symbol degrades from a ~60s
+         cash read to a <=10-min-old 1-min bar close, and the provenance
+         string returned to the caller says which one it used. Shadow path
+         only — the live exit path uses the active tick.
       3. the symbol's latest 1-min bar close from historical_bar (<=10 min
          old; DB read throttled via a 30s per-symbol cache).
 

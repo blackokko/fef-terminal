@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from fef_sidecar.db.models import FEFConfidence, FEFDirection
 from fef_sidecar.engine import FEFEngine, FEFInputs
-from fef_sidecar.quantdata.models import ExposureRow
+from fef_sidecar.engine.types import ExposureRow
 
 
 def _iter(*, ts: int, spx: float, drift_m: float, bias: str = "BULLISH",

@@ -2,7 +2,7 @@
 
 Uses the existing archetype day script (5_15_REPLAY / STEADY_BULL / etc.)
 for the SHAPE of the day, but exposes a smooth interpolated price as a
-function of simulated time. Every mock subsystem (bars, ticks, QuantData,
+function of simulated time. Every mock subsystem (bars, ticks,
 microstructure) should call PriceTrack.price_now() so they all agree.
 
 Also exposes derived state (drift, walls, aggression) that evolves
@@ -15,7 +15,7 @@ import random
 from dataclasses import dataclass
 
 from fef_sidecar.mock.clock import MockClock
-from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+from fef_sidecar.mock.mock_day import DAY_SCRIPT
 
 
 @dataclass
@@ -73,7 +73,7 @@ class PriceTrack:
             self._last_noise[bucket] = round(self._noise_rng.uniform(-0.25, 0.25), 2)
         return round(self.price_now() + self._last_noise[bucket], 2)
 
-    # -- derived state for QuantData snapshot --
+    # -- derived state for the mock day arc --
 
     def drift_at_minute(self, minute: float) -> float:
         a, _, _ = self._frame_pair(minute)

@@ -239,20 +239,23 @@ async def _maybe_trade_fire(
     if state.last_live_tick_spx > 0 and (now_ms - state.last_live_tick_ms) < 60_000:
         spot = state.last_live_tick_spx
 
-    # Wall-anchored strike/target geometry — identical to FEF fires so the
-    # exit watchers treat pattern positions the same way.
+    # Strike/target geometry.
+    #
+    # [REMOVED 2026-08-25] QuantData subscription CANCELLED. This used to pass
+    # WALL-ANCHORED geometry: state.last_snapshot -> snapshot_to_inputs ->
+    # top_gex_walls / top_dex_walls / ntm_max_pain. All three were QuantData
+    # exposure fields with no other producer, so build_plan now runs on its
+    # no-wall path (spot-anchored offsets + moneyness scaling; see
+    # engine/strikes.py). NOT silent: this is a real geometry change for pattern
+    # fires, and it is the same geometry FEF fires already fell back to whenever
+    # the snapshot was missing. `inputs` stays None so the SignalIter row below
+    # records empty walls rather than stale ones.
     inputs = None
-    try:
-        if state.last_snapshot is not None:
-            from fef_sidecar.engine.fef import snapshot_to_inputs
-            inputs = snapshot_to_inputs(state.last_snapshot)  # type: ignore[arg-type]
-    except Exception:
-        inputs = None
     plan = build_plan(
         spot, direction,
-        top_gex_walls=(inputs.top_gex_walls if inputs else []),
-        top_dex_walls=(inputs.top_dex_walls if inputs else []),
-        ntm_max_pain=(inputs.ntm_max_pain if inputs else None),
+        top_gex_walls=[],
+        top_dex_walls=[],
+        ntm_max_pain=None,
     )
 
     option_targets = None

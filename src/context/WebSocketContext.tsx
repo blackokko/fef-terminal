@@ -16,7 +16,6 @@ import type {
   PatternMatchEvent,
   RegimeEvent,
   SidecarEvent,
-  SnapshotEvent,
   StatusEvent,
   TicketEvent,
   TickEvent,
@@ -30,7 +29,8 @@ interface SidecarState {
   connection: ConnectionState;
   lastTick: TickEvent | null;
   lastIter: IterEvent | null;
-  lastSnapshot: SnapshotEvent | null;
+  // [REMOVED 2026-08-25] lastSnapshot — held the QuantData SnapshotEvent.
+  // Subscription CANCELLED; no consumer left.
   lastStatus: StatusEvent | null;
   lastRegime: RegimeEvent | null;
   lastAccount: AccountEvent | null;
@@ -48,7 +48,6 @@ const initialState: SidecarState = {
   connection: "connecting",
   lastTick: null,
   lastIter: null,
-  lastSnapshot: null,
   lastStatus: null,
   lastRegime: null,
   lastAccount: null,
@@ -108,8 +107,10 @@ export function SidecarProvider({
             lastIter: event,
             recentIters: [...prev.recentIters, event].slice(-RECENT_LIMIT),
           };
-        case "snapshot":
-          return { ...prev, lastSnapshot: event };
+        // [REMOVED 2026-08-25] case "snapshot" — the QuantData walls/drift/
+        // max-pain broadcast. Subscription CANCELLED. If the sidecar still
+        // emits the frame it now falls through to `default` and is ignored,
+        // which is the intended behaviour.
         case "pattern_match":
           return {
             ...prev,
@@ -156,7 +157,8 @@ export function SidecarProvider({
             lastStatus: {
               type: "status",
               timestamp_ms: Date.now(),
-              quantdata: s.quantdata,
+              // [REMOVED 2026-08-25] quantdata: s.quantdata — QuantData
+              // subscription CANCELLED; /status may still return the key.
               ibkr: s.ibkr,
               engine: s.engine_history_size > 0 ? "running" : "stopped",
               history_size: s.engine_history_size,
@@ -200,17 +202,11 @@ export function SidecarProvider({
                   secondary_scores: newest.extras?.secondary_scores ?? {},
                   option_pricing: newest.extras?.option_pricing ?? null,
                 },
-                snapshot: {
-                  top_gex: newest.top_gex_walls || [],
-                  top_dex: newest.top_dex_walls || [],
-                  drift: { cum_net_m: newest.drift_cum_net_m, bias: newest.drift_bias },
-                  ntm_max_pain: newest.ntm_max_pain,
-                  raw_max_pain: newest.raw_max_pain,
-                  aggression: newest.aggression_call_pct != null ? {
-                    call_pct: newest.aggression_call_pct,
-                    put_pct: newest.aggression_put_pct,
-                  } : null,
-                },
+                // [REMOVED 2026-08-25] snapshot: {top_gex, top_dex, drift,
+                // ntm_max_pain, raw_max_pain, aggression} — rebuilt here from
+                // the SignalIter history row. All six columns were QuantData
+                // and that subscription was CANCELLED. The columns may still
+                // exist in the DB for historical rows; nothing reads them.
               },
               recentIters: signals.reverse().map((r: any) => ({
                 type: "iter",
@@ -219,14 +215,8 @@ export function SidecarProvider({
                 session_date: r.session_date,
                 spx_price: r.spx_price,
                 verdict: { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning },
-                snapshot: {
-                  top_gex: r.top_gex_walls || [],
-                  top_dex: r.top_dex_walls || [],
-                  drift: { cum_net_m: r.drift_cum_net_m, bias: r.drift_bias },
-                  ntm_max_pain: r.ntm_max_pain,
-                  raw_max_pain: r.raw_max_pain,
-                  aggression: null,
-                },
+                // [REMOVED 2026-08-25] snapshot — see above; QuantData
+                // subscription CANCELLED.
               })),
             }));
           }

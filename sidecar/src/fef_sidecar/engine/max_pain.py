@@ -1,19 +1,24 @@
 """Near-the-money max pain calculation.
 
-Per [[ntm-max-pain]] memory: the chain-wide max pain reported by QuantData is
-polluted by far-OTM macro hedge OI. For signaling we want the max pain
-computed only over strikes near current spot — that's where dealer hedging
-actually matters intraday.
+Per [[ntm-max-pain]] memory: a chain-wide max pain is polluted by far-OTM
+macro hedge OI. For signaling we want the max pain computed only over strikes
+near current spot — that's where dealer hedging actually matters intraday.
 
 This module is a pure function — no I/O, no client dependency. Test it with
 a frozen OI list.
+
+[REMOVED 2026-08-25] QuantData subscription CANCELLED. This module used to
+live at `fef_sidecar/quantdata/max_pain.py` and was fed by the vendor's OI
+endpoint. It survives the vendor removal because its remaining caller —
+`scripts/research/replay_engine_backfill.py` — builds the OI rows from
+ThetaData, not from QuantData. Nothing in the live sidecar calls it now.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fef_sidecar.quantdata.models import OIRow
+from fef_sidecar.engine.types import OIRow
 
 
 @dataclass(frozen=True)

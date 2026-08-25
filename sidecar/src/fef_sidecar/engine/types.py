@@ -1,16 +1,99 @@
-"""Typed inputs/outputs for the FEF engine."""
+"""Typed inputs/outputs for the FEF engine.
+
+[REMOVED 2026-08-25] QuantData subscription CANCELLED. The exposure /
+order-flow / OI value models below used to live in
+`fef_sidecar.quantdata.models` and were populated by the QuantData REST
+client. They are NOT QuantData-specific — they are plain value objects, and
+they still have live producers that have nothing to do with that vendor:
+
+  * `exposure_rows_from_dicts` / `expiration_exposure_rows_from_dicts`
+    rebuild them from PERSISTED DB JSON (counterfactual replay, optimization,
+    auto_walk_forward).
+  * `scripts/research/replay_engine_backfill.py` builds `ExposureRow` /
+    `OIRow` from ThetaData option chains.
+
+So they moved here rather than being deleted with the vendor package. There
+is no longer any code path that constructs them from a live vendor feed.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field as _PField
 
 from fef_sidecar.db.models import FEFConfidence, FEFDirection
-from fef_sidecar.quantdata.models import (
-    ExpirationExposureRow,
-    ExposureRow,
-    OrderFlowRow,
-)
+
+WallSide = Literal["CALL", "PUT"]
+DriftBias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
+
+
+class ExposureRow(BaseModel):
+    """One row in the GEX/DEX/CEX/VEX wall table."""
+
+    strike: float
+    call_m: float = _PField(description="Call exposure in millions of dollars")
+    put_m: float = _PField(description="Put exposure in millions of dollars")
+    net_m: float = _PField(description="Net (call + put) exposure in millions; sign matters")
+
+    @property
+    def side(self) -> WallSide:
+        return "CALL" if self.net_m > 0 else "PUT"
+
+
+class ExpirationExposureRow(BaseModel):
+    """One row in the expiration-bucketed GEX/DEX table.
+
+    Mirrors ExposureRow but keyed by expiration date instead of strike.
+    Used to isolate 0DTE exposure from multi-expiry chains.
+    """
+
+    expiration: str  # YYYY-MM-DD or YYYYMMDD
+    call_m: float = _PField(description="Call exposure in millions of dollars")
+    put_m: float = _PField(description="Put exposure in millions of dollars")
+    net_m: float = _PField(description="Net (call + put) exposure in millions; sign matters")
+
+    @property
+    def side(self) -> WallSide:
+        return "CALL" if self.net_m > 0 else "PUT"
+
+
+class OrderFlowRow(BaseModel):
+    """One order from the consolidated order-flow stream.
+
+    `side_aggression` is one of AA/A/M/B/BB (from most aggressive buyer to
+    most aggressive seller). Classification flags (whale/sweep/block) are
+    additive — a golden sweep has both is_sweep=True and is_golden_sweep=True.
+    """
+
+    timestamp_ms: int
+    strike: float
+    right: str                      # "C" or "P"
+    expiration: str                 # YYYY-MM-DD or YYYYMMDD
+    premium_dollars: float
+    side_aggression: str            # AA / A / M / B / BB
+    is_whale: bool = False
+    is_sweep: bool = False
+    is_golden_sweep: bool = False   # >= $1M sweep
+    is_block: bool = False
+    other_flags: list[str] = _PField(default_factory=list)
+
+
+class OIRow(BaseModel):
+    """One strike's open interest. Consumed by `engine.max_pain`."""
+
+    strike: float
+    call_oi: int
+    put_oi: int
+
+    @property
+    def total_oi(self) -> int:
+        return self.call_oi + self.put_oi
+
+    @property
+    def pc_ratio(self) -> float:
+        return (self.put_oi / self.call_oi) if self.call_oi else 0.0
 
 
 def exposure_rows_from_dicts(dicts: list[dict] | None) -> list[ExposureRow]:

@@ -7,7 +7,7 @@ for fresh stochastic generation each run.
 
 from __future__ import annotations
 
-from fef_sidecar.quantdata.archetypes import DayFrame, build_day_script
+from fef_sidecar.mock.archetypes import DayFrame, build_day_script
 
 # Generated once at import. Restart the sidecar to switch archetypes.
 DAY_SCRIPT: list[DayFrame] = build_day_script()

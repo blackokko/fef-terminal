@@ -61,9 +61,10 @@ def build_option_targets(
     if quote.contract.strike is None or quote.contract.right is None:
         raise ValueError("OptionQuote.contract must have strike + right")
 
-    # Always anchor on the same SPX value that built the SPX targets (the FEF
-    # iter's snapshot price). The quote's underlying_price can lag or — in mock
-    # mode — diverge from the QuantData provider's SPX, breaking target ordering.
+    # Always anchor on the same SPX value that built the SPX targets (the
+    # caller's spot). The quote's underlying_price can lag or — in mock mode —
+    # diverge from it, breaking target ordering. (Pre-2026-08-25 that spot came
+    # from the QuantData snapshot; it is now the IBKR tick. Same contract.)
     spx = current_spx
     entry = quote.ask if quote.ask and quote.ask > 0 else quote.last
 

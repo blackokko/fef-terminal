@@ -181,16 +181,10 @@ body,
   border-color: var(--color-blue);
 }
 
-.all-mock-banner {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  padding: 2px 6px;
-  margin-right: 8px;
-  border: 1px solid var(--color-amber);
-  color: var(--color-amber);
-  border-radius: 3px;
-}
+/* [REMOVED 2026-08-25] .all-mock-banner — styled the "⚠ ALL MOCK" TopBar
+   badge, whose condition read lastStatus.quantdata.startsWith("Mock"). The
+   QuantData API and data subscription were CANCELLED, so the badge can never
+   render and was removed from TopBar.tsx. */
 
 /* Settings panel */
 
@@ -941,34 +935,10 @@ body,
   color: var(--color-text);
 }
 
-/* Walls list */
-
-.wall-list {
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-
-.wall-list li {
-  display: flex;
-  justify-content: space-between;
-  padding: 2px 0;
-}
-
-.wall-strike {
-  font-weight: 600;
-}
-
-.wall-call .wall-net {
-  color: var(--color-green);
-}
-
-.wall-put .wall-net {
-  color: var(--color-red);
-}
+/* [REMOVED 2026-08-25] Walls list — .wall-list, .wall-list li, .wall-strike,
+   .wall-call .wall-net, .wall-put .wall-net. Styled the GEX/DEX wall rows in
+   the QuantData panel, which was deleted when the QuantData API and data
+   subscription were CANCELLED. No other markup used these classes. */
 
 /* Ticket block */
 
@@ -1064,7 +1034,9 @@ button:active {
   padding: 1px 0;
 }
 
-/* QuantData panel subsections */
+/* Panel subsections. (Originally "QuantData panel subsections" — that panel was
+   deleted 2026-08-25 when the QuantData subscription was CANCELLED. These rules
+   stay because AnalyticsPanel uses .subsection-title.) */
 
 .subsection {
   margin-top: 8px;
@@ -1086,12 +1058,9 @@ button:active {
   font-size: 12px;
 }
 
-.aggression-row {
-  display: flex;
-  justify-content: space-between;
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
+/* [REMOVED 2026-08-25] .aggression-row — the call/put aggression rows in the
+   deleted QuantData panel. Aggression % came from QuantData's trade-side
+   endpoint; subscription CANCELLED. */
 
 /* Order ticket */
 

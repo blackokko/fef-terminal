@@ -29,7 +29,23 @@ IBKR TWS paper account, sidecar API on `127.0.0.1:8765`. System card: `docs/OPER
   `historical_bar` rows from May–Jul 2026 (stale ~40% of minutes) or on 2026-06-30 QuantData.
 - QuantData = the live signal input (garbage minutes exist; 250M ceiling; vendors disagree).
   Backtest inputs must match live inputs (Theta-vs-QD parity broke us once already).
-- Don't trust in-app walk-forward $, tournament w/ be_ladder, full_pipeline R, or ML tabs.
+- The in-app research tools that produced untrustworthy numbers (walk-forward/optimize $, tournament,
+  ML, what-if, tuning recs, strategy presets) were **deleted 2026-07-30**, along with their routes and
+  the nightly sweep that fed them. Do not rebuild them. `RESEARCH_TAB_TEARDOWN.md` in the archive says
+  what went and why; registry K0 says why a UI button cannot carry research discipline.
+- **Research lives in `C:\Users\diant\fef-research-archive\`. `RESEARCH_REGISTRY.md` is the index.**
+  Read **G0** (the strategy's measured verdict), **G00** (the strategic reframe), **G★** (the structural
+  answer) and **K** (methodology rules) before proposing any study or strategy change.
+
+## The verdict on the 0DTE strategy (2026-07-30, E4 + synthinject)
+- Measured under CONV-LEVEL (fill no better than the trigger level): **−$48.72/ct across 1,435 fires,
+  t=−3.80, negative in all five years, 0 of 181 grid cells positive OOS.** The published +$65,543
+  is **−$209,737** at 3 lots. This is well-powered — detection floor ~$27.71/ct vs a −$48.72 effect.
+- **The harness cannot detect an edge below ~5.0 index points** (k₄=0.47 makes it ~10). So the ~12
+  intraday directional nulls were **uninformative by construction** — cite G★ (structural), never the
+  null count. Rule 18: no null may be reported without its detection threshold.
+- The bot's job is now **execution truth** (fills, latency, qualify timeouts, broker behaviour) at
+  1 lot — not P&L. Do not score it on session P&L; that question is settled.
 
 ## Environment gotchas
 - Windows console is cp1252: scripts print with `sys.stdout.reconfigure(errors="replace")`.

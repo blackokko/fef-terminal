@@ -2,9 +2,22 @@
 
 Uses mock providers (default env). Verifies:
 - /healthz responds
-- /status reflects mock providers
+- /status reflects the mock provider
 - WS connection receives an initial StatusEvent
-- /run_iter_now triggers an IterEvent that's broadcast over WS
+- /history/signals serves persisted SignalIter rows
+
+[REMOVED 2026-08-25] QuantData subscription CANCELLED.
+  * test_run_iter_now_returns_verdict is DELETED. Its whole subject was
+    POST /run_iter_now, i.e. "fetch a fresh QuantData snapshot and run the FEF
+    engine on it now" — endpoint, fetch and engine call are all gone.
+  * test_status_reports_mock_providers no longer asserts on data["quantdata"]
+    (the key is gone from /status); it still pins the IBKR provider.
+  * test_history_signals_returns_persisted_iters no longer creates its rows by
+    driving a FEF iter, and no longer asserts on the QuantData-sourced columns
+    (top_gex_walls / ntm_max_pain) that /history/signals stopped serving. It
+    writes rows through SignalIterRepository directly — which is exactly how
+    the surviving writer (engine/pattern_trigger.py) produces them — so the
+    ENDPOINT stays covered.
 """
 
 from __future__ import annotations
@@ -16,7 +29,6 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 os.environ["FEF_DB_URL"] = "sqlite+aiosqlite:///:memory:"
-os.environ["FEF_PROVIDER_QUANTDATA"] = "mock"
 os.environ["FEF_PROVIDER_IBKR"] = "mock"
 # Disable background loops in tests — we drive iters manually via REST.
 os.environ["FEF_DISABLE_AUTO_LOOP"] = "true"
@@ -46,38 +58,41 @@ async def test_status_reports_mock_providers(app_with_lifespan) -> None:
         r = await ac.get("/status")
         assert r.status_code == 200
         data = r.json()
-        assert "Mock" in data["quantdata"]
         assert "Mock" in data["ibkr_provider"]
-
-
-@pytest.mark.asyncio
-async def test_run_iter_now_returns_verdict(app_with_lifespan) -> None:
-    transport = ASGITransport(app=app_with_lifespan)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        # Warm up the engine — first 3 iters are WAIT regardless
-        for _ in range(4):
-            r = await ac.post("/run_iter_now")
-            assert r.status_code == 200
-        data = r.json()
-        assert data["ok"] is True
-        assert data["iter_num"] == 4
-        assert "direction" in data["verdict"]
+        assert data["all_mock"] is True
 
 
 @pytest.mark.asyncio
 async def test_history_signals_returns_persisted_iters(app_with_lifespan) -> None:
+    from fef_sidecar.db import SignalIterRepository
+    from fef_sidecar.db.models import FEFConfidence, FEFDirection
+
+    for i in range(3):
+        await SignalIterRepository.write_iter(
+            spx_price=7400.0 + i,
+            direction=FEFDirection.WAIT,
+            confidence=FEFConfidence.NONE,
+            reasoning=f"row {i}",
+            drift_cum_net_m=0.0,
+            drift_bias="NEUTRAL",
+            ntm_max_pain=0.0,
+            raw_max_pain=0.0,
+            top_gex_walls=[],
+            top_dex_walls=[],
+        )
+
     transport = ASGITransport(app=app_with_lifespan)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        for _ in range(3):
-            await ac.post("/run_iter_now")
-
         r = await ac.get("/history/signals?limit=10")
         assert r.status_code == 200
         rows = r.json()
         assert len(rows) == 3
         assert rows[0]["iter_num"] == 3  # newest first
-        assert "top_gex_walls" in rows[0]
-        assert "ntm_max_pain" in rows[0]
+        assert rows[0]["spx_price"] == 7402.0
+        assert "extras" in rows[0]
+        # QuantData-sourced columns are no longer served (2026-08-25).
+        assert "top_gex_walls" not in rows[0]
+        assert "ntm_max_pain" not in rows[0]
 
 
 @pytest.mark.asyncio

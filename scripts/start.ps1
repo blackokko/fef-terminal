@@ -33,6 +33,21 @@ param(
     # those calls all run in DRY_RUN mode (write records, no submission).
     [switch]$LiveTrading,
 
+    # Enable FEF_ALLOW_CREDIT_SPREADS — the naked-short opt-in that
+    # place_credit_spread checks last, after FEF_LIVE_TRADING and the
+    # paper-account assertion. Without it every credit spread is marked
+    # REJECTED before transmission.
+    #
+    # WHY THIS EXISTS: this launcher is what actually starts the sidecar (the
+    # desktop app spawns its own via the watchdog below), and it had never heard
+    # of this variable. A separate hand-rolled launcher that DID set it lost the
+    # race, so on 2026-08-12 the spread path ran fully armed in every other
+    # respect and was refused at the innermost gate. Deliberately its own switch
+    # rather than a rider on -LiveTrading: arming directional orders and arming
+    # an uncovered short leg are different decisions and stay separate.
+    # Defaults OFF.
+    [switch]$CreditSpreads,
+
     # Force a specific IBKR port. If set, skips auto-detection. Use this
     # via the explicit FEF-Live-*.bat / FEF-Paper-*.bat launchers so you
     # always know which account you're connected to.
@@ -135,6 +150,21 @@ $liveTradingEnv = if ($LiveTrading) {
     "`$env:FEF_LIVE_TRADING='true'; "
 } else { "" }
 
+# Explicitly CLEAR the variable when the switch is absent. Inheriting a stale
+# 'true' from the launching shell is exactly how a naked-short path gets armed
+# by accident, and this is the one gate with no code-level default to fall back
+# on beyond the env read itself.
+$creditSpreadEnv = if ($CreditSpreads) {
+    if (-not $LiveTrading) {
+        Write-Warning "-CreditSpreads without -LiveTrading: spreads stay DRY_RUN (nothing transmitted)."
+    }
+    Write-Host "  Credit spreads: ARMED (FEF_ALLOW_CREDIT_SPREADS=true - uncovered short leg permitted)" -ForegroundColor Red
+    "`$env:FEF_ALLOW_CREDIT_SPREADS='true'; "
+} else {
+    Write-Host "  Credit spreads: off (pass -CreditSpreads to arm)"
+    "Remove-Item Env:FEF_ALLOW_CREDIT_SPREADS -ErrorAction SilentlyContinue; "
+}
+
 $watchdogScript = "Set-Location '" + (Join-Path $repo "sidecar") + "'; " + `
     "& .\.venv\Scripts\Activate.ps1; " + `
     "`$env:FEF_PROVIDER_QUANTDATA='" + $QuantDataMode + "'; " + `
@@ -142,6 +172,7 @@ $watchdogScript = "Set-Location '" + (Join-Path $repo "sidecar") + "'; " + `
     "`$env:FEF_IBKR_PORT='" + $ibkrPort + "'; " + `
     "`$env:FEF_LOOP_INTERVAL_SEC='" + $LoopIntervalSec + "'; " + `
     $liveTradingEnv + `
+    $creditSpreadEnv + `
     $scriptedDayEnv + `
     "while (`$true) { " + `
         "Write-Host '[watchdog] Starting fef-sidecar...' -ForegroundColor Yellow; " + `

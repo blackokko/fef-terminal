@@ -19,8 +19,6 @@ import time as _time
 from fef_sidecar.db.models import FEFConfidence, FEFDirection
 from fef_sidecar.engine.strikes import build_plan
 from fef_sidecar.engine.types import FEFInputs, FEFVerdict
-from fef_sidecar.quantdata.max_pain import compute_ntm_max_pain
-from fef_sidecar.quantdata.models import MarketSnapshot
 
 
 def classify_confidence(
@@ -102,50 +100,20 @@ def formula_confidence(
     return conf
 
 
-def snapshot_to_inputs(snap: MarketSnapshot) -> FEFInputs:
-    """Convert a QuantData MarketSnapshot into FEF engine inputs."""
-    ntm = (
-        compute_ntm_max_pain(snap.oi.rows, snap.spx_price).max_pain
-        if snap.oi is not None
-        else snap.max_pain.max_pain
-    )
-
-    # Expiration-bucketed exposure
-    today_top_gex = snap.gex_by_expiry.top(5) if snap.gex_by_expiry else []
-    today_top_dex = snap.dex_by_expiry.top(5) if snap.dex_by_expiry else []
-    zero_dte_gex = snap.gex_by_expiry.zero_dte() if snap.gex_by_expiry else None
-    zero_dte_dex = snap.dex_by_expiry.zero_dte() if snap.dex_by_expiry else None
-
-    # Order-flow summary — 30-min whale/golden-sweep counts
-    now_ms = snap.fetched_at_ms
-    cutoff_ms = now_ms - 30 * 60 * 1000
-    of_orders = snap.order_flow.orders if snap.order_flow else []
-    whale_30m = sum(1 for o in of_orders if o.is_whale and o.timestamp_ms >= cutoff_ms)
-    gs_30m = sum(1 for o in of_orders if o.is_golden_sweep and o.timestamp_ms >= cutoff_ms)
-
-    return FEFInputs(
-        timestamp_ms=snap.fetched_at_ms,
-        spx_price=snap.spx_price,
-        drift_cum_net_m=snap.drift.cumulative_net_m,
-        drift_bias=snap.drift.bias,
-        top_gex_walls=snap.gex.top(5),
-        top_dex_walls=snap.dex.top(5),
-        ntm_max_pain=ntm,
-        raw_max_pain=snap.max_pain.max_pain,
-        aggression_call_pct=snap.aggression.call.aggression_pct if snap.aggression else None,
-        aggression_put_pct=snap.aggression.put.aggression_pct if snap.aggression else None,
-        iv_rank_call_pct=snap.iv_rank.call.ivr_pct if snap.iv_rank and snap.iv_rank.call else None,
-        iv_rank_put_pct=snap.iv_rank.put.ivr_pct if snap.iv_rank and snap.iv_rank.put else None,
-        top_cex_walls=snap.cex.top(5) if snap.cex else [],
-        top_vex_walls=snap.vex.top(5) if snap.vex else [],
-        top_gex_by_expiry=today_top_gex,
-        top_dex_by_expiry=today_top_dex,
-        zero_dte_gex_net_m=zero_dte_gex.net_m if zero_dte_gex else None,
-        zero_dte_dex_net_m=zero_dte_dex.net_m if zero_dte_dex else None,
-        recent_orders=list(snap.order_flow.recent(20)) if snap.order_flow else [],
-        recent_whale_count_30m=whale_30m,
-        recent_golden_sweep_count_30m=gs_30m,
-    )
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED.
+#
+# `snapshot_to_inputs(snap: MarketSnapshot) -> FEFInputs` lived here. It was
+# the ONLY bridge from a live market feed into this engine, and the only
+# producer of MarketSnapshot was the QuantData REST client. With the vendor
+# gone there is no live path that builds FEFInputs, so the 0DTE DIRECTIONAL
+# bot (main iter loop, multi-symbol scanner, pattern-trigger wall geometry)
+# is retired. Operator-confirmed; the research registry had independently
+# concluded the directional premise was falsified.
+#
+# FEFEngine itself is NOT dead: offline/replay callers still build FEFInputs
+# from PERSISTED rows (engine/counterfactual.py::_flow_snapshot_to_inputs,
+# engine/optimization.py, engine/auto_walk_forward.py). Do not restore a
+# live-feed adapter here without a new, validated data source.
 
 
 class FEFEngine:
@@ -202,7 +170,8 @@ class FEFEngine:
             flow_surge_min_samples: minimum trailing readings before the adaptive
                 percentile is trusted; below this the warm-up bootstrap is used.
             drift_sanity_ceiling_m: reject any |ΔDrift| above this (in $M, scaled)
-                as a corrupted-capture GLITCH — QuantData occasionally emits a
+                as a corrupted-capture GLITCH — the QuantData feed (removed
+                2026-08-25) occasionally emitted a
                 garbage cumulative drift (e.g. -2839M vs a normal tens-of-M scale).
                 Such a reading would otherwise fire a false surge in a random
                 direction (as it enters AND leaves the 3-iter window) and poison
@@ -329,7 +298,7 @@ class FEFEngine:
 
         # GLITCH GUARD (2026-06-30): reject a corrupted-capture ΔDrift before it can
         # fire a false surge OR poison the adaptive-percentile buffer. A garbage
-        # cumulative drift (e.g. QuantData's -2839M on 2026-06-30) produces a huge
+        # cumulative drift (e.g. the -2839M print on 2026-06-30) produces a huge
         # ΔDrift as it enters AND again as it leaves the 3-iter window — two
         # wrong-direction fires from one bad tick. Bail out without firing and
         # WITHOUT recording it into the surge distribution.
@@ -627,7 +596,7 @@ class FEFEngine:
         # 2-iter persistence: require collapse signal to hold across two
         # comparisons (iter[-2]→iter[-1] AND iter[-3]→iter[-2]). On a 120s
         # cadence a 1-iter 20% wall drop is borderline indistinguishable
-        # from QuantData snapshot noise. Standard flow-system noise filter.
+        # from flow-snapshot noise. Standard flow-system noise filter.
         if len(self._history) < 3:
             return False, None
 

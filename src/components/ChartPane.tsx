@@ -15,8 +15,12 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { useSidecar } from "../context/WebSocketContext";
-import type { IterEvent, WallRow } from "../lib/events";
-import { formatExposureM } from "../lib/format";
+// [REMOVED 2026-08-25] `import type { IterEvent, WallRow }` and
+// `formatExposureM` — both existed only to build the GEX/DEX wall price lines
+// and the NTM max-pain line. The QuantData API and data subscription were
+// CANCELLED, so those overlays were removed. Nothing else in this file used
+// them. The StdDev regression channel below is NOT affected — it is computed
+// locally from price bars.
 
 const API_BASE = "http://127.0.0.1:8765";
 
@@ -146,10 +150,13 @@ const CANDLE_OPTIONS = {
   wickUpColor: "#3fb950", wickDownColor: "#f85149",
 };
 
-const WALL_COLORS = {
-  GEX_CALL: "#58a6ff", GEX_PUT: "#a371f7",
-  DEX_CALL: "#3fb950", DEX_PUT: "#f85149",
-  MAX_PAIN: "#d29922", DAY_HIGH: "#3fb950", DAY_LOW: "#f85149",
+// Ambient price-line colors. [RENAMED + TRIMMED 2026-08-25] was WALL_COLORS,
+// which also carried GEX_CALL / GEX_PUT / DEX_CALL / DEX_PUT / MAX_PAIN. Those
+// five drove QuantData-sourced overlays; the QuantData API and data
+// subscription were CANCELLED and the overlays removed with them. What is left
+// is derived from the loaded bars, not from any subscription.
+const LEVEL_COLORS = {
+  DAY_HIGH: "#3fb950", DAY_LOW: "#f85149",
   VWAP: "#58a6ff",
 };
 
@@ -289,30 +296,11 @@ const REG_PRESETS: { label: string; duration: string; barSize: string }[] = [
   { label: "5D·5m", duration: "5 D", barSize: "5 mins" },
 ];
 
-interface AggregatedWall {
-  strike: number; sources: string[]; dominantColor: string;
-}
-
-function aggregateWalls(iter: IterEvent | null): { walls: AggregatedWall[]; ntmMaxPain: number | null } {
-  if (!iter) return { walls: [], ntmMaxPain: null };
-  const byStrike = new Map<number, AggregatedWall>();
-  const addWall = (w: WallRow, kind: "GEX" | "DEX") => {
-    const existing = byStrike.get(w.strike);
-    const label = `${kind} ${formatExposureM(w.net_m)}`;
-    const color = kind === "GEX"
-      ? (w.side === "CALL" ? WALL_COLORS.GEX_CALL : WALL_COLORS.GEX_PUT)
-      : (w.side === "CALL" ? WALL_COLORS.DEX_CALL : WALL_COLORS.DEX_PUT);
-    if (existing) {
-      existing.sources.push(label);
-      if (Math.abs(w.net_m) > 0) existing.dominantColor = color;
-    } else {
-      byStrike.set(w.strike, { strike: w.strike, sources: [label], dominantColor: color });
-    }
-  };
-  for (const w of iter.snapshot.top_gex.slice(0, 5)) addWall(w, "GEX");
-  for (const w of iter.snapshot.top_dex.slice(0, 5)) addWall(w, "DEX");
-  return { walls: Array.from(byStrike.values()), ntmMaxPain: iter.snapshot.ntm_max_pain };
-}
+// [REMOVED 2026-08-25] `AggregatedWall` + `aggregateWalls()`. They merged the
+// top-5 GEX and top-5 DEX rows from IterEvent.snapshot into one price line per
+// strike and carried NTM max pain alongside. Every input came from QuantData,
+// whose API and data subscription were CANCELLED, so the whole overlay was
+// removed rather than left drawing a frozen last snapshot on a live chart.
 
 interface FetchedBar {
   timestamp_ms: number; open: number; high: number; low: number; close: number; volume: number;
@@ -349,11 +337,15 @@ export function ChartPane() {
   const [showOverlay, setShowOverlay] = useState(false);
   const [overlayBarSize, setOverlayBarSize] = useState("1 day");
   const [overlayLookback, setOverlayLookback] = useState("6 M");
-  const priceLinesRef = useRef<IPriceLine[]>([]);
+  // [REMOVED 2026-08-25] priceLinesRef — held the GEX/DEX/max-pain price-line
+  // handles. Its only writer was the wall-overlay effect, deleted with the
+  // QuantData subscription. ambientLinesRef (Day H/L) is unrelated and stays.
   const ambientLinesRef = useRef<IPriceLine[]>([]);
   const renderedBarCountRef = useRef(0);
 
-  const { lastIter, lastTick, activeSymbol } = useSidecar();
+  // [REMOVED 2026-08-25] `lastIter` was destructured here only to feed the wall
+  // overlay. QuantData subscription CANCELLED; overlay gone.
+  const { lastTick, activeSymbol } = useSidecar();
   const symbol = activeSymbol ?? "SPX";  // dropdown in TopBar is single source of truth
   const [timeframe, setTimeframe] = useState<string>("2 mins");
   const [bars, setBars] = useState<FetchedBar[]>([]);
@@ -478,7 +470,6 @@ export function ChartPane() {
       overlayRef.current = {
         center: null, up1: null, up2: null, up3: null, dn1: null, dn2: null, dn3: null,
       };
-      priceLinesRef.current = [];
       ambientLinesRef.current = [];
       renderedBarCountRef.current = 0;
     };
@@ -561,8 +552,8 @@ export function ChartPane() {
       trendSupportRef.current?.setData([]);
       trendResistRef.current?.setData([]);
       if (seriesRef.current) {
-        for (const line of priceLinesRef.current) seriesRef.current.removePriceLine(line);
-        priceLinesRef.current = [];
+        // (The priceLinesRef sweep that stood here cleared the QuantData
+        // GEX/DEX/max-pain lines — removed 2026-08-25 with that subscription.)
         for (const line of ambientLinesRef.current) seriesRef.current.removePriceLine(line);
         ambientLinesRef.current = [];
       }
@@ -787,33 +778,67 @@ export function ChartPane() {
       dn1: LineData[]; dn2: LineData[]; dn3: LineData[];
     } = { mid: [], up1: [], up2: [], up3: [], dn1: [], dn2: [], dn3: [] };
 
+    // ⚠ REPAINT FIX (2026-08-11). The original code fitted ONE line across all n
+    // loaded bars and drew it over every bar, so each new bar moved every
+    // historical band value. Measured by `tospane` (research archive), replaying
+    // these exact presets bar by bar:
+    //
+    //   preset     ±2σ drift (median)  = % of band width   P(really at 2σ | shown at 2σ)
+    //   5D·5m      31.85 pts           37%                 47.2%
+    //   10D·30m    49.90 pts           38%                 49.5%
+    //   6mo·1D     152.4 pts           35%                 51.1%
+    //
+    // The drawn slope disagreed in SIGN with the live one 21–28% of the time, the
+    // live σ ran 0.68–0.74× the finished σ, and only 10–16% of the ±2σ touches that
+    // actually happened stayed visible. Scoring signals off the finished line gave
+    // +19..+85 pts/signal and t≥3 in 43 of 46 cells — 0 of 46 scored honestly.
+    // Matched random walks reproduced ALL of it: the repaint was the estimator, not
+    // the market. Server-side twin: engine/technical.stddev_channel_rolling().
+    //
+    // Now each bar is fitted on its OWN trailing window, so the invariant holds:
+    //     band[i] depends only on closes[0..i]
+    // Successive points are therefore NOT collinear — this is a curve, not a line.
+    // Set SD_CHANNEL_FULL_RANGE = true to restore the old (repainting) look.
+    const SD_CHANNEL_FULL_RANGE = false;
+    const SD_CHANNEL_LOOKBACK = 0;  // 0 = expand to all prior bars; >0 = fixed trailing window
+
     if (closes.length >= 2) {
       const n = closes.length;
-      const xbar = (n - 1) / 2;  // mean of 0..n-1
-      let ybar = 0;
-      for (let i = 0; i < n; i++) ybar += closes[i];
-      ybar /= n;
-      let sxx = 0, sxy = 0;
-      for (let i = 0; i < n; i++) {
-        const dx = i - xbar;
-        const dy = closes[i] - ybar;
-        sxx += dx * dx;
-        sxy += dx * dy;
-      }
-      const m = sxx !== 0 ? sxy / sxx : 0;
-      const intercept = ybar - m * xbar;
-      // Residual stddev — population N (matches TOS convention)
-      let ssq = 0;
-      for (let i = 0; i < n; i++) {
-        const pred = m * i + intercept;
-        const e = closes[i] - pred;
-        ssq += e * e;
-      }
-      const sd_ = Math.sqrt(ssq / n);
-      // Build the 7 parallel lines across every bar
+      const fitAt = (endIdx: number): { y: number; sd: number } => {
+        // Fit closes[lo..endIdx] and evaluate at endIdx. Centered OLS for the same
+        // numerical reason as before; population-N residual σ to match TOS.
+        const lo = SD_CHANNEL_FULL_RANGE
+          ? 0
+          : SD_CHANNEL_LOOKBACK > 0
+            ? Math.max(0, endIdx - SD_CHANNEL_LOOKBACK + 1)
+            : 0;
+        const hi = SD_CHANNEL_FULL_RANGE ? n - 1 : endIdx;
+        const w = hi - lo + 1;
+        if (w < 2) return { y: closes[endIdx], sd: 0 };
+        const xbar = (w - 1) / 2;
+        let ybar = 0;
+        for (let j = 0; j < w; j++) ybar += closes[lo + j];
+        ybar /= w;
+        let sxx = 0, sxy = 0;
+        for (let j = 0; j < w; j++) {
+          const dx = j - xbar;
+          const dy = closes[lo + j] - ybar;
+          sxx += dx * dx;
+          sxy += dx * dy;
+        }
+        const m = sxx !== 0 ? sxy / sxx : 0;
+        const intercept = ybar - m * xbar;
+        let ssq = 0;
+        for (let j = 0; j < w; j++) {
+          const e = closes[lo + j] - (m * j + intercept);
+          ssq += e * e;
+        }
+        return { y: m * (endIdx - lo) + intercept, sd: Math.sqrt(ssq / w) };
+      };
+
       for (let i = 0; i < n; i++) {
         const t = times[i];
-        const y = m * i + intercept;
+        const { y, sd: sd_ } = fitAt(i);
         channelData.mid.push({ time: t, value: y });
         channelData.up1.push({ time: t, value: y + sd_ });
         channelData.up2.push({ time: t, value: y + 2 * sd_ });
@@ -857,31 +882,13 @@ export function ChartPane() {
     try { seriesRef.current.update(candle); } catch {}
   }, [lastTick, symbol, bars, isTickTf]);
 
-  // Wall overlays. ALWAYS clear stale lines on any change so switching from
-  // SPX to ES/SPY/etc. doesn't leave SPX wall labels stuck on the chart.
-  // Then only re-add the wall lines when symbol is SPX (the only one with
-  // QuantData flow walls).
-  useEffect(() => {
-    if (!seriesRef.current) return;
-    const series = seriesRef.current;
-    for (const line of priceLinesRef.current) series.removePriceLine(line);
-    priceLinesRef.current = [];
-    if (symbol !== "SPX") return;  // walls are SPX-only
-    if (isTickTf) return;  // tick candles are ES prices — SPX strikes would misalign
-    const { walls, ntmMaxPain } = aggregateWalls(lastIter);
-    for (const w of walls) {
-      priceLinesRef.current.push(series.createPriceLine({
-        price: w.strike, color: w.dominantColor, lineWidth: 1, lineStyle: LineStyle.Solid,
-        axisLabelVisible: true, title: w.sources.join(" | "),
-      }));
-    }
-    if (ntmMaxPain && ntmMaxPain > 0) {
-      priceLinesRef.current.push(series.createPriceLine({
-        price: ntmMaxPain, color: WALL_COLORS.MAX_PAIN, lineWidth: 2, lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true, title: `NTM MP ${ntmMaxPain.toFixed(0)}`,
-      }));
-    }
-  }, [lastIter, symbol, isTickTf]);
+  // [REMOVED 2026-08-25] The wall-overlay effect. It drew one solid price line
+  // per aggregated GEX/DEX strike plus a dashed NTM max-pain line, SPX-only,
+  // refreshed on every IterEvent. The QuantData API and data subscription were
+  // CANCELLED, so the inputs are gone; a chart that keeps drawing the last
+  // snapshot's walls is worse than one that draws none. The `priceLinesRef`
+  // that held the handles went with it — this effect was its only writer.
+  // The Day H/L lines below are unrelated (computed from loaded bars).
 
   // Day H/L
   const dayHighLow = useMemo(() => {
@@ -901,11 +908,11 @@ export function ChartPane() {
     ambientLinesRef.current = [];
     if (dayHighLow) {
       ambientLinesRef.current.push(series.createPriceLine({
-        price: dayHighLow.high, color: WALL_COLORS.DAY_HIGH, lineWidth: 1, lineStyle: LineStyle.Dotted,
+        price: dayHighLow.high, color: LEVEL_COLORS.DAY_HIGH, lineWidth: 1, lineStyle: LineStyle.Dotted,
         axisLabelVisible: true, title: `H ${dayHighLow.high.toFixed(2)}`,
       }));
       ambientLinesRef.current.push(series.createPriceLine({
-        price: dayHighLow.low, color: WALL_COLORS.DAY_LOW, lineWidth: 1, lineStyle: LineStyle.Dotted,
+        price: dayHighLow.low, color: LEVEL_COLORS.DAY_LOW, lineWidth: 1, lineStyle: LineStyle.Dotted,
         axisLabelVisible: true, title: `L ${dayHighLow.low.toFixed(2)}`,
       }));
     }

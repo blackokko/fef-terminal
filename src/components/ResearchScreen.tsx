@@ -1,352 +1,143 @@
 import { useState } from "react";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { PanelCard } from "./PanelCard";
-import { PresetTournamentPanel } from "../panels/PresetTournamentPanel";
-import { StrategyPresetsPanel } from "../panels/StrategyPresetsPanel";
-import { PatternLibraryPanel } from "../panels/PatternLibraryPanel";
-import { MultiStrategyPanel } from "../panels/MultiStrategyPanel";
-import { TournamentPanel } from "../panels/TournamentPanel";
-import { WalkForwardPanel } from "../panels/WalkForwardPanel";
-import { OptimizePanel } from "../panels/OptimizePanel";
-import { MLPanel } from "../panels/MLPanel";
-import { CounterfactualPanel } from "../panels/CounterfactualPanel";
 import { ReplayPanel } from "../panels/ReplayPanel";
-import { AttributionPanel } from "../panels/AttributionPanel";
-import { TuningPanel } from "../panels/TuningPanel";
+import { EngineChangeLogPanel } from "../panels/EngineChangeLogPanel";
 
 /**
- * Research screen — consolidates backtest, parameter sweep, pattern
- * discovery, and strategy comparison tools. Each panel has an expandable
- * "What is this?" help block so the screen is self-documenting.
+ * Research screen — REDUCED 2026-07-30 from 12 panels to 2.
+ *
+ * WHAT HAPPENED
+ * -------------
+ * Nine panels were removed because they GENERATE strategy conclusions, and
+ * every one of them had been found to generate wrong ones. The 2026-07-01
+ * research-tab audit already flagged most of them (walk-forward/optimize
+ * dollars 6x inflated and their "optimal" params noise; tournament winners
+ * flipped by a +0.5R BE-stop bug; ML vacuous, inflated and lookahead-
+ * contaminated; what-if discarding partials; tuning recs unweighted and
+ * stale). Nothing was fixed in the intervening month, and the research done
+ * since made the case worse rather than better.
+ *
+ * THE DEEPER REASON — this is the part worth reading before rebuilding any
+ * of it. Roughly thirty pre-registered studies in the research archive
+ * established that there is no mechanical 0DTE directional edge on the SPX
+ * price series at tradeable strikes: the achievable edge over 1-60 minutes
+ * is 0.08-0.35 index points against a 0.442-point friction floor. So these
+ * panels were searching for something that is not there, and a search that
+ * cannot succeed still returns a top row. Every one of them ranks its
+ * results and shows you a winner.
+ *
+ * And the form is the problem, not just the implementations. What made the
+ * archive's work trustworthy was a discipline layer: pre-registered locks
+ * written before results, untradeable-vehicle controls, TRAIN/OOS splits,
+ * BH-FDR across cells, trivial-baseline comparators, adversarial replication.
+ * A UI button cannot enforce any of that. Clicking "Optimize" yields a number
+ * with no lock file, no null, no control, and no record of how many cells
+ * were searched. That is not a panel that is currently broken and could be
+ * repaired — it is a panel whose shape is incompatible with a trustworthy
+ * result.
+ *
+ * The concrete harm was observable: walk-forward's optimal `wall_proximity`
+ * flipped 3 -> 5 -> 8 across consecutive sessions. That is noise, rendered in
+ * the visual grammar of a recommendation.
+ *
+ * WHAT SURVIVED, AND WHY
+ * ----------------------
+ * The two panels here REPORT rather than INFER. Replay shows a session as it
+ * happened. The engine change log lists what was applied and when. Neither
+ * ranks anything, neither has a winner row, and neither can be overfit,
+ * because neither is fitting.
+ *
+ * REMOVED (component files remain on disk, unreferenced, pending the deploy
+ * window; their sidecar endpoints are untouched and still live):
+ *   PresetTournamentPanel, StrategyPresetsPanel, MultiStrategyPanel,
+ *   TournamentPanel, PatternLibraryPanel, MLPanel, CounterfactualPanel,
+ *   WalkForwardPanel, OptimizePanel, TuningPanel (recommendations half;
+ *   its engine-change log was extracted to EngineChangeLogPanel).
+ *
+ * Real strategy research lives in C:\Users\diant\fef-research-archive\ —
+ * RESEARCH_REGISTRY.md is the index, and section K0 states what that work
+ * can and cannot establish.
  */
 export function ResearchScreen() {
-  const [showQuickstart, setShowQuickstart] = useState(true);
+  const [showWhy, setShowWhy] = useState(false);
 
   return (
     <div className="research-screen">
       <header className="research-header">
         <div className="research-header-row">
-          <h1>Research Orchestration</h1>
+          <h1>Research</h1>
           <button
             className="research-quickstart-toggle"
-            onClick={() => setShowQuickstart((s) => !s)}
+            onClick={() => setShowWhy((s) => !s)}
           >
-            {showQuickstart ? "Hide quickstart" : "Show quickstart"}
+            {showWhy ? "Hide" : "Why is this screen nearly empty?"}
           </button>
         </div>
         <p className="muted">
-          Backtest, parameter sweep, pattern discovery, and strategy comparison.
-          Everything here operates on historical or shadow data. Nothing on
-          this screen places live trades.
+          Session replay and the engine change log. Both read-only, both
+          historical. Nothing here places trades, changes config, or ranks
+          anything.
         </p>
 
-        {showQuickstart && (
+        {showWhy && (
           <div className="research-quickstart">
-            <h3>How to use this screen — workflow in order</h3>
-            <p className="muted small" style={{ marginBottom: 12 }}>
-              You don't need every tool every day. Each panel has a colored
-              timing badge — match those to your workflow stage.
+            <h3>Nine panels were removed on 2026-07-30</h3>
+
+            <p className="muted small">
+              They generated strategy conclusions, and the conclusions were
+              not reliable. The 2026-07-01 audit had already flagged most of
+              them — walk-forward and optimize reporting dollars inflated
+              roughly sixfold with unstable "optimal" parameters, tournament
+              winners flipped by a break-even stop bug, the ML tab vacuous
+              and lookahead-contaminated, what-if discarding partial exits,
+              tuning recommendations unweighted and stale.
             </p>
 
-            <details className="quickstart-stage-details" open>
-              <summary>
-                <span className="quickstart-stage-tag" style={{ background: "var(--color-green)", color: "white" }}>
-                  Start here today
-                </span>
-              </summary>
-              <ol>
-                <li>
-                  <strong>Preset Tournament</strong> (top of screen) —
-                  pick "last 7 days", click Run. See if any saved preset
-                  would have outperformed your current config.
-                </li>
-                <li>
-                  <strong>Attribution</strong> — see where your edge actually
-                  came from over recent sessions. Hour of day, trigger type,
-                  regime, FE ratio, wall distance.
-                </li>
-              </ol>
-            </details>
+            <p className="muted small">
+              The deeper reason is that they were searching for something the
+              research archive has since ruled out. Around thirty
+              pre-registered studies put the achievable directional edge over
+              1&ndash;60 minutes at 0.08&ndash;0.35 index points against a
+              0.442-point friction floor. A search that cannot succeed still
+              returns a top row &mdash; every one of these panels ranked its
+              results and showed a winner.
+            </p>
 
-            <details className="quickstart-stage-details" open>
-              <summary>
-                <span className="quickstart-stage-tag" style={{ background: "var(--color-accent)", color: "white" }}>
-                  Each trading day
-                </span>
-              </summary>
-              <ol>
-                <li>
-                  <strong>Pre-market</strong>: glance at Strategy Presets if
-                  you have a regime read. Otherwise leave on "Default 2-min".
-                </li>
-                <li>
-                  <strong>During hours</strong>: Multi-Strategy and Strategy
-                  Tournament populate with live A/B verdicts (other panels
-                  on Trading screen handle live execution).
-                </li>
-                <li>
-                  <strong>End of day</strong>: run Preset Tournament to see
-                  what would have done best, check Attribution for the day,
-                  add notes to DEFERRED_CHANGES if anything stood out.
-                </li>
-              </ol>
-            </details>
+            <p className="muted small">
+              And the form was the problem as much as the code. What made the
+              archive's work trustworthy was pre-registered locks written
+              before results, controls that could falsify the finding,
+              train/test splits, multiple-comparison correction, and
+              independent replication. A button cannot enforce any of that.
+              Clicking "Optimize" gave a number with no lock, no null, and no
+              record of how many combinations were searched.
+            </p>
 
-            <details className="quickstart-stage-details">
-              <summary>
-                <span className="quickstart-stage-tag" style={{ background: "var(--color-text-muted)", color: "white" }}>
-                  Weekly review
-                </span>
-              </summary>
-              <ol>
-                <li>
-                  <strong>Replay</strong> any confusing sessions visually.
-                </li>
-                <li>
-                  <strong>Pattern Library</strong>: backtest specific setups
-                  you noticed (define rule → run backtest → check Wilson CI).
-                </li>
-                <li>
-                  <strong>ML proposals</strong>: review queued recommendations.
-                  Add interesting ones to Pattern Library for validation.
-                </li>
-              </ol>
-            </details>
+            <p className="muted small">
+              The observable harm: walk-forward's optimal wall-proximity
+              value flipped 3 &rarr; 5 &rarr; 8 across consecutive sessions.
+              Noise, drawn in the visual grammar of a recommendation.
+            </p>
 
-            <details className="quickstart-stage-details">
-              <summary>
-                <span className="quickstart-stage-tag" style={{ background: "var(--color-text-muted)", color: "white" }}>
-                  After 10+ sessions of data
-                </span>
-              </summary>
-              <ol>
-                <li>
-                  <strong>Walk-Forward</strong>: validate that your current
-                  thresholds aren't overfit. Two Sharpe numbers — train and
-                  test — close together = robust.
-                </li>
-                <li>
-                  <strong>Parameter Sweep</strong>: only AFTER walk-forward.
-                  Find new optimal thresholds, then validate via walk-forward
-                  before shipping.
-                </li>
-                <li>
-                  <strong>Auto Walk-Forward</strong>: runs nightly on its own.
-                  Check the latest WalkForwardRun in the morning.
-                </li>
-              </ol>
-            </details>
+            <p className="muted small">
+              <strong>What survived reports rather than infers.</strong>{" "}
+              Replay shows a session as it happened; the change log lists what
+              was applied and when. Neither ranks anything, so neither can be
+              overfit.
+            </p>
 
-            <p style={{ marginTop: 10, fontSize: 11 }} className="muted">
-              <strong>Important:</strong> nothing on this screen places
-              live trades or resets the freeze counter — all research is
-              read-only on historical data. Loading a preset into the live
-              engine via the Strategy Presets panel IS a live config change;
-              everything else just analyses.
+            <p className="muted small" style={{ marginTop: 10 }}>
+              Strategy research now lives in the research archive.{" "}
+              <code>RESEARCH_REGISTRY.md</code> is the index; section K0 states
+              what that work can and cannot establish, including the parts that
+              are permanently unavailable.
             </p>
           </div>
         )}
       </header>
 
-      <ErrorBoundary label="PresetTournament">
-        <PresetTournamentPanel />
-      </ErrorBoundary>
-
       <div className="research-grid">
-        <div className="research-column">
-          <h2 className="research-section-title">Strategies</h2>
-
-          <PanelCard help={{
-            title: "Strategy Presets",
-            cadence: "pre-market",
-            whatItDoes:
-              "Saved bundles of FEF threshold values (wall proximity, " +
-              "wall collapse %, absorption FE minimum, etc.). Each preset " +
-              "is a complete config you can load into the live engine.",
-            useItWhen:
-              "Before market open, if you have a strong read on what kind " +
-              "of day you expect — load the matching preset (Pin / Trend / " +
-              "Volatile / Chop / Power Hour). 'Default 2-min' is the safe " +
-              "baseline when uncertain.",
-            expect:
-              "A list of saved presets with Apply / Edit / Delete buttons. " +
-              "Hitting Apply hot-swaps the live engine's thresholds. The " +
-              "active preset name shows in the UI; auto-trader will fire " +
-              "differently based on the loaded thresholds.",
-            note:
-              "Loading a preset IS a live engine change. During the freeze " +
-              "period, prefer the 'Default 2-min' preset unless you have a " +
-              "specific tested reason to swap.",
-          }}>
-            <StrategyPresetsPanel />
-          </PanelCard>
-
-          <PanelCard help={{
-            title: "Multi-Strategy",
-            cadence: "daily-live",
-            whatItDoes:
-              "Runs N FEFEngine instances in parallel on the SAME live " +
-              "data, each with different threshold configs. Your production " +
-              "engine is the only one that fires real trades; the others " +
-              "are silent observers logging what they WOULD have fired.",
-            useItWhen:
-              "During market hours, when you want to A/B test multiple " +
-              "presets simultaneously without committing to one. Useful " +
-              "to spot 'the Trend Day preset would have caught this move " +
-              "that my Default 2-min missed' patterns.",
-            expect:
-              "Side-by-side verdict per strategy per iter, updating live. " +
-              "Discrepancies between strategies are flagged. Empty outside " +
-              "market hours.",
-            liveOnly: true,
-          }}>
-            <MultiStrategyPanel />
-          </PanelCard>
-
-          <PanelCard help={{
-            title: "Strategy Tournament (live)",
-            cadence: "daily-live",
-            whatItDoes:
-              "Same parallel runner as Multi-Strategy, but adds a consensus " +
-              "tally on top — 'how many strategies agree on this direction?' " +
-              "Surfaces strong-agreement entries and warns on splits.",
-            useItWhen:
-              "During market hours, as a confirmation overlay. Strong " +
-              "consensus (4 of 5 same direction) suggests robust signal; " +
-              "full disagreement suggests mixed-regime chop — skip.",
-            expect:
-              "Per-variant verdicts plus a consensus row at the top with " +
-              "agreement counts and consensus_strength (0.0–1.0). Empty " +
-              "outside market hours.",
-            liveOnly: true,
-          }}>
-            <TournamentPanel />
-          </PanelCard>
-        </div>
-
-        <div className="research-column">
-          <h2 className="research-section-title">Patterns &amp; ML</h2>
-
-          <PanelCard help={{
-            title: "Pattern Library",
-            cadence: "weekly",
-            whatItDoes:
-              "Hand-crafted rule definitions for repeatable setups. Example: " +
-              "'drift_cum > 5 AND fe_ratio > 0.5 AND nearest_wall_distance > 15 " +
-              "AND aligned = True.' Distinct from the FEF model itself — " +
-              "these are deterministic if-then triggers you can backtest.",
-            useItWhen:
-              "When you notice a specific setup pattern and want quantitative " +
-              "validation. Define the pattern as a rule, hit Backtest, see " +
-              "how often it fired and what the win rate / expectancy was.",
-            expect:
-              "Per-pattern statistics: n matches, wins/losses, win rate " +
-              "with Wilson confidence interval, expectancy R, max drawdown, " +
-              "Sharpe ratio.",
-          }}>
-            <PatternLibraryPanel />
-          </PanelCard>
-
-          <PanelCard help={{
-            title: "ML Pattern Discovery",
-            cadence: "weekly",
-            whatItDoes:
-              "Engine watches the DB for winning streaks and proposes new " +
-              "pattern definitions or gate changes. Not 'AI deciding trades' " +
-              "— an idea queue surfacing combinations of features that " +
-              "correlate with wins.",
-            useItWhen:
-              "Periodic review (weekly). Browse suggestions, evaluate " +
-              "with skepticism, manually add to Pattern Library if " +
-              "compelling.",
-            expect:
-              "List of proposed rules with backing data (sample size, win " +
-              "rate, p-value). Currently INFORMATIONAL only — Apply buttons " +
-              "don't auto-mutate the engine.",
-            note:
-              "Auto-applying recommendations is in DEFERRED_CHANGES because " +
-              "it's a freeze-impacting change. Small samples easily lie — " +
-              "human review required.",
-          }}>
-            <MLPanel />
-          </PanelCard>
-
-          <PanelCard help={{
-            title: "What-If Analysis",
-            cadence: "daily-eod",
-            whatItDoes:
-              "Shows what today's WR% and P/L would be with proposed changes " +
-              "(option-price BE ladder + B+C+D exits, or faster polling intervals) " +
-              "without actually shipping them. Quantifies the impact of deferred " +
-              "changes so you can prioritize which to ship after the freeze.",
-            useItWhen:
-              "Before deciding to reset the freeze counter for an engine change — " +
-              "see the projected upside vs current behavior.",
-            expect:
-              "Side-by-side actual vs counterfactual P/L for the BE/TP changes, " +
-              "plus a polling-interval comparison table (120s actual vs 30s/60s/90s).",
-            note:
-              "All read-only — no DB writes, no engine changes, freeze counter " +
-              "unaffected. BE/TP counterfactual uses BE-step as proxy for option " +
-              "MFE; polling counterfactual replays FEFEngine over FlowSnapshots.",
-          }}>
-            <CounterfactualPanel />
-          </PanelCard>
-        </div>
-
-        <div className="research-column">
-          <h2 className="research-section-title">Optimization</h2>
-
-          <PanelCard help={{
-            title: "Walk-Forward",
-            cadence: "after-more-data",
-            whatItDoes:
-              "Parameter sweep PLUS out-of-sample validation. Sweeps " +
-              "threshold combinations on the first 60% of historical data, " +
-              "picks the winner, then tests it on the LAST 40% (data the " +
-              "sweep never saw). Reports both train and test metrics.",
-            useItWhen:
-              "When you think you've found good parameters and need to " +
-              "know if they'll generalize — versus being curve-fit to " +
-              "history. The gold standard for parameter selection.",
-            expect:
-              "Two Sharpe numbers per run: train Sharpe (in-sample) and " +
-              "test Sharpe (out-of-sample). If they're close, the params " +
-              "generalize. If train >> test, they overfit — don't use.",
-            note:
-              "Auto Walk-Forward runs this nightly at 10pm — check the " +
-              "latest WalkForwardRun row each morning for fresh tuning " +
-              "context.",
-          }}>
-            <WalkForwardPanel />
-          </PanelCard>
-
-          <PanelCard help={{
-            title: "Parameter Sweep (Optimize)",
-            cadence: "after-more-data",
-            whatItDoes:
-              "Grid search through threshold combinations. Tries hundreds " +
-              "of combos (wall_proximity × wall_collapse_pct × floor × " +
-              "absorption_FE_min) and ranks each by historical Sharpe / " +
-              "expectancy.",
-            useItWhen:
-              "Exploration phase — when you want to FIND optimal threshold " +
-              "values from data instead of guessing. The output feeds into " +
-              "Walk-Forward for validation.",
-            expect:
-              "A ranked table of parameter combinations with Sharpe / " +
-              "expectancy / max drawdown. The top combination is the BEST " +
-              "ON HISTORY — does not guarantee it works going forward " +
-              "(that's what Walk-Forward proves).",
-            note:
-              "Parameter Sweep alone is the engine. Walk-Forward is the " +
-              "methodology that wraps it with train/test validation. Always " +
-              "validate sweep results via Walk-Forward before shipping.",
-          }}>
-            <OptimizePanel />
-          </PanelCard>
-        </div>
-
         <div className="research-column">
           <h2 className="research-section-title">Historical analysis</h2>
 
@@ -354,10 +145,12 @@ export function ResearchScreen() {
             title: "Replay",
             cadence: "weekly",
             whatItDoes:
+              // Walls and max pain were dropped from this list 2026-08-25:
+              // the QuantData API and data subscription were CANCELLED, so
+              // replay no longer repopulates either overlay.
               "Visual playback of a past session on the chart with all " +
-              "indicators populated. Walls, drift, regime, max pain — " +
-              "everything you saw live, rewound and scrubbed forward at " +
-              "your pace.",
+              "indicators populated. Drift, regime — everything you saw " +
+              "live, rewound and scrubbed forward at your pace.",
             useItWhen:
               "When a specific session was confusing or anomalous and you " +
               "want to SEE what happened — not just read aggregate stats. " +
@@ -366,51 +159,43 @@ export function ResearchScreen() {
               "Chart loads with historical bars. You select a date and " +
               "time, hit play, indicators populate in sequence. Scrub " +
               "controls to advance one iter at a time.",
+            note:
+              "Replay shows you a session; it does not score one. Reading a " +
+              "cause into a single replayed session is the same forking-path " +
+              "error the removed panels automated — with n=1.",
           }}>
-            <ReplayPanel />
+            <ErrorBoundary label="Replay">
+              <ReplayPanel />
+            </ErrorBoundary>
           </PanelCard>
+        </div>
+
+        <div className="research-column">
+          <h2 className="research-section-title">Audit record</h2>
 
           <PanelCard help={{
-            title: "Attribution",
+            title: "Engine change log",
             cadence: "start-here",
             whatItDoes:
-              "Performance breakdown by dimensions — trigger type, regime, " +
-              "hour-of-day, FE ratio band, wall distance band, direction. " +
-              "Answers 'WHERE is my edge actually coming from?'",
+              "Chronological record of every engine change ever applied — " +
+              "what changed, when, in what category, and at which commit.",
             useItWhen:
-              "Weekly review. After enough trades to have statistical " +
-              "signal, this is the panel that tells you which subset of " +
-              "your strategy is paying you and which is bleeding R.",
+              "When a session's numbers look unlike the ones around it, and " +
+              "you need to know whether something was changed underneath " +
+              "them. This is the first thing to check before reading any " +
+              "drift in metrics as signal.",
             expect:
-              "Tables of expectancy / win rate per dimension. Example: " +
-              "'confluence trigger = +0.37R, aligned-only = -0.26R; " +
-              "11am-noon CT = +1.04R, 2pm-3pm CT = -0.45R.'",
-          }}>
-            <AttributionPanel />
-          </PanelCard>
-
-          <PanelCard help={{
-            title: "Tuning recommendations + Engine changes log",
-            cadence: "after-more-data",
-            whatItDoes:
-              "Suggested parameter changes (from auto-walk-forward analysis) " +
-              "plus a chronological log of every engine change ever applied. " +
-              "Use this to understand WHY a session's data looks the way it " +
-              "does (recent change vs steady-state) and what tuning the data " +
-              "is currently suggesting.",
-            useItWhen:
-              "When investigating drift in metrics, considering a tuning " +
-              "decision, or auditing the engine-change history before " +
-              "applying a recommendation.",
-            expect:
-              "Tuning panel with current recommendations + recent engine " +
-              "changes table. Applying a tuning recommendation IS an engine " +
-              "change — it resets the freeze counter.",
+              "A dated list, newest first. Read-only — there is no Apply " +
+              "button, by design.",
             note:
-              "Moved here from the trading sidebar — this is research/tuning " +
-              "work, not live-trade work.",
+              "Recorded impact figures are shown AS RECORDED. Historical " +
+              "R-to-dollar conversions in this project were overstated ~7x " +
+              "(they assumed ATM delta 0.50 where live strikes ran ~0.09), " +
+              "so treat an older impact number as a label, not a P&L claim.",
           }}>
-            <TuningPanel />
+            <ErrorBoundary label="EngineChangeLog">
+              <EngineChangeLogPanel />
+            </ErrorBoundary>
           </PanelCard>
         </div>
       </div>

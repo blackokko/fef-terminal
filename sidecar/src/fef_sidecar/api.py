@@ -11,7 +11,7 @@ from fastapi import Body
 
 from fef_sidecar.config_store import UIConfig, load_config, save_config
 from fef_sidecar.db import SignalIterRepository
-from fef_sidecar.loop import _get_cached_bars, _run_one_iter
+from fef_sidecar.loop import _get_cached_bars
 
 # NOTE (2026-07-08): this binding was MISSING while six handlers already
 # called logger.exception(...) in their error paths — each was a latent
@@ -35,10 +35,12 @@ async def healthz() -> dict[str, str]:
 @router.get("/status")
 async def status(request: Request) -> dict[str, Any]:
     s = _state(request)
-    is_quantdata_mock = type(s.quantdata).__name__ == "MockQuantDataClient"
+    # [REMOVED 2026-08-25] QuantData subscription CANCELLED — the "quantdata"
+    # provider-name key is gone from this payload (frontend dropped it in the
+    # same change), and "all_mock" now means "IBKR is mocked" because IBKR is
+    # the only provider left.
     is_ibkr_mock = type(s.ibkr).__name__ == "MockIBKRProvider"
     return {
-        "quantdata": type(s.quantdata).__name__,
         "ibkr": s.ibkr_status if s.ibkr_status != "unknown" else (
             "connected" if s.ibkr.is_connected else "disconnected"
         ),
@@ -47,7 +49,7 @@ async def status(request: Request) -> dict[str, Any]:
         "last_spx_price": s.last_spx_price,
         "last_iter_num": s.last_iter_num,
         "subscriber_count": s.broadcaster.subscriber_count,
-        "all_mock": is_quantdata_mock and is_ibkr_mock,  # IMPROVEMENTS #13
+        "all_mock": is_ibkr_mock,  # IMPROVEMENTS #13
         "last_iter_perf_ms": s.last_iter_perf_ms,  # IMPROVEMENTS #10
         "active_symbol": s.active_symbol,
         "available_symbols": s.available_symbols,
@@ -140,7 +142,6 @@ async def set_symbol(request: Request, body: dict[str, str] = Body(...)) -> dict
 
     prev_symbol = s.active_symbol
     s.active_symbol = symbol
-    s.last_snapshot = None  # force a fresh QuantData fetch on the new symbol
     # MAJOR-2 (2026-07-23 incident review): the cached active tick belongs to
     # the PREVIOUS symbol — zero it so nothing serves an ES print as "SPX"
     # while the new streams (re)subscribe. The poll loop idles on spot<=0 and
@@ -764,6 +765,140 @@ async def auto_trade_runner_protect(request: Request, body: dict[str, Any] = Bod
     return {"ok": True, "runner_protect_enabled": s.runner_protect_enabled}
 
 
+# ---------------------------------------------------------------------------
+# Credit-spread auto-trader (2026-08-17)
+#
+# WHY THESE EXIST. This module shipped with NO api surface at all, which left
+# two problems the directional bot has never had:
+#   1. It could only be armed by restarting the process with an env var, so it
+#      was armed for a whole session or not at all — no per-session toggle.
+#   2. There was no way to ask WHY it did not fire. On 2026-08-12 that cost an
+#      hour of hand-querying signal_log.db to discover a self-refused order had
+#      silently consumed the day's once-per-session budget.
+# These mirror /auto_trade/status and /auto_trade/toggle deliberately, so the
+# two bots are operated the same way.
+# ---------------------------------------------------------------------------
+
+@router.get("/spread_auto_trade/status")
+async def spread_auto_trade_status(request: Request) -> dict[str, Any]:
+    """Config + counters + WHY THE LAST EVALUATION DID WHAT IT DID."""
+    import os as _os
+    from fef_sidecar.engine.live_trading import is_live_trading_enabled
+
+    s = _state(request)
+    # The two env gates are read fresh from the process environment on every
+    # call rather than cached: they are the outermost safety layer and a stale
+    # cached "true" is the one lie this endpoint must never tell.
+    credit_env = _os.environ.get("FEF_ALLOW_CREDIT_SPREADS", "false").lower() in (
+        "1", "true", "yes",
+    )
+    live_env = is_live_trading_enabled()
+    enabled = bool(getattr(s, "spread_auto_trade_enabled", False))
+    observe = bool(getattr(s, "spread_auto_trade_observe_only", False))
+    return {
+        "enabled": enabled,
+        "observe_only": observe,
+        # What the operator actually wants to know: will a qualifying setup
+        # reach the broker RIGHT NOW? Every layer must line up, so compute it
+        # once here instead of making the UI re-derive the gate stack.
+        "would_transmit": bool(enabled and not observe and credit_env and live_env),
+        "credit_spread_env": credit_env,
+        "live_trading_env": live_env,
+        "qty": getattr(s, "spread_auto_trade_qty", 0),
+        "width": getattr(s, "spread_width", None),
+        "delta_max": getattr(s, "spread_delta_max", None),
+        "delta_floor_frac": getattr(s, "spread_delta_floor_frac", None),
+        "min_credit_width_ratio": getattr(s, "spread_min_credit_width_ratio", None),
+        "puts_only": getattr(s, "spread_puts_only", None),
+        "require_gate": getattr(s, "spread_require_gate", None),
+        "rec_max_age_sec": getattr(s, "spread_rec_max_age_sec", None),
+        "last_placement_date": getattr(s, "spread_auto_trade_last_date", ""),
+        "count_session": getattr(s, "spread_auto_trade_count_session", 0),
+        "last_reason": getattr(s, "spread_auto_trade_last_reason", ""),
+        "last_reason_code": getattr(s, "spread_auto_trade_last_reason_code", ""),
+        "last_eval_at_ms": getattr(s, "spread_auto_trade_last_eval_at_ms", 0),
+        "has_recommendation": bool(getattr(s, "last_spread_recommendation", None)),
+        # Added 2026-08-25: with the FEF IterEvent no longer the primary
+        # carrier, this is the canonical read of what the credit-spread bot
+        # currently sees. Diagnostics only — no gate reads it back.
+        "recommendation": getattr(s, "last_spread_recommendation", None),
+    }
+
+
+@router.post("/spread_auto_trade/toggle")
+async def spread_auto_trade_toggle(
+    request: Request, body: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
+    """Turn the credit-spread auto-trader on/off for this session.
+
+    Body: {enabled: bool, confirm: bool, [observe_only: bool]}
+
+    `confirm=true` is required when enabling — same defence as
+    /auto_trade/toggle, against a stale fetch or a replayed request arming a
+    naked-short-capable path by accident.
+
+    ⚠ THIS TOGGLE CANNOT GRANT A CAPABILITY THE PROCESS DOES NOT HAVE. If
+    FEF_ALLOW_CREDIT_SPREADS is unset the broker call refuses regardless, so
+    enabling here would produce a bot that runs every gate and is then denied
+    at the last step — which is precisely the confusing 2026-08-12 failure.
+    Refuse up front and say so instead.
+    """
+    import os as _os
+    from fef_sidecar.db.repository import SignalIterRepository
+    from fef_sidecar.engine.live_trading import is_live_trading_enabled
+
+    s = _state(request)
+    new_enabled = bool(body.get("enabled"))
+    if new_enabled and not body.get("confirm"):
+        raise HTTPException(
+            400, "confirm=true required when enabling the credit-spread auto-trader"
+        )
+    if new_enabled:
+        if _os.environ.get("FEF_ALLOW_CREDIT_SPREADS", "false").lower() not in (
+            "1", "true", "yes",
+        ):
+            raise HTTPException(
+                400,
+                "FEF_ALLOW_CREDIT_SPREADS env not set — the uncovered short leg "
+                "would be refused at the broker. Relaunch with -CreditSpreads "
+                "(scripts/start.ps1) first.",
+            )
+        if not is_live_trading_enabled():
+            raise HTTPException(
+                400,
+                "FEF_LIVE_TRADING env not set — spreads would stay DRY_RUN. "
+                "Relaunch with -LiveTrading first.",
+            )
+
+    s.spread_auto_trade_enabled = new_enabled
+    if "observe_only" in body:
+        s.spread_auto_trade_observe_only = bool(body["observe_only"])
+
+    try:
+        await SignalIterRepository.write_audit_log(
+            category="spread_auto_trade_toggle", actor="user",
+            summary=(
+                f"Credit-spread auto-trade "
+                f"{'ENABLED' if new_enabled else 'disabled'}"
+                f"{' (observe-only)' if s.spread_auto_trade_observe_only else ''}"
+            ),
+            details={
+                "enabled": s.spread_auto_trade_enabled,
+                "observe_only": s.spread_auto_trade_observe_only,
+                "qty": getattr(s, "spread_auto_trade_qty", 0),
+            },
+        )
+    except Exception:
+        # Never let an audit-write failure block the operator from DISABLING.
+        pass
+
+    return {
+        "ok": True,
+        "enabled": s.spread_auto_trade_enabled,
+        "observe_only": s.spread_auto_trade_observe_only,
+    }
+
+
 @router.post("/auto_trade/toggle")
 async def auto_trade_toggle(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Turn auto-trade on/off + optionally update settings.
@@ -1336,70 +1471,16 @@ async def history_reviews(limit: int = 30) -> list[dict[str, Any]]:
     ]
 
 
-@router.get("/tuning/recommendations")
-async def tuning_recommendations(status: str = "OPEN", limit: int = 50) -> list[dict[str, Any]]:
-    """Return TuningRecommendation rows. Default status=OPEN returns the
-    currently-active batch (most recent generation, not yet APPLIED/DISMISSED).
-    Use status=all to see history.
-    """
-    from fef_sidecar.db.engine import get_session as _gs
-    from fef_sidecar.db.models import TuningRecommendation as _TR
-    from sqlmodel import select as _s
-    async with _gs() as session:
-        stmt = _s(_TR).order_by(_TR.generated_at.desc()).limit(limit)  # type: ignore[attr-defined]
-        if status != "all":
-            stmt = stmt.where(_TR.status == status)
-        rows = list((await session.exec(stmt)).all())
-    return [
-        {"id": r.id, "generated_at": r.generated_at.isoformat(),
-         "based_on_sessions": r.based_on_sessions,
-         "based_on_window_start": r.based_on_window_start,
-         "based_on_window_end": r.based_on_window_end,
-         "kind": r.kind, "priority": r.priority,
-         "title": r.title, "body": r.body, "backing_data": r.backing_data,
-         "status": r.status,
-         "applied_engine_change_id": r.applied_engine_change_id,
-         "decided_at": r.decided_at.isoformat() if r.decided_at else None,
-         "decided_by": r.decided_by}
-        for r in rows
-    ]
-
-
-@router.post("/tuning/recompute")
-async def tuning_recompute(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    """Re-run the tuning recommender over a date range (or all data if no range)."""
-    from fef_sidecar.engine.tuning_runner import run_tuning_recommendations
-    start = body.get("start"); end = body.get("end")
-    return await run_tuning_recommendations(start=start, end=end)
-
-
-@router.post("/tuning/decide")
-async def tuning_decide(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Mark a TuningRecommendation as APPLIED or DISMISSED.
-    Body: {recommendation_id: int, decision: 'APPLIED'|'DISMISSED', applied_engine_change_id?: int}
-    """
-    from fef_sidecar.db.engine import get_session as _gs
-    from fef_sidecar.db.models import TuningRecommendation as _TR
-    from sqlmodel import select as _s
-    import datetime as _dt
-    rec_id = int(body["recommendation_id"])
-    decision = body["decision"]
-    if decision not in ("APPLIED", "DISMISSED"):
-        raise HTTPException(400, "decision must be APPLIED or DISMISSED")
-    async with _gs() as session:
-        r = (await session.exec(_s(_TR).where(_TR.id == rec_id))).first()
-        if r is None:
-            raise HTTPException(404, f"recommendation {rec_id} not found")
-        r.status = decision
-        r.decided_at = _dt.datetime.now(_dt.timezone.utc)
-        r.decided_by = body.get("decided_by", "user")
-        if "applied_engine_change_id" in body:
-            r.applied_engine_change_id = body["applied_engine_change_id"]
-        session.add(r)
-        await session.commit()
-    return {"ok": True, "id": rec_id, "status": decision}
-
-
+# [REMOVED 2026-07-30] Tuning routes (/tuning/recommendations,
+# /tuning/recompute, /tuning/decide).
+#
+# The nightly recommender that populated these was removed from
+# engine/auto_walk_forward.py::nightly_scheduler in the same deploy, so these
+# would have served indefinitely-stale rows. The TopBar 'MDL' pill that read
+# them was removed too.
+#
+# See fef-research-archive/RESEARCH_REGISTRY.md K0 for why a nightly job
+# cannot carry the discipline a parameter recommendation needs.
 @router.get("/engine/freeze_state")
 async def engine_freeze_state() -> dict[str, Any]:
     """Sessions since most recent EngineChange — drives the FREEZE N/10
@@ -3936,7 +4017,11 @@ async def diag_streams(request: Request) -> dict[str, Any]:
                 "last_tick_age_ms": tick_age_ms,
             },
             "bar_stream": {"status": _state_of(s.bar_task)},
-            "quantdata_poll": {"status": _state_of(s.quantdata_poll_task)},
+            # [REMOVED 2026-08-25] "quantdata_poll" — QuantData subscription
+            # CANCELLED, loop deleted. "fef_tick" keeps its wire name but now
+            # reports the CREDIT-SPREAD driver (loop.spread_tick_loop), which is
+            # what state.loop_task holds.
+            "spread_tick": {"status": _state_of(s.loop_task)},
             "fef_tick": {"status": _state_of(s.loop_task)},
             "health_check": {"status": _state_of(s.health_check_task)},
             "vix_poll": {"status": _state_of(s.vix_task)},
@@ -4761,8 +4846,12 @@ async def history_flow(
     to_ms: int | None = None,
     limit: int = 5000,
 ) -> list[dict[str, Any]]:
-    """Persisted QuantData flow snapshots — walls, drift, max pain, IVR.
-    Replay any past day's flow evolution."""
+    """Persisted flow snapshots — walls, drift, max pain, IVR.
+
+    [REMOVED 2026-08-25] QuantData subscription CANCELLED — this is now a
+    READ-ONLY HISTORY endpoint. loop.quantdata_poll_loop was the only writer of
+    flow_snapshot; rows stop at the cancellation date. The table is not dropped
+    so past sessions stay replayable."""
     rows = await SignalIterRepository.query_flow_snapshots(
         symbol=symbol.upper(), session_date=session_date,
         from_ms=from_ms, to_ms=to_ms, limit=limit,
@@ -4842,15 +4931,11 @@ async def history_actionable(
     return [_signal_to_dict(r) for r in rows]
 
 
-@router.post("/run_iter_now")
-async def run_iter_now(request: Request) -> dict[str, Any]:
-    """Manually trigger one FEF iter (bypasses the 2-min cadence + cache)."""
-    s = _state(request)
-    try:
-        await _run_one_iter(s, force_fresh=True)
-        return {"ok": True, "iter_num": s.last_iter_num, "verdict": s.last_verdict}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED — POST /run_iter_now
+# deleted. It called loop._run_one_iter(force_fresh=True), i.e. "fetch a fresh
+# QuantData snapshot and run the FEF engine on it now". Both are gone and no
+# frontend caller exists. The credit-spread iteration runs on its own loop
+# (loop.spread_tick_loop); its state is readable at GET /spread_auto_trade/status.
 
 
 # IMPROVEMENTS #24: UI-tunable config (no env-var editing needed)
@@ -4898,16 +4983,26 @@ async def update_config(
     except Exception:
         logger.exception("config-change audit write failed (config saved)")
 
-    # Hot-reload engine thresholds (those that don't require restart)
+    # Hot-reload engine thresholds (those that don't require restart).
+    # absorption_fe_ratio_min joined this list 2026-07-30 — it had no config
+    # path at all before, only the retired preset-apply handler, so the UI
+    # could not honour it. The frontend reads `hot_reloaded` back from this
+    # response rather than hardcoding the list, so both stay in step.
     s.engine._wall_proximity_pts = merged.wall_proximity_pts  # type: ignore[attr-defined]
     s.engine._wall_collapse_pct = merged.wall_collapse_pct  # type: ignore[attr-defined]
     s.engine._wall_collapse_floor_m = merged.wall_collapse_floor_m  # type: ignore[attr-defined]
+    s.engine._absorption_fe_min = merged.absorption_fe_ratio_min  # type: ignore[attr-defined]
 
     return {
         "ok": True,
         "config": merged.model_dump(),
-        "hot_reloaded": ["wall_proximity_pts", "wall_collapse_pct", "wall_collapse_floor_m"],
-        "requires_restart": ["fef_loop_interval_sec", "quantdata_poll_interval_sec"],
+        "hot_reloaded": [
+            "wall_proximity_pts", "wall_collapse_pct", "wall_collapse_floor_m",
+            "absorption_fe_ratio_min",
+        ],
+        # [REMOVED 2026-08-25] "quantdata_poll_interval_sec" — the key is gone
+        # from UIConfig with the vendor.
+        "requires_restart": ["fef_loop_interval_sec"],
     }
 
 
@@ -5032,131 +5127,23 @@ async def close_ticket(
     return {"ok": True, "ticket_id": ticket_id, "status": status_value}
 
 
-# IMPROVEMENTS #C: strategy presets — save/apply named threshold sets
-@router.get("/presets")
-async def list_presets() -> list[dict[str, Any]]:
-    from sqlmodel import select
-
-    from fef_sidecar.db.engine import get_session
-    from fef_sidecar.db.models import StrategyPreset
-
-    async with get_session() as session:
-        rows = (await session.exec(select(StrategyPreset).order_by(StrategyPreset.name))).all()
-        return [
-            {
-                "id": p.id,
-                "name": p.name,
-                "description": p.description,
-                "fef_loop_interval_sec": p.fef_loop_interval_sec,
-                "wall_proximity_pts": p.wall_proximity_pts,
-                "wall_collapse_pct": p.wall_collapse_pct,
-                "wall_collapse_floor_m": p.wall_collapse_floor_m,
-                "absorption_fe_ratio_min": p.absorption_fe_ratio_min,
-            }
-            for p in rows
-        ]
-
-
-@router.post("/presets")
-async def create_preset(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    from datetime import UTC, datetime
-
-    from fef_sidecar.db.engine import get_session
-    from fef_sidecar.db.models import StrategyPreset
-
-    async with get_session() as session:
-        preset = StrategyPreset(
-            name=str(body["name"]),
-            description=str(body.get("description", "")),
-            fef_loop_interval_sec=int(body.get("fef_loop_interval_sec", 120)),
-            wall_proximity_pts=float(body.get("wall_proximity_pts", 5.0)),
-            wall_collapse_pct=float(body.get("wall_collapse_pct", 0.20)),
-            wall_collapse_floor_m=float(body.get("wall_collapse_floor_m", 5.0)),
-            absorption_fe_ratio_min=float(body.get("absorption_fe_ratio_min", 5.0)),
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
-        )
-        session.add(preset)
-        await session.flush()
-        return {"ok": True, "preset_id": preset.id}
-
-
-@router.delete("/presets/{preset_id}")
-async def delete_preset(preset_id: int) -> dict[str, Any]:
-    from sqlmodel import select
-
-    from fef_sidecar.db.engine import get_session
-    from fef_sidecar.db.models import StrategyPreset
-
-    async with get_session() as session:
-        preset = (await session.exec(select(StrategyPreset).where(StrategyPreset.id == preset_id))).first()
-        if preset is None:
-            raise HTTPException(404, f"Preset {preset_id} not found")
-        await session.delete(preset)
-        return {"ok": True}
-
-
-@router.post("/presets/seed_defaults")
-async def seed_default_presets() -> dict[str, Any]:
-    """Insert built-in strategy presets if not already present (idempotent)."""
-    from datetime import UTC, datetime
-
-    from sqlmodel import select
-
-    from fef_sidecar.db.engine import get_session
-    from fef_sidecar.db.models import StrategyPreset
-    from fef_sidecar.engine.preset_templates import DEFAULT_PRESETS
-
-    added = []
-    async with get_session() as session:
-        for tpl in DEFAULT_PRESETS:
-            existing = (
-                await session.exec(select(StrategyPreset).where(StrategyPreset.name == tpl["name"]))
-            ).first()
-            if existing:
-                continue
-            session.add(
-                StrategyPreset(
-                    name=tpl["name"],
-                    description=tpl["description"],
-                    fef_loop_interval_sec=tpl["fef_loop_interval_sec"],
-                    wall_proximity_pts=tpl["wall_proximity_pts"],
-                    wall_collapse_pct=tpl["wall_collapse_pct"],
-                    wall_collapse_floor_m=tpl["wall_collapse_floor_m"],
-                    absorption_fe_ratio_min=tpl["absorption_fe_ratio_min"],
-                    created_at=datetime.now(UTC),
-                    updated_at=datetime.now(UTC),
-                )
-            )
-            added.append(tpl["name"])
-    return {"ok": True, "added": added}
-
-
-@router.post("/presets/{preset_id}/apply")
-async def apply_preset(preset_id: int, request: Request) -> dict[str, Any]:
-    """Hot-apply preset thresholds to the live engine."""
-    from sqlmodel import select
-
-    from fef_sidecar.db.engine import get_session
-    from fef_sidecar.db.models import StrategyPreset
-
-    s = _state(request)
-    async with get_session() as session:
-        preset = (await session.exec(select(StrategyPreset).where(StrategyPreset.id == preset_id))).first()
-        if preset is None:
-            raise HTTPException(404, f"Preset {preset_id} not found")
-        s.engine._wall_proximity_pts = preset.wall_proximity_pts  # type: ignore[attr-defined]
-        s.engine._wall_collapse_pct = preset.wall_collapse_pct  # type: ignore[attr-defined]
-        s.engine._wall_collapse_floor_m = preset.wall_collapse_floor_m  # type: ignore[attr-defined]
-        s.engine._absorption_fe_min = preset.absorption_fe_ratio_min  # type: ignore[attr-defined]
-        return {
-            "ok": True,
-            "applied": preset.name,
-            "hot_reloaded": ["wall_proximity_pts", "wall_collapse_pct", "wall_collapse_floor_m", "absorption_fe_ratio_min"],
-            "requires_restart_for": ["fef_loop_interval_sec"],
-        }
-
-
+# [REMOVED 2026-07-30] Strategy-preset routes (/presets GET|POST|DELETE,
+# /presets/seed_defaults, /presets/{id}/apply).
+#
+# Retired with the Research-tab teardown. /presets/{id}/apply was the
+# reason this could not simply be left in place: it hot-swapped LIVE engine
+# thresholds, and after the UI panel was deleted it became an unguarded
+# mutation endpoint reachable by anything that could reach the port but by
+# nothing a user could see. An invisible live-mutation route is worse than a
+# dead one.
+#
+# The bundles themselves were never evidence: the sweep that produced them
+# returned optimal wall_proximity 3, then 5, then 8 on consecutive sessions.
+# Threshold editing now lives at POST /config (validated, audited, one row
+# per effective change) driving the Settings > Engine thresholds panel.
+#
+# NOT to be confused with /auto_trade/presets, a DIFFERENT and still-live
+# route family used by AutoTradePanel. That one stays.
 # IMPROVEMENTS #Q: chart annotations — user-marked horizontal levels
 @router.get("/annotations")
 async def list_annotations() -> list[dict[str, Any]]:
@@ -5595,7 +5582,7 @@ def _aggregate_scripted_bars(symbol: str, bar_size: str, max_frame: int | None =
     """
     from datetime import datetime, time, timedelta
 
-    from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+    from fef_sidecar.mock.mock_day import DAY_SCRIPT
 
     size_minutes = {
         "1 min": 1, "2 mins": 2, "5 mins": 5, "15 mins": 15, "30 mins": 30,
@@ -5843,40 +5830,12 @@ async def pattern_matches(pattern_id: int, limit: int = 50) -> list[dict[str, An
         ]
 
 
-@router.post("/patterns/test")
-async def test_pattern(
-    request: Request,
-    body: dict[str, Any] = Body(...),
-) -> dict[str, Any]:
-    """Test a conditions list against the most recent iter (returns matched + per-condition debug).
-
-    Body: { 'conditions': [...] }
-    """
-    from fef_sidecar.engine.patterns import evaluate_pattern, extract_fields
-    from fef_sidecar.engine.fef import snapshot_to_inputs
-
-    s = _state(request)
-    if s.last_snapshot is None or not s.last_verdict:
-        raise HTTPException(400, "No iter to test against — run /run_iter_now first")
-
-    inputs = snapshot_to_inputs(s.last_snapshot)  # type: ignore[arg-type]
-    # Reconstruct a partial verdict for field extraction
-    from types import SimpleNamespace
-
-    fake_verdict = SimpleNamespace(
-        direction=SimpleNamespace(value=s.last_verdict.get("direction", "WAIT")),
-        confidence=SimpleNamespace(value=s.last_verdict.get("confidence", "NONE")),
-        nearest_wall_distance=s.last_verdict.get("nearest_wall_distance"),
-        delta_price=s.last_verdict.get("delta_price"),
-        delta_drift_m=s.last_verdict.get("delta_drift_m"),
-        fe_ratio=s.last_verdict.get("fe_ratio"),
-        aligned=s.last_verdict.get("aligned", False),
-        absorption=s.last_verdict.get("absorption", False),
-    )
-
-    fields = extract_fields(inputs, fake_verdict, vix=s.last_vix, iter_num=s.last_iter_num)
-    matched, results = evaluate_pattern(body.get("conditions", []), fields)
-    return {"matched": matched, "conditions": results, "field_values": fields}
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED — POST /patterns/test
+# deleted. It evaluated a conditions list against "the most recent iter", which
+# it rebuilt from state.last_snapshot via snapshot_to_inputs plus a faked
+# FEFVerdict from state.last_verdict. Both inputs are gone. No frontend caller.
+# Pattern DETECTION on bars is unaffected (engine/pattern_overlay.py +
+# engine/pattern_trigger.py).
 
 
 @router.post("/patterns/seed_defaults")
@@ -6294,13 +6253,11 @@ def _signal_to_dict(r) -> dict[str, Any]:
         "direction": r.direction.value if r.direction else None,
         "confidence": r.confidence.value if r.confidence else None,
         "reasoning": r.reasoning,
-        "drift_cum_net_m": r.drift_cum_net_m,
-        "drift_bias": r.drift_bias,
-        "ntm_max_pain": r.ntm_max_pain,
-        "raw_max_pain": r.raw_max_pain,
-        "top_gex_walls": r.top_gex_walls,
-        "top_dex_walls": r.top_dex_walls,
-        "aggression_call_pct": r.aggression_call_pct,
-        "aggression_put_pct": r.aggression_put_pct,
+        # [REMOVED 2026-08-25] QuantData subscription CANCELLED — drift_cum_net_m,
+        # drift_bias, ntm_max_pain, raw_max_pain, top_gex_walls, top_dex_walls,
+        # aggression_call_pct and aggression_put_pct dropped from this payload.
+        # Every one was a QuantData exposure/flow field, nothing reads them any
+        # more, and no new row can populate them. The SignalIter COLUMNS are
+        # deliberately kept (see db/models.py) so historical rows are intact.
         "extras": r.extras,
     }

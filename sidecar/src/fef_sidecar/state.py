@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Protocol
 
 from fef_sidecar.engine import FEFEngine
 from fef_sidecar.engine.microstructure import MicrostructureState
@@ -18,16 +17,12 @@ from fef_sidecar.engine.tick_candles import TickCandleService
 from fef_sidecar.engine.tournament import DEFAULT_VARIANTS, TournamentRunner
 from fef_sidecar.events import EventBroadcaster
 from fef_sidecar.ibkr import IBKRProvider, LiveIBKRProvider, MockIBKRProvider
-from fef_sidecar.quantdata import MockQuantDataClient, QuantDataClient
 
-
-class QuantDataProvider(Protocol):
-    """Both QuantDataClient and MockQuantDataClient satisfy this duck-type."""
-
-    async def __aenter__(self) -> "QuantDataProvider": ...
-    async def __aexit__(self, *args: object) -> None: ...
-    async def aclose(self) -> None: ...
-    async def fetch_market_snapshot(self, **kwargs: object) -> object: ...
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED. `QuantDataProvider`
+# (the QuantDataClient / MockQuantDataClient duck-type), `make_quantdata_client`
+# and the AppState fields `quantdata`, `quantdata_poll_task` and `last_snapshot`
+# are all gone. Nothing in the process holds a vendor client any more, so there
+# is no session to open in the lifespan and nothing to aclose on shutdown.
 
 
 def _env_use_mock(key: str, default: bool = True) -> bool:
@@ -37,19 +32,13 @@ def _env_use_mock(key: str, default: bool = True) -> bool:
     return raw.lower() not in ("live", "true", "1", "yes", "on")
 
 
-def make_quantdata_client() -> QuantDataProvider:
-    if _env_use_mock("FEF_PROVIDER_QUANTDATA", default=True):
-        # Enable coherent track so this mock returns a price that matches
-        # the IBKR mock + tick stream + microstructure at the same moment.
-        os.environ.setdefault("FEF_MOCK_COHERENT", "true")
-        return MockQuantDataClient()  # type: ignore[return-value]
-    return QuantDataClient()  # type: ignore[return-value]
-
-
 def make_ibkr_provider() -> IBKRProvider:
     if _env_use_mock("FEF_PROVIDER_IBKR", default=True):
         # Production mock: coherent PriceTrack so chart bars + ticks +
-        # QuantData + microstructure all show the same price.
+        # microstructure all show the same price. The FEF_MOCK_COHERENT default
+        # used to be set by make_quantdata_client (deleted 2026-08-25); it moves
+        # here so the mock stack stays coherent.
+        os.environ.setdefault("FEF_MOCK_COHERENT", "true")
         return MockIBKRProvider(use_coherent_track=True)
     host = os.environ.get("FEF_IBKR_HOST", "127.0.0.1")
     port = int(os.environ.get("FEF_IBKR_PORT", "7497"))
@@ -59,7 +48,6 @@ def make_ibkr_provider() -> IBKRProvider:
 
 @dataclass
 class AppState:
-    quantdata: QuantDataProvider
     ibkr: IBKRProvider
     engine: FEFEngine
     regime_detector: RegimeDetector
@@ -69,14 +57,11 @@ class AppState:
     loop_task: object | None = None
     bar_task: object | None = None
     tick_task: object | None = None
-    quantdata_poll_task: object | None = None
     health_check_task: object | None = None
     last_spx_price: float = 0.0
-    # Live tick from IBKR (tick_stream_loop) — set ONLY by that loop, never
-    # overwritten by QuantData fetches. Used by _run_one_iter to override the
-    # snapshot's spx_price with the freshest possible spot, so the engine
-    # evaluates wall distance / MP gravity / etc. against current price
-    # instead of the up-to-15s-stale QuantData snapshot price.
+    # Live tick from IBKR (tick_stream_loop) — set ONLY by that loop. Since
+    # 2026-08-25 this is the ONLY spot source in the process: loop._spread_spot
+    # reads it (freshness- and symbol-checked) to price the credit spread.
     last_live_tick_spx: float = 0.0
     last_live_tick_ms: int = 0
     # Which symbol's feed last wrote last_live_tick_spx / last_spx_price
@@ -85,9 +70,13 @@ class AppState:
     # the cached value belongs to the PREVIOUS symbol until the new stream's
     # first print lands.
     last_live_tick_symbol: str | None = None
+    # [REMOVED 2026-08-25] `last_snapshot` (the cached QuantData MarketSnapshot)
+    # is gone. `last_iter_num` / `last_verdict` are KEPT but no longer describe a
+    # FEF verdict: loop._run_spread_iter bumps the counter and stores a
+    # WAIT-shaped dict whose only real payload is `spread_recommendation`, which
+    # is what the frontend OrderTicketPanel reads off the IterEvent wire.
     last_iter_num: int = 0
     last_verdict: dict[str, object] = field(default_factory=dict)
-    last_snapshot: object | None = None  # cached MarketSnapshot for FEF to consume
     ibkr_status: str = "unknown"  # "connected" | "disconnected" | "reconnecting" | "unknown"
     # Account class — populated by the IBKR provider on connect. Determines
     # whether SignalIter / LiveOrder writes get tagged 'paper' / 'live' /
@@ -205,17 +194,130 @@ class AppState:
     # Spread exit rule (always premium_pct for now):
     #   TP  = close for $0.05 debit (basically expire worthless)
     #   Stop = close when current debit reaches stop_multiplier × initial credit
-    spread_stop_multiplier: float = 4.0
-    spread_tp_close_debit: float = 0.05
+    # --- credit-spread structure. Defaults are the MEASURED-BEST values, not the
+    # playbook ones. Every prior default was the worst option on its own axis
+    # (research archive, 2026-08-10/11). Set them back explicitly to restore the
+    # original playbook behaviour; nothing here changes any logic.
+    #
+    #   width 5 -> 10        edge/friction 1.47x -> 2.59x (`touchsell2`); `jointopt`
+    #                        found widest wins at EVERY tenor, 4 of 4 rectangles.
+    #   premium_min 0.70 -> 0  a $0.70 floor on a 5-wide means credit/width >= 14%,
+    #                        so the bot silently refused to trade on calm days and
+    #                        traded on volatile ones. An UNDESIGNED vol filter.
+    #   puts_only            call spreads are negative even at MID in BOTH eras
+    #                        (`tds_sweep` S5); 1DTE calls miscalibrate the wrong way.
+    #   require_gate False   0 of 236 entry gates beat "sell every session" (`vrpsig`),
+    #                        and gating fraction r forfeits sqrt(r) of Sharpe outright.
+    #   delta_max            0.15 wins on mean $/ct, 0.08 wins on Sortino (1.460 vs
+    #                        1.146, `jointopt`). Left at 0.15 pending the operator.
+    spread_width: float = 10.0
+    spread_delta_max: float = 0.15
+    spread_premium_min: float = 0.0
+    spread_puts_only: bool = True
+    spread_require_gate: bool = False
+
+    # --- strike-selection guards (added 2026-08-14 after the 0.0329-delta pick)
+    # ⚠ These MUST stay equal to the DEFAULT_* constants in engine/strike_picker.py.
+    # The whole incident started with that divergence: the module said
+    # premium_min=0.70 while this file passed 0.0, so the only credit guard in
+    # the system had been switched off for the auto-trader's entire life and the
+    # module docstring still advertised it.
+    #
+    #   delta_floor_frac   The short strike must be NEAREST spread_delta_max, not
+    #                      merely under it. Floor = spread_delta_max * this, so at
+    #                      0.15 the accepted band is [0.075, 0.15]. Anything below
+    #                      is REJECTED (the old code's `delta_max * 0.5` test sat
+    #                      after the accept test and could never fire).
+    #   min_quote_coverage Fraction of scanned strikes that must return a delta
+    #                      before "nearest" means anything. The 8/12 scan saw two
+    #                      of six and picked from those two.
+    #   min_credit_width_  Net credit floor as a fraction of WIDTH so it scales
+    #     ratio            instead of becoming an accidental vol filter the way a
+    #                      flat $0.70 on a 5-wide did (= 14%). 5% is a
+    #                      "cannot pay its own commission" backstop: the rejected
+    #                      8/12 spread was 1.55% of width, with commission at
+    #                      16.5% of gross credit. A true 0.15Δ runs 15-25%.
+    #   min_net_credit     Absolute per-share floor, so a narrow width cannot
+    #                      ratio its way down to pennies.
+    spread_delta_floor_frac: float = 0.5
+    spread_min_quote_coverage: float = 0.5
+    spread_min_credit_width_ratio: float = 0.05
+    spread_min_net_credit: float = 0.10
+
+    # HOLD TO EXPIRY is the measured-best exit: it beat the 4x-stop + $0.05-TP pair
+    # in 49 of 72 cells, and that exact pair ranked 6 of 6 in `touchsell2`. Exiting
+    # on a touch costs 43-68% of the whole expectation, and on a defined-risk spread
+    # the long leg IS the stop -- it was already bought and paid for.
+    # Disable via the sentinels below; the watcher needs no code change.
+    #   stop  off: spread_stop_multiplier >= 1e9   (debit never reaches it)
+    #   TP    off: spread_tp_close_debit  <= 0.0   (debit is always > 0)
+    spread_stop_multiplier: float = 1e9
+    spread_tp_close_debit: float = 0.0
+
+    # --- spread auto-trade. OFF by default; this is the flag that makes the bot
+    # actually place credit spreads rather than only recommend them. One position
+    # per session, fixed qty. See engine/spread_auto_trader.py for every gate.
+    #
+    # What it harvests: options over-price the probability of touching the short
+    # strike by 7.25pp (t = +7.36, both eras) -- a risk premium, not a forecast.
+    # What it is measuring: the adverse-selection cost of insisting on a mid fill,
+    # estimated at -$16.34/ct with a CI of [-156, +84] -- wider than the edge, and
+    # a MODEL, because no order was ever actually resting there. Sixty sessions of
+    # real attempts collapses that band; no amount of backtesting can.
+    # ENABLED 2026-08-12 at the operator's direction. Target is the IBKR PAPER
+    # account (DU098107); `require_paper_account()` is a code-level guard that
+    # refuses any account id not starting with "DU", independent of every env
+    # var, so no configuration of this path reaches real money.
+    #
+    # ⚠ DEFAULT FLIPPED True -> False 2026-08-17, and the reason is a safety
+    # ASYMMETRY, not caution for its own sake. The directional bot requires a
+    # per-session UI toggle before it can fire; this module had no API route and
+    # no UI, so `True` here meant "armed the instant the process starts" — MORE
+    # automatic than the bot it sits beside, and unflippable without a restart.
+    # Now that GET/POST /spread_auto_trade/* exist, the launcher flag
+    # (FEF_ALLOW_CREDIT_SPREADS) is the CAPABILITY and this toggle is the INTENT,
+    # which is exactly how auto_trade_enabled behaves. Two levels, not one.
+    spread_auto_trade_enabled: bool = False
+    # OBSERVE-ONLY. Runs every gate against live data and records exactly what it
+    # WOULD have placed and every reason it did not — but sends nothing. Default
+    # True so that enabling auto-trade cannot, by itself, put on a position: the
+    # operator must clear BOTH flags. Adversarial review (2026-08-11) returned
+    # DO NOT SHIP with five open findings, three of which can establish a position
+    # nobody intended; none of them apply while nothing is sent.
+    #
+    # It is not a stub. It starts the attempt ledger — INCLUDING THE SKIPS, which
+    # are the control group the whole fill measurement depends on — and exercises
+    # every gate against real market data, which is how the remaining bugs surface
+    # before an order exists rather than after.
+    spread_auto_trade_observe_only: bool = False
+    spread_auto_trade_qty: int = 1
+    spread_auto_trade_last_date: str = ""   # ET date of the last placement, "" = none
+    # Max age of a recommendation before the auto-trader refuses it. The loop
+    # does NOT refresh last_spread_recommendation when the bar fetch returns
+    # empty, so without this a stale structure stays tradeable indefinitely.
+    spread_rec_max_age_sec: float = 300.0
+    # --- observability (2026-08-17) ------------------------------------------
+    # Why the last evaluation did or did not fire. On 2026-08-12 answering that
+    # question took an hour of hand-querying signal_log.db, because the decision
+    # was returned to the loop, logged, and then discarded. /auto_trade/status
+    # has exposed `last_block_reason` for months; this is the same idea, and its
+    # absence here is why a self-refused order silently burned a whole session.
+    # Diagnostics only — nothing in the gate stack reads these.
+    spread_auto_trade_last_reason: str = ""
+    spread_auto_trade_last_reason_code: str = ""
+    spread_auto_trade_last_eval_at_ms: int = 0
+    # Placements this process has made (NOT a P&L counter, and NOT the dedupe —
+    # the once-per-session guarantee is enforced by spread_auto_trade_last_date
+    # plus the DB check, both of which survive a restart. This does not.)
+    spread_auto_trade_count_session: int = 0
     spread_exit_task: object | None = None
     position_task: object | None = None
     auto_wf_task: object | None = None
-    # Active symbol — drives which contract is fed to bar/tick/iter loops and
-    # which ticker is set on the QuantData page filter. Changing it triggers
-    # a loop restart (api.py /config/symbol POST handler).
+    # Active symbol — drives which contract is fed to the bar/tick/spread loops.
+    # Changing it triggers a loop restart (api.py /config/symbol POST handler).
     active_symbol: str = field(default_factory=lambda: os.environ.get("FEF_ACTIVE_SYMBOL", "SPX").upper())
-    # Symbols allowed in the UI selector (env-overridable for users with
-    # extra QuantData subscriptions). Default = SPX + the new equity tickers.
+    # Symbols allowed in the UI selector (env-overridable). Default = SPX plus
+    # the equity tickers.
     available_symbols: list[str] = field(default_factory=lambda: [
         s.strip().upper() for s in os.environ.get(
             "FEF_AVAILABLE_SYMBOLS",
@@ -388,7 +490,6 @@ class AppState:
     @classmethod
     def build(cls) -> AppState:
         return cls(
-            quantdata=make_quantdata_client(),
             ibkr=make_ibkr_provider(),
             engine=_make_engine(),
             regime_detector=RegimeDetector(
@@ -455,8 +556,8 @@ def _make_engine(
         flow_surge_window=int(os.environ.get("FEF_FLOW_SURGE_WINDOW", "120")),
         flow_surge_noise_floor_m=float(os.environ.get("FEF_FLOW_SURGE_NOISE_FLOOR_M", "1.0")),
         flow_surge_min_samples=int(os.environ.get("FEF_FLOW_SURGE_MIN_SAMPLES", "8")),
-        # Reject corrupted-capture drift glitches (e.g. QuantData -2839M) before
-        # they fire a false surge or poison the adaptive percentile.
+        # Reject corrupted-capture drift glitches (e.g. the -2839M print seen on
+        # 2026-06-30) before they fire a false surge or poison the percentile.
         drift_sanity_ceiling_m=float(os.environ.get("FEF_DRIFT_SANITY_CEILING_M", "250.0")),
         # INERT by default (2026-06-30): the flow-surge directional edge was retired
         # as a spot-reconstruction artifact. The drift input still feeds bias/regime,

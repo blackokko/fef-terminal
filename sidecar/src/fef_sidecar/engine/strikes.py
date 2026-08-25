@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fef_sidecar.db.models import FEFDirection
-from fef_sidecar.quantdata.models import ExposureRow
+from fef_sidecar.engine.types import ExposureRow
 
 
 @dataclass(frozen=True)

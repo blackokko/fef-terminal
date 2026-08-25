@@ -69,8 +69,8 @@ if str(_SRC) not in sys.path:
 from fef_sidecar.db.models import FEFConfidence, FEFDirection, SignalIter  # noqa: E402
 from fef_sidecar.engine.fef import FEFEngine  # noqa: E402
 from fef_sidecar.engine.types import FEFInputs  # noqa: E402
-from fef_sidecar.quantdata.max_pain import compute_ntm_max_pain  # noqa: E402
-from fef_sidecar.quantdata.models import ExposureRow, OIRow  # noqa: E402
+from fef_sidecar.engine.max_pain import compute_ntm_max_pain  # noqa: E402
+from fef_sidecar.engine.types import ExposureRow, OIRow  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Config / constants

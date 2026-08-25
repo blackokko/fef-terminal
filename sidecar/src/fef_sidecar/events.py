@@ -48,20 +48,10 @@ class IterEvent(BaseModel):
     snapshot: dict[str, Any]
 
 
-class SnapshotEvent(BaseModel):
-    """Lightweight market snapshot — fires on the QuantData poll cadence (faster
-    than the FEF loop). Lets the sidebar walls/drift/MP refresh without waiting
-    for the next FEF iter."""
-
-    type: Literal["snapshot"] = "snapshot"
-    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
-    spx_price: float
-    top_gex: list[dict[str, Any]]
-    top_dex: list[dict[str, Any]]
-    drift: dict[str, Any]
-    ntm_max_pain: float
-    raw_max_pain: float
-    aggression: dict[str, Any] | None = None
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED — `SnapshotEvent` (the
+# ~15s walls/drift/max-pain/aggression broadcast that refreshed the sidebar
+# ahead of the FEF iter cadence) is deleted. Its only producer was
+# loop.quantdata_poll_loop and the frontend dropped the type in the same change.
 
 
 class TicketEvent(BaseModel):
@@ -84,7 +74,8 @@ class TicketEvent(BaseModel):
 class StatusEvent(BaseModel):
     type: Literal["status"] = "status"
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
-    quantdata: str  # "connected" | "disconnected" | "mock"
+    # [REMOVED 2026-08-25] `quantdata: str` — provider status for a feed that no
+    # longer exists. Frontend dropped it in the same change.
     ibkr: str
     engine: str  # "running" | "stopped"
     history_size: int = 0
@@ -210,7 +201,6 @@ Event = (
     | IterEvent
     | TicketEvent
     | StatusEvent
-    | SnapshotEvent
     | PatternMatchEvent
     | RegimeEvent
     | AccountEvent
