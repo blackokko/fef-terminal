@@ -210,7 +210,7 @@ class MockIBKRProvider:
         from datetime import datetime, time, timedelta
         import os as _os
         import random as _random
-        from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+        from fef_sidecar.mock.mock_day import DAY_SCRIPT
 
         if getattr(self, "_scripted_bars_done", False):
             return  # already replayed — don't re-yield with same timestamps
@@ -435,7 +435,7 @@ class MockIBKRProvider:
         net_liq = 50_000.0
         # If scripted day on, derive a plausible P/L from where we are in the day
         if _os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false").lower() in ("true", "1", "yes"):
-            from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+            from fef_sidecar.mock.mock_day import DAY_SCRIPT
             idx = max(0, min(self._scripted_index, len(DAY_SCRIPT) - 1))
             frame = DAY_SCRIPT[idx]
             # Simple model: daily P/L scales with how far drift has moved from 0,
@@ -473,7 +473,7 @@ class MockIBKRProvider:
         contract: Contract,
     ) -> AsyncIterator[Quote]:
         """Emit ticks from the coherent PriceTrack — price always matches
-        what bars / QuantData / microstructure see at the same instant."""
+        what bars / microstructure see at the same instant."""
         import os
         from datetime import datetime
 

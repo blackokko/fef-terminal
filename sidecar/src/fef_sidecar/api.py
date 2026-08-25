@@ -11,7 +11,7 @@ from fastapi import Body
 
 from fef_sidecar.config_store import UIConfig, load_config, save_config
 from fef_sidecar.db import SignalIterRepository
-from fef_sidecar.loop import _get_cached_bars, _run_one_iter
+from fef_sidecar.loop import _get_cached_bars
 
 # NOTE (2026-07-08): this binding was MISSING while six handlers already
 # called logger.exception(...) in their error paths — each was a latent
@@ -35,10 +35,12 @@ async def healthz() -> dict[str, str]:
 @router.get("/status")
 async def status(request: Request) -> dict[str, Any]:
     s = _state(request)
-    is_quantdata_mock = type(s.quantdata).__name__ == "MockQuantDataClient"
+    # [REMOVED 2026-08-25] QuantData subscription CANCELLED — the "quantdata"
+    # provider-name key is gone from this payload (frontend dropped it in the
+    # same change), and "all_mock" now means "IBKR is mocked" because IBKR is
+    # the only provider left.
     is_ibkr_mock = type(s.ibkr).__name__ == "MockIBKRProvider"
     return {
-        "quantdata": type(s.quantdata).__name__,
         "ibkr": s.ibkr_status if s.ibkr_status != "unknown" else (
             "connected" if s.ibkr.is_connected else "disconnected"
         ),
@@ -47,7 +49,7 @@ async def status(request: Request) -> dict[str, Any]:
         "last_spx_price": s.last_spx_price,
         "last_iter_num": s.last_iter_num,
         "subscriber_count": s.broadcaster.subscriber_count,
-        "all_mock": is_quantdata_mock and is_ibkr_mock,  # IMPROVEMENTS #13
+        "all_mock": is_ibkr_mock,  # IMPROVEMENTS #13
         "last_iter_perf_ms": s.last_iter_perf_ms,  # IMPROVEMENTS #10
         "active_symbol": s.active_symbol,
         "available_symbols": s.available_symbols,
@@ -140,7 +142,6 @@ async def set_symbol(request: Request, body: dict[str, str] = Body(...)) -> dict
 
     prev_symbol = s.active_symbol
     s.active_symbol = symbol
-    s.last_snapshot = None  # force a fresh QuantData fetch on the new symbol
     # MAJOR-2 (2026-07-23 incident review): the cached active tick belongs to
     # the PREVIOUS symbol — zero it so nothing serves an ES print as "SPX"
     # while the new streams (re)subscribe. The poll loop idles on spot<=0 and
@@ -817,6 +818,10 @@ async def spread_auto_trade_status(request: Request) -> dict[str, Any]:
         "last_reason_code": getattr(s, "spread_auto_trade_last_reason_code", ""),
         "last_eval_at_ms": getattr(s, "spread_auto_trade_last_eval_at_ms", 0),
         "has_recommendation": bool(getattr(s, "last_spread_recommendation", None)),
+        # Added 2026-08-25: with the FEF IterEvent no longer the primary
+        # carrier, this is the canonical read of what the credit-spread bot
+        # currently sees. Diagnostics only — no gate reads it back.
+        "recommendation": getattr(s, "last_spread_recommendation", None),
     }
 
 
@@ -4012,7 +4017,11 @@ async def diag_streams(request: Request) -> dict[str, Any]:
                 "last_tick_age_ms": tick_age_ms,
             },
             "bar_stream": {"status": _state_of(s.bar_task)},
-            "quantdata_poll": {"status": _state_of(s.quantdata_poll_task)},
+            # [REMOVED 2026-08-25] "quantdata_poll" — QuantData subscription
+            # CANCELLED, loop deleted. "fef_tick" keeps its wire name but now
+            # reports the CREDIT-SPREAD driver (loop.spread_tick_loop), which is
+            # what state.loop_task holds.
+            "spread_tick": {"status": _state_of(s.loop_task)},
             "fef_tick": {"status": _state_of(s.loop_task)},
             "health_check": {"status": _state_of(s.health_check_task)},
             "vix_poll": {"status": _state_of(s.vix_task)},
@@ -4837,8 +4846,12 @@ async def history_flow(
     to_ms: int | None = None,
     limit: int = 5000,
 ) -> list[dict[str, Any]]:
-    """Persisted QuantData flow snapshots — walls, drift, max pain, IVR.
-    Replay any past day's flow evolution."""
+    """Persisted flow snapshots — walls, drift, max pain, IVR.
+
+    [REMOVED 2026-08-25] QuantData subscription CANCELLED — this is now a
+    READ-ONLY HISTORY endpoint. loop.quantdata_poll_loop was the only writer of
+    flow_snapshot; rows stop at the cancellation date. The table is not dropped
+    so past sessions stay replayable."""
     rows = await SignalIterRepository.query_flow_snapshots(
         symbol=symbol.upper(), session_date=session_date,
         from_ms=from_ms, to_ms=to_ms, limit=limit,
@@ -4918,15 +4931,11 @@ async def history_actionable(
     return [_signal_to_dict(r) for r in rows]
 
 
-@router.post("/run_iter_now")
-async def run_iter_now(request: Request) -> dict[str, Any]:
-    """Manually trigger one FEF iter (bypasses the 2-min cadence + cache)."""
-    s = _state(request)
-    try:
-        await _run_one_iter(s, force_fresh=True)
-        return {"ok": True, "iter_num": s.last_iter_num, "verdict": s.last_verdict}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED — POST /run_iter_now
+# deleted. It called loop._run_one_iter(force_fresh=True), i.e. "fetch a fresh
+# QuantData snapshot and run the FEF engine on it now". Both are gone and no
+# frontend caller exists. The credit-spread iteration runs on its own loop
+# (loop.spread_tick_loop); its state is readable at GET /spread_auto_trade/status.
 
 
 # IMPROVEMENTS #24: UI-tunable config (no env-var editing needed)
@@ -4991,7 +5000,9 @@ async def update_config(
             "wall_proximity_pts", "wall_collapse_pct", "wall_collapse_floor_m",
             "absorption_fe_ratio_min",
         ],
-        "requires_restart": ["fef_loop_interval_sec", "quantdata_poll_interval_sec"],
+        # [REMOVED 2026-08-25] "quantdata_poll_interval_sec" — the key is gone
+        # from UIConfig with the vendor.
+        "requires_restart": ["fef_loop_interval_sec"],
     }
 
 
@@ -5571,7 +5582,7 @@ def _aggregate_scripted_bars(symbol: str, bar_size: str, max_frame: int | None =
     """
     from datetime import datetime, time, timedelta
 
-    from fef_sidecar.quantdata.mock_day import DAY_SCRIPT
+    from fef_sidecar.mock.mock_day import DAY_SCRIPT
 
     size_minutes = {
         "1 min": 1, "2 mins": 2, "5 mins": 5, "15 mins": 15, "30 mins": 30,
@@ -5819,40 +5830,12 @@ async def pattern_matches(pattern_id: int, limit: int = 50) -> list[dict[str, An
         ]
 
 
-@router.post("/patterns/test")
-async def test_pattern(
-    request: Request,
-    body: dict[str, Any] = Body(...),
-) -> dict[str, Any]:
-    """Test a conditions list against the most recent iter (returns matched + per-condition debug).
-
-    Body: { 'conditions': [...] }
-    """
-    from fef_sidecar.engine.patterns import evaluate_pattern, extract_fields
-    from fef_sidecar.engine.fef import snapshot_to_inputs
-
-    s = _state(request)
-    if s.last_snapshot is None or not s.last_verdict:
-        raise HTTPException(400, "No iter to test against — run /run_iter_now first")
-
-    inputs = snapshot_to_inputs(s.last_snapshot)  # type: ignore[arg-type]
-    # Reconstruct a partial verdict for field extraction
-    from types import SimpleNamespace
-
-    fake_verdict = SimpleNamespace(
-        direction=SimpleNamespace(value=s.last_verdict.get("direction", "WAIT")),
-        confidence=SimpleNamespace(value=s.last_verdict.get("confidence", "NONE")),
-        nearest_wall_distance=s.last_verdict.get("nearest_wall_distance"),
-        delta_price=s.last_verdict.get("delta_price"),
-        delta_drift_m=s.last_verdict.get("delta_drift_m"),
-        fe_ratio=s.last_verdict.get("fe_ratio"),
-        aligned=s.last_verdict.get("aligned", False),
-        absorption=s.last_verdict.get("absorption", False),
-    )
-
-    fields = extract_fields(inputs, fake_verdict, vix=s.last_vix, iter_num=s.last_iter_num)
-    matched, results = evaluate_pattern(body.get("conditions", []), fields)
-    return {"matched": matched, "conditions": results, "field_values": fields}
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED — POST /patterns/test
+# deleted. It evaluated a conditions list against "the most recent iter", which
+# it rebuilt from state.last_snapshot via snapshot_to_inputs plus a faked
+# FEFVerdict from state.last_verdict. Both inputs are gone. No frontend caller.
+# Pattern DETECTION on bars is unaffected (engine/pattern_overlay.py +
+# engine/pattern_trigger.py).
 
 
 @router.post("/patterns/seed_defaults")
@@ -6270,13 +6253,11 @@ def _signal_to_dict(r) -> dict[str, Any]:
         "direction": r.direction.value if r.direction else None,
         "confidence": r.confidence.value if r.confidence else None,
         "reasoning": r.reasoning,
-        "drift_cum_net_m": r.drift_cum_net_m,
-        "drift_bias": r.drift_bias,
-        "ntm_max_pain": r.ntm_max_pain,
-        "raw_max_pain": r.raw_max_pain,
-        "top_gex_walls": r.top_gex_walls,
-        "top_dex_walls": r.top_dex_walls,
-        "aggression_call_pct": r.aggression_call_pct,
-        "aggression_put_pct": r.aggression_put_pct,
+        # [REMOVED 2026-08-25] QuantData subscription CANCELLED — drift_cum_net_m,
+        # drift_bias, ntm_max_pain, raw_max_pain, top_gex_walls, top_dex_walls,
+        # aggression_call_pct and aggression_put_pct dropped from this payload.
+        # Every one was a QuantData exposure/flow field, nothing reads them any
+        # more, and no new row can populate them. The SignalIter COLUMNS are
+        # deliberately kept (see db/models.py) so historical rows are intact.
         "extras": r.extras,
     }

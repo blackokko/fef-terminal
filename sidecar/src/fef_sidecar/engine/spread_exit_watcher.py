@@ -96,7 +96,7 @@ async def spread_exit_watcher_loop(state) -> None:
                     long_opt = Option(sp.symbol, sp.expiry, sp.spread_long_strike, sp.right,
                                       "CBOE" if sp.symbol == "SPX" else "SMART", currency="USD")
                     await ib.qualifyContractsAsync(short_opt, long_opt)
-                    bag = Bag(sp.symbol, exchange="CBOE" if sp.symbol == "SPX" else "SMART", currency="USD")
+                    bag = Bag(symbol=sp.symbol, exchange="CBOE" if sp.symbol == "SPX" else "SMART", currency="USD")
                     bag.comboLegs = [
                         ComboLeg(conId=short_opt.conId, ratio=1, action="BUY",
                                  exchange="CBOE" if sp.symbol == "SPX" else "SMART"),

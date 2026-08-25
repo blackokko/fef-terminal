@@ -1,3 +1,8 @@
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED. THIS SCRIPT NO LONGER
+# RUNS: it imports fef_sidecar.quantdata, which is deleted, and it fetched from
+# the QuantData REST API, which we no longer have credentials for. Kept as the
+# provenance record of the study/backfill it performed (see RESEARCH_REGISTRY);
+# delete it only as a deliberate archive decision, not as a cleanup.
 """Replace the broken pre-2026-05-28 exposure_chain_point backfill (old dashboard
 API — isolated put concentration at spot -> absurd far-OTM gamma flips) with
 clean official-API data. Deletes source='backfill' rows for the listed sessions,

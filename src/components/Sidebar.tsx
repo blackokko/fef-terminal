@@ -18,7 +18,6 @@ import { MicrostructurePanel } from "../panels/MicrostructurePanel";
 import { FEFVerdictPanel } from "../panels/FEFVerdictPanel";
 import { OptionChainPanel } from "../panels/OptionChainPanel";
 import { OrderTicketPanel } from "../panels/OrderTicketPanel";
-import { QuantDataPanel } from "../panels/QuantDataPanel";
 import { RegimePanel } from "../panels/RegimePanel";
 import { SignalLogPanel } from "../panels/SignalLogPanel";
 import { AnalyticsPanel } from "../panels/AnalyticsPanel";
@@ -93,7 +92,13 @@ export function Sidebar() {
         )}
         {tab === "data" && (
           <>
-            <Safe name="QuantData"><QuantDataPanel /></Safe>
+            {/* [REMOVED 2026-08-25] QuantDataPanel — the QuantData API and data
+                subscription were CANCELLED. The panel rendered GEX/DEX walls,
+                net drift, NTM/raw max pain and call/put aggression, all of
+                which came from that feed and nothing else. With the feed gone
+                it could only show a frozen last value or an empty shell, so it
+                was deleted rather than left to display stale data. Do not
+                restore without a replacement data source. */}
             <Safe name="SignalLog"><SignalLogPanel /></Safe>
           </>
         )}

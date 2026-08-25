@@ -1,5 +1,5 @@
 """Coherent mock data — a single PriceTrack + MockClock all subsystems
-sync to, so chart bars / ticks / QuantData snapshot / FEF verdict /
+sync to, so chart bars / ticks /
 microstructure all agree on the current SPX price at every moment."""
 
 from fef_sidecar.mock.clock import MockClock

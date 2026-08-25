@@ -451,7 +451,6 @@ async def nightly_scheduler(state) -> None:
       5. compute_daily_review (consumes the fresh IBKR + live_order data)
       6. [REMOVED 2026-07-30 — was the tuning recommender]
       7. Shadow exit replay
-      8. Option-chain backfill from QuantData
       9+ forward-shadow scorers
 
     Steps 1-3 are what make everything after them trustworthy: they ensure
@@ -554,21 +553,12 @@ async def nightly_scheduler(state) -> None:
             except Exception:
                 logger.exception("Nightly: shadow_exit_replay failed")
 
-            # 8. Option chain backfill from QuantData — fills in price-only
-            # rows for ATM±25pt strike grid so alternate-strike shadow
-            # variants have data even when the live IBKR capture loop
-            # didn't run (e.g., sidecar started post-session, or a strike
-            # outside the live ±25 range becomes interesting later).
-            # Idempotent against the live capture's IBKR rows via UNIQUE
-            # index — no duplicates even if both ran on the same minute.
-            try:
-                from fef_sidecar.engine.option_chain_backfill import (
-                    backfill_session_chains_quantdata,
-                )
-                n = await backfill_session_chains_quantdata(state, session_date)
-                logger.info("Nightly: backfilled %d chain points via QuantData", n)
-            except Exception:
-                logger.exception("Nightly: chain backfill failed")
+            # [REMOVED 2026-08-25] QuantData subscription CANCELLED — step 8
+            # (option-chain backfill for the ATM+/-25pt strike grid, source tag
+            # 'quantdata_backfill') is deleted along with
+            # engine/option_chain_backfill.py. It had exactly one data source.
+            # The LIVE IBKR capture (engine/option_chain_capture.py) is
+            # unaffected and remains the only writer of chain points.
 
             # 9. vwap_loss_short forward-shadow scoring (Phase 1, paper). Scores
             # the FROZEN candidate on today's ES RTH bars + persists to

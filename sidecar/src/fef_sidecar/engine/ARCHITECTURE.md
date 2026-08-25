@@ -1,5 +1,20 @@
 # Engine Architecture
 
+> **[REMOVED 2026-08-25] QuantData subscription CANCELLED — MOST OF THIS
+> DOCUMENT IS NOW HISTORY.** Everything below describing `quantdata_poll_loop`,
+> `_run_one_iter`, `snapshot_to_inputs`, `multi_symbol_scanner_loop`, the
+> directional auto-trade path and the wall/drift/max-pain inputs describes code
+> that has been DELETED. `FEFEngine` itself survives but has no live feed: the
+> only producers of `FEFInputs` left are offline replay callers
+> (`engine/counterfactual.py`, `engine/optimization.py`).
+>
+> What actually runs now: `loop.spread_tick_loop` -> `_run_spread_iter` ->
+> `_build_spread_recommendation` (IBKR 30-min bars + option quotes) ->
+> `_run_spread_auto_trade` -> `engine/spread_auto_trader.maybe_auto_trade_spread`,
+> plus the bar/tick/microstructure/HFT/VIX capture loops and
+> `engine/pattern_trigger.py`. Kept as the record of what the directional
+> pipeline was; do not read it as current behaviour.
+
 The FEF engine is the signal-generation core of the terminal. This doc maps
 the data flow from raw market snapshots to auto-trade orders, where each gate
 lives, and the side-systems (regime, scanner, exit watcher, BE ladder).

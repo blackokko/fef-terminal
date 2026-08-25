@@ -840,7 +840,7 @@ async def place_credit_spread(
                           "CBOE" if spec.symbol == "SPX" else "SMART", currency="USD")
         await ib.qualifyContractsAsync(short_opt, long_opt)
 
-        bag = Bag(spec.symbol, exchange="CBOE" if spec.symbol == "SPX" else "SMART", currency="USD")
+        bag = Bag(symbol=spec.symbol, exchange="CBOE" if spec.symbol == "SPX" else "SMART", currency="USD")
         bag.comboLegs = [
             ComboLeg(conId=short_opt.conId, ratio=1, action="SELL",
                      exchange="CBOE" if spec.symbol == "SPX" else "SMART"),

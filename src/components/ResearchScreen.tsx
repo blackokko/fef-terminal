@@ -145,10 +145,12 @@ export function ResearchScreen() {
             title: "Replay",
             cadence: "weekly",
             whatItDoes:
+              // Walls and max pain were dropped from this list 2026-08-25:
+              // the QuantData API and data subscription were CANCELLED, so
+              // replay no longer repopulates either overlay.
               "Visual playback of a past session on the chart with all " +
-              "indicators populated. Walls, drift, regime, max pain — " +
-              "everything you saw live, rewound and scrubbed forward at " +
-              "your pace.",
+              "indicators populated. Drift, regime — everything you saw " +
+              "live, rewound and scrubbed forward at your pace.",
             useItWhen:
               "When a specific session was confusing or anomalous and you " +
               "want to SEE what happened — not just read aggregate stats. " +

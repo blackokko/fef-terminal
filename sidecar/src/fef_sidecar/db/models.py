@@ -263,8 +263,17 @@ class DailySession(SQLModel, table=True):
 # durable across restarts and replayable for backtesting. None of these
 # were saved in v1 — the bar/tick/microstructure/snapshot WS broadcasts
 # evaporated after delivery. With these tables in place, every iter,
-# every bar, every microstructure sample, and every QuantData snapshot
-# is recoverable for historical chart review + offline strategy testing.
+# every bar, every microstructure sample, and (until 2026-08-25) every
+# QuantData snapshot is recoverable for historical chart review + offline
+# strategy testing.
+#
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED. NO TABLE OR COLUMN IS
+# DROPPED — dropping them would need a migration and would destroy replayable
+# history for zero benefit. What changed is that five of them became READ-ONLY:
+# flow_snapshot, exposure_chain_point, oi_chain_point, aggression_detail and
+# flow_series_point had exactly one writer (loop.quantdata_poll_loop) and it is
+# deleted. Their rows end at the cancellation date. Same for the
+# source='quantdata_backfill' rows in historical_option_chain_point.
 #
 # Storage rough order-of-magnitude per symbol (active trading hours only):
 #   - HistoricalBar:        ~390 rows/day/timeframe ⟶ ~14 MB/yr per timeframe
@@ -344,11 +353,12 @@ class SignalLookaheadOutcome(SQLModel, table=True):
 
 
 class FlowSnapshot(SQLModel, table=True):
-    """One QuantData market snapshot — walls, drift, max pain, aggression, IVR.
+    """One market flow snapshot — walls, drift, max pain, aggression, IVR.
 
-    Written by quantdata_poll_loop on every successful fetch (default 15s
-    cadence). Lets the user replay any past day's flow evolution without
-    re-hitting the QuantData REST API."""
+    [REMOVED 2026-08-25] QuantData subscription CANCELLED — READ-ONLY as of that
+    date. Its only writer was loop.quantdata_poll_loop (every successful fetch,
+    default 15s cadence), which is deleted. The table is kept so past sessions
+    stay replayable via GET /history/flow; no new rows are produced."""
 
     __tablename__ = "flow_snapshot"
 
@@ -459,9 +469,12 @@ class HistoricalOptionChainPoint(SQLModel, table=True):
     Captured via IBKR reqMktData(snapshot=True) every 2 min for ATM±25pt
     × {C,P} = 22 contracts per snapshot. Powers shadow variants that need
     alternate-strike replay (e.g., 'what would ATM call have done'). The
-    QuantData EOD backfill path populates source='quantdata_backfill' rows
-    with bid/ask/last from minute-resolution intraday price paths (no
-    greeks available from that endpoint).
+    [REMOVED 2026-08-25] QuantData subscription CANCELLED — the EOD backfill
+    path that populated source='quantdata_backfill' rows (bid/ask/last from
+    minute-resolution intraday price paths, no greeks) is deleted along with
+    engine/option_chain_backfill.py. Existing rows with that source tag are
+    left in place; the LIVE IBKR capture is unaffected and is now the only
+    writer.
 
     Idempotency: a UNIQUE index on (timestamp_ms, strike, right, expiry)
     is created by init_db; same-minute re-captures silently no-op via
@@ -503,20 +516,22 @@ class HistoricalOptionChainPoint(SQLModel, table=True):
     theta: float | None = None
     vega: float | None = None
 
-    source: str = Field(default="ibkr_snapshot")  # 'ibkr_snapshot' / 'quantdata_backfill'
+    # 'ibkr_snapshot' (live capture, still written) / 'quantdata_backfill'
+    # (historical only — see the class docstring; no new rows since 2026-08-25).
+    source: str = Field(default="ibkr_snapshot")
 
 
 class ExposureChainPoint(SQLModel, table=True):
     """One strike's exposure for one greek at one moment in time.
 
-    Captures the FULL per-strike exposure chain that QuantData returns from
+    Captures the FULL per-strike exposure chain that the (now removed) QuantData feed returned from
     exposure_by_strike (~200 strikes × {GAMMA,DELTA,CHARM,VANNA}), rather than
     just snap.gex.top(5) which the flow_snapshot path truncates to. Per-strike
     rows (not a JSON blob) are what cumulative-gamma / gamma-flip queries need:
     sort by strike, accumulate net_m, find the sign-change crossing near spot.
 
     Two write paths:
-      - source='live_poll'  — quantdata_poll_loop persists the ±60-strike-
+      - source='live_poll'  — quantdata_poll_loop persisted the ±60-strike-
         around-spot window every poll (keeps storage bounded; covers the flip
         zone). The existing top-5 wall persistence to flow_snapshot is kept.
       - source='backfill'   — backfill_exposure_chains.py persists the FULL
@@ -553,7 +568,7 @@ class ExposureChainPoint(SQLModel, table=True):
 class OiChainPoint(SQLModel, table=True):
     """One strike's open interest (call + put) at one moment in time.
 
-    Captures the FULL per-strike OI chain that QuantData returns from
+    Captures the FULL per-strike OI chain that the (now removed) QuantData feed returned from
     get_oi_by_strike (~238 strikes), rather than collapsing to the
     ntm_max_pain/raw_max_pain scalars that flow_snapshot keeps. Per-strike OI
     rows are what pinning / range-regime detection need: where is the largest
@@ -563,7 +578,7 @@ class OiChainPoint(SQLModel, table=True):
     Mirrors ExposureChainPoint exactly (Report 36 — same gap, same fix).
 
     Two write paths:
-      - source='live_poll'  — quantdata_poll_loop persists the ±60-strike-
+      - source='live_poll'  — quantdata_poll_loop persisted the ±60-strike-
         around-spot window at REDUCED cadence (once per minute, NOT every 15s
         poll — OI is slow-moving, per-poll would be ~1.3M rows/session).
       - source='backfill'   — backfill_oi_and_aggression.py persists the FULL
@@ -598,7 +613,7 @@ class OiChainPoint(SQLModel, table=True):
 class AggressionDetailPoint(SQLModel, table=True):
     """Full raw trade-side aggression buckets at one moment in time.
 
-    Captures the FULL AA/A/M/B/BB bucket set per side that QuantData returns
+    Captures the FULL AA/A/M/B/BB bucket set per side that the (now removed) QuantData feed returned
     from get_trade_side_stats, rather than collapsing to the single
     aggression_call_pct/aggression_put_pct scalars that flow_snapshot keeps.
     The raw buckets preserve capitulation-vs-chase detail: AA/A are aggressive
@@ -609,7 +624,7 @@ class AggressionDetailPoint(SQLModel, table=True):
     b/bb). Stored fully — it's one row per poll (tiny), so no windowing.
 
     Two write paths:
-      - source='live_poll'  — quantdata_poll_loop persists every poll (1 row).
+      - source='live_poll'  — quantdata_poll_loop persisted every poll (1 row).
       - source='backfill'   — backfill_oi_and_aggression.py persists one row
         per historical session_date via set_page_filter.
 
@@ -649,7 +664,8 @@ class AggressionDetailPoint(SQLModel, table=True):
 class FlowSeriesPoint(SQLModel, table=True):
     """One minute of intraday call/put premium flow (net-drift + net-flow).
 
-    The official QuantData API serves the FULL intraday time-series per
+    [REMOVED 2026-08-25] QuantData subscription CANCELLED — READ-ONLY table.
+    The QuantData API served the FULL intraday time-series per
     sessionDate from net-drift (signed net call/put premium) and net-flow
     (call/put premium sums). flow_snapshot only stores the per-poll cumulative
     scalar (drift_cum_net_m); this table preserves the per-minute series — a
@@ -657,7 +673,8 @@ class FlowSeriesPoint(SQLModel, table=True):
     one part of an outage gap that's recoverable (exposure is EOD-only).
 
     Two write paths:
-      - source='live_poll' — quantdata_poll_loop upserts new minutes each poll.
+      - source='live_poll' — quantdata_poll_loop upserted new minutes each poll
+        (writer deleted 2026-08-25).
       - source='backfill'  — backfill_flow_series.py pulls a full session.
 
     Idempotency: UNIQUE (timestamp_ms, symbol) created by init_db.
@@ -667,7 +684,7 @@ class FlowSeriesPoint(SQLModel, table=True):
 
     id: int | None = Field(default=None, primary_key=True)
     captured_at: datetime = Field(default_factory=_utcnow, index=True)
-    timestamp_ms: int = Field(index=True)  # minute bucket, UTC ms (from QuantData)
+    timestamp_ms: int = Field(index=True)  # minute bucket, UTC ms
     session_date: str = Field(index=True)  # YYYY-MM-DD ET
     symbol: str = Field(default="SPX", index=True)
 

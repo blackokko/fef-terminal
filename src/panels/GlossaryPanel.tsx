@@ -10,34 +10,20 @@ interface TermEntry {
   negative?: string;
 }
 
+// [REMOVED 2026-08-25] Three groups of entries went out with the QuantData
+// API and data subscription, which were CANCELLED:
+//
+//   "Greek exposures"  — GEX (Gamma Exposure), DEX (Delta Exposure)
+//   "Pin gravity"      — Max Pain (raw), NTM Max Pain
+//   "Aggression %"     — from the Order flow section
+//
+// All four numbers came from QuantData's exposure/max-pain/trade-side
+// endpoints and nothing else, and every UI surface that displayed them (the
+// QuantData panel, the chart's wall + max-pain price lines) was removed in the
+// same pass. A glossary that defines readouts the terminal can no longer show
+// teaches the operator to look for something that is not there. Restore these
+// only alongside a replacement data source.
 const TERMS: { section: string; entries: TermEntry[] }[] = [
-  {
-    section: "Greek exposures",
-    entries: [
-      {
-        term: "GEX (Gamma Exposure)",
-        short:
-          "Net gamma that dealers are exposed to at each strike. Tells you how dealer hedging will dampen or amplify moves near that price.",
-        fefContext:
-          "Big GEX walls act as magnets or barriers. Spot near a dominant GEX wall = pin-prone — FEF skips trades within 5pts of one.",
-        positive:
-          "+net = call-side dominance at that strike → wall acts as a FLOOR (dealers buying to hedge as price falls).",
-        negative:
-          "−net = put-side dominance at that strike → wall acts as a CEILING.",
-      },
-      {
-        term: "DEX (Delta Exposure)",
-        short:
-          "Net delta of all open options at each strike. Where the gravity of directional bets is concentrated.",
-        fefContext:
-          "DEX call walls = real support (dealers long calls hedge by selling SPX on rallies). DEX put walls = real resistance. Use the dominant DEX strike as the floor/ceiling reference for the day.",
-        positive:
-          "+net at strike = massive call wall (e.g., 5/15 $7,400 = +$1.34M net DEX). Defended hard.",
-        negative:
-          "−net at strike = massive put wall (e.g., 5/15 $7,500 = −$976K net DEX). Defended hard from above.",
-      },
-    ],
-  },
   {
     section: "Order flow",
     entries: [
@@ -49,34 +35,6 @@ const TERMS: { section: string; entries: TermEntry[] }[] = [
           "ΔDrift over the 3-iter window is the FEF model's primary 'effort' input. Combined with ΔPrice via the FE ratio.",
         positive: "Cumulative + = bullish flow building under price.",
         negative: "Cumulative − = bearish flow building.",
-      },
-      {
-        term: "Aggression %",
-        short:
-          "What fraction of trades hit at or above the ask (aggressive buyers) vs at or below the bid (aggressive sellers).",
-        fefContext:
-          "Call aggression > put aggression = bull tape. Confirms or contradicts the drift bias.",
-        positive: "Call aggr > put aggr = buyers chasing calls (bullish confirmation).",
-        negative: "Put aggr > call aggr = buyers chasing puts (bearish confirmation).",
-      },
-    ],
-  },
-  {
-    section: "Pin gravity",
-    entries: [
-      {
-        term: "Max Pain (raw)",
-        short:
-          "Strike where total option holder losses are maximized at expiration. Price gravitates toward it.",
-        fefContext:
-          "⚠️ Raw chain MP includes far-OTM macro hedges (LEAPS, deep-OTM puts) and is often nonsense. On 5/15 it returned $7,000 while real pin was $7,410.",
-      },
-      {
-        term: "NTM Max Pain",
-        short:
-          "Max pain recomputed only over strikes within $50 of spot. Filters out macro-hedge noise.",
-        fefContext:
-          "This is the number FEF actually uses for MP gravity. On 5/15 = $7,400, exactly where price camped. Late-session, NTM MP acts as a magnet — set T3 (last partial) near it on aligned trades.",
       },
     ],
   },

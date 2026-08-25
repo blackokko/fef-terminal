@@ -1,3 +1,8 @@
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED. THIS SCRIPT NO LONGER
+# RUNS: it imports fef_sidecar.quantdata, which is deleted, and it fetched from
+# the QuantData REST API, which we no longer have credentials for. Kept as the
+# provenance record of the study/backfill it performed (see RESEARCH_REGISTRY);
+# delete it only as a deliberate archive decision, not as a cleanup.
 """Probe: (1) does QuantData `net-drift` accept a per-expiry (0DTE) filter, and
 (2) does 0DTE-scoping bring its scale into line with the ThetaData 0DTE aggressive
 signed-flow the edge was validated on? Read-only. Run from `sidecar` with the venv:

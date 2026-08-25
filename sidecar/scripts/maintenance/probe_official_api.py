@@ -1,3 +1,8 @@
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED. THIS SCRIPT NO LONGER
+# RUNS: it imports fef_sidecar.quantdata, which is deleted, and it fetched from
+# the QuantData REST API, which we no longer have credentials for. Kept as the
+# provenance record of the study/backfill it performed (see RESEARCH_REGISTRY);
+# delete it only as a deliberate archive decision, not as a cleanup.
 """Probe QuantData official API (api.quantdata.us/v1) to capture request
 schemas + response shapes for the tools the sidecar needs. Read-only.
 Writes full JSON responses to scripts/maintenance/_qd_probe/<tool>.json and

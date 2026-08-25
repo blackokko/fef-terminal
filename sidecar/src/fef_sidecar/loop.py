@@ -1,17 +1,27 @@
 """Background loops:
 
-- fef_tick_loop        — every FEF_LOOP_INTERVAL_SEC (default 120s): consumes
-                         the cached snapshot, runs FEF, persists, broadcasts IterEvent
+- spread_tick_loop     — every FEF_LOOP_INTERVAL_SEC (default 120s): builds the
+                         credit-spread recommendation from cached 30-min IBKR
+                         bars and offers it to the spread auto-trader
 - bar_stream_loop      — continuously streams IBKR 2-min bars, broadcasts TickEvent
                          on each close
 - tick_stream_loop     — sub-second last-price stream (live: ib_async updateEvent;
                          mock: synthetic ticks every FEF_TICK_INTERVAL_SEC). Broadcasts
                          TickEvent without a bar payload.
-- quantdata_poll_loop  — every FEF_QUANTDATA_POLL_INTERVAL_SEC (default 15s): fetches
-                         a fresh MarketSnapshot, caches it in AppState, broadcasts
-                         SnapshotEvent so the sidebar refreshes ahead of the FEF cadence
 
-All four spawn as asyncio tasks in the FastAPI lifespan and cancel on shutdown.
+[REMOVED 2026-08-25] QuantData subscription CANCELLED.
+  * `quantdata_poll_loop` (the ~15s MarketSnapshot fetch that cached the
+    snapshot on AppState, persisted flow_snapshot / exposure-chain / OI-chain /
+    aggression-detail / flow-series rows, fed the phase detector and broadcast
+    SnapshotEvent) is gone — every one of those writes had exactly one source.
+  * `_run_one_iter` (the FEF iteration) is gone. Its input came from
+    `snapshot_to_inputs(MarketSnapshot)`, which had no other producer, so the
+    0DTE DIRECTIONAL bot is retired along with the vendor. Operator-confirmed.
+  * The CREDIT-SPREAD path that used to execute INSIDE `_run_one_iter`, purely
+    by position, was extracted first — see `_build_spread_recommendation` /
+    `_run_spread_auto_trade` / `_run_spread_iter` below. It never had a
+    QuantData import; only its enclosing function did. It now runs on its own
+    schedule off IBKR quotes + cached 30-min bars.
 """
 
 from __future__ import annotations
@@ -22,25 +32,9 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from fef_sidecar.db import (
-    FEFConfidence,
-    FEFDirection,
-    SignalIterRepository,
-)
-from fef_sidecar.engine.fef import snapshot_to_inputs
-from fef_sidecar.engine.mock_autotrader import advance_pending, maybe_create_ticket
+from fef_sidecar.db import SignalIterRepository
 from fef_sidecar.engine.option_targets import OptionTargets, build_option_targets
-from fef_sidecar.engine.patterns import evaluate_pattern, extract_fields
-from fef_sidecar.engine.regime import RegimeSample, now_minutes_since_open_et
-from fef_sidecar.engine.tournament import consensus
-from fef_sidecar.events import (
-    IterEvent,
-    PatternMatchEvent,
-    RegimeEvent,
-    SnapshotEvent,
-    TickEvent,
-    TournamentEvent,
-)
+from fef_sidecar.events import IterEvent, TickEvent
 from fef_sidecar.ibkr import Contract, ContractKind
 
 if TYPE_CHECKING:
@@ -75,270 +69,18 @@ def _walls_json(walls: Any) -> list[dict[str, Any]]:
     ]
 
 
-def _expiry_rows_json(rows: Any) -> list[dict[str, Any]]:
-    """Serialise ExpirationExposureRow list to JSON-safe dicts."""
-    return [
-        {
-            "expiration": r.expiration,
-            "call_m": round(r.call_m, 4),
-            "put_m": round(r.put_m, 4),
-            "net_m": round(r.net_m, 4),
-        }
-        for r in (rows or [])
-    ]
-
-
-# ±N-strike window (around spot) for the full-chain exposure capture. Keeps
-# storage bounded while still covering the gamma-flip zone. Full chain is ~200
-# strikes × 4 greeks/poll (~312k rows/session); the ±60 window is ~24 strikes ×
-# 4 greeks/poll (~37k rows/session). The flip is always near spot, so the
-# window loses nothing the regime classifier needs. See [[freeze-scope]] — pure
-# persistence, no engine impact.
-EXPOSURE_CHAIN_WINDOW_PTS = float(os.environ.get("FEF_EXPOSURE_CHAIN_WINDOW_PTS", "60"))
-
-# ±N-strike window (around spot) for the full-chain OI capture — kept
-# consistent with the exposure-chain window. The OI chain QuantData returns is
-# ~238 strikes; the ±60 window is ~24 strikes. Slow-moving OI is captured at
-# REDUCED cadence (once per minute, gated below) — per-poll @15s would be
-# ~1.3M rows/session. Aggression is tiny (one row) so it's stored every poll.
-# See [[freeze-scope]] — pure persistence, no engine impact.
-OI_CHAIN_WINDOW_PTS = float(os.environ.get("FEF_OI_CHAIN_WINDOW_PTS", "60"))
-# Minimum seconds between OI chain captures. OI barely moves intraday, so once
-# per minute is plenty and keeps storage bounded (~4 captures/min @15s poll
-# would be wasteful). Overridable for tests / tuning.
-OI_CHAIN_MIN_INTERVAL_SEC = float(os.environ.get("FEF_OI_CHAIN_MIN_INTERVAL_SEC", "60"))
-
-# Per-symbol last OI-chain capture timestamp (ms since epoch of the snapshot).
-# Gates the reduced (1/min) OI cadence so we don't write the slow-moving OI
-# chain on every 15s poll. In-process state — resets on restart, which is fine
-# (idempotent unique index dedups any boundary double-write anyway).
-_last_oi_capture_ms: dict[str, int] = {}
-
-# Per-session last flow-series minute persisted (ms). Lets the poll loop insert
-# only NEW minutes from the full intraday net-drift/net-flow series each poll
-# (the endpoint returns the whole day every call). In-process; idempotent index
-# dedups across restarts.
-_last_flow_series_ms: dict[str, int] = {}
-
-
-def _build_exposure_chain_rows(snap: Any, symbol: str, session_date: str) -> list[Any]:
-    """Build ExposureChainPoint rows for all 4 greeks within ±WINDOW of spot.
-
-    Best-effort: any greek snapshot that's missing is skipped. Returns an empty
-    list rather than raising so the poll loop never breaks on a malformed snap.
-    """
-    from fef_sidecar.db.models import ExposureChainPoint
-
-    spot = getattr(snap, "spx_price", None)
-    if not spot or spot <= 0:
-        return []
-    ts = getattr(snap, "fetched_at_ms", None)
-    if not ts:
-        return []
-    lo, hi = spot - EXPOSURE_CHAIN_WINDOW_PTS, spot + EXPOSURE_CHAIN_WINDOW_PTS
-
-    greek_snaps = {
-        "GAMMA": getattr(snap, "gex", None),
-        "DELTA": getattr(snap, "dex", None),
-        "CHARM": getattr(snap, "cex", None),
-        "VANNA": getattr(snap, "vex", None),
-    }
-    rows: list[Any] = []
-    for greek_type, gsnap in greek_snaps.items():
-        if gsnap is None:
-            continue
-        for r in getattr(gsnap, "rows", []) or []:
-            if not (lo <= r.strike <= hi):
-                continue
-            rows.append(ExposureChainPoint(
-                timestamp_ms=int(ts),
-                session_date=session_date,
-                symbol=symbol,
-                greek_type=greek_type,
-                strike=float(r.strike),
-                net_m=round(float(r.net_m), 4),
-                call_m=round(float(r.call_m), 4),
-                put_m=round(float(r.put_m), 4),
-                spot_at_capture=float(spot),
-                source="live_poll",
-            ))
-    return rows
-
-
-async def _persist_exposure_chain_rows(rows: list[Any]) -> int:
-    """Idempotent bulk insert of ExposureChainPoint rows. Same insert-and-
-    swallow-IntegrityError pattern as option_chain_backfill._persist_rows."""
-    if not rows:
-        return 0
-    from sqlalchemy.exc import IntegrityError
-
-    from fef_sidecar.db.engine import get_session
-
-    try:
-        async with get_session() as session:
-            session.add_all(rows)
-            await session.flush()
-        return len(rows)
-    except IntegrityError:
-        pass
-    except Exception:
-        logger.exception("Exposure-chain bulk persist failed; trying per-row")
-
-    n = 0
-    for r in rows:
-        try:
-            async with get_session() as session:
-                session.add(r)
-                await session.flush()
-            n += 1
-        except IntegrityError:
-            continue
-        except Exception:
-            logger.exception("Exposure-chain per-row persist failed (%s %s)",
-                             getattr(r, "greek_type", "?"), getattr(r, "strike", "?"))
-    return n
-
-
-def _build_oi_chain_rows(snap: Any, symbol: str, session_date: str) -> list[Any]:
-    """Build OiChainPoint rows within ±OI_CHAIN_WINDOW_PTS of spot.
-
-    Mirrors _build_exposure_chain_rows. Best-effort: returns [] (never raises)
-    if the snapshot is missing the OI chain or spot/timestamp.
-    """
-    from fef_sidecar.db.models import OiChainPoint
-
-    spot = getattr(snap, "spx_price", None)
-    if not spot or spot <= 0:
-        return []
-    ts = getattr(snap, "fetched_at_ms", None)
-    if not ts:
-        return []
-    oi_snap = getattr(snap, "oi", None)
-    if oi_snap is None:
-        return []
-    lo, hi = spot - OI_CHAIN_WINDOW_PTS, spot + OI_CHAIN_WINDOW_PTS
-
-    rows: list[Any] = []
-    for r in getattr(oi_snap, "rows", []) or []:
-        if not (lo <= r.strike <= hi):
-            continue
-        rows.append(OiChainPoint(
-            timestamp_ms=int(ts),
-            session_date=session_date,
-            symbol=symbol,
-            strike=float(r.strike),
-            call_oi=int(r.call_oi),
-            put_oi=int(r.put_oi),
-            spot_at_capture=float(spot),
-            source="live_poll",
-        ))
-    return rows
-
-
-def _build_aggression_detail_row(snap: Any, symbol: str, session_date: str) -> Any | None:
-    """Build a single AggressionDetailPoint from the full AA/A/M/B/BB buckets.
-
-    Best-effort: returns None (never raises) if the snapshot has no aggression
-    stats or no spot/timestamp.
-    """
-    from fef_sidecar.db.models import AggressionDetailPoint
-
-    spot = getattr(snap, "spx_price", None)
-    if not spot or spot <= 0:
-        return None
-    ts = getattr(snap, "fetched_at_ms", None)
-    if not ts:
-        return None
-    agg = getattr(snap, "aggression", None)
-    if agg is None or agg.call is None or agg.put is None:
-        return None
-
-    c, p = agg.call, agg.put
-    return AggressionDetailPoint(
-        timestamp_ms=int(ts),
-        session_date=session_date,
-        symbol=symbol,
-        spot_at_capture=float(spot),
-        call_aa=float(c.aa),
-        call_a=float(c.a),
-        call_mid=float(c.mid),
-        call_b=float(c.b),
-        call_bb=float(c.bb),
-        put_aa=float(p.aa),
-        put_a=float(p.a),
-        put_mid=float(p.mid),
-        put_b=float(p.b),
-        put_bb=float(p.bb),
-        source="live_poll",
-    )
-
-
-async def _persist_rows_idempotent(rows: list[Any], label: str) -> int:
-    """Idempotent bulk insert with per-row fallback (same insert-and-swallow-
-    IntegrityError pattern as _persist_exposure_chain_rows). Generic over the
-    row model so OI + aggression share one path."""
-    if not rows:
-        return 0
-    from sqlalchemy.exc import IntegrityError
-
-    from fef_sidecar.db.engine import get_session
-
-    try:
-        async with get_session() as session:
-            session.add_all(rows)
-            await session.flush()
-        return len(rows)
-    except IntegrityError:
-        pass
-    except Exception:
-        logger.exception("%s bulk persist failed; trying per-row", label)
-
-    n = 0
-    for r in rows:
-        try:
-            async with get_session() as session:
-                session.add(r)
-                await session.flush()
-            n += 1
-        except IntegrityError:
-            continue
-        except Exception:
-            logger.exception("%s per-row persist failed", label)
-    return n
-
-
-def _build_flow_series_rows(snap: Any, symbol: str, session_date: str, since_ms: int) -> list[Any]:
-    """Merge snap.drift + snap.net_flow into per-minute FlowSeriesPoint rows for
-    minutes strictly newer than since_ms. The full intraday series is returned
-    every poll, so we only persist the new tail."""
-    from fef_sidecar.db.models import FlowSeriesPoint
-
-    merged: dict[int, dict[str, float]] = {}
-    for e in (getattr(snap.drift, "entries", None) or []):
-        if e.timestamp_ms <= since_ms:
-            continue
-        m = merged.setdefault(e.timestamp_ms, {})
-        m["drift_net_call"] = e.call_dollars
-        m["drift_net_put"] = e.put_dollars
-        m["spx_price"] = e.spx_price
-    nf = getattr(snap, "net_flow", None)
-    for e in (getattr(nf, "entries", None) or []):
-        if e.timestamp_ms <= since_ms:
-            continue
-        m = merged.setdefault(e.timestamp_ms, {})
-        m["flow_call_sum"] = e.call_dollars
-        m["flow_put_sum"] = e.put_dollars
-    return [
-        FlowSeriesPoint(
-            timestamp_ms=ts, session_date=session_date, symbol=symbol,
-            drift_net_call=v.get("drift_net_call", 0.0),
-            drift_net_put=v.get("drift_net_put", 0.0),
-            flow_call_sum=v.get("flow_call_sum", 0.0),
-            flow_put_sum=v.get("flow_put_sum", 0.0),
-            spx_price=v.get("spx_price", 0.0), source="live_poll",
-        )
-        for ts, v in sorted(merged.items())
-    ]
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED. The full-chain
+# capture layer lived here and had exactly one producer — the QuantData
+# snapshot. Deleted with it:
+#   _expiry_rows_json / _orders_json      (MarketSnapshot -> JSON serialisers)
+#   EXPOSURE_CHAIN_WINDOW_PTS, OI_CHAIN_WINDOW_PTS, OI_CHAIN_MIN_INTERVAL_SEC
+#   _last_oi_capture_ms, _last_flow_series_ms   (per-poll cadence gates)
+#   _build_exposure_chain_rows / _persist_exposure_chain_rows
+#   _build_oi_chain_rows / _build_aggression_detail_row
+#   _build_flow_series_rows / _persist_rows_idempotent
+# The DB tables they wrote (exposure_chain_point, oi_chain_point,
+# aggression_detail, flow_series_point, flow_snapshot) are NOT dropped —
+# historical rows stay queryable; nothing writes new ones.
 
 
 def _et_date_from_ms(ts_ms: int) -> str:
@@ -469,294 +211,18 @@ async def es_vwap_loop(state: Any) -> None:
         await asyncio.sleep(interval)
 
 
-def _orders_json(orders: Any) -> list[dict[str, Any]]:
-    """Serialise OrderFlowRow list to JSON-safe dicts (top 20 most recent)."""
-    out = []
-    for o in (orders or [])[:20]:
-        out.append({
-            "timestamp_ms": o.timestamp_ms,
-            "strike": o.strike,
-            "right": o.right,
-            "expiration": o.expiration,
-            "premium_dollars": round(o.premium_dollars, 2),
-            "side_aggression": o.side_aggression,
-            "is_whale": o.is_whale,
-            "is_sweep": o.is_sweep,
-            "is_golden_sweep": o.is_golden_sweep,
-            "is_block": o.is_block,
-            "other_flags": list(o.other_flags),
-        })
-    return out
-
-
-# Per-symbol plausible price range — anything outside is rejected as
-# garbage (stale ticker route, wrong-symbol QuantData response, etc.).
-# Catches the 5/18-5/20 corruption where active_symbol=ES caused
-# QuantData to return spx_price≈67 which then cascaded into
-# delta_price=-7341 / nearest_wall_distance=7300+ across hundreds of
-# SignalIter rows. Guard prevents new bad rows; old rows are filtered
-# downstream via the same range.
-SYMBOL_PRICE_BOUNDS: dict[str, tuple[float, float]] = {
-    "SPX": (1000.0, 20000.0),
-    "SPY": (200.0, 1500.0),
-    "QQQ": (200.0, 1500.0),
-    "IWM": (100.0, 800.0),
-    "GLD": (100.0, 500.0),
-    "SMH": (100.0, 500.0),
-    "TLT": (50.0, 300.0),
-    "ES":  (1000.0, 20000.0),  # E-mini SPX futures — same band as SPX
-    "NQ":  (5000.0, 50000.0),
-    "RTY": (1000.0, 5000.0),
-}
-
-
-def _snapshot_plausible(snap: Any, symbol: str) -> tuple[bool, str]:
-    """Validate a QuantData snapshot against per-symbol price bounds.
-    Returns (ok, reason). When False, the snapshot is garbage and must
-    NOT be cached, persisted, or fed into the FEF engine."""
-    if snap is None:
-        return False, "snap is None"
-    spx = getattr(snap, "spx_price", None)
-    if spx is None or spx <= 0:
-        return False, f"spx_price={spx!r} non-positive"
-    lo, hi = SYMBOL_PRICE_BOUNDS.get(symbol, (50.0, 50000.0))
-    if not (lo <= spx <= hi):
-        return False, f"spx_price={spx:.2f} outside {symbol} bounds [{lo:.0f}, {hi:.0f}]"
-    return True, "ok"
-
-
-# ---------------------------------------------------------------------------
-# QuantData poll loop — refreshes the cached snapshot at high cadence
-# ---------------------------------------------------------------------------
-
-
-def _qd_scope_lock(qd) -> asyncio.Lock:
-    """Lock serializing every set_page_filter → fetch_market_snapshot pair on
-    the shared QuantData client (2026-07-06 hotfix).
-
-    set_page_filter only mutates client._ticker locally (no HTTP) and every
-    sub-fetch reads it at request-build time, so an unlocked set+fetch from
-    one loop could interleave with another loop's set_page_filter and issue
-    some of its concurrent sub-requests for the WRONG SYMBOL — the GLD
-    scanner engine received an SPX-priced snapshot ("ΔPrice +7147.15pts").
-    The lock lives on the client object itself so every loop sharing the
-    client (poll loop, force-fresh iter fetch, multi-symbol scanner) shares
-    one lock."""
-    lock = getattr(qd, "_fef_scope_lock", None)
-    if lock is None:
-        lock = asyncio.Lock()
-        try:
-            qd._fef_scope_lock = lock
-        except Exception:
-            # Client forbids attribute assignment — degrade to unserialized
-            # (pre-hotfix) behavior rather than crashing the loop.
-            return asyncio.Lock()
-    return lock
-
-
-async def quantdata_poll_loop(state: AppState) -> None:
-    from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
-    interval = float(os.environ.get("FEF_QUANTDATA_POLL_INTERVAL_SEC", "15"))
-    logger.info("Starting QuantData poll loop (interval=%.1fs, symbol=%s)", interval, state.active_symbol)
-
-    while True:
-        _wd_beat(state, "quantdata-poll")
-        try:
-            # Ensure QuantData page filter matches active symbol (idempotent).
-            # Scope lock: set+fetch must be atomic vs the scanner's per-symbol
-            # set+fetch on the same client (see _qd_scope_lock).
-            async with _qd_scope_lock(state.quantdata):
-                await state.quantdata.set_page_filter(ticker=state.active_symbol)  # type: ignore[attr-defined]
-                snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
-            ok, reason = _snapshot_plausible(snap, state.active_symbol)
-            if not ok:
-                logger.warning(
-                    "Discarded implausible snapshot for %s: %s — not caching or persisting",
-                    state.active_symbol, reason,
-                )
-                await asyncio.sleep(interval)
-                continue
-            state.last_snapshot = snap
-            state.last_spx_price = snap.spx_price  # type: ignore[union-attr]
-
-            # Persist flow snapshot for historical replay + backtest
-            try:
-                # Compute order-flow 30m summary for the snapshot timestamp
-                _of_orders = snap.order_flow.orders if snap.order_flow else []  # type: ignore[union-attr]
-                _of_cutoff = snap.fetched_at_ms - 30 * 60 * 1000  # type: ignore[union-attr]
-                _whale_30m = sum(1 for o in _of_orders if o.is_whale and o.timestamp_ms >= _of_cutoff)
-                _gs_30m = sum(1 for o in _of_orders if o.is_golden_sweep and o.timestamp_ms >= _of_cutoff)
-
-                await SignalIterRepository.write_flow_snapshot(
-                    symbol=state.active_symbol,
-                    session_date=_today_et(),
-                    timestamp_ms=snap.fetched_at_ms,  # type: ignore[union-attr]
-                    spx_price=snap.spx_price,  # type: ignore[union-attr]
-                    top_gex_walls=_walls_json(snap.gex.top(5)),  # type: ignore[union-attr]
-                    top_dex_walls=_walls_json(snap.dex.top(5)),  # type: ignore[union-attr]
-                    top_cex_walls=_walls_json(snap.cex.top(5)) if snap.cex else [],  # type: ignore[union-attr]
-                    top_vex_walls=_walls_json(snap.vex.top(5)) if snap.vex else [],  # type: ignore[union-attr]
-                    top_gex_by_expiry=_expiry_rows_json(snap.gex_by_expiry.top(5)) if snap.gex_by_expiry else [],  # type: ignore[union-attr]
-                    top_dex_by_expiry=_expiry_rows_json(snap.dex_by_expiry.top(5)) if snap.dex_by_expiry else [],  # type: ignore[union-attr]
-                    zero_dte_gex_net_m=snap.gex_by_expiry.zero_dte().net_m if snap.gex_by_expiry and snap.gex_by_expiry.zero_dte() else None,  # type: ignore[union-attr]
-                    zero_dte_dex_net_m=snap.dex_by_expiry.zero_dte().net_m if snap.dex_by_expiry and snap.dex_by_expiry.zero_dte() else None,  # type: ignore[union-attr]
-                    recent_orders=_orders_json(snap.order_flow.recent(20)) if snap.order_flow else [],  # type: ignore[union-attr]
-                    recent_whale_count_30m=_whale_30m,
-                    recent_golden_sweep_count_30m=_gs_30m,
-                    drift_cum_net_m=snap.drift.cumulative_net_m,  # type: ignore[union-attr]
-                    drift_bias=snap.drift.bias,  # type: ignore[union-attr]
-                    ntm_max_pain=_ntm_max_pain(snap),
-                    raw_max_pain=snap.max_pain.max_pain,  # type: ignore[union-attr]
-                    aggression_call_pct=snap.aggression.call.aggression_pct if snap.aggression and snap.aggression.call else None,  # type: ignore[union-attr]
-                    aggression_put_pct=snap.aggression.put.aggression_pct if snap.aggression and snap.aggression.put else None,  # type: ignore[union-attr]
-                    iv_rank_call_pct=snap.iv_rank.call.ivr_pct if snap.iv_rank and snap.iv_rank.call else None,  # type: ignore[union-attr]
-                    iv_rank_put_pct=snap.iv_rank.put.ivr_pct if snap.iv_rank and snap.iv_rank.put else None,  # type: ignore[union-attr]
-                )
-            except Exception:
-                logger.exception("Failed to persist flow snapshot")
-
-            # ---- Phase detector feed (RIDE / FADE / WAIT direction refiner) ----
-            # Velocity/bounce pillars need sub-minute samples, so we feed the
-            # detector HERE on the dense 15s poll — NOT the 120s iter loop.
-            # Advisory: stores the latest verdict on state; maybe_auto_trade
-            # consults it at trade time. SPX-only (the traded underlier) so the
-            # rolling window never mixes symbols. Best-effort — never breaks the
-            # poll cadence. atm_iv=None for now: iv_rank is a different scale;
-            # deriving a true ATM IV from the 0DTE chain is the first refinement.
-            if state.phase_mode in ("advisory", "active") and state.active_symbol == "SPX":
-                try:
-                    from fef_sidecar.engine.phase_detector import PhaseDetector, PhaseSample
-                    if state.phase_detector is None:
-                        state.phase_detector = PhaseDetector(
-                            window_sec=state.phase_window_sec, vel_sec=state.phase_vel_sec,
-                            vel_ignite=state.phase_vel_ignite, vel_stall=state.phase_vel_stall,
-                            min_move=state.phase_min_move, bounce_pt=state.phase_bounce_pt,
-                            iv_delta=state.phase_iv_delta, mp_overshoot=state.phase_mp_overshoot,
-                            fade_min=state.phase_fade_min, ride_min=state.phase_ride_min,
-                        )
-                    _agg = snap.aggression  # type: ignore[union-attr]
-                    _pv = state.phase_detector.update(PhaseSample(  # type: ignore[attr-defined]
-                        ts_ms=int(snap.fetched_at_ms),  # type: ignore[union-attr]
-                        spx=snap.spx_price,  # type: ignore[union-attr]
-                        drift_bias=snap.drift.bias if snap.drift else None,  # type: ignore[union-attr]
-                        call_pct=_agg.call.aggression_pct if _agg and _agg.call else None,
-                        put_pct=_agg.put.aggression_pct if _agg and _agg.put else None,
-                        atm_iv=None,
-                        max_pain=_ntm_max_pain(snap),
-                    ))
-                    state.phase_last_verdict = {
-                        "state": _pv.state, "direction": _pv.direction,
-                        "score": _pv.score, "threshold": _pv.threshold,
-                        "reasons": _pv.reasons, "actionable": _pv.actionable,
-                        "mode": state.phase_mode, "ts_ms": int(snap.fetched_at_ms),  # type: ignore[union-attr]
-                        "spx": snap.spx_price,  # type: ignore[union-attr]
-                    }
-                    if _pv.actionable:
-                        logger.info(
-                            "phase[%s]: %s/%s %d/%d — %s", state.phase_mode,
-                            _pv.state, _pv.direction, _pv.score, _pv.threshold,
-                            "; ".join(_pv.reasons[:3]),
-                        )
-                except Exception:
-                    logger.exception("phase detector feed failed")
-            elif state.phase_mode == "off":
-                state.phase_last_verdict = None
-
-            # Full-chain captures below default ON — we need this data for the
-            # new exposures-as-regime strategy. The 2026-05-28 hang was the
-            # missing DB busy_timeout (writers instant-failed on lock collision),
-            # NOT the capture itself; busy_timeout=30s (db/engine.py) is the
-            # root-cause fix. Kept as a kill-switch: set FEF_CAPTURE_ENABLED=false
-            # to disable without a code change if contention ever recurs.
-            _capture_on = os.environ.get("FEF_CAPTURE_ENABLED", "true").lower() in ("true", "1", "yes", "on")
-
-            # Persist the FULL (±window) per-strike exposure chain for all 4
-            # greeks. The flow_snapshot write above keeps only top-5 walls; this
-            # captures the whole chain near spot so cumulative-gamma / gamma-flip
-            # queries are possible. Independent best-effort block — must never
-            # break the flow_snapshot persistence above or the poll cadence.
-            try:
-                _chain_rows = _build_exposure_chain_rows(
-                    snap, state.active_symbol, _today_et(),
-                ) if _capture_on else []
-                if _chain_rows:
-                    await _persist_exposure_chain_rows(_chain_rows)
-            except Exception:
-                logger.exception("Failed to persist exposure chain")
-
-            # Persist the FULL (±window) per-strike OI chain at REDUCED cadence
-            # (once per OI_CHAIN_MIN_INTERVAL_SEC — OI is slow-moving; per-poll
-            # would balloon storage). Independent best-effort block. Report 36
-            # gap: flow_snapshot collapses OI to max-pain scalars. See
-            # [[freeze-scope]] — pure persistence.
-            try:
-                _now_ms = int(snap.fetched_at_ms)  # type: ignore[arg-type]
-                _last_ms = _last_oi_capture_ms.get(state.active_symbol, 0)
-                if _capture_on and _now_ms - _last_ms >= OI_CHAIN_MIN_INTERVAL_SEC * 1000:
-                    _oi_rows = _build_oi_chain_rows(
-                        snap, state.active_symbol, _today_et(),
-                    )
-                    if _oi_rows:
-                        await _persist_rows_idempotent(_oi_rows, "OI-chain")
-                    # Advance the gate even if rows were empty so we don't retry
-                    # a missing-OI snapshot every poll.
-                    _last_oi_capture_ms[state.active_symbol] = _now_ms
-            except Exception:
-                logger.exception("Failed to persist OI chain")
-
-            # Persist the FULL raw aggression buckets (AA/A/M/B/BB per side)
-            # EVERY poll — it's a single tiny row. Report 36 gap: flow_snapshot
-            # collapses aggression to call_pct/put_pct scalars, losing the
-            # capitulation-vs-chase detail. Independent best-effort block.
-            try:
-                _agg_row = _build_aggression_detail_row(
-                    snap, state.active_symbol, _today_et(),
-                ) if _capture_on else None
-                if _agg_row is not None:
-                    await _persist_rows_idempotent([_agg_row], "aggression-detail")
-            except Exception:
-                logger.exception("Failed to persist aggression detail")
-
-            # Persist NEW minutes of the intraday call/put premium-flow series
-            # (net-drift + net-flow). The full day's series comes back every
-            # poll; we insert only minutes past the last-seen for this session.
-            # Independent best-effort block.
-            try:
-                if _capture_on:
-                    _sd = _today_et()
-                    _since = _last_flow_series_ms.get(_sd, 0)
-                    _fs_rows = _build_flow_series_rows(snap, state.active_symbol, _sd, _since)
-                    if _fs_rows:
-                        await _persist_rows_idempotent(_fs_rows, "flow-series")
-                        _last_flow_series_ms[_sd] = max(r.timestamp_ms for r in _fs_rows)
-            except Exception:
-                logger.exception("Failed to persist flow series")
-
-            event = SnapshotEvent(
-                timestamp_ms=snap.fetched_at_ms,  # type: ignore[union-attr]
-                spx_price=snap.spx_price,  # type: ignore[union-attr]
-                top_gex=_walls_json(snap.gex.top(5)),  # type: ignore[union-attr]
-                top_dex=_walls_json(snap.dex.top(5)),  # type: ignore[union-attr]
-                drift={
-                    "cum_net_m": snap.drift.cumulative_net_m,  # type: ignore[union-attr]
-                    "bias": snap.drift.bias,  # type: ignore[union-attr]
-                },
-                ntm_max_pain=_ntm_max_pain(snap),
-                raw_max_pain=snap.max_pain.max_pain,  # type: ignore[union-attr]
-                aggression={
-                    "call_pct": snap.aggression.call.aggression_pct,  # type: ignore[union-attr]
-                    "put_pct": snap.aggression.put.aggression_pct,  # type: ignore[union-attr]
-                }
-                if snap.aggression is not None  # type: ignore[union-attr]
-                else None,
-            )
-            await state.broadcaster.publish(event)
-        except asyncio.CancelledError:
-            logger.info("QuantData poll loop cancelled — exiting")
-            raise
-        except Exception:
-            logger.exception("QuantData poll iteration failed")
-        await asyncio.sleep(interval)
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED. Deleted here:
+#   _orders_json          — MarketSnapshot order-flow -> JSON
+#   _snapshot_plausible   — per-symbol price-bounds guard on a QD snapshot
+#   _qd_scope_lock        — the set_page_filter/fetch atomicity lock
+#   quantdata_poll_loop   — the ~15s poll: cached the snapshot on AppState,
+#                           wrote flow_snapshot + the four chain-capture
+#                           tables, fed the PHASE DETECTOR (advisory
+#                           RIDE/FADE/WAIT, state.phase_last_verdict) and
+#                           broadcast SnapshotEvent.
+# The phase detector goes with it: its samples (spx, drift_bias, aggression
+# call/put %, max pain) were ALL snapshot fields. state.phase_last_verdict now
+# stays None, which auto_trader already handles as "no phase read".
 
 
 # Historical-bar cache TTL — a freshly closed bar is picked up within this
@@ -823,21 +289,26 @@ async def _get_spread_bars_30m(state: AppState) -> list[Any]:
     return await _get_cached_bars(state, state.active_symbol, "30 mins", "5 D")
 
 
-def _ntm_max_pain(snap: Any) -> float:
-    """NTM max pain from the snapshot's OI rows, or fall back to raw chain MP."""
-    if snap.oi is None:
-        return snap.max_pain.max_pain
-    from fef_sidecar.quantdata.max_pain import compute_ntm_max_pain
-
-    return compute_ntm_max_pain(snap.oi.rows, snap.spx_price).max_pain
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED — `_ntm_max_pain(snap)`
+# read snapshot OI rows. The pure calculation it wrapped survives at
+# engine/max_pain.py::compute_ntm_max_pain for the ThetaData research path.
 
 
 # ---------------------------------------------------------------------------
-# FEF tick loop — consumes the cached snapshot, runs the engine
+# Spread tick loop - drives the credit-spread recommendation + auto-trade
+# ---------------------------------------------------------------------------
+#
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED. This was
+# `fef_tick_loop`, which called `_run_one_iter` (QuantData fetch ->
+# snapshot_to_inputs -> FEF verdict -> directional auto-trade). The credit
+# spread path executed inside that function purely by POSITION, so a naive
+# deletion of the QuantData fetch would have taken the spread bot down with
+# the directional bot at the `snapshot_to_inputs(None)` line. It is now its
+# own driver, with no snapshot, no verdict and no engine in the path.
 # ---------------------------------------------------------------------------
 
 
-async def fef_tick_loop(state: AppState) -> None:
+async def spread_tick_loop(state: AppState) -> None:
     interval = int(os.environ.get("FEF_LOOP_INTERVAL_SEC", "120"))
     market_hours_only = os.environ.get("FEF_LOOP_MARKET_HOURS_ONLY", "false").lower() in (
         "true",
@@ -845,169 +316,63 @@ async def fef_tick_loop(state: AppState) -> None:
         "yes",
         "on",
     )
-    warmup_iters = int(os.environ.get("FEF_WARMUP_ITERS", "3"))
     logger.info(
-        "Starting FEF tick loop (interval=%ds, market_hours_only=%s)",
+        "Starting spread tick loop (interval=%ds, market_hours_only=%s)",
         interval,
         market_hours_only,
     )
 
-    # IMPROVEMENTS #21: pre-market warmup — seed the engine buffer with
-    # `warmup_iters` quick fetches so the first post-open iter isn't WAIT.
-    if warmup_iters > 0:
-        logger.info("Pre-warming FEF buffer with %d quick iters", warmup_iters)
-        for i in range(warmup_iters):
-            try:
-                await _run_one_iter(state, force_fresh=True)
-                if i < warmup_iters - 1:
-                    await asyncio.sleep(1)
-            except Exception:
-                logger.exception("Warmup iter %d failed", i)
-
     while True:
         try:
-            # IMPROVEMENTS #22: detect new session_date and reset engine
+            # Session-boundary bookkeeping. The engine buffer reset that used
+            # to happen here went with the FEF iteration; the spread path's
+            # own once-per-session guarantee lives in spread_auto_trader
+            # (spread_auto_trade_last_date + a DB check), so all this needs to
+            # do is keep state.session_date current for the audit rows.
             current_date = _today_et()
             if state.session_date != current_date:
                 if state.session_date != "":
                     logger.info(
-                        "New session detected (%s -> %s) — resetting engine buffer",
+                        "New session detected (%s -> %s)",
                         state.session_date,
                         current_date,
                     )
-                    state.engine.reset()
-                    # Scanner engines carry the SAME per-session drift/wall
-                    # history assumptions — reset them at the boundary too
-                    # (previously only state.engine was reset, so scanner
-                    # engines started each new session with stale deltas).
-                    for _sym, _eng in list(state.scanner_engines.items()):
-                        try:
-                            _eng.reset()
-                        except Exception:
-                            logger.exception("scanner engine reset failed for %s", _sym)
                 state.session_date = current_date
 
             if market_hours_only and not _in_market_hours_et():
-                logger.debug("Outside market hours — sleeping 60s")
+                logger.debug("Outside market hours - sleeping 60s")
                 await asyncio.sleep(60)
                 continue
 
-            await _run_one_iter(state)
+            await _run_spread_iter(state)
         except asyncio.CancelledError:
-            logger.info("FEF tick loop cancelled — exiting")
+            logger.info("Spread tick loop cancelled - exiting")
             raise
         except Exception:
-            logger.exception("FEF tick loop iteration failed")
+            logger.exception("Spread tick loop iteration failed")
 
         await asyncio.sleep(interval)
 
 
 def _current_provider_mode(state: AppState) -> str:
-    """'live' / 'mock' / 'mixed' — tag for the SignalIter.provider_mode column.
-    Captures whether QuantData + IBKR are real or mocked. Independent of the
-    IBKR account class (paper vs live) — see _current_account_class below."""
-    qd_mock = type(state.quantdata).__name__.startswith("Mock")
+    """'live' / 'mock' — tag for the SignalIter.provider_mode column.
+    Captures whether IBKR is real or mocked. Independent of the IBKR account
+    class (paper vs live) — see _current_account_class below.
+
+    [REMOVED 2026-08-25] QuantData subscription CANCELLED. This used to be a
+    two-provider check (QD x IBKR) that could return 'mixed'. With one provider
+    left there is no mixed state; 'mixed' is never emitted again. Historical
+    rows still carry it."""
     ibkr_mock = type(state.ibkr).__name__.startswith("Mock")
-    if qd_mock and ibkr_mock:
-        return "mock"
-    if not qd_mock and not ibkr_mock:
-        return "live"
-    return "mixed"
+    return "mock" if ibkr_mock else "live"
 
 
-def _ema(values: list[float], period: int) -> float | None:
-    if len(values) < period:
-        return None
-    alpha = 2 / (period + 1)
-    ema = sum(values[:period]) / period  # SMA seed
-    for v in values[period:]:
-        ema = alpha * v + (1 - alpha) * ema
-    return ema
-
-
-async def _alt_direction_signal(
-    state: AppState,
-    *,
-    n_bars: int,
-    ema_short: int,
-    ema_long: int,
-    label: str,
-) -> dict | None:
-    """Compute an independent SPX EMA-stack direction signal at the
-    requested lookback. Stamped into signal_iter.extras at write time so
-    we can correlate engine direction (drift_bias) vs alt signals across
-    sessions WITHOUT gating any live trade on them.
-
-    Reads the most recent n_bars SPX 1-min bars from HistoricalBar.
-    Returns None on insufficient data. Cheap: indexed read, ~5ms per call.
-
-    Built 2026-05-21 in response to the finding that drift_bias is
-    88-100% BULLISH on 4 of 4 sessions regardless of actual SPX path.
-    P3 (2026-05-21): now parametric so we can shadow at multiple
-    timeframes (30m, 4h) and pick the most predictive one post-freeze."""
-    try:
-        from sqlmodel import select
-        from fef_sidecar.db.engine import get_session
-        from fef_sidecar.db.models import HistoricalBar
-        async with get_session() as session:
-            bars = list((await session.exec(
-                select(HistoricalBar)
-                .where(HistoricalBar.symbol == "SPX")
-                .where(HistoricalBar.bar_size == "1 min")
-                .order_by(HistoricalBar.timestamp_ms.desc())  # type: ignore[attr-defined]
-                .limit(n_bars)
-            )).all())
-        if len(bars) < ema_long:
-            return {"signal": "INSUFFICIENT_DATA", "n_bars": len(bars), "label": label}
-        bars.reverse()  # chronological
-        closes = [b.close for b in bars]
-
-        ema_s = _ema(closes, ema_short)
-        ema_l = _ema(closes, ema_long)
-        if ema_s is None or ema_l is None:
-            return None
-        # Slope window scaled with the timeframe — 5 bars for short EMA-8
-        # (5 min on 1-min bars), 30 bars for slow EMA-50 (30 min). Picks
-        # up trend acceleration / deceleration regardless of timeframe.
-        slope_window = max(5, ema_short // 2)
-        ema_s_prev = _ema(closes[:-slope_window], ema_short) if len(closes) >= ema_short + slope_window else None
-        ema_s_slope = ema_s - ema_s_prev if ema_s_prev is not None else 0
-        current_spx = closes[-1]
-        if ema_s > ema_l * 1.0005 and current_spx > ema_s:
-            alignment = "BULLISH"
-        elif ema_s < ema_l * 0.9995 and current_spx < ema_s:
-            alignment = "BEARISH"
-        else:
-            alignment = "NEUTRAL"
-        return {
-            "signal": alignment,
-            "label": label,
-            f"ema_{ema_short}": round(ema_s, 2),
-            f"ema_{ema_long}": round(ema_l, 2),
-            f"ema_{ema_short}_slope_{slope_window}bar": round(ema_s_slope, 2),
-            f"spx_vs_ema{ema_short}_pts": round(current_spx - ema_s, 2),
-            "n_bars": len(bars),
-        }
-    except Exception:
-        logger.exception("_alt_direction_signal(%s) failed", label)
-        return None
-
-
-async def _alt_direction_30m_signal(state: AppState) -> dict | None:
-    """30-min shadow: 25 1-min bars, EMA-8/EMA-21."""
-    return await _alt_direction_signal(
-        state, n_bars=25, ema_short=8, ema_long=21, label="30m"
-    )
-
-
-async def _alt_direction_4h_signal(state: AppState) -> dict | None:
-    """4-hour shadow: 240 1-min bars, EMA-50/EMA-200. Catches the
-    slower trend regime that the 30m read can flip on the wrong side of.
-    Needs 200+ stored 1-min bars (~3.3 hours of session) before it
-    returns a non-INSUFFICIENT_DATA signal."""
-    return await _alt_direction_signal(
-        state, n_bars=240, ema_short=50, ema_long=200, label="4h"
-    )
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED - `_ema`,
+# `_alt_direction_signal`, `_alt_direction_30m_signal` and
+# `_alt_direction_4h_signal` deleted. They were observational SHADOW signals
+# whose only consumer was SignalIter.extras["alt_direction_30m" / "_4h"],
+# written by the (now deleted) FEF iteration. They existed to be compared
+# against drift_bias, which is also gone.
 
 
 def _current_account_class(state: AppState) -> str:
@@ -1022,360 +387,89 @@ def _current_account_class(state: AppState) -> str:
     return getattr(state.ibkr, "account_class", "unknown") or "unknown"
 
 
-async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
-    """One FEF iter — uses cached snapshot if available, else fetches fresh.
+# ---------------------------------------------------------------------------
+# Credit-spread iteration - EXTRACTED from _run_one_iter (2026-08-25)
+# ---------------------------------------------------------------------------
+#
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED. `_run_one_iter` was
+# the FEF iteration: fetch MarketSnapshot -> snapshot_to_inputs -> engine.push
+# -> persist SignalIter -> broadcast IterEvent -> directional auto_trade ->
+# pattern eval -> tournament -> regime detector. Every one of those steps was
+# fed, directly or transitively, by the vendor snapshot, and snapshot_to_inputs
+# had no other producer. It is deleted whole.
+#
+# The two CREDIT-SPREAD blocks it contained had ZERO QuantData imports - they
+# ran on IBKR quotes and cached 30-min bars and were nested in the FEF iter
+# only by position. They are extracted verbatim below, with two changes:
+#   1. the recommendation is returned as a LOCAL dict instead of being written
+#      into event.verdict["spread_recommendation"] (the FEF verdict object no
+#      longer exists);
+#   2. the underlying spot comes from `_spread_spot` (the IBKR tick) instead of
+#      `inputs.spx_price` (the QuantData snapshot price). That path already
+#      preferred the live tick - `_run_one_iter` overlaid it onto the snapshot
+#      before the recommender ran - so this is the same number by a shorter
+#      route, not a new data source.
+# ---------------------------------------------------------------------------
 
-    force_fresh=True bypasses the cache and fetches a new snapshot. Used by
-    manual /run_iter_now triggers so rapid back-to-back calls actually see
-    new data instead of replaying the same cached snapshot.
+
+def _spread_spot(state: AppState, bars_30m: list[Any]) -> float:
+    """Underlying spot for the credit-spread recommender.
+
+    Order of preference:
+      1. the live IBKR tick, if it is <60s old AND was stamped by the symbol
+         we are recommending for (the 2026-07-23 MAJOR-2 cross-symbol guard -
+         after a /config/symbol flip the cached tick belongs to the PREVIOUS
+         symbol);
+      2. the close of the most recent 30-min bar we already fetched;
+      3. state.last_spx_price.
+
+    Returns 0.0 when nothing is available; the caller treats that as "no
+    recommendation this iter" rather than passing a bogus spot to strike
+    selection.
+    """
+    import time as _t
+
+    if (
+        state.last_live_tick_spx > 0
+        and state.last_live_tick_ms > 0
+        and (int(_t.time() * 1000) - state.last_live_tick_ms) < 60_000
+        # FAILS CLOSED on an unstamped tick. `x or active == active` would be
+        # True when the stamp is None, trusting a tick whose symbol we cannot
+        # confirm - which is exactly the cross-symbol contamination the
+        # 2026-07-23 MAJOR-2 guard exists to stop. Falling through to the bar
+        # close costs at most 30 minutes of staleness; guessing costs a strike.
+        and state.last_live_tick_symbol == state.active_symbol
+    ):
+        return float(state.last_live_tick_spx)
+
+    for bar in reversed(bars_30m or []):
+        close = getattr(bar, "close", None)
+        if close is None and isinstance(bar, dict):
+            close = bar.get("close")
+        if close:
+            return float(close)
+
+    return float(state.last_spx_price or 0.0)
+
+
+async def _build_spread_recommendation(state: AppState) -> dict[str, Any] | None:
+    """Credit-spread recommendation - TA-driven entries (EMA 8/21 cross +
+    pullback engulfing on StdDev channel) with delta-targeted strikes (short
+    strike NEAREST spread_delta_max, net credit above the credit/width floor).
+
+    Reads cached 30-min bars; refreshes them at most every 25 minutes per
+    symbol. Sets state.last_spread_recommendation and returns the dict, or
+    None if the block faulted.
     """
     import time as _time
 
-    perf: dict[str, float] = {}
-    t_start = _time.perf_counter()
-
-    # SPY mirror: warm the SPY stock-spot TTL cache each iter. Under
-    # fresh-or-skip (2026-07-27) a fresh cache entry is the mirror's ONLY
-    # acceptable plan anchor (no SPX/ratio derivation exists anymore) — but
-    # at this loop's 120s cadence this site alone would leave the mirror
-    # skipping most fires; the load-bearing kick is the fire-commit one in
-    # auto_trader._maybe_auto_trade_locked (scanner loop has a belt too).
-    # Non-blocking (a detached refresh is kicked, not awaited) + fail-soft;
-    # no-op when the mirror is disabled; never a synchronous SPY round-trip
-    # inside the fire hook (2026-07-20 contention rule).
-    try:
-        from fef_sidecar.engine.spy_mirror import warm_spy_spot_cache
-        await warm_spy_spot_cache(state)
-    except Exception:
-        logger.debug("SPY mirror cache warm failed", exc_info=True)
-
-    # SPX sanity guard — defense in depth.
-    # Layer 1 (absolute bounds): catches snapshots whose price is outside
-    # the active symbol's plausible range. Doesn't require a live tick, so
-    # it works pre-market and during IBKR reconnects. The 5/18-5/20 ES
-    # corruption (spx_price≈67) is caught here.
-    if state.last_snapshot is not None:
-        ok, reason = _snapshot_plausible(state.last_snapshot, state.active_symbol)
-        if not ok:
-            logger.warning("Skip iter: cached snapshot failed plausibility check — %s", reason)
-            state.last_snapshot = None
-            return
-    # Layer 2 (relative drift): catches snapshots that pass the absolute
-    # bounds but diverge sharply from the live IBKR tick (stale data
-    # mid-session). Requires a live tick reference.
-    if state.last_snapshot is not None and state.last_live_tick_spx > 0:
-        snap_spx = getattr(state.last_snapshot, "spx_price", 0)
-        if snap_spx > 0 and abs(snap_spx - state.last_live_tick_spx) > state.last_live_tick_spx * 0.5:
-            logger.warning(
-                "Skip iter: snapshot spx_price=%.2f diverges from live tick %.2f "
-                "(>50%% — stale/garbage data, likely from futures symbol)",
-                snap_spx, state.last_live_tick_spx,
-            )
-            state.last_snapshot = None  # force re-fetch next iter
-            return
-
-    snap = state.last_snapshot
-    if snap is None or force_fresh:
-        t0 = _time.perf_counter()
-        # Scope lock: atomic set+fetch vs the scanner (see _qd_scope_lock).
-        async with _qd_scope_lock(state.quantdata):
-            await state.quantdata.set_page_filter(ticker=state.active_symbol)  # type: ignore[attr-defined]
-            snap = await state.quantdata.fetch_market_snapshot()  # type: ignore[func-returns-value]
-        state.last_snapshot = snap
-        perf["quantdata_fetch_ms"] = (_time.perf_counter() - t0) * 1000
-
-    t0 = _time.perf_counter()
-    inputs = snapshot_to_inputs(snap)  # type: ignore[arg-type]
-
-    # Live-price overlay: prefer the freshest IBKR tick over the QuantData
-    # snapshot's spx_price (which can be 15+s stale by the time we evaluate).
-    # Keeps exposure structure (walls/drift/MP) from QuantData but uses live
-    # spot for distance calculations so 'nearest_wall_distance' etc. are
-    # accurate to the moment of the verdict.
-    if state.last_live_tick_spx > 0 and state.last_live_tick_ms > 0:
-        age_ms = int(_time.time() * 1000) - state.last_live_tick_ms
-        if age_ms < 60_000:  # only trust ticks <60s old
-            from dataclasses import replace
-            snap_spx = inputs.spx_price
-            live_spx = state.last_live_tick_spx
-            # Only override if the live price is materially different (>0.5pt)
-            # to avoid micro-jitter in the verdict reasoning
-            if abs(live_spx - snap_spx) > 0.5:
-                inputs = replace(inputs, spx_price=live_spx)
-                perf["live_price_overlay_pts"] = round(live_spx - snap_spx, 2)
-
-    verdict = state.engine.push(inputs)
-    perf["fef_compute_ms"] = (_time.perf_counter() - t0) * 1000
-    state.last_spx_price = inputs.spx_price
-
-    # Shadow engine: parallel eval. Auto-trade ignores its output;
-    # ShadowComparison row written for later analysis.
-    if state.shadow_engine is not None:
-        try:
-            shadow_verdict = state.shadow_engine.push(inputs)  # type: ignore[attr-defined]
-            from fef_sidecar.db.engine import get_session as _sgs
-            from fef_sidecar.db.models import ShadowComparison
-            async with _sgs() as _ss:
-                _ss.add(ShadowComparison(
-                    session_date=_today_et(),
-                    iter_num=state.last_iter_num + 1,
-                    production_direction=verdict.direction,
-                    production_confidence=verdict.confidence,
-                    production_reasoning=verdict.reasoning[:500],
-                    shadow_label=state.shadow_label,
-                    shadow_direction=shadow_verdict.direction,
-                    shadow_confidence=shadow_verdict.confidence,
-                    shadow_reasoning=shadow_verdict.reasoning[:500],
-                    direction_agree=(verdict.direction == shadow_verdict.direction),
-                    confidence_agree=(verdict.confidence == shadow_verdict.confidence),
-                ))
-                await _ss.commit()
-        except Exception:
-            logger.exception("shadow engine eval failed")
-
-    # When verdict is actionable, also pull the option chain quote for the
-    # recommended strike and compute target option prices via delta.
-    t0 = _time.perf_counter()
-    option_targets = await _maybe_fetch_option_targets(state, verdict, inputs)
-    perf["option_quote_ms"] = (_time.perf_counter() - t0) * 1000
-
-    # ML inference overlay — Phase 2. Observational only: stamps
-    # ml_expected_r into SignalIter.extras + IterEvent without altering the
-    # verdict object that auto_trader consumes. Engine-freeze-safe.
-    ml_expected_r: float | None = None
-    try:
-        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-        ml_svc = getattr(state, "ml_inference", None)
-        if ml_svc is not None and ml_svc.is_ready() and verdict.direction.value != "WAIT":
-            et = _tz(_td(hours=-4))
-            hour_et = int(_dt.now(et).strftime("%H"))
-            ml_expected_r = ml_svc.score(
-                {
-                    "direction": verdict.direction.value,
-                    "confidence": verdict.confidence.value,
-                    "spx_price": inputs.spx_price,
-                    "ntm_max_pain": inputs.ntm_max_pain,
-                    "drift_cum_net_m": inputs.drift_cum_net_m,
-                    "aggression_call_pct": inputs.aggression_call_pct,
-                    "aggression_put_pct": inputs.aggression_put_pct,
-                    "iv_rank_call_pct": inputs.iv_rank_call_pct,
-                    "iv_rank_put_pct": inputs.iv_rank_put_pct,
-                    "top_gex_walls": _walls_json(inputs.top_gex_walls),
-                    "top_dex_walls": _walls_json(inputs.top_dex_walls),
-                    "extras": {
-                        "fe_ratio": verdict.fe_ratio,
-                        "delta_price": verdict.delta_price,
-                        "delta_drift_m": verdict.delta_drift_m,
-                    },
-                },
-                hour_et=hour_et,
-            )
-    except Exception:
-        logger.exception("ML inference scoring failed")
-        ml_expected_r = None
-
-    # Fire-order: count of preceding signals on this (direction, strike)
-    # within the dedup window. fire_order=1 = first fire of a cluster,
-    # 2+ = stacks. Lets analytics distinguish first-fire signal quality
-    # from stack-fire signal quality.
-    fire_order = 0
-    try:
-        from fef_sidecar.engine.fire_order import compute_fire_order_live
-        if verdict.direction.value != "WAIT":
-            fire_order = compute_fire_order_live(
-                state, verdict.direction.value, verdict.strike_rec,
-            )
-    except Exception:
-        logger.exception("fire_order computation failed")
-
-    # Shadow-track an independent direction signal alongside drift_bias.
-    # NOT a gate — purely observational so we can correlate engine
-    # direction vs this alt signal across sessions. Built tonight after
-    # finding drift_bias is structurally 88-100% BULLISH regardless of
-    # actual SPX path; want data on whether an alt signal predicts
-    # outcomes any better before deciding to gate on it (post-freeze).
-    alt_direction = await _alt_direction_30m_signal(state)
-    alt_direction_4h = await _alt_direction_4h_signal(state)
-
-    signal = await SignalIterRepository.write_iter(
-        spx_price=inputs.spx_price,
-        direction=verdict.direction,
-        confidence=verdict.confidence,
-        reasoning=verdict.reasoning,
-        drift_cum_net_m=inputs.drift_cum_net_m,
-        drift_bias=inputs.drift_bias,
-        ntm_max_pain=inputs.ntm_max_pain,
-        raw_max_pain=inputs.raw_max_pain,
-        top_gex_walls=_walls_json(inputs.top_gex_walls),
-        top_dex_walls=_walls_json(inputs.top_dex_walls),
-        top_cex_walls=_walls_json(inputs.top_cex_walls),
-        top_vex_walls=_walls_json(inputs.top_vex_walls),
-        top_gex_by_expiry=_expiry_rows_json(inputs.top_gex_by_expiry),
-        top_dex_by_expiry=_expiry_rows_json(inputs.top_dex_by_expiry),
-        zero_dte_gex_net_m=inputs.zero_dte_gex_net_m,
-        zero_dte_dex_net_m=inputs.zero_dte_dex_net_m,
-        recent_orders=_orders_json(inputs.recent_orders),
-        recent_whale_count_30m=inputs.recent_whale_count_30m,
-        recent_golden_sweep_count_30m=inputs.recent_golden_sweep_count_30m,
-        aggression_call_pct=inputs.aggression_call_pct,
-        aggression_put_pct=inputs.aggression_put_pct,
-        iv_rank_call_pct=inputs.iv_rank_call_pct,
-        iv_rank_put_pct=inputs.iv_rank_put_pct,
-        extras={
-            **verdict.to_log_extras(),
-            "option_pricing": _option_pricing_dict(option_targets),
-            "regime_at_fire": state.last_regime.regime if state.last_regime else None,
-            "ml_expected_r": ml_expected_r,
-            "fire_order": fire_order,
-            # Account-class tag (paper / live / mock / unknown). Lets
-            # research scripts keep paper and live data strictly separated
-            # once both flow through the same DB. Independent of
-            # provider_mode (which captures mock-vs-IBKR, not paper-vs-live).
-            "account_class": _current_account_class(state),
-            "account_id": getattr(state.ibkr, "account_id", "") or "",
-            # Shadow alt direction signals — SPX EMA stack at multiple
-            # timeframes. Observational only; NOT used to gate any trade.
-            # Compare against drift_bias outcomes across N sessions to
-            # decide whether to gate on either post-freeze.
-            #   30m = 25 1-min bars, EMA-8/EMA-21 (immediate context)
-            #   4h  = 240 1-min bars, EMA-50/EMA-200 (session-trend context)
-            # Two timeframes so we can spot regime conflict: 30m BEARISH
-            # vs 4h BULLISH suggests a pullback within an uptrend, not a
-            # full reversal — exit-only gating may be more appropriate
-            # than block-fire gating in that case.
-            "alt_direction_30m": alt_direction,
-            "alt_direction_4h": alt_direction_4h,
-            # Higher-order Greek walls (CEX/VEX) are now top-level columns
-            # on SignalIter — not duplicated here.
-            # Snapshot the latest HFT + microstructure state at fire time so
-            # offline analysis (ML pattern discovery, TuningRecommendation)
-            # can correlate signal outcomes with HFT/microstructure context
-            # without doing a time-window join.
-            "hft_at_fire": dict(state.last_hft_state) if state.last_hft_state else None,
-            "microstructure_at_fire": dict(state.last_microstructure_state) if state.last_microstructure_state else None,
-            # VIX at fire time — enables regime-conditional backtests + theta
-            # projection. Captured from the global VIX poller's last reading.
-            "vix_at_fire": state.last_vix,
-            # Auto-trader gate state at iter time — was a fire eligible? if not
-            # which gate would have blocked it? Used by backtester to replay
-            # full live behavior, not just FEF verdicts.
-            "gate_state_at_fire": {
-                "auto_trade_enabled": state.auto_trade_enabled,
-                "session_count": state.auto_trade_count_session,
-                "cool_down_remaining_sec_global": max(
-                    0, state.auto_trade_cool_down_sec - int(
-                        (int(_time.time() * 1000) - state.auto_trade_last_at_ms) / 1000
-                    )
-                ) if state.auto_trade_last_at_ms else 0,
-                "count_by_symbol": dict(state.auto_trade_count_by_symbol),
-                "max_per_symbol": state.auto_trade_max_per_symbol,
-                "trigger_types_enabled": list(state.auto_trade_trigger_types),
-            },
-        },
-        session_date=_today_et(),
-        provider_mode=_current_provider_mode(state),
-    )
-    state.last_iter_num = signal.iter_num
-
-    event = IterEvent(
-        iter_num=signal.iter_num,
-        session_date=signal.session_date,
-        spx_price=inputs.spx_price,
-        verdict={
-            "direction": verdict.direction.value,
-            "confidence": verdict.confidence.value,
-            "reasoning": verdict.reasoning,
-            "strike_rec": verdict.strike_rec,
-            "t1": verdict.t1,
-            "t2": verdict.t2,
-            "t3": verdict.t3,
-            "stop": verdict.stop,
-            "delta_price": verdict.delta_price,
-            "delta_drift_m": verdict.delta_drift_m,
-            "fe_ratio": verdict.fe_ratio,
-            # Bias at verdict time — the auto-trader's wall-collapse re-grade
-            # needs it to mirror fef.py's demotion exactly at gate time.
-            "drift_bias": inputs.drift_bias,
-            "aligned": verdict.aligned,
-            "absorption": verdict.absorption,
-            "wall_proximity_skip": verdict.wall_proximity_skip,
-            "wall_collapse_trigger": verdict.wall_collapse_trigger,
-            "nearest_wall_strike": verdict.nearest_wall_strike,
-            "nearest_wall_distance": verdict.nearest_wall_distance,
-            "secondary_scores": verdict.secondary_scores,
-            "option_pricing": _option_pricing_dict(option_targets),
-            "ml_expected_r": ml_expected_r,
-        },
-        snapshot={
-            "top_gex": _walls_json(inputs.top_gex_walls),
-            "top_dex": _walls_json(inputs.top_dex_walls),
-            "drift": {
-                "cum_net_m": inputs.drift_cum_net_m,
-                "bias": inputs.drift_bias,
-            },
-            "ntm_max_pain": inputs.ntm_max_pain,
-            "raw_max_pain": inputs.raw_max_pain,
-            "aggression": {
-                "call_pct": inputs.aggression_call_pct,
-                "put_pct": inputs.aggression_put_pct,
-            }
-            if inputs.aggression_call_pct is not None
-            else None,
-        },
-    )
-    # Calendar pause window — demote actionable verdicts to WAIT during
-    # FOMC/CPI/NFP windows. Engine still records the original direction in
-    # extras so backtest analysis can see what the verdict would've been.
-    try:
-        from fef_sidecar.engine.calendar import is_pause_window
-        pause = await is_pause_window()
-        if pause.paused and verdict.direction.value != "WAIT":
-            event.verdict["original_direction"] = verdict.direction.value
-            event.verdict["direction"] = "WAIT"
-            event.verdict["reasoning"] = f"PAUSED — {pause.reason}"
-            event.verdict["calendar_pause"] = {
-                "reason": pause.reason, "event": pause.event,
-            }
-    except Exception:
-        logger.exception("Calendar pause check failed")
-
-    # Regime gate — soft demotion when prior-iter regime was CHOP / PIN_DAY /
-    # WALL_TEST. Today's data: aligned-only signals during chop regimes had
-    # ~17% win. Demoting them keeps the verdict visible (we can still see it
-    # in the UI for manual interpretation) but lowers conviction so the
-    # auto-trade confidence floor gates them out.
-    try:
-        if (state.last_regime is not None
-            and event.verdict.get("direction") in ("LONG_CALLS", "LONG_PUTS")
-            and state.last_regime.regime in ("CHOP", "PIN_DAY", "WALL_TEST")):
-            prev_conf = event.verdict.get("confidence", "NONE")
-            new_conf = (
-                "MEDIUM" if prev_conf == "HIGH" else
-                "LOW" if prev_conf == "MEDIUM" else
-                prev_conf
-            )
-            if new_conf != prev_conf:
-                event.verdict["confidence"] = new_conf
-                event.verdict["reasoning"] = (event.verdict.get("reasoning", "")
-                    + f" [regime={state.last_regime.regime}: demoted {prev_conf}->{new_conf}]")
-                event.verdict["regime_demoted"] = {
-                    "regime": state.last_regime.regime, "from": prev_conf, "to": new_conf,
-                }
-    except Exception:
-        logger.exception("Regime gate check failed")
-
-    # Spread recommendation — TA-driven entries (EMA 8/21 cross + pullback
-    # engulfing on StdDev channel) with delta-targeted strikes (short strike
-    # NEAREST spread_delta_max, net credit above the credit/width floor).
-    # Reads cached 30-min bars; refreshes them at most every 25 minutes per
-    # symbol. Independent of FEF direction.
     try:
         from fef_sidecar.engine.spread_recommender import recommend_from_bars
         from fef_sidecar.engine.spread_entry import SpreadEntryTrigger  # noqa: F401
 
         bars_30m = await _get_spread_bars_30m(state)
         if not bars_30m:
-            event.verdict["spread_recommendation"] = {
+            return {
                 "kind": "NONE", "reasoning": "30-min bar history not yet available",
                 "short_strike": None, "long_strike": None, "spread_width": None,
                 "estimated_credit_per_contract": None,
@@ -1383,110 +477,89 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
                 "max_loss_per_contract": None,
                 "breakeven": None,
             }
-        else:
-            today_ymd = _today_et().replace("-", "")
-            spread_rec = await recommend_from_bars(
-                bars_30m,
-                ibkr=state.ibkr,
-                symbol=state.active_symbol,
-                expiry=today_ymd,
-                spot=inputs.spx_price,
-                # Structure comes from AppState so every axis is tunable without a
-                # code change. Defaults are the measured-best values -- see state.py
-                # for what each one is worth and which study measured it.
-                width=state.spread_width,
-                delta_max=state.spread_delta_max,
-                premium_min=state.spread_premium_min,
-                puts_only=state.spread_puts_only,
-                require_gate=state.spread_require_gate,
-                # Strike-selection guards added after the 2026-08-12
-                # 0.0329-delta pick. See state.py for what each refuses.
-                delta_floor_frac=state.spread_delta_floor_frac,
-                min_quote_coverage=state.spread_min_quote_coverage,
-                min_credit_width_ratio=state.spread_min_credit_width_ratio,
-                min_net_credit=state.spread_min_net_credit,
-            )
-            event.verdict["spread_recommendation"] = {
-                "kind": spread_rec.kind,
-                "reasoning": spread_rec.reasoning,
-                "short_strike": spread_rec.short_strike,
-                "long_strike": spread_rec.long_strike,
-                "spread_width": spread_rec.spread_width,
-                "estimated_credit_per_contract": spread_rec.estimated_credit_per_contract,
-                "max_profit_per_contract": spread_rec.max_profit_per_contract,
-                "max_loss_per_contract": spread_rec.max_loss_per_contract,
-                "breakeven": spread_rec.breakeven,
-                "trigger_bar_close_ms": spread_rec.trigger_bar_close_ms,
-                "trigger_signature": spread_rec.trigger_signature,
-                "short_delta": spread_rec.short_delta,
-                "fail_reasons": spread_rec.fail_reasons,
-                "fresh_trigger": bool(
-                    spread_rec.trigger_signature
-                    and spread_rec.trigger_signature != state.last_spread_trigger_signature
-                ),
-                # Provenance, so a consumer can tell a live recommendation from a
-                # stale one. `last_spread_recommendation` is NOT updated when the
-                # bar fetch returns empty (documented best-effort []) and is never
-                # session-reset, so without these a Monday PCS could be sold on
-                # Tuesday after a gap — at max loss on entry. Review finding B2.
-                "session_date": today_ymd,
-                "as_of_ms": int(_time.time() * 1000),
-                "symbol": state.active_symbol,
+
+        spot = _spread_spot(state, bars_30m)
+        if spot <= 0:
+            # No trustworthy underlying price. Do NOT hand strike selection a
+            # zero/stale spot - that is how a wrong-symbol print becomes a
+            # real short strike. Report it instead of guessing.
+            return {
+                "kind": "NONE",
+                "reasoning": "no fresh underlying price for the active symbol",
+                "short_strike": None, "long_strike": None, "spread_width": None,
+                "estimated_credit_per_contract": None,
+                "max_profit_per_contract": None,
+                "max_loss_per_contract": None,
+                "breakeven": None,
             }
-            if spread_rec.trigger_signature:
-                state.last_spread_trigger_signature = spread_rec.trigger_signature
-            state.last_spread_recommendation = event.verdict["spread_recommendation"]
+
+        today_ymd = _today_et().replace("-", "")
+        spread_rec = await recommend_from_bars(
+            bars_30m,
+            ibkr=state.ibkr,
+            symbol=state.active_symbol,
+            expiry=today_ymd,
+            spot=spot,
+            # Structure comes from AppState so every axis is tunable without a
+            # code change. Defaults are the measured-best values -- see state.py
+            # for what each one is worth and which study measured it.
+            width=state.spread_width,
+            delta_max=state.spread_delta_max,
+            premium_min=state.spread_premium_min,
+            puts_only=state.spread_puts_only,
+            require_gate=state.spread_require_gate,
+            # Strike-selection guards added after the 2026-08-12
+            # 0.0329-delta pick. See state.py for what each refuses.
+            delta_floor_frac=state.spread_delta_floor_frac,
+            min_quote_coverage=state.spread_min_quote_coverage,
+            min_credit_width_ratio=state.spread_min_credit_width_ratio,
+            min_net_credit=state.spread_min_net_credit,
+        )
+        rec = {
+            "kind": spread_rec.kind,
+            "reasoning": spread_rec.reasoning,
+            "short_strike": spread_rec.short_strike,
+            "long_strike": spread_rec.long_strike,
+            "spread_width": spread_rec.spread_width,
+            "estimated_credit_per_contract": spread_rec.estimated_credit_per_contract,
+            "max_profit_per_contract": spread_rec.max_profit_per_contract,
+            "max_loss_per_contract": spread_rec.max_loss_per_contract,
+            "breakeven": spread_rec.breakeven,
+            "trigger_bar_close_ms": spread_rec.trigger_bar_close_ms,
+            "trigger_signature": spread_rec.trigger_signature,
+            "short_delta": spread_rec.short_delta,
+            "fail_reasons": spread_rec.fail_reasons,
+            "fresh_trigger": bool(
+                spread_rec.trigger_signature
+                and spread_rec.trigger_signature != state.last_spread_trigger_signature
+            ),
+            # Provenance, so a consumer can tell a live recommendation from a
+            # stale one. `last_spread_recommendation` is NOT updated when the
+            # bar fetch returns empty (documented best-effort []) and is never
+            # session-reset, so without these a Monday PCS could be sold on
+            # Tuesday after a gap - at max loss on entry. Review finding B2.
+            "session_date": today_ymd,
+            "as_of_ms": int(_time.time() * 1000),
+            "symbol": state.active_symbol,
+        }
+        if spread_rec.trigger_signature:
+            state.last_spread_trigger_signature = spread_rec.trigger_signature
+        state.last_spread_recommendation = rec
+        return rec
     except Exception:
         logger.exception("Spread recommendation failed")
+        return None
 
-    state.last_verdict = event.verdict
-    t0 = _time.perf_counter()
-    await state.broadcaster.publish(event)
-    perf["broadcast_ms"] = (_time.perf_counter() - t0) * 1000
 
-    # Auto-trade evaluation — checks all gates, may place a bracket order.
-    # Defensive: never let an auto-trade exception break the iter pipeline.
-    try:
-        from fef_sidecar.engine.auto_trader import maybe_auto_trade
-        decision = await maybe_auto_trade(
-            state, event.verdict, source="auto_main",
-            # Counterfactual gates (floor/cap) tag this iter's persisted row.
-            signal_iter_id=signal.id,
-        )
-        state.auto_trade_last_block_reason = decision.reason
-        if decision.fired and decision.order_result:
-            logger.info("auto_trade fired: %s", decision.order_result)
-        elif (
-            state.auto_trade_enabled
-            and event.verdict.get("direction") in ("LONG_CALLS", "LONG_PUTS")
-            and decision.reason != "auto_trade disabled"
-        ):
-            # Auto-trade was on AND verdict was actionable but we blocked it.
-            # Write to audit so the user can see WHY without polling status.
-            try:
-                await SignalIterRepository.write_audit_log(
-                    category="auto_trade_block", actor="system",
-                    summary=f"BLOCKED {event.verdict.get('direction')} {event.verdict.get('confidence')}: {decision.reason}",
-                    details={
-                        "source": "auto_main",
-                        "direction": event.verdict.get("direction"),
-                        "confidence": event.verdict.get("confidence"),
-                        "strike_rec": event.verdict.get("strike_rec"),
-                        "reason": decision.reason,
-                        "reason_code": decision.reason_code,
-                    },
-                    block_reason_code=decision.reason_code,
-                )
-            except Exception:
-                pass
-    except Exception:
-        logger.exception("Auto-trade evaluation failed")
+async def _run_spread_auto_trade(state: AppState) -> None:
+    """Spread auto-trade - the wire from recommendation to order. Entirely
+    independent of the (now retired) directional auto-trader: different
+    structure, different exit path (spread_exit_watcher), its own enable flag,
+    its own once-per-session dedupe. Defensive - an auto-trade fault must never
+    break the iteration pipeline.
+    """
+    import time as _time
 
-    # Spread auto-trade — the wire from recommendation to order. Entirely
-    # independent of the directional auto-trader above: different structure,
-    # different exit path (spread_exit_watcher), its own enable flag, its own
-    # once-per-session dedupe. Defensive for the same reason as the block above —
-    # an auto-trade fault must never break the iteration pipeline.
     try:
         from fef_sidecar.engine.spread_auto_trader import maybe_auto_trade_spread
         spread_decision = await maybe_auto_trade_spread(
@@ -1494,7 +567,7 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
         )
         # Record every decision so GET /spread_auto_trade/status can answer
         # "why didn't it fire?" without hand-querying signal_log.db (2026-08-17).
-        # Diagnostics only — no gate reads these back.
+        # Diagnostics only - no gate reads these back.
         state.spread_auto_trade_last_reason = spread_decision.reason
         state.spread_auto_trade_last_reason_code = spread_decision.reason_code
         state.spread_auto_trade_last_eval_at_ms = int(_time.time() * 1000)
@@ -1506,7 +579,6 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
             and spread_decision.reason_code not in ("disabled", "rec_none", "no_rec")
         ):
             # Enabled and there WAS something to trade, but a gate blocked it.
-            # Surface it the same way the directional path does.
             try:
                 await SignalIterRepository.write_audit_log(
                     category="spread_auto_trade_block", actor="system",
@@ -1524,180 +596,58 @@ async def _run_one_iter(state: AppState, *, force_fresh: bool = False) -> None:
     except Exception:
         logger.exception("Spread auto-trade evaluation failed")
 
-    # IMPROVEMENTS #R: evaluate user-defined patterns against this iter
-    t0 = _time.perf_counter()
-    await _evaluate_patterns(state, inputs, verdict, signal.id, signal.iter_num)
-    perf["pattern_eval_ms"] = (_time.perf_counter() - t0) * 1000
 
-    # Tournament: parallel strategies
-    t0 = _time.perf_counter()
-    variant_verdicts = state.tournament.push(inputs)
-    cons = consensus(variant_verdicts)
-    await state.broadcaster.publish(
-        TournamentEvent(
-            iter_num=signal.iter_num,
-            spx_price=inputs.spx_price,
-            variants=[
-                {
-                    "name": v.name,
-                    "direction": v.direction,
-                    "confidence": v.confidence,
-                    "reasoning": v.reasoning,
-                    "aligned": v.aligned,
-                    "absorption": v.absorption,
-                }
-                for v in variant_verdicts
-            ],
-            consensus=cons,
-        )
-    )
-    perf["tournament_ms"] = (_time.perf_counter() - t0) * 1000
+async def _run_spread_iter(state: AppState) -> None:
+    """One credit-spread iteration: recommend, then offer to the auto-trader.
 
-    # Mock auto-trader (opt-in via env var, default ON when scripted day active)
-    auto_trade = os.environ.get(
-        "FEF_MOCK_AUTO_TRADE",
-        os.environ.get("FEF_MOCK_SCRIPTED_DAY", "false")
-    ).lower() in ("true", "1", "yes")
-    if auto_trade and signal.id is not None:
+    Runs with NO market snapshot, NO FEF verdict and NO engine in the path.
+    Both halves keep their own try/except so neither can break the driver.
+    """
+    import time as _time
+
+    t_start = _time.perf_counter()
+    rec = await _build_spread_recommendation(state)
+    await _run_spread_auto_trade(state)
+
+    # Keep the recommendation on the existing WS wire. The frontend's
+    # OrderTicketPanel reads `IterEvent.verdict.spread_recommendation`; the FEF
+    # verdict that used to carry it is gone, so we publish a WAIT-shaped
+    # verdict whose only real payload is the spread block. Everything else on
+    # it is a constant - there is no direction engine behind it any more.
+    if rec is not None:
         try:
-            await maybe_create_ticket(
-                state.autotrader, verdict, inputs, signal.id, signal.iter_num
-            )
-            await advance_pending(state.autotrader, signal.iter_num, inputs.spx_price)
-        except Exception:
-            logger.exception("Mock auto-trader iteration failed")
-
-    # Market regime detection — push this iter, broadcast updated assessment
-    t0 = _time.perf_counter()
-    # Honor simulated time of day from the mock day script if present
-    sim_minutes = getattr(snap, "simulated_minutes_since_open", None)
-    sim_vix = getattr(snap, "simulated_vix", None)
-    minutes_for_regime = sim_minutes if sim_minutes is not None else now_minutes_since_open_et()
-    vix_for_regime = sim_vix if sim_vix is not None else state.last_vix
-    state.regime_detector.push(
-        RegimeSample(
-            spx_price=inputs.spx_price,
-            drift_cum_net_m=inputs.drift_cum_net_m,
-            drift_bias=inputs.drift_bias,
-            wall_proximity_pts=verdict.nearest_wall_distance,
-            aligned=verdict.aligned,
-            absorption=verdict.absorption,
-            direction=verdict.direction.value,
-            confidence=verdict.confidence.value,
-            fe_ratio=verdict.fe_ratio,
-            minutes_since_open=minutes_for_regime,
-            vix=vix_for_regime,
-        )
-    )
-    assessment = state.regime_detector.assess()
-    assessment.detected_at_iter = signal.iter_num
-    state.last_regime = assessment
-    await state.broadcaster.publish(
-        RegimeEvent(
-            regime=assessment.regime,
-            label=assessment.label,
-            confidence=assessment.confidence,
-            rationale=assessment.rationale,
-            recommended_preset_hint=assessment.recommended_preset_hint,
-            recommended_patterns=assessment.recommended_patterns,
-            bias=assessment.bias,
-            sizing=assessment.sizing,
-        )
-    )
-    perf["regime_ms"] = (_time.perf_counter() - t0) * 1000
-
-    perf["total_ms"] = (_time.perf_counter() - t_start) * 1000
-    state.last_iter_perf_ms = {k: round(v, 2) for k, v in perf.items()}
-
-    if perf["total_ms"] > 1000:
-        logger.warning(
-            "FEF iter %d took %.0fms (qd=%.0f / fef=%.0f / opt=%.0f / bcast=%.0f)",
-            signal.iter_num,
-            perf["total_ms"],
-            perf.get("quantdata_fetch_ms", 0),
-            perf["fef_compute_ms"],
-            perf["option_quote_ms"],
-            perf["broadcast_ms"],
-        )
-    else:
-        logger.debug(
-            "FEF iter %d — SPX $%.2f — %s (%.0fms)",
-            signal.iter_num,
-            inputs.spx_price,
-            verdict.direction.value,
-            perf["total_ms"],
-        )
-
-
-# ---------------------------------------------------------------------------
-# Bar stream — chart candles
-# ---------------------------------------------------------------------------
-
-
-async def _evaluate_patterns(
-    state: AppState,
-    inputs: Any,
-    verdict: Any,
-    signal_iter_id: int | None,
-    iter_num: int,
-) -> None:
-    """Walk enabled patterns; fire PatternMatchEvent + log match for each hit."""
-    if signal_iter_id is None:
-        return
-
-    from sqlmodel import select
-
-    from fef_sidecar.db.engine import get_session
-    from fef_sidecar.db.models import Pattern, PatternMatch
-
-    field_values = extract_fields(
-        inputs, verdict, vix=state.last_vix, iter_num=iter_num
-    )
-
-    async with get_session() as session:
-        patterns = (
-            await session.exec(select(Pattern).where(Pattern.enabled == True))  # noqa: E712
-        ).all()
-
-        for pattern in patterns:
-            matched, _ = evaluate_pattern(pattern.conditions or [], field_values)
-            if not matched:
-                continue
-
-            from datetime import UTC, datetime
-
-            pattern.match_count += 1
-            pattern.last_matched_at = datetime.now(UTC)
-            session.add(pattern)
-
-            session.add(
-                PatternMatch(
-                    pattern_id=pattern.id,
-                    signal_iter_id=signal_iter_id,
-                    fields_snapshot={
-                        k: v for k, v in field_values.items() if v is not None
-                    },
-                )
-            )
-
+            state.last_iter_num += 1
+            verdict: dict[str, Any] = {
+                "direction": "WAIT",
+                "confidence": "NONE",
+                "reasoning": "directional engine retired 2026-08-25 (QuantData cancelled)",
+                "strike_rec": None,
+                "t1": None, "t2": None, "t3": None, "stop": None,
+                "spread_recommendation": rec,
+            }
+            state.last_verdict = verdict
             await state.broadcaster.publish(
-                PatternMatchEvent(
-                    pattern_id=pattern.id,
-                    pattern_name=pattern.name,
-                    pattern_description=pattern.description,
-                    signal_iter_id=signal_iter_id,
-                    iter_num=iter_num,
-                    spx_price=inputs.spx_price,
-                    audio_alert=pattern.audio_alert,
-                    toast_alert=pattern.toast_alert,
+                IterEvent(
+                    iter_num=state.last_iter_num,
+                    session_date=_today_et(),
+                    spx_price=_spread_spot(state, []),
+                    verdict=verdict,
+                    snapshot={},
                 )
             )
-            logger.info(
-                "Pattern matched: '%s' on iter #%d (SPX $%.2f)",
-                pattern.name,
-                iter_num,
-                inputs.spx_price,
-            )
+        except Exception:
+            logger.exception("Spread iter broadcast failed")
+
+    state.last_iter_perf_ms = {
+        "total_ms": round((_time.perf_counter() - t_start) * 1000, 2)
+    }
+
+
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED - `_evaluate_patterns`
+# deleted. It scored user-defined patterns against FEFInputs + FEFVerdict, both
+# of which only existed inside the FEF iteration. Live pattern trading is
+# unaffected: engine/pattern_trigger.py runs off confirmed IBKR bars and has
+# its own loop.
 
 
 async def _fetch_option_quote_with_retry(
@@ -1734,23 +684,10 @@ async def _fetch_option_quote_with_retry(
     return None, attempts
 
 
-async def _maybe_fetch_option_targets(
-    state: AppState,
-    verdict: Any,
-    inputs: Any,
-) -> OptionTargets | None:
-    """If verdict is actionable, fetch the option chain quote and build option-price targets."""
-    if verdict.direction.value == "WAIT" or verdict.strike_rec is None:
-        return None
-    if verdict.t1 is None or verdict.t2 is None or verdict.t3 is None or verdict.stop is None:
-        return None
-    return await fetch_option_targets(
-        state,
-        direction_value=verdict.direction.value,
-        strike_rec=verdict.strike_rec,
-        t1=verdict.t1, t2=verdict.t2, t3=verdict.t3, stop=verdict.stop,
-        spx_price=inputs.spx_price,
-    )
+# [REMOVED 2026-08-25] QuantData subscription CANCELLED - the verdict-gated
+# wrapper `_maybe_fetch_option_targets(state, verdict, inputs)` is deleted with
+# the FEF verdict. `fetch_option_targets` below is unchanged and still live:
+# engine/pattern_trigger.py calls it directly.
 
 
 async def fetch_option_targets(
@@ -2103,11 +1040,15 @@ async def bar_capture_health_loop(state: AppState) -> None:
 async def vix_poll_loop(state: AppState) -> None:
     """IMPROVEMENTS #M — refresh VIX every FEF_VIX_POLL_INTERVAL_SEC (default 30s).
 
-    Primary source: IBKR ^VIX index quote. Fallback: QuantData iv_rank.last_iv
-    (SPX ~30-day ATM IV, same scale as VIX within ~1-2 points). The fallback
-    kicks in when the IBKR VIX subscription is unavailable (paper accounts
-    often lack it intermittently). When neither source has a value, last_vix
-    stays at its prior reading.
+    Source: IBKR ^VIX index quote. When it has no value, last_vix stays at its
+    prior reading.
+
+    [REMOVED 2026-08-25] QuantData subscription CANCELLED. The fallback source
+    (last_snapshot.iv_rank.vix_proxy — SPX ~30-day ATM IV, same scale as VIX
+    within ~1-2 points) is gone, so an unavailable IBKR VIX subscription now
+    means a STALE last_vix instead of a proxied one. This is visible, not
+    silent: /status and the top bar keep showing the last good reading, and
+    write_vix stops persisting new samples.
     """
     from fef_sidecar.events import StatusEvent
     from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
@@ -2127,17 +1068,6 @@ async def vix_poll_loop(state: AppState) -> None:
                 vix_value = float(quote.last)
                 vix_ts_ms = int(quote.timestamp.timestamp() * 1000)
                 source = "ibkr"
-            else:
-                # Fallback to QuantData iv_rank proxy. last_snapshot is the most
-                # recent MarketSnapshot from the QuantData poll loop, refreshed
-                # every ~15s. Its iv_rank field is parsed from options/iv-rank.
-                snap = getattr(state, "last_snapshot", None)
-                iv = getattr(snap, "iv_rank", None) if snap is not None else None
-                proxy = iv.vix_proxy if iv is not None else None
-                if proxy is not None and proxy > 0:
-                    vix_value = float(proxy)
-                    vix_ts_ms = int(_time.time() * 1000)
-                    source = "quantdata_iv_proxy"
 
             if vix_value is not None:
                 state.last_vix = vix_value
@@ -2151,15 +1081,13 @@ async def vix_poll_loop(state: AppState) -> None:
                 # Broadcast updated status with VIX value
                 await state.broadcaster.publish(
                     StatusEvent(
-                        quantdata=type(state.quantdata).__name__,
                         ibkr=state.ibkr_status if state.ibkr_status != "unknown" else "connected",
                         engine="running" if state.loop_task is not None else "stopped",
                         history_size=state.engine.history_size,
                         vix=state.last_vix,
                     )
                 )
-                if source == "quantdata_iv_proxy":
-                    logger.debug("VIX from QuantData iv_rank proxy: %.2f", vix_value)
+                logger.debug("VIX from %s: %.2f", source, vix_value)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2730,7 +1658,7 @@ async def ibkr_health_check_loop(state: AppState) -> None:
     interval = float(os.environ.get("FEF_IBKR_HEALTHCHECK_SEC", "30"))
     logger.info("Starting IBKR health check loop (interval=%.1fs)", interval)
 
-    # Wait for the initial connect race (bar/tick/quantdata loops all calling
+    # Wait for the initial connect race (bar/tick loops all calling
     # connect() simultaneously) to settle before starting health checks.
     # Without this, ping fires while ib_async is mid-connect and returns
     # False → forces a disconnect that fights with the in-flight connect,
@@ -2741,7 +1669,6 @@ async def ibkr_health_check_loop(state: AppState) -> None:
 
     async def _publish(current: str) -> None:
         event = StatusEvent(
-            quantdata=type(state.quantdata).__name__,
             ibkr=current,
             engine="running" if state.loop_task is not None else "stopped",
             history_size=state.engine.history_size,

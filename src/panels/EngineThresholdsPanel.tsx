@@ -80,12 +80,12 @@ const FIELDS: FieldSpec[] = [
     min: 10, max: 600, step: 5, hot: false,
     help: "Seconds between engine evaluations. Restart required.",
   },
-  {
-    key: "quantdata_poll_interval_sec",
-    label: "QuantData poll interval (sec)",
-    min: 5, max: 120, step: 1, hot: false,
-    help: "Seconds between QuantData fetches. Restart required.",
-  },
+  // [REMOVED 2026-08-25] the `quantdata_poll_interval_sec` field. The
+  // QuantData API and data subscription were CANCELLED — there is no fetch
+  // left for the interval to govern, and an editable knob over a dead poller
+  // is exactly the kind of control that reads as working when it is not. The
+  // key may survive in the sidecar's UIConfig and in config.json; this panel
+  // sends only the keys it renders, so it no longer touches it.
 ];
 
 type Cfg = Record<string, any>;

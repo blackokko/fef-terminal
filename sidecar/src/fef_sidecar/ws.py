@@ -21,8 +21,9 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
 
     # Send initial status snapshot
+    # [REMOVED 2026-08-25] StatusEvent.quantdata — QuantData subscription
+    # CANCELLED; the frontend stopped declaring the field in the same change.
     initial = StatusEvent(
-        quantdata=type(state.quantdata).__name__,
         ibkr=state.ibkr_status if state.ibkr_status != "unknown"
         else ("connected" if state.ibkr.is_connected else "disconnected"),
         engine="running" if state.loop_task is not None else "stopped",

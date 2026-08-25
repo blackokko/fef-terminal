@@ -6,7 +6,10 @@ import { useEffect, useState } from "react";
 
 interface Config {
   fef_loop_interval_sec: number;
-  quantdata_poll_interval_sec: number;
+  // [REMOVED 2026-08-25] quantdata_poll_interval_sec — the QuantData API and
+  // data subscription were CANCELLED, so there is nothing left to poll. The
+  // key may still exist in ~/.fef-terminal/config.json and in the sidecar's
+  // UIConfig model; the UI no longer reads or writes it.
   wall_proximity_pts: number;
   wall_collapse_pct: number;
   wall_collapse_floor_m: number;
@@ -67,14 +70,8 @@ export function SettingsPanel() {
           min={10}
           max={600}
         />
-        <Field
-          label="QuantData poll (s)"
-          hint="Restart required"
-          value={config.quantdata_poll_interval_sec}
-          onChange={(v) => save({ quantdata_poll_interval_sec: v })}
-          min={5}
-          max={120}
-        />
+        {/* [REMOVED 2026-08-25] "QuantData poll (s)" field — subscription
+            CANCELLED, nothing to poll. */}
         <Field
           label="Wall proximity (pts)"
           hint="Hot-reload"

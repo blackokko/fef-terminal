@@ -8,10 +8,21 @@ concurrent sub-fetches read it at request-build time, so the main poll's
 set_page_filter(ticker='SPX') interleaving mid-GLD-fetch made some GLD
 sub-requests carry ticker='SPX' → snapshot.spx_price came from SPX GEX.
 
-Source race is closed by loop._qd_scope_lock (atomic set+fetch); these tests
+Source race was closed by loop._qd_scope_lock (atomic set+fetch); these tests
 cover the input-boundary backstop: a spot deviating >20% from the engine's
 last ACCEPTED spot rejects the whole iteration (no engine.push, no verdict
-cache, audit row 'scanner_input_glitch' with both values)."""
+cache, audit row 'scanner_input_glitch' with both values).
+
+[REMOVED 2026-08-25] QuantData subscription CANCELLED. Two INTEGRATION tests in
+this file drove `_scan_one_symbol` through a `_FakeQD` client
+(set_page_filter/fetch_market_snapshot) with `mss.snapshot_to_inputs`
+monkeypatched — i.e. they existed only to exercise the QuantData path, and both
+that function and `_scan_one_symbol` are deleted. They are removed with it:
+  * test_scan_one_symbol_skips_engine_on_contaminated_snapshot
+  * test_scan_one_symbol_rejects_iteration_on_reference_pollution
+The guard they wrapped, `_reject_scanner_input_glitch`, is UNCHANGED and still
+covered directly by every other test here (band rejection, reference pollution,
+threshold boundaries, window quarantine)."""
 
 from __future__ import annotations
 
@@ -22,12 +33,8 @@ import pytest
 
 os.environ["FEF_DB_URL"] = "sqlite+aiosqlite:///:memory:"
 
-import fef_sidecar.engine.multi_symbol_scanner as mss
 from fef_sidecar.db import SignalIterRepository, dispose_db, init_db
-from fef_sidecar.engine.multi_symbol_scanner import (
-    _reject_scanner_input_glitch,
-    _scan_one_symbol,
-)
+from fef_sidecar.engine.multi_symbol_scanner import _reject_scanner_input_glitch
 
 
 @pytest.fixture(autouse=True)
@@ -111,53 +118,6 @@ class _FakeEngine:
             nearest_wall_strike=None, nearest_wall_distance=None,
             nearest_wall_family=None, secondary_scores={},
         )
-
-
-class _FakeQD:
-    def __init__(self) -> None:
-        self.tickers: list[str | None] = []
-
-    async def set_page_filter(self, **kw) -> None:
-        self.tickers.append(kw.get("ticker"))
-
-    async def fetch_market_snapshot(self, **kw):
-        return object()  # opaque — snapshot_to_inputs is monkeypatched
-
-
-async def test_scan_one_symbol_skips_engine_on_contaminated_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    engine = _FakeEngine()
-    state = SimpleNamespace(
-        scanner_engines={"GLD": engine},
-        quantdata=_FakeQD(),
-        last_scanner_verdict_by_symbol={},
-        _scanner_last_spot={"GLD": 379.65},
-    )
-    spots = iter([7526.8, 380.2])
-    monkeypatch.setattr(
-        mss, "snapshot_to_inputs",
-        lambda snap: SimpleNamespace(
-            spx_price=next(spots), drift_cum_net_m=0.0, drift_bias="NEUTRAL",
-            ntm_max_pain=0.0, raw_max_pain=0.0,
-            top_gex_walls=[], top_dex_walls=[],
-        ),
-    )
-
-    # Contaminated tick: the engine NEVER sees it, nothing cached for the
-    # FE panel, the glitch is audit-logged.
-    await _scan_one_symbol(state, "GLD")
-    assert engine.pushed == []
-    assert "GLD" not in state.last_scanner_verdict_by_symbol
-    rows = await SignalIterRepository.query_audit_log(category="scanner_input_glitch")
-    assert len(rows) == 1
-
-    # Next (sane) tick flows through normally — guard does not stick.
-    await _scan_one_symbol(state, "GLD")
-    assert len(engine.pushed) == 1
-    assert engine.pushed[0].spx_price == pytest.approx(380.2)
-    assert state.last_scanner_verdict_by_symbol["GLD"]["spx_price"] == pytest.approx(380.2)
-    assert state._scanner_last_spot["GLD"] == pytest.approx(380.2)
 
 
 # ---------------------------------------------------------------------------
@@ -295,38 +255,3 @@ class _FakeEngineWithWindow(_FakeEngine):
     def reset(self) -> None:
         self._history.clear()
         self.resets += 1
-
-
-async def test_scan_one_symbol_rejects_iteration_on_reference_pollution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """End-to-end: a valid spot + polluted window ⇒ the engine NEVER sees the
-    push (no mixed-pair delta possible), the window is reset, and the next
-    scan flows into a clean re-warming engine."""
-    engine = _FakeEngineWithWindow([14340.0])
-    state = SimpleNamespace(
-        scanner_engines={"SPX": engine},
-        quantdata=_FakeQD(),
-        last_scanner_verdict_by_symbol={},
-        _scanner_last_spot={"SPX": 7540.0},
-    )
-    spots = iter([7546.0, 7547.5])
-    monkeypatch.setattr(
-        mss, "snapshot_to_inputs",
-        lambda snap: SimpleNamespace(
-            spx_price=next(spots), drift_cum_net_m=0.0, drift_bias="NEUTRAL",
-            ntm_max_pain=0.0, raw_max_pain=0.0,
-            top_gex_walls=[], top_dex_walls=[],
-        ),
-    )
-
-    await _scan_one_symbol(state, "SPX")
-    assert engine.pushed == []                       # iteration rejected
-    assert engine.resets == 1                        # window quarantined
-    assert "SPX" not in state.last_scanner_verdict_by_symbol
-    assert len(await _pollution_audits()) == 1
-
-    # Clean window now — the next scan pushes normally.
-    await _scan_one_symbol(state, "SPX")
-    assert len(engine.pushed) == 1
-    assert engine.pushed[0].spx_price == pytest.approx(7547.5)

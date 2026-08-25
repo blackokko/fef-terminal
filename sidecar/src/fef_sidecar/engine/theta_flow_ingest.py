@@ -4,7 +4,8 @@ the session drift series (`drift_theta_cum_m`) for the scanner's shadow
 comparison and the (default-OFF) `flow_source='theta'` swap.
 
 WHY (2026-07-15 parity diagnostic, scratchpad/parity_report.md): the live
-QuantData `drift_cum_net_m` moves at ~7-9% of the magnitude of the backtest's
+QuantData `drift_cum_net_m` (feed removed 2026-08-25) moved at ~7-9% of the
+magnitude of the backtest's
 `option_flow_minute`-derived drift on the same sessions (31x fewer >=10M 3-min
 surges). The strict-HIGH backtest was measured on Theta-scale inputs; the live
 scanner can neither harvest nor validate that edge through the QD feed. The

@@ -27,11 +27,10 @@ from fef_sidecar.db import dispose_db, init_db
 from fef_sidecar.loop import (
     account_poll_loop,
     bar_stream_loop,
-    fef_tick_loop,
     hft_loop,
     ibkr_health_check_loop,
     microstructure_loop,
-    quantdata_poll_loop,
+    spread_tick_loop,
     tick_stream_loop,
     vix_poll_loop,
 )
@@ -353,7 +352,7 @@ def spawn_data_loops(state: AppState) -> None:
     the active symbol is changed via /config/symbol so the loops pick up
     the new symbol immediately.
 
-    2026-07-07: critical loops (tick/bar streams, QD poll, VIX poll,
+    2026-07-07: critical loops (tick/bar streams, VIX poll,
     position snapshots, watcher loops, scanner) are spawned SUPERVISED —
     heartbeat + traceback-on-death + auto-respawn (engine/loop_watchdog.py).
     spawn_supervised also cancels a live same-name task first, which closes
@@ -363,11 +362,10 @@ def spawn_data_loops(state: AppState) -> None:
     _task_alive for the same reason."""
     from fef_sidecar.engine.loop_watchdog import spawn_supervised
 
-    state.quantdata_poll_task = spawn_supervised(
-        state, "quantdata-poll", lambda: quantdata_poll_loop(state),
-        cadence_sec=15, stale_after_sec=120,
-    )
-    state.loop_task = asyncio.create_task(fef_tick_loop(state), name="fef-tick-loop")
+    # [REMOVED 2026-08-25] QuantData subscription CANCELLED — the supervised
+    # "quantdata-poll" loop is gone. `loop_task` now drives the CREDIT-SPREAD
+    # iteration, which is the surviving trading path.
+    state.loop_task = asyncio.create_task(spread_tick_loop(state), name="spread-tick-loop")
     state.bar_task = spawn_supervised(
         state, "bar-stream", lambda: bar_stream_loop(state),
         cadence_sec=15, stale_after_sec=120,
@@ -428,11 +426,10 @@ def spawn_data_loops(state: AppState) -> None:
         state.spread_exit_task = asyncio.create_task(
             spread_exit_watcher_loop(state), name="spread-exit-watcher-loop"
         )
-    from fef_sidecar.engine.multi_symbol_scanner import multi_symbol_scanner_loop
-    state.scanner_task = spawn_supervised(
-        state, "multi-symbol-scanner", lambda: multi_symbol_scanner_loop(state),
-        cadence_sec=60, stale_after_sec=300,
-    )
+    # [REMOVED 2026-08-25] QuantData subscription CANCELLED — the supervised
+    # "multi-symbol-scanner" task is gone. Its per-symbol FEF scan was driven by
+    # multi_symbol_scanner._scan_one_symbol, whose only input was the vendor
+    # snapshot. state.scanner_task stays None; /status reports it as such.
     # Option chain capture — snapshots ATM±25pt × {C,P} via IBKR every 2 min
     # so shadow variants can replay alternate-strike outcomes. Isolated task:
     # failure won't affect signal/auto-trade loops. Disable via
@@ -507,7 +504,7 @@ async def cancel_data_loops(state: AppState) -> None:
     teardown before respawning."""
     tasks = [
         state.loop_task, state.bar_task, state.tick_task,
-        state.quantdata_poll_task, state.health_check_task,
+        state.health_check_task,
         state.vix_task, state.account_task, state.microstructure_task,
         state.hft_task, state.pattern_trigger_task,
     ]
@@ -521,7 +518,7 @@ async def cancel_data_loops(state: AppState) -> None:
             except (asyncio.CancelledError, Exception):
                 pass
     state.loop_task = state.bar_task = state.tick_task = None
-    state.quantdata_poll_task = state.health_check_task = None
+    state.health_check_task = None
     state.vix_task = state.account_task = state.microstructure_task = None
     state.hft_task = None
     state.pattern_trigger_task = None
@@ -562,14 +559,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("startup: scanner-symbol pin restore failed")
 
-    # Live QuantDataClient needs its httpx session initialized via __aenter__.
-    # Mock is a no-op. Done here so all loops can call set_page_filter/fetch
-    # without each one wrapping in 'async with'.
-    if hasattr(state.quantdata, "__aenter__"):
-        try:
-            await state.quantdata.__aenter__()
-        except Exception:
-            logger.exception("QuantData __aenter__ failed — calls will error")
+    # [REMOVED 2026-08-25] QuantData subscription CANCELLED — the live client's
+    # httpx session used to be opened here via __aenter__. No vendor client is
+    # constructed any more, so there is nothing to open (or aclose on shutdown).
 
     auto_loops = os.environ.get("FEF_DISABLE_AUTO_LOOP", "false").lower() not in (
         "true",
@@ -608,8 +600,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_reconcile_after_connect(), name="position-reconcile-startup")
 
     logger.info(
-        "fef-sidecar ready (QD=%s, IBKR=%s, auto_loops=%s)",
-        type(state.quantdata).__name__,
+        "fef-sidecar ready (IBKR=%s, auto_loops=%s)",
         type(state.ibkr).__name__,
         auto_loops,
     )
@@ -635,7 +626,6 @@ async def lifespan(app: FastAPI):
             state.loop_task,
             state.bar_task,
             state.tick_task,
-            state.quantdata_poll_task,
             state.health_check_task,
             state.vix_task,
             state.account_task,
@@ -655,11 +645,6 @@ async def lifespan(app: FastAPI):
             await state.ibkr.disconnect()
         except Exception:
             logger.exception("Failed to disconnect IBKR cleanly")
-
-        try:
-            await state.quantdata.aclose()
-        except Exception:
-            logger.exception("Failed to close QuantData client cleanly")
 
         await dispose_db()
         logger.info("fef-sidecar shutdown complete")

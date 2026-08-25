@@ -13,11 +13,10 @@ export interface Bar {
   volume: number;
 }
 
-export interface WallRow {
-  strike: number;
-  net_m: number;
-  side: "CALL" | "PUT";
-}
+// [REMOVED 2026-08-25] WallRow — the {strike, net_m, side} row used by the
+// top_gex / top_dex wall lists. The QuantData API and data subscription were
+// CANCELLED; exposure-by-strike had no other source in this stack, so the
+// walls, and the type describing them, are gone.
 
 export interface OptionPricing {
   contract_strike: number;
@@ -54,14 +53,11 @@ export interface FEFVerdict {
   option_pricing?: OptionPricing | null;
 }
 
-export interface IterSnapshot {
-  top_gex: WallRow[];
-  top_dex: WallRow[];
-  drift: { cum_net_m: number; bias: string };
-  ntm_max_pain: number;
-  raw_max_pain: number;
-  aggression: { call_pct: number; put_pct: number } | null;
-}
+// [REMOVED 2026-08-25] IterSnapshot — every field on it (top_gex, top_dex,
+// drift, ntm_max_pain, raw_max_pain, aggression) was QuantData-sourced, and
+// that subscription was CANCELLED. IterEvent.snapshot went with it. The
+// sidecar may still put a `snapshot` key on the wire; the frontend simply
+// does not declare or read it any more.
 
 export interface TickEvent {
   type: "tick";
@@ -83,20 +79,13 @@ export interface IterEvent {
   session_date: string;
   spx_price: number;
   verdict: FEFVerdict;
-  snapshot: IterSnapshot;
 }
 
-export interface SnapshotEvent {
-  type: "snapshot";
-  timestamp_ms: number;
-  spx_price: number;
-  top_gex: WallRow[];
-  top_dex: WallRow[];
-  drift: { cum_net_m: number; bias: string };
-  ntm_max_pain: number;
-  raw_max_pain: number;
-  aggression: { call_pct: number; put_pct: number } | null;
-}
+// [REMOVED 2026-08-25] SnapshotEvent — the ~15s QuantData broadcast (walls,
+// drift, max pain, aggression) that refreshed the sidebar ahead of the FEF
+// iter cadence. QuantData subscription CANCELLED; the event carries nothing
+// the frontend can still source, so the type, the "snapshot" case in
+// WebSocketContext and `lastSnapshot` were all removed together.
 
 export interface HFTEvent {
   type: "hft";
@@ -200,7 +189,10 @@ export interface TicketEvent {
 export interface StatusEvent {
   type: "status";
   timestamp_ms: number;
-  quantdata: string;
+  // [REMOVED 2026-08-25] `quantdata: string` — provider status string
+  // ("Connected" / "Mock ..."). QuantData subscription CANCELLED, so there is
+  // no provider left to report on. The sidecar's /status may still emit the
+  // key; nothing in the UI reads it.
   ibkr: string;
   engine: string;
   history_size: number;
@@ -211,7 +203,6 @@ export type SidecarEvent =
   | IterEvent
   | TicketEvent
   | StatusEvent
-  | SnapshotEvent
   | PatternMatchEvent
   | RegimeEvent
   | AccountEvent

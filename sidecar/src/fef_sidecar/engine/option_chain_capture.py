@@ -156,8 +156,14 @@ async def _capture_once(
     if not _within_rth(now):
         return 0
 
-    # Pull live SPX spot. Prefer the freshest IBKR tick; fall back to the
-    # last quantdata snapshot price if the tick stream is down.
+    # Pull live SPX spot from the freshest IBKR tick.
+    #
+    # [REMOVED 2026-08-25] QuantData subscription CANCELLED. `last_spx_price`
+    # used to be refreshed by the QuantData poll loop, so it was a genuine
+    # fallback when the tick stream went down. Nothing writes it now except
+    # the spread iter, so in practice this is tick-or-nothing: with no tick,
+    # spot is 0 and the capture skips the iteration (return 0 below) rather
+    # than writing rows against a stale price.
     spot = float(getattr(state, "last_live_tick_spx", 0.0)
                  or getattr(state, "last_spx_price", 0.0) or 0.0)
     if spot <= 0:

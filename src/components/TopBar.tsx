@@ -81,7 +81,7 @@ interface TopBarProps {
 }
 
 export function TopBar({ screen = "trading", onScreenChange }: TopBarProps = {}) {
-  const { connection, lastTick, lastIter, lastStatus, lastSnapshot, lastAccount } = useSidecar();
+  const { connection, lastTick, lastIter, lastStatus, lastAccount } = useSidecar();
   const spx = lastTick?.spx_price ?? lastIter?.spx_price;
 
   // IMPROVEMENTS #I: price flash on tick — micro-flash green/red on direction
@@ -102,23 +102,13 @@ export function TopBar({ screen = "trading", onScreenChange }: TopBarProps = {})
     return () => window.clearTimeout(t);
   }, [spx]);
 
-  // IMPROVEMENTS #N: stale-data audio chime if QuantData snapshot stalls >60s
-  const staleAlertedRef = useRef(false);
-  useEffect(() => {
-    if (!lastSnapshot) return;
-    const interval = window.setInterval(() => {
-      const age = Date.now() - lastSnapshot.timestamp_ms;
-      if (age > 60_000 && !staleAlertedRef.current) {
-        staleAlertedRef.current = true;
-        void import("../lib/audioAlert").then((m) =>
-          m.playTones?.([392, 311.13], 0.25, 0.18),
-        );  // descending warning tone
-      } else if (age < 30_000) {
-        staleAlertedRef.current = false;
-      }
-    }, 5000);
-    return () => window.clearInterval(interval);
-  }, [lastSnapshot]);
+  // [REMOVED 2026-08-25] The "IMPROVEMENTS #N" stale-data audio chime. It
+  // watched lastSnapshot.timestamp_ms and played a descending two-tone warning
+  // when the QuantData snapshot aged past 60s. The QuantData API and data
+  // subscription were CANCELLED, so there is no snapshot to age — the chime
+  // would either never arm (no first snapshot) or fire forever. Deliberately
+  // not repointed at another feed: pick a stream and write a fresh staleness
+  // rule for it rather than restoring this one.
 
   return (
     <header className="topbar">
@@ -166,17 +156,9 @@ export function TopBar({ screen = "trading", onScreenChange }: TopBarProps = {})
         </span>
       </div>
 
-      <div className="topbar-section">
-        <span className="topbar-label">QuantData</span>
-        <span className="topbar-value">
-          {(() => {
-            const q = lastStatus?.quantdata;
-            if (!q) return "—";
-            if (q.startsWith("Mock")) return "mock";
-            return "connected";
-          })()}
-        </span>
-      </div>
+      {/* [REMOVED 2026-08-25] QuantData provider pill (connected / mock).
+          The QuantData API and data subscription were CANCELLED — there is no
+          provider left to show a status for. */}
 
       <div className="topbar-section">
         <span className="topbar-label">IBKR</span>
@@ -210,11 +192,12 @@ export function TopBar({ screen = "trading", onScreenChange }: TopBarProps = {})
         >
           ⧉ Pop chart
         </button>
-        {lastStatus?.quantdata?.startsWith("Mock") && lastStatus?.ibkr === "connected" && (
-          <span className="all-mock-banner" title="Both providers are mock — signals are replay only">
-            ⚠ ALL MOCK
-          </span>
-        )}
+        {/* [REMOVED 2026-08-25] "⚠ ALL MOCK" banner. Its condition was
+            lastStatus.quantdata.startsWith("Mock") — i.e. it existed to warn
+            that the QuantData provider was serving mock data. The QuantData
+            API and data subscription were CANCELLED, so the condition can no
+            longer be evaluated and the banner can never render. IBKR mock
+            state, if it needs surfacing, belongs in its own indicator. */}
         <span
           className="connection-dot"
           style={{ background: connectionColor[connection] }}
