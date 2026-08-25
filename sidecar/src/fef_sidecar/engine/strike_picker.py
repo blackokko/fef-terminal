@@ -176,13 +176,30 @@ async def _scan_short_leg(
         if quote is None or quote.delta is None:
             unquotable += 1
             continue
+        # ⚠ THE SHORT LEG GETS THE SAME TWO-SIDED TEST AS THE WING (2026-08-25).
+        # `OptionQuote.mid` falls back to `last` when a side is missing or zero,
+        # so an hours-old print can become the larger term of the credit — and
+        # the credit becomes the combo LIMIT PRICE. The wing has been guarded
+        # since 2026-08-11; the short leg was not, which is the asymmetry the
+        # reconciliation harness measured: 80.5% of recorded credits reproduce
+        # from ThetaData at SOME minute of their session but at a median of
+        # -51.5 minutes, and two structures carried byte-identical credits while
+        # their legs re-quoted. The join was sound; the anchor was stale.
+        #
+        # Require a genuine two-sided quote and compute the mid here rather than
+        # trusting the model's. A strike we cannot price is UNQUOTABLE, which
+        # feeds the coverage guard — it must not silently become a candidate.
+        sb, sa = quote.bid, quote.ask
+        if sb is None or sa is None or sb <= 0 or sa <= 0 or sa < sb:
+            unquotable += 1
+            continue
         candidates.append(
             _Candidate(
                 strike=short_strike,
                 delta=quote.delta,
-                mid=quote.mid,
-                bid=quote.bid,
-                ask=quote.ask,
+                mid=(sb + sa) / 2.0,
+                bid=sb,
+                ask=sa,
             )
         )
         if abs(quote.delta) < delta_floor:

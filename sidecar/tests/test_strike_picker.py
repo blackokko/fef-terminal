@@ -310,18 +310,30 @@ async def test_a_rejected_candidate_does_not_abort_the_whole_scan() -> None:
     """A failed credit/wing check rejects the CANDIDATE, not the scan — the
     next-nearest strike still gets its turn.
 
-    7680 is quoted 0.00 x 1.60: unusable as 7690's WING (one-sided, so the mid
-    would be an `last`-derived guess that becomes the combo limit price), yet
-    still fine as a short leg in its own right. That asymmetry is deliberate.
+    ⚠ THE ASYMMETRY THIS TEST ONCE ASSERTED WAS REVERSED 2026-08-25. It used to
+    hold that a 0.00 x 1.60 quote was "unusable as a WING yet still fine as a
+    short leg." That is wrong: in a credit spread you SELL the short leg, so your
+    proceeds are bounded by its BID. A zero bid means nobody will pay anything —
+    there is no credit to collect — and `OptionQuote.mid` falls back to `last`,
+    so the number that survives is a stale print which becomes the combo LIMIT
+    PRICE. The reconciliation harness measured the consequence: 80.5% of recorded
+    credits reproduce from ThetaData at some minute of their own session, but at
+    a median of -51.5 minutes.
+
+    Here 7680 refuses to quote at all, so 7690 loses its wing and is rejected —
+    and the scan still goes on to price 7670.
     """
     pick = await _pcs(FakeIBKR(
-        {7690.0: 0.140, 7680.0: 0.100, 7670.0: 0.080, 7660.0: 0.050},
-        mids={7690.0: 2.00, 7680.0: 1.50, 7670.0: 0.60},
-        spreads={7680.0: (0.0, 1.60), 7670.0: (0.55, 0.65)},
+        {7690.0: 0.140, 7680.0: None, 7670.0: 0.115,
+         7660.0: 0.100, 7650.0: 0.085, 7640.0: 0.070},
+        spreads={7690.0: (2.95, 3.05), 7670.0: (1.75, 1.85), 7660.0: (1.15, 1.25),
+                 7650.0: (0.55, 0.65), 7640.0: (0.25, 0.35)},
     ))
     assert pick is not None
-    assert pick.short_strike == 7680.0
-    assert pick.estimated_credit == pytest.approx(0.90)
+    # 7690 is nearest the 0.15 target but its wing (7680) refuses to quote, so
+    # the candidate is dropped and the scan carries on to price 7670/7660.
+    assert pick.short_strike == 7670.0
+    assert pick.estimated_credit == pytest.approx(0.60)
 
 
 @pytest.mark.asyncio
@@ -358,3 +370,62 @@ def test_module_defaults_match_state_defaults() -> None:
     assert (defaults["spread_min_credit_width_ratio"]
             == strike_picker.DEFAULT_MIN_CREDIT_WIDTH_RATIO)
     assert defaults["spread_min_net_credit"] == strike_picker.DEFAULT_MIN_NET_CREDIT
+
+
+# ---------------------------------------------------------------------------
+# The SHORT leg is held to the same two-sided test as the wing (2026-08-25).
+#
+# The wing has been guarded since 2026-08-11. The short leg was not — and it is
+# the LARGER term of the credit. `OptionQuote.mid` falls back to `last` when a
+# side is missing or zero, so an hours-old print could set the combo limit.
+#
+# Measured consequence, from the backtest/live reconciliation harness: 80.5% of
+# recorded credits reproduce from ThetaData at SOME minute of their own session,
+# but the best match sits a median -51.5 minutes earlier, and two structures
+# carried byte-identical credits while their legs re-quoted. The join was sound;
+# the anchor was stale.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bid,ask,label", [
+    (0.0, 3.05, "zero bid — nobody pays, and mid falls back to last"),
+    (2.95, 0.0, "zero ask"),
+    (3.40, 2.90, "crossed quote"),
+])
+@pytest.mark.asyncio
+async def test_short_leg_without_a_two_sided_quote_is_never_selected(bid, ask, label):
+    """7690 is NEAREST 0.15 and would win on delta alone — but it cannot be
+    priced, so it counts UNQUOTABLE and the next-best strike wins instead. The
+    scan is not aborted; the bad strike simply cannot be sold."""
+    ladder = {7690.0: 0.150, 7680.0: 0.130, 7670.0: 0.115,
+              7660.0: 0.100, 7650.0: 0.085, 7640.0: 0.070}
+    # Explicit two-sided quotes: $0.60 credit at every rung, clearing the 5%
+    # of width floor. The fake's default `delta * 20` ladder gives $0.30, which
+    # the floor correctly refuses -- that is the guard working, not a fixture.
+    good = {7690.0: (2.95, 3.05), 7680.0: (2.35, 2.45), 7670.0: (1.75, 1.85),
+            7660.0: (1.15, 1.25), 7650.0: (0.55, 0.65), 7640.0: (0.25, 0.35)}
+    good[7690.0] = (bid, ask)
+    pick = await _pcs(FakeIBKR(ladder, spreads=good))
+    assert pick is not None, f"scan aborted on {label} instead of moving on"
+    assert pick.short_strike != 7690.0, f"selected an unpriceable short leg ({label})"
+
+
+@pytest.mark.asyncio
+async def test_short_leg_mid_is_recomputed_not_taken_from_the_model():
+    """Even when `mid` is present we recompute from bid/ask: a model mid that
+    disagrees with its own two-sided quote is not the tradeable price."""
+    ladder = {7690.0: 0.150, 7680.0: 0.130, 7670.0: 0.115,
+              7660.0: 0.100, 7650.0: 0.085, 7640.0: 0.070}
+    # Explicit two-sided quotes: $0.60 credit at every rung, clearing the 5%
+    # of width floor. The fake's default `delta * 20` ladder gives $0.30, which
+    # the floor correctly refuses -- that is the guard working, not a fixture.
+    good = {7690.0: (2.95, 3.05), 7680.0: (2.35, 2.45), 7670.0: (1.75, 1.85),
+            7660.0: (1.15, 1.25), 7650.0: (0.55, 0.65), 7640.0: (0.25, 0.35)}
+    pick = await _pcs(FakeIBKR(
+        ladder, mids={7690.0: 99.0, 7680.0: 99.0}, spreads=good,
+    ))
+    assert pick is not None
+    assert pick.short_strike == 7690.0
+    assert pick.short_mid == pytest.approx(3.00), pick.short_mid
+    assert pick.long_mid == pytest.approx(2.40), pick.long_mid
+    assert pick.estimated_credit == pytest.approx(0.60), pick.estimated_credit
