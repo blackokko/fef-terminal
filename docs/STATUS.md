@@ -60,6 +60,20 @@ contradicts the mechanism he describes; it **cannot** refute forty markets. Cost
 instruments — the twin earns the same +0.044 R — so "modestly profitable" and "the level is why"
 are different claims, and only the second one failed.
 
+## 2b. This week's studies (2026-09-27) — scope: equity options and shares only
+
+Pre-registered in the archive before any data, each run by a separate agent. Registry section E and H.
+
+| study | what | state |
+|---|---|---|
+| `lasthalf` | SPY 15:00–15:30 move predicts 15:30–16:00, traded as SPY shares | **Closed: no edge.** +0.87 bp per trade before costs, −0.13 bp after a 1 bp round trip, 2017–21. The July "survives OOS" claim was a regression t, not a trade (registry J). |
+| `hedgevol` | SPY iron fly ~45 DTE, delta-hedged daily with SPY shares, 2016–2026 | Running |
+| `earnvol` | S&P 500 single-stock options around earnings: buy the run-up, sell the crush | Running |
+| `vixroll` / `vixroll2` | Short VIX futures in contango | Closed at the harness gate (benchmark error, rule 37), then **cancelled: out of scope** |
+
+**Open question for the operator:** the trend v3 paper sleeve holds GLD, DBC and HYG alongside equity
+ETFs. Under the equities-only scope those would be out; not changed pending the operator's answer.
+
 ## 3. Data loss, and the move out of Temp (DONE 2026-09-26)
 
 **What was lost while the data lived in Temp.** `chainfill_cache.db` (574 million option quote rows,
@@ -104,9 +118,8 @@ ledgers, not caches.
    directly changes the book that would be traded.
 4. **Then breadth, or stop.** Every research thread since `powercal` has ended at the same wall:
    the control stack certifies 13.4 %/yr on 289 names, ~4 % on 3,000, and three instruments cannot
-   see a forty-market effect. A ~40-instrument delta-one 1-minute panel (ETFs from Alpaca's free
-   data tier; futures need another source) is the only thing that would let the cross-sectional
-   ranker, the breakout claim, or the 1-minute variance-ratio question be tested honestly. **Do
+   see a forty-market effect. Within the equities-only scope, breadth means many stocks, not many
+   asset classes: single-stock options events (`earnvol`) are the first study built that way. **Do
    not run another single-instrument intraday study — we have measured that it cannot resolve the
    answer either way.** New data goes to `D:\fef-data`, never the agent scratchpad.
 

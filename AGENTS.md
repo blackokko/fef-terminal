@@ -39,6 +39,9 @@ the index of ~40 studies and 36 methodology rules, and its `README.md` orients a
    `file:...?mode=ro` with `pragma query_only=1`.
 9. **Bot P&L = fills attributed to `LiveOrder` parents only.** The paper account mixes in the
    operator's manual trades; never use aggregate account math for bot claims.
+10. **Scope (operator, 2026-09-27): options and shares on equities only** — single stocks, equity
+    ETFs and their options. SPX/NDX index options only once something works on equities. **No
+    futures, no VIX products, no FX/rates/commodities.** Do not propose or run studies outside this.
 
 ## Two-agent protocol (Claude + Codex on the same repo)
 
