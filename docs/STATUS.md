@@ -68,7 +68,11 @@ Pre-registered in the archive before any data, each run by a separate agent. Reg
 |---|---|---|
 | `lasthalf` | SPY 15:00–15:30 move predicts 15:30–16:00, traded as SPY shares | **Closed: no edge.** +0.87 bp per trade before costs, −0.13 bp after a 1 bp round trip, 2017–21. The July "survives OOS" claim was a regression t, not a trade (registry J). |
 | `hedgevol` | SPY iron fly ~45 DTE, delta-hedged daily with SPY shares, 2016–2026 | **Closed: Branch C, not harvestable at retail.** −$27.07 per monthly position at bid/ask, +$3.00 even at the mid; both halves negative. Hedged straddle/strangle without wings +$15/+$31, not significant, with 0.5 SPY correlation. ATM implied beat realized volatility by only +0.80 vol points on average; the premium sits in the crash-protection wings. |
-| `earnvol` | S&P 500 single-stock options around earnings: buy the run-up, sell the crush | Running |
+| `earnvol` | S&P 500 single-stock options around earnings: buy the run-up, sell the crush | **Closed: both legs Branch C.** 2,566 / 2,358 events 2016–2026. Run-up −5.58 % of premium per event at bid/ask (+0.79 % at mid, not significant), no better than a non-earnings date. Crush iron fly −23.40 % of max loss (−0.77 % at mid). Negative in all 11 years. Spread cost $72 per straddle, $171 per fly, with no premium underneath at the mid. |
+
+**What the week's four in-scope tests say together:** on SPY and single-stock options, the premia are
+priced close to fair at the mid, and the bid-ask spread — which the market maker collects — is the
+largest term in every result. Paying it is the retail trader's structural cost.
 | `vixroll` / `vixroll2` | Short VIX futures in contango | Closed at the harness gate (benchmark error, rule 37), then **cancelled: out of scope** |
 
 **Open question for the operator:** the trend v3 paper sleeve holds GLD, DBC and HYG alongside equity
