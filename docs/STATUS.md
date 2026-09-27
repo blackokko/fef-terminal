@@ -67,7 +67,7 @@ Pre-registered in the archive before any data, each run by a separate agent. Reg
 | study | what | state |
 |---|---|---|
 | `lasthalf` | SPY 15:00–15:30 move predicts 15:30–16:00, traded as SPY shares | **Closed: no edge.** +0.87 bp per trade before costs, −0.13 bp after a 1 bp round trip, 2017–21. The July "survives OOS" claim was a regression t, not a trade (registry J). |
-| `hedgevol` | SPY iron fly ~45 DTE, delta-hedged daily with SPY shares, 2016–2026 | Running |
+| `hedgevol` | SPY iron fly ~45 DTE, delta-hedged daily with SPY shares, 2016–2026 | **Closed: Branch C, not harvestable at retail.** −$27.07 per monthly position at bid/ask, +$3.00 even at the mid; both halves negative. Hedged straddle/strangle without wings +$15/+$31, not significant, with 0.5 SPY correlation. ATM implied beat realized volatility by only +0.80 vol points on average; the premium sits in the crash-protection wings. |
 | `earnvol` | S&P 500 single-stock options around earnings: buy the run-up, sell the crush | Running |
 | `vixroll` / `vixroll2` | Short VIX futures in contango | Closed at the harness gate (benchmark error, rule 37), then **cancelled: out of scope** |
 
