@@ -51,8 +51,7 @@ from .ibkr_ruler import ET, IBKR_DB, ibkr_open, ibkr_series
 sys.stdout.reconfigure(encoding="utf-8")
 
 SIG_DB = os.path.expanduser("~/.fef-terminal/signal_log.db")
-SCRATCH = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-           r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad")
+SCRATCH = (r"D:\fef-data")
 GLITCH = 0.05          # drop any |return| > 5% (ruler spike)
 TOL_MS = 120_000       # nearest-bar tolerance for an ET mark
 RNG = np.random.default_rng(20260701)

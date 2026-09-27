@@ -18,8 +18,7 @@ import sqlite3
 import httpx
 
 BASE = "http://127.0.0.1:25503/v3/option/history/quote"
-_SCRATCH = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-            r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad")
+_SCRATCH = (r"D:\fef-data")
 CACHE_DB = os.path.join(_SCRATCH, "tick_cache.db")   # NOT the production DB
 
 

@@ -43,8 +43,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 ET = ZoneInfo("America/New_York")
 
 CACHE_PKL = os.path.join(os.environ.get("TEMP", "."), "phase_cache.pkl")
-OUT_DIR = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-           r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad")
+OUT_DIR = (r"D:\fef-data")
 
 WIN_LO, WIN_HI = 9.5833, 15.5      # entries 09:35..15:30 ET (same as validated harness)
 EP_GAP_MS = 120_000                # same state+dir within 2 min = same episode

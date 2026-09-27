@@ -1,4 +1,4 @@
-# STATUS — 2026-09-21
+# STATUS — 2026-09-27
 
 Current state of the operation, what was just learned, and what to do next, in order. Written for an
 agent picking this up cold. The research detail behind every number here is in
@@ -14,7 +14,8 @@ agent picking this up cold. The research detail behind every number here is in
 | **Credit-spread bot** (0DTE SPX put vertical, ~0.15Δ, 1 lot, sells every session) | **Armed, never filled.** 200 parent orders 2026-08-12 → 08-25, zero fills: 197 died on `Bag()` being called positionally (ib_async is keyword-only), 3 on an env gate. **All four known blockers are now fixed** — env var in the launcher, strike picker rewritten to nearest-delta with a credit/width floor, `Bag(symbol=...)`, and the short leg held to a two-sided quote. Toggle is in the UI (`SpreadAutoTradePanel`). Default is OFF; the launcher flag is the capability, the panel is the intent. |
 | **Sleeve executor** (trend v3 + PEAD → MOC orders) | **Built, tested, never transmitted.** 33 tests, five guards mutation-verified. Six MOC buys have been pending since August (trend v3: EFA, VNQ; PEAD: single names). Quantities come from `plan` — do not hard-code them, the ledgers move. Needs TWS up on 7497 before 15:45 ET. Carry v1 disabled (measured de-allocate, −4.46 %/yr alpha). |
 | **Reconciliation harness** (`recon.py`) | **Built and tested; no measurement yet.** Zero credit-spread fills exist to reconcile. Two of its four Rule-3 join gates currently fail — the join is sound, the recorded anchors are contaminated — so it correctly publishes no aggregate. The adverse-selection prior stays at −$16.34/ct, CI [−156, +84]: unmeasured. Its advisory cross-check read `chainfill_cache.db`, now gone (§3); the primary path (live `signal_log.db` + ThetaData via `recon_quotes.db`) is intact. |
-| **Collectors** | `runner_watch.py` and `caphead_watch.py` are running (both restarted 2026-09-21 10:16 local). Do not kill them. They run from the session scratchpad under `AppData\Local\Temp` — the same disposable location as the lost caches (§3). Find them with `Get-CimInstance Win32_Process` filtered on the script name; PIDs change. |
+| **Collectors** | `runner_watch.py` and `caphead_watch.py` run from `D:\fef-data` (restarted there 2026-09-26, detached). Do not kill them during market hours. `FEF-DailyOpen` restarts them at 08:30 CT if they are down. Find them with `Get-CimInstance Win32_Process` filtered on the script name; PIDs change. |
+| **Paper ledgers** | Trend v3, PEAD, overnight, carry v1, caphead grading and runner outcomes update daily via `FEF-DailyClose` from `D:\fef-data`, mirrored to the archive. **The carry ledger failed silently on 16 runs, 2026-09-03 → 09-25** (§3); repaired 2026-09-26, and the one rebalance it missed (2026-09-08) was booked late by the same mechanical rule. |
 
 **The honest book-level number:** portfolio alpha **+17.75 %/yr at t = +1.50** — economically
 interesting, statistically unconfirmed. Portfolio R² against 11 factors is **0.005** (not a
@@ -59,23 +60,28 @@ contradicts the mechanism he describes; it **cannot** refute forty markets. Cost
 instruments — the twin earns the same +0.044 R — so "modestly profitable" and "the level is why"
 are different claims, and only the second one failed.
 
-## 3. ⚠ Data loss — and the structural cause
+## 3. Data loss, and the move out of Temp (DONE 2026-09-26)
 
-**`chainfill_cache.db` is gone.** 574 million option quote rows across 964 sessions, 49.8 GB — the
-ThetaData backfill behind every credit-spread study and `recon.py`'s cross-check. Also gone:
-`iwm_bars_cache.db`, `conf_siblings.db`, and ~50 other databases (78 of ~130 remain). Not on C:,
-not on D:. Last seen alive **2026-08-25**; already gone when the scratchpad was measured on 09-09.
+**What was lost while the data lived in Temp.** `chainfill_cache.db` (574 million option quote rows,
+964 sessions, 49.8 GB — the backfill behind every credit-spread study and `recon.py`'s cross-check),
+`iwm_bars_cache.db`, `conf_siblings.db` and ~50 other databases, last seen 2026-08-25. **Also
+`carry_v1_study.py`**, deleted between the 2026-09-02 and 09-03 ledger runs: the carry ledger imports
+it, so it failed on 16 consecutive runs and nobody noticed (the scheduled task went red; nothing
+reads that). Cause of the deletions not determined; Storage Sense is enabled.
 
-Ruled out: the `vbreak` workflow (nine agents, none deleted a `.db`); a simple age cutoff (July
-files survived, August files vanished). Storage Sense is enabled. Cause not determined.
+**The move.** The whole session scratchpad (2,332 files, 34.9 GB) now lives in **`D:\fef-data`**
+(Samsung 990 PRO NVMe, 1.2 TB free) with the same relative layout, so an old report's
+`...\scratchpad\X` is now `D:\fef-data\X`. Every file was SHA-256-verified against its original
+before the originals were deleted. 318 code files had hard-coded Temp paths rewritten; each rewritten
+Python file was proven path-only by an AST comparison. The ledger job and the collectors run from
+D: and passed a full run. `carry_v1_study.py` was rebuilt by replaying the session transcript that
+wrote it and reproduces the study's saved output **bit-exact over 4,915 days**. Record, manifest,
+proofs and a zip of the pre-rewrite code: `D:\fef-data\_migration_2026-09-26\`. Git backups of every
+ledger updater and its imports: `fef-research-archive\ledger_updaters\`.
 
-**The cause matters less than the location.** The entire research data layer lives in
-`C:\Users\diant\AppData\Local\Temp\claude\...\scratchpad\` — a directory the OS, cleanup tools,
-and the agent harness all treat as disposable. `multidte_cache.db` (9.4 GB, 7.8 h to build) survived
-only because `vbreak` happened to touch it. The two collectors (§1) run from the same directory.
-
-**Recoverable:** chainfill rebuilds from ThetaData (subscription active; hours of pulls);
-`iwm_bars` from Yahoo/IBKR. **Not recoverable until moved:** everything, on the next cleanup.
+**Still to rebuild when a study needs it:** `chainfill_cache.db` from ThetaData (hours of pulls);
+`iwm_bars` from Yahoo/IBKR. D: is not backed up anywhere; the archive's git copies cover code and
+ledgers, not caches.
 
 ## 4. Priorities, in order
 
@@ -91,9 +97,8 @@ only because `vbreak` happened to touch it. The two collectors (§1) run from th
    remaining uncertainty that matters — real slippage, adverse selection, whether t = 1.50 is real
    — is resolved by fills, not by research.** The `Bag()` bug that killed 197 orders was found by
    *trying to run*, not by any study.
-2. **Move the research caches out of Temp.** Migrate survivors to `D:\fef-data\` (1.2 TB free),
-   repoint every study's path (and the collectors'), then rebuild `chainfill_cache.db` from
-   ThetaData. Nothing else in the research programme is safe until this is done.
+2. ~~**Move the research caches out of Temp.**~~ **Done 2026-09-26** (§3). Rebuild
+   `chainfill_cache.db` from ThetaData only when a study needs it.
 3. **The one cheap study that needs no new data:** the leverage question from `sizing` — the book
    runs at mean gross **0.753** and hits its 1.0 cap on **27 %** of rebalances. Standalone lock,
    directly changes the book that would be traded.
@@ -103,8 +108,7 @@ only because `vbreak` happened to touch it. The two collectors (§1) run from th
    data tier; futures need another source) is the only thing that would let the cross-sectional
    ranker, the breakout claim, or the 1-minute variance-ratio question be tested honestly. **Do
    not run another single-instrument intraday study — we have measured that it cannot resolve the
-   answer either way.** Do the migration first; pulling 40 instruments into a directory that just
-   ate 50 GB is how this happens twice.
+   answer either way.** New data goes to `D:\fef-data`, never the agent scratchpad.
 
 ## 5. Do not
 

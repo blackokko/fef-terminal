@@ -56,7 +56,10 @@ This file keeps the Claude-specific notes.
 ## Environment gotchas
 - Windows console is cp1252: scripts print with `sys.stdout.reconfigure(errors="replace")`.
 - Epoch timestamps are **milliseconds** everywhere in the DB.
-- Temp/analysis files go to the session scratchpad, not the repo.
+- Throwaway files go to the session scratchpad, not the repo. **Anything that must survive —
+  caches, study scripts, ledger state — goes to `D:\fef-data`**, never the scratchpad: it sits
+  under `AppData\Local\Temp`, and cleanups there destroyed research data twice before the
+  2026-09-26 move. See `AGENTS.md` (authoritative rules) and `docs/STATUS.md`.
 - Frontend rebuilds: cargo PATH prefix + kill the running binary first (Tauri lock).
 
 ## Sidecar API quick refs

@@ -38,8 +38,7 @@ import numpy as np
 from . import vrp_data as V
 
 sys.stdout.reconfigure(encoding="utf-8")
-SCRATCH = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-           r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad")
+SCRATCH = (r"D:\fef-data")
 
 DTE_TARGET = 35
 DTE_LO, DTE_HI = 30, 45

@@ -41,8 +41,7 @@ from .data import BAD
 
 sys.stdout.reconfigure(encoding="utf-8")
 ET = ZoneInfo("America/New_York")
-SCRATCH = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-           r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad")
+SCRATCH = (r"D:\fef-data")
 
 ENTRY_ET = 10.0
 WING = 10.0

@@ -58,8 +58,7 @@ from .holdout import DEV_END, HOLDOUT_END, HOLDOUT_START
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-SCRATCH = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-           r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad")
+SCRATCH = (r"D:\fef-data")
 SIG_DB = os.path.expanduser("~/.fef-terminal/signal_log.db")
 YEAR_MIN = 365.0 * 24 * 60
 GLITCH = 0.05

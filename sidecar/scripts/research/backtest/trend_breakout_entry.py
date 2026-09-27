@@ -55,8 +55,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 sys.stdout.reconfigure(encoding="utf-8")
 ET = ZoneInfo("America/New_York")
-SCRATCH = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-           r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad")
+SCRATCH = (r"D:\fef-data")
 CACHE_PKL = os.path.join(os.environ.get("TEMP", "."), "phase_cache.pkl")
 
 # ---- fidelity constants (match the rest of the harness) --------------------------

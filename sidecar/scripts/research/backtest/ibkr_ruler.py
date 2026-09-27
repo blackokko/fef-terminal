@@ -13,8 +13,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 ET = ZoneInfo("America/New_York")
-IBKR_DB = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-           r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad\ibkr_spx_1m.db")
+IBKR_DB = (r"D:\fef-data\ibkr_spx_1m.db")
 
 
 def ibkr_open():

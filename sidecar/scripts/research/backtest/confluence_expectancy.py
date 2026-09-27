@@ -68,8 +68,7 @@ from .phase_pillars import build_session
 sys.stdout.reconfigure(encoding="utf-8")
 ET = ZoneInfo("America/New_York")
 SIG_DB = os.path.expanduser("~/.fef-terminal/signal_log.db")
-SCRATCH = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-           r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad")
+SCRATCH = (r"D:\fef-data")
 FULL_CACHE = os.path.join(SCRATCH, "conf_cache_full.pkl")
 DEV_CACHE = os.path.join(os.environ.get("TEMP", "."), "phase_cache.pkl")
 

@@ -67,8 +67,11 @@ the index of ~40 studies and 36 methodology rules, and its `README.md` orients a
 - Frontend rebuilds need `export PATH="/c/Users/diant/.cargo/bin:$PATH"` first (a build without it
   reports success and produces no binary) and the running `fef-terminal.exe` closed (Cargo cannot
   overwrite a locked binary). Ask before killing the operator's app.
-- Temp/analysis files go to the session scratchpad, not the repo. **The research caches currently
-  live under `AppData\Local\Temp` and have already been lost once** — see `docs/STATUS.md` §3.
+- **Research data and working scripts live in `D:\fef-data`** (moved out of `AppData\Local\Temp`
+  on 2026-09-26, after Temp cleanups destroyed `chainfill_cache.db` and, silently, a module the
+  carry ledger imports). The agent session scratchpad is for throwaway files only: **anything that
+  must survive goes to `D:\fef-data` or a repo, never the scratchpad.** Old reports that cite
+  `...\Temp\claude\C--Users-diant\13885fae-...\scratchpad\X` now mean `D:\fef-data\X`.
 
 ## Where things are
 
@@ -80,3 +83,5 @@ the index of ~40 studies and 36 methodology rules, and its `README.md` orients a
 | backtest↔live reconciliation | `fef-research-archive/recon.py` (+ tests) — awaiting fills, see STATUS |
 | launchers | `scripts/FEF-Paper-AutoTrade.bat` → `scripts/start.ps1 -LiveTrading -CreditSpreads -IbkrPort 7497` |
 | research index | `fef-research-archive/RESEARCH_REGISTRY.md` — §G★ structural result, §H closed doors, §J corrections, §K rules |
+| research data, caches, working study scripts | `D:\fef-data` (not in git; 35 GB; `_migration_2026-09-26\` holds the move's manifest and proofs) |
+| paper-ledger jobs | Task Scheduler `FEF-DailyClose` 15:15 CT → `C:\Users\diant\fef-watchers\run_ledgers.ps1` (runs updaters in `D:\fef-data`, mirrors to the archive); `FEF-DailyOpen` 08:30 CT starts the two collectors |

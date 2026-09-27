@@ -56,8 +56,7 @@ from . import trend_breakout_entry as TB
 sys.stdout.reconfigure(encoding="utf-8")
 ET = ZoneInfo("America/New_York")
 DB = os.path.expanduser("~/.fef-terminal/signal_log.db")
-SCRATCH = (r"C:\Users\diant\AppData\Local\Temp\claude\C--Users-diant"
-           r"\13885fae-da20-4300-a83a-94697ac91ce4\scratchpad")
+SCRATCH = (r"D:\fef-data")
 
 # ---- sets --------------------------------------------------------------------------
 DEV_START, DEV_END = "2022-01-03", "2025-08-12"
