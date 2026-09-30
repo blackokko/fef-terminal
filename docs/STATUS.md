@@ -20,7 +20,7 @@ studies are pre-registered (`pcs0dte` running; `ivsignal`, `volxs`, `snflow2` qu
 |---|---|
 | **0DTE directional bot** | **Retired 2026-08-25.** Its data source (QuantData) was cancelled; `snapshot_to_inputs` was the only bridge into the FEF engine. Its premise was independently falsified: intraday direction on SPX is structurally foreclosed (achievable edge 0.08–0.35 index pts vs a 0.442 pt friction floor; the inverted signal performs identically at 49.2%). |
 | **Credit-spread bot** (in the terminal; 0DTE put vertical, ~0.15Δ, 1 lot) | **OFF, and its order would be REJECTED.** Verified 2026-09-30 with an IBKR what-if (nothing transmitted): its combo form — legs SELL short / BUY long, order **SELL at a positive limit** — is refused by IBKR as a "riskless/guaranteed-loss combination". The accepted form is the same legs with order **BUY at a negative limit** (what-if margin +$200 on a $2 SPY spread). It also prices at the mid only, runs one symbol at a time (an SPX spread blocks a SPY one) and has no close-before-16:00 for SPY. **Superseded for paper by the put-spread runner below; do not turn it on.** Earlier history: 200 parents 08-12 → 08-25, zero fills (`Bag()` positional, env gate). |
-| **Put-spread runner** (`fef-research-archive/options_executor.py`, standalone, client 178, orderRef `fef-pcs-*`) | **Built 2026-09-30, under adversarial review, NOT scheduled.** Paper 0DTE put credit spreads per `pcs0dte_LOCK.md`: `spx25` (SPXW 25-wide 0.15Δ, hold to cash settlement) and `spy2` (SPY $2-wide 0.15Δ, closed at 15:30 ET if spot < short × 1.003) side by side, entries 10:00/12:00/14:00 ET at the natural credit. Strikes chosen with the study's own code on a ThetaData snapshot. 36 tests, 26/26 mutations caught. Wrapper `fef-watchers\run_options_executor.ps1`. Purpose: execution truth (fills vs natural, fees, SPY assignment); `pcs0dte` is the P&L evidence. |
+| **Put-spread runner** (`fef-research-archive/options_executor.py`, standalone, client 178, orderRef `fef-pcs-*`) | **Built 2026-09-30, NOT scheduled.** Review round 1: SHIP AFTER FIXES (unconfirmed cancels, unreconciled fills, non-sticky unknown states, no position check before the 15:30 close, rejections logged as "unfilled"); all fixed the same day (73 tests, 43/43 mutations), re-review running. Before its first armed run: IBKR what-if of the SPX/CBOE open and both close forms (nothing transmitted). Paper 0DTE put credit spreads per `pcs0dte_LOCK.md`: `spx25` (SPXW 25-wide 0.15Δ, hold to cash settlement) and `spy2` (SPY $2-wide 0.15Δ, closed at 15:30 ET if spot < short × 1.003) side by side, entries 10:00/12:00/14:00 ET at the natural credit. Strikes chosen with the study's own code on a ThetaData snapshot. 36 tests, 26/26 mutations caught. Wrapper `fef-watchers\run_options_executor.ps1`. Purpose: execution truth (fills vs natural, fees, SPY assignment); `pcs0dte` is the P&L evidence. |
 | **Sleeve executor** (trend v3 + PEAD → MOC orders, client 177, orderRef `fef-sleeve`) | **LIVE on paper since 2026-09-30.** First run: 10 MOC buys (SPY 2, IWM 4, EFA 15, EWJ 9, HYG 32, DBC 22, GLD 1; NVS 12, DELL 4, ARM 6), **all filled at the close and certified that evening**; its own book equals the account's stock positions. Trades only its OWN book (design rule 6); per-day certification — a later run can never certify an earlier day; `certify --date D --i-have-reconciled [--own SYM=N]` is the manual path. 93 tests, 49/49 mutations caught, three adversarial review rounds → **SHIP** (archive 9b5641c). **Daily task `FEF-SleeveExecute` (14:30 CT) ENABLED** — re-enabled 2026-09-30 after the review, confirmed by the operator the same day ("Keep it enabled"); first unattended run 2026-10-01. `record-fills` runs first in `FEF-DailyClose`. **The first large unattended rebalance is expected ~Fri 10-02**, once the trend ledger books the month-end it missed while frozen: look at `run_sleeve_executor.ps1 -PlanOnly` before 14:30 CT that day. Carry v1 disabled (de-allocate). |
 | **Reconciliation harness** (`recon.py`) | **Built and tested; no measurement yet.** Zero credit-spread fills exist to reconcile. Two of its four Rule-3 join gates currently fail — the join is sound, the recorded anchors are contaminated — so it correctly publishes no aggregate. The adverse-selection prior stays at −$16.34/ct, CI [−156, +84]: unmeasured. Its advisory cross-check read `chainfill_cache.db`, now gone (§3); the primary path (live `signal_log.db` + ThetaData via `recon_quotes.db`) is intact. |
 | **Collectors** | `runner_watch.py` and `caphead_watch.py` run from `D:\fef-data` (restarted there 2026-09-26, detached). Do not kill them during market hours. `FEF-DailyOpen` restarts them at 08:30 CT if they are down. Find them with `Get-CimInstance Win32_Process` filtered on the script name; PIDs change. |
@@ -130,13 +130,13 @@ ledgers, not caches.
 1. **Deploy the daylight-saving fix before Monday 2026-11-02.** The sidecar hard-codes ET as UTC−4 in
    ~55 places (market-hours window, VWAP anchor, session dates, pause windows, expiry resolution); after
    clocks fall back the loop would run 08:30–15:00 real ET. A patch routing every site through one
-   zoneinfo helper (`fef_sidecar/et_time.py`) is ready — 1,071 tests pass (+117 pinning both
-   transitions), zero behaviour change on every daylight-time minute of 2026 — and is under adversarial
-   review. It is uncommitted on branch `fix/et-zoneinfo-dst` in a clone at
-   `fef-research-archive\.claude\worktrees\agent-a281b1bfd6834ecd9\fef-terminal` (patch file in
-   `..\_dst_work\`). **It touches `loop.py` and other live-path files: install only in a window with the
-   terminal closed, after the review, with the full suite green.** The frontend's `ReplayPanel.todayET()`
-   has the same UTC−4 assumption (needs an app rebuild; replay only).
+   zoneinfo helper (`fef_sidecar/et_time.py`) is ready: 1,071 tests pass (+117 pinning both
+   transitions), zero behaviour change on every daylight-time minute of 2026, **adversarial review SHIP
+   (no blockers)**, and `git apply --check` passes on the live checkout. **Patch + runbook:
+   `D:\fef-data\_deploy\2026-10_dst_fix\` (`et_zoneinfo_dst_v2.patch`, `DEPLOY.md`).** It touches
+   `loop.py` and other live-path files: install only when the operator says "terminal closed", following
+   `DEPLOY.md`. Known leftovers with no trading effect are listed there (the frontend's
+   `ReplayPanel.todayET()` needs an app rebuild; replay default date only).
 2. **Sleeve executor: running daily** (review SHIP; re-enabled 2026-09-30 and confirmed by the operator).
    It trades at 14:30 CT; `record-fills` books the fills at 15:15 CT. Watch the first run after the trend
    book refreshes (the missed month-end rebalance books on 10-01/10-02 — check `-PlanOnly` first). A day
@@ -188,6 +188,12 @@ ledgers, not caches.
   2026-09-30: the combo is built the form IBKR rejects (SELL at a positive limit; see §1)**, a resting
   unfilled SELL combo is marked CLOSED by the phantom sweep within 300 s, and the fill backfill sums
   both legs of a combo as if they were one. Do not revive this bot without fixing all three.
+- **Operator rule while the put-spread runner holds spreads (2026-09-30): do NOT use the terminal's
+  kill / `/panic/flat` / `/admin/sweep_orphans`** — they market-close every option position in the
+  account, including the runner's legs (a sold long leg leaves the short put naked). The sidecar will
+  log the runner's legs as "ORPHAN POSITIONS … call /admin/sweep_orphans" every 300 s: expected, ignore.
+  The operator places manual trades in TWS, never through the terminal's ticket, so no sidecar parent
+  can adopt the runner's legs. A sidecar-side protection of the runner's legs is a later item.
 - **Two order-placing programs live OUTSIDE the terminal**, in the archive, run by Task Scheduler:
   `sleeve_executor.py` (client 177) and `options_executor.py` (client 178). Same review rules as the
   live path. Each trades only what it placed itself (its own client id / orderRef); never "fix" either
