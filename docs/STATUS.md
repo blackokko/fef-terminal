@@ -1,8 +1,16 @@
-# STATUS — 2026-09-27
+# STATUS — 2026-09-30
 
 Current state of the operation, what was just learned, and what to do next, in order. Written for an
 agent picking this up cold. The research detail behind every number here is in
-`blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` §H‡‡ (`vbreak`) and rule 36.
+`blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
+
+**2026-09-30 in one paragraph:** the sleeve executor placed its first orders (10 MOC buys, all filled,
+booked and certified that evening). Two adversarial reviews of its new "own book" logic found and fixed
+real duplicate-order paths. The trend and carry paper ledgers turned out to have been frozen at
+2026-09-09 by a hard-coded Yahoo end date; fixed. A standalone 0DTE put-credit-spread runner (SPX and
+SPY side by side, paper) was built and is under review. The terminal was found to assume daylight time
+in ~55 places; a fix is ready and under review and must be deployed before Mon 2026-11-02. Four new
+studies are pre-registered (`pcs0dte` running; `ivsignal`, `volxs`, `snflow2` queued).
 
 ---
 
@@ -11,11 +19,12 @@ agent picking this up cold. The research detail behind every number here is in
 | component | state |
 |---|---|
 | **0DTE directional bot** | **Retired 2026-08-25.** Its data source (QuantData) was cancelled; `snapshot_to_inputs` was the only bridge into the FEF engine. Its premise was independently falsified: intraday direction on SPX is structurally foreclosed (achievable edge 0.08–0.35 index pts vs a 0.442 pt friction floor; the inverted signal performs identically at 49.2%). |
-| **Credit-spread bot** (0DTE SPX put vertical, ~0.15Δ, 1 lot, sells every session) | **Armed, never filled.** 200 parent orders 2026-08-12 → 08-25, zero fills: 197 died on `Bag()` being called positionally (ib_async is keyword-only), 3 on an env gate. **All four known blockers are now fixed** — env var in the launcher, strike picker rewritten to nearest-delta with a credit/width floor, `Bag(symbol=...)`, and the short leg held to a two-sided quote. Toggle is in the UI (`SpreadAutoTradePanel`). Default is OFF; the launcher flag is the capability, the panel is the intent. |
-| **Sleeve executor** (trend v3 + PEAD → MOC orders) | **Built, tested, never transmitted.** 33 tests, five guards mutation-verified. Six MOC buys have been pending since August (trend v3: EFA, VNQ; PEAD: single names). Quantities come from `plan` — do not hard-code them, the ledgers move. Needs TWS up on 7497 before 15:45 ET. Carry v1 disabled (measured de-allocate, −4.46 %/yr alpha). |
+| **Credit-spread bot** (in the terminal; 0DTE put vertical, ~0.15Δ, 1 lot) | **OFF, and its order would be REJECTED.** Verified 2026-09-30 with an IBKR what-if (nothing transmitted): its combo form — legs SELL short / BUY long, order **SELL at a positive limit** — is refused by IBKR as a "riskless/guaranteed-loss combination". The accepted form is the same legs with order **BUY at a negative limit** (what-if margin +$200 on a $2 SPY spread). It also prices at the mid only, runs one symbol at a time (an SPX spread blocks a SPY one) and has no close-before-16:00 for SPY. **Superseded for paper by the put-spread runner below; do not turn it on.** Earlier history: 200 parents 08-12 → 08-25, zero fills (`Bag()` positional, env gate). |
+| **Put-spread runner** (`fef-research-archive/options_executor.py`, standalone, client 178, orderRef `fef-pcs-*`) | **Built 2026-09-30, under adversarial review, NOT scheduled.** Paper 0DTE put credit spreads per `pcs0dte_LOCK.md`: `spx25` (SPXW 25-wide 0.15Δ, hold to cash settlement) and `spy2` (SPY $2-wide 0.15Δ, closed at 15:30 ET if spot < short × 1.003) side by side, entries 10:00/12:00/14:00 ET at the natural credit. Strikes chosen with the study's own code on a ThetaData snapshot. 36 tests, 26/26 mutations caught. Wrapper `fef-watchers\run_options_executor.ps1`. Purpose: execution truth (fills vs natural, fees, SPY assignment); `pcs0dte` is the P&L evidence. |
+| **Sleeve executor** (trend v3 + PEAD → MOC orders, client 177, orderRef `fef-sleeve`) | **LIVE on paper since 2026-09-30.** First run: 10 MOC buys (SPY 2, IWM 4, EFA 15, EWJ 9, HYG 32, DBC 22, GLD 1; NVS 12, DELL 4, ARM 6), **all filled at the close and certified that evening**; its own book equals the account's stock positions. Trades only its OWN book (design rule 6); per-day certification — a later run can never certify an earlier day; `certify --date D --i-have-reconciled [--own SYM=N]` is the manual path. 93 tests, 49/49 mutations caught, two adversarial reviews. **Daily task `FEF-SleeveExecute` (14:30 CT) DISABLED until the final review sign-off**; `record-fills` runs first in `FEF-DailyClose`. Carry v1 disabled (de-allocate). |
 | **Reconciliation harness** (`recon.py`) | **Built and tested; no measurement yet.** Zero credit-spread fills exist to reconcile. Two of its four Rule-3 join gates currently fail — the join is sound, the recorded anchors are contaminated — so it correctly publishes no aggregate. The adverse-selection prior stays at −$16.34/ct, CI [−156, +84]: unmeasured. Its advisory cross-check read `chainfill_cache.db`, now gone (§3); the primary path (live `signal_log.db` + ThetaData via `recon_quotes.db`) is intact. |
 | **Collectors** | `runner_watch.py` and `caphead_watch.py` run from `D:\fef-data` (restarted there 2026-09-26, detached). Do not kill them during market hours. `FEF-DailyOpen` restarts them at 08:30 CT if they are down. Find them with `Get-CimInstance Win32_Process` filtered on the script name; PIDs change. |
-| **Paper ledgers** | Trend v3, PEAD, overnight, carry v1, caphead grading and runner outcomes update daily via `FEF-DailyClose` from `D:\fef-data`, mirrored to the archive. **The carry ledger failed silently on 16 runs, 2026-09-03 → 09-25** (§3); repaired 2026-09-26, and the one rebalance it missed (2026-09-08) was booked late by the same mechanical rule. |
+| **Paper ledgers** | Trend v3, PEAD, overnight, carry v1, caphead grading and runner outcomes update daily via `FEF-DailyClose` from `D:\fef-data`, mirrored to the archive. **The carry ledger failed silently on 16 runs, 2026-09-03 → 09-25** (§3); repaired 2026-09-26. **And the trend and carry books were FROZEN at 2026-09-09 from 09-10 to 09-30**: both asked Yahoo for `period2=1789000000`, a "beyond today" constant that is 2026-09-09 20:26 ET, while every run logged "ok". Fixed 2026-09-30 (archive 4c41f41): dynamic end date, and each ledger now exits 3 when its latest close is > 5 days old. The trend book the sleeve executor reads refreshes from the 10-01 run. |
 
 **The honest book-level number:** portfolio alpha **+17.75 %/yr at t = +1.50** — economically
 interesting, statistically unconfirmed. Portfolio R² against 11 factors is **0.005** (not a
@@ -75,8 +84,23 @@ priced close to fair at the mid, and the bid-ask spread — which the market mak
 largest term in every result. Paying it is the retail trader's structural cost.
 | `vixroll` / `vixroll2` | Short VIX futures in contango | Closed at the harness gate (benchmark error, rule 37), then **cancelled: out of scope** |
 
-**Open question for the operator:** the trend v3 paper sleeve holds GLD, DBC and HYG alongside equity
-ETFs. Under the equities-only scope those would be out; not changed pending the operator's answer.
+**Pre-registered 2026-09-30** (operator: "run this on SPY for the put credit spreads… have it fill both";
+"I want you to pre-register all three of those tests. Especially since I have to stock data now"):
+
+| study | what | state |
+|---|---|---|
+| `pcs0dte` (E10) | 0DTE put credit spreads, SPX vs SPY, 2016–2026: does the corrected `tenorsell` cell (+$19.63/ct, t 1.27) replicate on unseen sessions; SPX vs SPY per $1,000 of width; does it help the trend + PEAD book | **Running** (pulls after 16:05 ET only) |
+| `ivsignal` (E11) | Do single-stock option prices (smirk, call−put IV spread) predict next-month S&P 500 returns beyond past returns, as a monthly share sleeve after costs? Builds the shared monthly option panel `D:\fef-data\xsopt\` | **Queued** behind `pcs0dte`'s ThetaData pull |
+| `volxs` (E12) | Rank single-stock volatility (HV − IV; IV term slope): long cheap straddles / short rich iron flies at real bid/ask | **Queued** for `ivsignal`'s panel |
+| `snflow2` (E13) | Single-name option flow INTRADAY (TSLA/NVDA vs SMH/QQQ) on the real stock tape; Stage 2 of the July track, whose kill gates bind | **Queued**, runs last |
+
+**ThetaData now includes the STOCK tier** (bought 2026-09-30; the terminal had to be restarted to see it).
+There is no index tier and none is needed (the SPX level comes with option greeks). Etiquette for every
+study: at most 2 concurrent requests, **no bulk pulls 09:25–16:05 ET** (the live flow feed shares the
+terminal), and a `PULL_DONE.txt` marker hands the terminal to the next study.
+
+**Resolved 2026-09-30:** the trend v3 sleeve keeps GLD, DBC and HYG (operator: "I want all of those also
+added today alongside the stocks sleeves").
 
 ## 3. Data loss, and the move out of Temp (DONE 2026-09-26)
 
@@ -103,29 +127,37 @@ ledgers, not caches.
 
 ## 4. Priorities, in order
 
-1. **Run what exists.** This is the actual next step and has been for a month. Start TWS on 7497,
-   then in PowerShell from the archive, before 15:45 ET:
-   ```powershell
-   cd C:\Users\diant\fef-research-archive
-   python sleeve_executor.py plan
-   $env:FEF_SLEEVE_EXEC_LIVE = "true"
-   python sleeve_executor.py execute --i-mean-it --accept-unknown-turnover
-   ```
-   Launch the terminal via `FEF-Paper-AutoTrade.bat` and flip the credit-spread panel on. **Every
-   remaining uncertainty that matters — real slippage, adverse selection, whether t = 1.50 is real
-   — is resolved by fills, not by research.** The `Bag()` bug that killed 197 orders was found by
-   *trying to run*, not by any study.
-2. ~~**Move the research caches out of Temp.**~~ **Done 2026-09-26** (§3). Rebuild
-   `chainfill_cache.db` from ThetaData only when a study needs it.
-3. **The one cheap study that needs no new data:** the leverage question from `sizing` — the book
+1. **Deploy the daylight-saving fix before Monday 2026-11-02.** The sidecar hard-codes ET as UTC−4 in
+   ~55 places (market-hours window, VWAP anchor, session dates, pause windows, expiry resolution); after
+   clocks fall back the loop would run 08:30–15:00 real ET. A patch routing every site through one
+   zoneinfo helper (`fef_sidecar/et_time.py`) is ready — 1,071 tests pass (+117 pinning both
+   transitions), zero behaviour change on every daylight-time minute of 2026 — and is under adversarial
+   review. It is uncommitted on branch `fix/et-zoneinfo-dst` in a clone at
+   `fef-research-archive\.claude\worktrees\agent-a281b1bfd6834ecd9\fef-terminal` (patch file in
+   `..\_dst_work\`). **It touches `loop.py` and other live-path files: install only in a window with the
+   terminal closed, after the review, with the full suite green.** The frontend's `ReplayPanel.todayET()`
+   has the same UTC−4 assumption (needs an app rebuild; replay only).
+2. **Sleeve executor: re-enable `FEF-SleeveExecute` after the final review sign-off.** Then it runs
+   itself daily at 14:30 CT; `record-fills` books the fills at 15:15 CT. Watch the first run after the
+   trend book refreshes (the 09-30 month-end rebalance books on 10-01/10-02).
+3. **Put-spread runner: after its review, register the five tasks** (09:00/11:00/13:00 CT entries,
+   14:30 CT threat check, 15:20 CT record) and run SPX and SPY side by side on paper. Judge it on
+   execution (fill vs natural, fees, assignment), not P&L — `pcs0dte` answers P&L.
+4. **Research queue** (ThetaData-sequenced): `pcs0dte` → `ivsignal` → `volxs` → `snflow2`.
+5. ~~**Run what exists.**~~ **Done 2026-09-30** for the sleeves; see §1. ~~**Move the research caches
+   out of Temp.**~~ **Done 2026-09-26** (§3).
+6. **The one cheap study that needs no new data:** the leverage question from `sizing` — the book
    runs at mean gross **0.753** and hits its 1.0 cap on **27 %** of rebalances. Standalone lock,
    directly changes the book that would be traded.
-4. **Then breadth, or stop.** Every research thread since `powercal` has ended at the same wall:
+7. **Then breadth, or stop.** Every research thread since `powercal` has ended at the same wall:
    the control stack certifies 13.4 %/yr on 289 names, ~4 % on 3,000, and three instruments cannot
    see a forty-market effect. Within the equities-only scope, breadth means many stocks, not many
    asset classes: single-stock options events (`earnvol`) are the first study built that way. **Do
    not run another single-instrument intraday study — we have measured that it cannot resolve the
-   answer either way.** New data goes to `D:\fef-data`, never the agent scratchpad.
+   answer either way.** New data goes to `D:\fef-data`, never the agent scratchpad. *(Tension, stated:
+   `snflow2` is intraday on two names. It was pre-registered at the operator's explicit request, is
+   event-based rather than a timing rule on one index, keeps the July kill gates, and has an
+   UNDERPOWERED branch — read its detection floor before its verdict.)*
 
 ## 5. Do not
 
@@ -149,10 +181,18 @@ ledgers, not caches.
   in the engine's input schema, `config_store.py`, older docs (`README.md`, `SETUP.md`,
   `SMOKE_TEST.md`, `docs/OPERATING_CARD.md`) and the launchers' `-QuantDataMode` flag, which nothing
   in the sidecar reads any more. Cleanup is safe but not urgent. Do not rebuild a QuantData client.
-- **Open review items on the credit-spread path** (from the 2026-08-25 adversarial review; none
-  blocks a first fill): narrow the `try` in `live_trading`, TP sentinel on a crossed pair,
-  `confirm=True` actor mislabel, half-day sessions, `/panic/flat` does not disarm the spread bot,
-  scan step coupled to spread width.
+- **Open review items on the credit-spread path** (from the 2026-08-25 adversarial review): narrow the
+  `try` in `live_trading`, TP sentinel on a crossed pair, `confirm=True` actor mislabel, half-day
+  sessions, `/panic/flat` does not disarm the spread bot, scan step coupled to spread width. **Plus,
+  2026-09-30: the combo is built the form IBKR rejects (SELL at a positive limit; see §1)**, a resting
+  unfilled SELL combo is marked CLOSED by the phantom sweep within 300 s, and the fill backfill sums
+  both legs of a combo as if they were one. Do not revive this bot without fixing all three.
+- **Two order-placing programs live OUTSIDE the terminal**, in the archive, run by Task Scheduler:
+  `sleeve_executor.py` (client 177) and `options_executor.py` (client 178). Same review rules as the
+  live path. Each trades only what it placed itself (its own client id / orderRef); never "fix" either
+  by editing its state file — use its `certify` / `status` commands.
+- **Never write a fixed UTC offset for ET or CT** (use `zoneinfo`), and **never a fixed "far-future"
+  epoch** for a data request's end date (the 2026-09-09 ledger freeze).
 - **The next research lock must state the entry-bar stop convention.** The `vbreak` implementation
   diff found +201 gross R over 54 cells riding on it (99 of 123 affected trades opened beyond the
   stop; one implementation books −1 R, the other rides to +5…+8.5 R).
