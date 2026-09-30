@@ -69,7 +69,10 @@ the index of ~40 studies and 36 methodology rules, and its `README.md` orients a
   index for its ETF at intraday horizon — registry rule 36.
 - Frontend rebuilds need `export PATH="/c/Users/diant/.cargo/bin:$PATH"` first (a build without it
   reports success and produces no binary) and the running `fef-terminal.exe` closed (Cargo cannot
-  overwrite a locked binary). Ask before killing the operator's app.
+  overwrite a locked binary). Ask before killing the operator's app. **Any change under `src/`
+  needs an app rebuild to reach the window**; the sidecar runs from source, the window does not.
+  The 2026-08-25 QuantData removal ran against an 8/18 window until 2026-09-30, and the old chart
+  code crashed the whole shell on the sidecar's now-empty `snapshot`.
 - **Research data and working scripts live in `D:\fef-data`** (moved out of `AppData\Local\Temp`
   on 2026-09-26, after Temp cleanups destroyed `chainfill_cache.db` and, silently, a module the
   carry ledger imports). The agent session scratchpad is for throwaway files only: **anything that
