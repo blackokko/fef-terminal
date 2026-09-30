@@ -22,6 +22,7 @@ from __future__ import annotations
 import bisect
 import hashlib
 
+from fef_sidecar import et_time
 from fef_sidecar.engine.signals import dale, vwap
 from fef_sidecar.engine.signals.dale import Bar
 
@@ -83,8 +84,9 @@ def _atr(bars: list[Bar], period: int = ATR_PERIOD) -> list[float | None]:
 
 
 def _et_date(ts_ms: int) -> str:
-    import datetime as dt
-    return dt.datetime.fromtimestamp(ts_ms/1000, dt.timezone(dt.timedelta(hours=-4))).strftime("%Y-%m-%d")
+    # DST-correct ET date. Identical to the old fixed UTC-4 on the ES RTH bars
+    # this definition scores (see vwap._ET), so the frozen outputs do not move.
+    return et_time.session_date_et(ts_ms)
 
 
 def _walk_short(entry, target, stop, bars1m, ts1, start_ts, horizon):

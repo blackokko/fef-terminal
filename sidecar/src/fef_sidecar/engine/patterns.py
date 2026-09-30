@@ -13,9 +13,9 @@ IMPROVEMENTS #R (feature-loaded).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from fef_sidecar import et_time
 from fef_sidecar.engine.types import FEFInputs, FEFVerdict
 
 
@@ -76,8 +76,7 @@ def extract_fields(
     iter_num: int | None = None,
 ) -> dict[str, Any]:
     """Flatten one iter's full context into a name->value dict for matching."""
-    et = timezone(timedelta(hours=-4))
-    now_et = datetime.now(et)
+    now_et = et_time.now_et()
     minutes_since_open = (now_et.hour - 9) * 60 + (now_et.minute - 30)
 
     top_gex = inputs.top_gex_walls[0] if inputs.top_gex_walls else None

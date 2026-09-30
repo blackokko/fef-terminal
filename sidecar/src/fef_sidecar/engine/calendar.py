@@ -16,15 +16,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta
 
+from fef_sidecar import et_time
 from fef_sidecar.db.models import CalendarEvent
 from fef_sidecar.db.repository import SignalIterRepository
 
 logger = logging.getLogger(__name__)
 
 
-ET = timezone(timedelta(hours=-4))  # EST/EDT — close enough for our pause-window math
+ET = et_time.ET  # America/New_York — EDT or EST as of each event's own date
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,7 @@ async def seed_calendar_if_empty() -> None:
         seeded += 1
 
     # NFP + OPEX for next 6 months
-    today = datetime.now(ET)
+    today = et_time.now_et()
     for i in range(6):
         d = today + timedelta(days=30 * i)
         nfp = _first_friday(d.year, d.month)
@@ -113,7 +114,7 @@ async def seed_calendar_if_empty() -> None:
 async def is_pause_window(now: datetime | None = None) -> PauseDecision:
     """Check if 'now' falls inside any event's pause window.
     Returns PauseDecision with reason + event details if paused."""
-    now = now or datetime.now(ET)
+    now = now or et_time.now_et()
     today = now.strftime("%Y-%m-%d")
 
     events = await SignalIterRepository.query_calendar_events(

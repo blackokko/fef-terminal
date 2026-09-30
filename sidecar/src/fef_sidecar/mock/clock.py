@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, time as dtime
 
-ET = timezone(timedelta(hours=-4))
+from fef_sidecar import et_time
+
+ET = et_time.ET
 
 # 6.5h trading day = 390 minutes
 SESSION_MINUTES = 390

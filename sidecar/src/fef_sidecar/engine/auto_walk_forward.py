@@ -13,6 +13,7 @@ import logging
 import os
 from datetime import UTC, datetime
 
+from fef_sidecar import et_time
 from fef_sidecar.db.models import WalkForwardRun
 from fef_sidecar.db.repository import SignalIterRepository
 
@@ -200,8 +201,8 @@ async def _persist_today_ibkr_fills(state) -> int:
         # execDetails future resolves — see ib_async wrapper.py:824, 856).
         wait_sec = float(os.environ.get("FEF_COMMISSION_RACE_WAIT_SEC", "2.0"))
         await asyncio.sleep(wait_sec)
-        from datetime import timezone as _tz, timedelta as _td
-        et_tz = _tz(_td(hours=-4))
+        from datetime import timezone as _tz
+        et_tz = et_time.ET
         new_count = 0
         async with get_session() as session:
             for ex in execs:
@@ -387,9 +388,11 @@ async def _audit_data_integrity(session_date: str) -> dict:
         from fef_sidecar.db.models import LiveOrder
         bot_execs = [e for e in execs if (e.side or "").upper() == "BOT"]
         if bot_execs:
-            # LiveOrder has no session_date column — filter by submitted_at ET-day.
+            # LiveOrder has no session_date column — filter by submitted_at ET-day:
+            # 09:00-21:00 ET, in UTC (13:00Z start in EDT, 14:00Z in EST).
             from datetime import timedelta as _td2
-            day_start = datetime.fromisoformat(session_date).replace(hour=13, minute=0, tzinfo=UTC)
+            day_start = datetime.fromisoformat(session_date).replace(
+                hour=9, minute=0, tzinfo=et_time.ET).astimezone(UTC)
             day_end = day_start + _td2(hours=12)
             parents = list((await ss.exec(
                 select(LiveOrder).where(LiveOrder.action == "BUY")  # type: ignore[arg-type]

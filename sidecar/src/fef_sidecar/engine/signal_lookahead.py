@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlmodel import select
 
+from fef_sidecar import et_time
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import HistoricalBar, SignalIter, SignalLookaheadOutcome
 
@@ -264,9 +265,9 @@ async def lookahead_worker(state) -> None:
     """
     while True:
         try:
-            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-            today_et = _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
-            yesterday_et = (_dt.now(_tz(_td(hours=-4))) - _td(days=1)).strftime("%Y-%m-%d")
+            from datetime import timedelta as _td
+            today_et = et_time.today_et()
+            yesterday_et = (et_time.now_et() - _td(days=1)).strftime("%Y-%m-%d")
             for date in (yesterday_et, today_et):
                 try:
                     result = await backfill_session(date)

@@ -11,7 +11,7 @@ This file keeps the Claude-specific notes.
 - **NEVER edit `sidecar/src/` or restart the sidecar while it is running live.** The user says
   "terminal closed" before any deploy window opens. If unsure whether it's live, check port 8765.
 - Nothing ships without the **full test suite green**: from `sidecar/`,
-  `./.venv/Scripts/python.exe -m pytest tests/ -q` (955 passing as of 2026-08-25).
+  `./.venv/Scripts/python.exe -m pytest tests/ -q` (1072 passing as of 2026-09-30).
 - Changes to the live trading path (`auto_trader.py`, `live_trading.py`, `spread_auto_trader.py`,
   `strike_picker.py`, `spread_exit_watcher.py`, `spx_target_watcher.py`, `multi_symbol_scanner.py`,
   `loop.py`, `position_reconcile.py`) get an adversarial second-context review before shipping —

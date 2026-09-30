@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from fastapi import Body
 
+from fef_sidecar import et_time
 from fef_sidecar.config_store import UIConfig, load_config, save_config
 from fef_sidecar.db import SignalIterRepository
 from fef_sidecar.loop import _get_cached_bars
@@ -1671,9 +1672,9 @@ async def _persist_ibkr_executions(fills) -> int:
     from fef_sidecar.db.engine import get_session as _gs
     from fef_sidecar.db.models import IBKRExecution
     from sqlmodel import select as _s
-    from datetime import timezone as _tz, timedelta as _td
+    from datetime import timezone as _tz
 
-    et_tz = _tz(_td(hours=-4))
+    et_tz = et_time.ET
     new_count = 0
     async with _gs() as session:
         existing = set((await session.exec(_s(IBKRExecution.exec_id))).all())
@@ -1839,7 +1840,7 @@ async def diag_trade_reconcile(request: Request) -> dict[str, Any]:
     from fef_sidecar.db.models import LiveOrder
     from fef_sidecar.ibkr.live import LiveIBKRProvider
     from sqlmodel import select as _s
-    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from datetime import timezone as _tz
 
     s = _state(request)
     if not isinstance(s.ibkr, LiveIBKRProvider):
@@ -1848,7 +1849,7 @@ async def diag_trade_reconcile(request: Request) -> dict[str, Any]:
     if ib is None or not ib.isConnected():
         return {"mode": "disconnected"}
 
-    today_et = _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    today_et = et_time.today_et()
 
     async with _gs() as session:
         db_parents = list((await session.exec(
@@ -1959,7 +1960,7 @@ async def diag_signal_execution_audit(
     from fef_sidecar.db.models import LiveOrder
     from fef_sidecar.ibkr.live import LiveIBKRProvider
     from sqlmodel import select as _s
-    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from datetime import timezone as _tz
 
     s = _state(request)
     if not isinstance(s.ibkr, LiveIBKRProvider):
@@ -1968,7 +1969,7 @@ async def diag_signal_execution_audit(
     if ib is None or not ib.isConnected():
         return {"mode": "disconnected"}
 
-    target_date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    target_date = session_date or et_time.today_et()
 
     async with _gs() as session:
         db_parents = list((await session.exec(
@@ -3274,11 +3275,11 @@ async def diag_signal_audit_buckets(
     from fef_sidecar.db.engine import get_session as _gs
     from fef_sidecar.db.models import LiveOrder, SignalIter
     from sqlmodel import select as _s
-    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from datetime import timezone as _tz
     import statistics as _stat
     from collections import Counter as _Counter
 
-    target_date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    target_date = session_date or et_time.today_et()
 
     async with _gs() as session:
         parents = list((await session.exec(
@@ -3546,12 +3547,11 @@ async def diag_non_fire_analysis(
     Surfaces "WAIT verdicts that would have hit T1" — the missed-trade
     blind spot. Read-only; freeze-safe.
     """
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from fef_sidecar.db.engine import get_session as _gs
     from fef_sidecar.db.models import SignalIter, SignalLookaheadOutcome
     from sqlmodel import select as _s
 
-    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    date = session_date or et_time.today_et()
     if lookahead_minutes not in (5, 15, 30, 60):
         raise HTTPException(400, "lookahead_minutes must be one of 5/15/30/60")
 
@@ -3608,9 +3608,8 @@ async def diag_non_fire_backfill(session_date: str | None = None) -> dict[str, A
     """Trigger an on-demand backfill of SignalLookaheadOutcome rows for
     the given session_date (default today). Normally handled by the
     background worker every 5min; this endpoint forces immediate run."""
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from fef_sidecar.engine.signal_lookahead import backfill_session
-    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    date = session_date or et_time.today_et()
     return await backfill_session(date)
 
 
@@ -3623,9 +3622,8 @@ async def diag_counterfactual_signal_strength(session_date: str | None = None) -
     Pure analytics — does not modify any state. Quantifies "what would
     today's P/L be with option-price + trail + time-decay exits?"
     """
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from fef_sidecar.engine.counterfactual import run_for_session
-    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    date = session_date or et_time.today_et()
     return await run_for_session(date)
 
 
@@ -3645,9 +3643,8 @@ async def diag_counterfactual_polling_interval(
         session_date: YYYY-MM-DD (default today ET)
         intervals: comma-separated target intervals in seconds (default "30,60,90")
     """
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from fef_sidecar.engine.counterfactual import run_polling_simulation
-    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    date = session_date or et_time.today_et()
     iv_list = [int(x.strip()) for x in intervals.split(",") if x.strip().isdigit()]
     return await run_polling_simulation(date, iv_list or [30, 60, 90])
 
@@ -3661,12 +3658,11 @@ async def diag_fire_order_analysis(session_date: str | None = None) -> dict[str,
     fills to compute realized R per fire_order bucket.
     """
     from collections import defaultdict
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from fef_sidecar.db.engine import get_session as _gs
     from fef_sidecar.db.models import IBKRExecution, LiveOrder, SignalIter
     from sqlmodel import select as _s
 
-    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    date = session_date or et_time.today_et()
 
     async with _gs() as session:
         sigs = list((await session.exec(
@@ -3778,9 +3774,8 @@ async def diag_realistic_fill_replay(session_date: str | None = None) -> dict[st
     latency drag + commissions). Tells you "if my edge is execution +
     stacking, what's left when paper-flattering effects are removed?"
     """
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from fef_sidecar.engine.realistic_fill import replay_session
-    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    date = session_date or et_time.today_et()
     return await replay_session(date)
 
 
@@ -3801,22 +3796,20 @@ async def diag_edge_decomposition(
         session_dates: comma-separated YYYY-MM-DD list (default: today only)
         realistic_fill_haircut_pct: 0.20 = 20% haircut (moderate scenario)
     """
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from fef_sidecar.engine.shapley_decomposition import run_decomposition
     if session_dates:
         dates = [d.strip() for d in session_dates.split(",") if d.strip()]
     else:
-        dates = [_dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")]
+        dates = [et_time.today_et()]
     return await run_decomposition(dates, realistic_fill_haircut_pct=realistic_fill_haircut_pct)
 
 
 @router.get("/diag/realistic_fill_history")
 async def diag_realistic_fill_history(days: int = 7) -> dict[str, Any]:
     """Per-session realistic-fill replay history. Tracks haircut % over time."""
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from datetime import timedelta as _td
     from fef_sidecar.engine.realistic_fill import replay_all_sessions
-    et = _tz(_td(hours=-4))
-    today = _dt.now(et)
+    today = et_time.now_et()
     dates = [(today - _td(days=i)).strftime("%Y-%m-%d") for i in range(days)]
     return await replay_all_sessions(dates)
 
@@ -3834,9 +3827,8 @@ async def diag_counterfactual_cooldown(
     would have made it through that cooldown gate, then simulates trade
     outcomes via 1-min SPX bars.
     """
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from fef_sidecar.engine.counterfactual import run_cooldown_simulation
-    date = session_date or _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    date = session_date or et_time.today_et()
     cd_list = [int(x.strip()) for x in cooldowns.split(",") if x.strip().isdigit()]
     return await run_cooldown_simulation(date, cd_list or [60, 180, 300, 600])
 
@@ -3861,9 +3853,8 @@ async def diag_session_pnl_estimate(request: Request) -> dict[str, Any]:
     from fef_sidecar.db.engine import get_session as _gs
     from fef_sidecar.db.models import IBKRExecution, LiveOrder
     from sqlmodel import select as _s
-    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 
-    today_et = _dt.now(_tz(_td(hours=-4))).strftime("%Y-%m-%d")
+    today_et = et_time.today_et()
 
     async with _gs() as session:
         # Primary: persisted IBKR executions for today
@@ -4275,9 +4266,7 @@ async def admin_daily_review(body: dict[str, Any] = Body(default={})) -> dict[st
     """On-demand DailyReview compute. Body: {session_date?: 'YYYY-MM-DD'}.
     Defaults to today (ET)."""
     from fef_sidecar.engine.daily_review import compute_daily_review
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-    et = _tz(_td(hours=-4))
-    session_date = body.get("session_date") or _dt.now(et).strftime("%Y-%m-%d")
+    session_date = body.get("session_date") or et_time.today_et()
     review = await compute_daily_review(session_date)
     return {"ok": True, "session_date": review.session_date,
             "win_rate_pct": review.win_rate_pct,
@@ -5639,14 +5628,11 @@ async def option_chain(
 
     expiry: YYYYMMDD; defaults to today's session_date for 0DTE.
     """
-    from datetime import datetime, timedelta, timezone
-
     from fef_sidecar.ibkr.models import Contract, ContractKind
 
     s = _state(request)
     if expiry is None:
-        et = timezone(timedelta(hours=-4))
-        expiry = datetime.now(et).strftime("%Y%m%d")
+        expiry = et_time.now_et().strftime("%Y%m%d")
 
     spx = s.last_spx_price or 7400.0
     # Round to nearest 5 then ±strike_range in 5-pt steps

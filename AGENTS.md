@@ -17,7 +17,7 @@ the index of ~40 studies and 36 methodology rules, and its `README.md` orients a
    the trading path, check port 8765. If it is listening, stop: the operator says "terminal closed"
    to open a deploy window. If unsure, it is live.
 2. **Nothing ships without the full suite green.** From `sidecar/`:
-   `./.venv/Scripts/python.exe -m pytest tests/ -q` — **955 passing** as of 2026-08-25. A red
+   `./.venv/Scripts/python.exe -m pytest tests/ -q` — **1072 passing** as of 2026-09-30 (the ET/DST fix added 117). A red
    suite is a blocker, not a note.
 3. **Changes to the live trading path get an adversarial second-context review before shipping** —
    `auto_trader.py`, `live_trading.py`, `spread_auto_trader.py`, `strike_picker.py`,

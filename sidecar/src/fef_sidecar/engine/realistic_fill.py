@@ -181,9 +181,9 @@ async def replay_session(session_date: str, cfg: RealisticFillConfig | None = No
 async def replay_all_sessions(session_dates: list[str] | None = None) -> dict:
     """Run realistic-fill replay across multiple sessions for trend tracking."""
     if session_dates is None:
-        from datetime import datetime, timedelta, timezone
-        et = timezone(timedelta(hours=-4))
-        today = datetime.now(et)
+        from datetime import timedelta
+        from fef_sidecar import et_time
+        today = et_time.now_et()
         session_dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(0, 7)]
 
     results = []

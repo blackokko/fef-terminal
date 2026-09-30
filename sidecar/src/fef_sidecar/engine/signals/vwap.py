@@ -16,9 +16,13 @@ import datetime as _dt
 import math
 from dataclasses import dataclass, field
 
+from fef_sidecar import et_time
 from fef_sidecar.engine.signals.dale import CALLS, PUTS, Bar, Signal
 
-_ET = _dt.timezone(_dt.timedelta(hours=-4))
+# Real ET (DST-correct). On RTH bars the session/week keys are identical to the
+# old fixed UTC-4 in both EDT and EST (RTH never comes within an hour of ET
+# midnight); only overnight bars near midnight could key differently.
+_ET = et_time.ET
 
 
 def _et(ts_ms: int) -> _dt.datetime:

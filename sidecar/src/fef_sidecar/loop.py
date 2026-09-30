@@ -29,9 +29,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from fef_sidecar import et_time
 from fef_sidecar.db import SignalIterRepository
 from fef_sidecar.engine.option_targets import OptionTargets, build_option_targets
 from fef_sidecar.events import IterEvent, TickEvent
@@ -48,8 +48,7 @@ def _market_hours_et() -> tuple[int, int]:
 
 
 def _in_market_hours_et() -> bool:
-    et = timezone(timedelta(hours=-4))
-    now = datetime.now(et)
+    now = et_time.now_et()
     if now.weekday() >= 5:
         return False
     minute = now.hour * 60 + now.minute
@@ -58,8 +57,7 @@ def _in_market_hours_et() -> bool:
 
 
 def _today_et() -> str:
-    et = timezone(timedelta(hours=-4))
-    return datetime.now(et).strftime("%Y-%m-%d")
+    return et_time.today_et()
 
 
 def _walls_json(walls: Any) -> list[dict[str, Any]]:
@@ -84,10 +82,8 @@ def _walls_json(walls: Any) -> list[dict[str, Any]]:
 
 
 def _et_date_from_ms(ts_ms: int) -> str:
-    """ET (UTC-4) session date YYYY-MM-DD for an epoch-ms timestamp."""
-    from datetime import datetime, timedelta, timezone
-    et = timezone(timedelta(hours=-4))
-    return datetime.fromtimestamp(ts_ms / 1000, et).strftime("%Y-%m-%d")
+    """ET session date YYYY-MM-DD for an epoch-ms timestamp (DST-correct)."""
+    return et_time.session_date_et(ts_ms)
 
 
 async def refresh_es_vwap(ib: Any, duration: str = "1 D") -> int:
@@ -998,18 +994,13 @@ async def bar_capture_health_loop(state: AppState) -> None:
     each top-of-hour during RTH (see _bar_capture_health_report). Checks
     every 60s; dedupes by (session, slot)."""
     from fef_sidecar.engine.loop_watchdog import heartbeat as _wd_beat
-    try:
-        from zoneinfo import ZoneInfo
-        et = ZoneInfo("America/New_York")  # DST-correct (review MINOR-10)
-    except Exception:
-        et = timezone(timedelta(hours=-4))
     fired: set[str] = set()
     logger.info("Starting bar-capture health loop (open + hourly during RTH)")
     while True:
         try:
             _wd_beat(state, "bar-capture-health")
             if _in_market_hours_et():
-                now = datetime.now(et)
+                now = et_time.now_et()  # DST-correct (review MINOR-10)
                 slot = None
                 if now.hour == 9 and now.minute in (31, 32):
                     slot = "open"

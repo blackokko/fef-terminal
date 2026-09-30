@@ -24,19 +24,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+
+from fef_sidecar import et_time
 
 logger = logging.getLogger(__name__)
 
 
 def _today_et_ymd() -> str:
-    et = timezone(timedelta(hours=-4))
-    return datetime.now(et).strftime("%Y%m%d")
+    return et_time.now_et().strftime("%Y%m%d")
 
 
 def _today_et_session() -> str:
-    et = timezone(timedelta(hours=-4))
-    return datetime.now(et).strftime("%Y-%m-%d")
+    return et_time.today_et()
 
 
 async def resolve_nearest_expiry(state, symbol: str) -> str:

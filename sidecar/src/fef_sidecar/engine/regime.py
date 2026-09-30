@@ -16,8 +16,9 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from fef_sidecar import et_time
 
 
 @dataclass
@@ -302,6 +303,5 @@ class RegimeDetector:
 
 
 def now_minutes_since_open_et() -> int:
-    et = timezone(timedelta(hours=-4))
-    now = datetime.now(et)
+    now = et_time.now_et()
     return (now.hour - 9) * 60 + (now.minute - 30)

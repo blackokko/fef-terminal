@@ -22,6 +22,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from fef_sidecar import et_time
 from fef_sidecar.api import router as api_router
 from fef_sidecar.db import dispose_db, init_db
 from fef_sidecar.loop import (
@@ -119,15 +120,14 @@ async def backfill_regime_from_db(state: AppState) -> None:
     """Reconstruct RegimeSamples from today's SignalIter rows and seed the
     regime detector. Lets the regime panel show a real assessment on app
     load instead of waiting through warmup iters."""
-    from datetime import datetime, timezone
+    from datetime import timezone
     from fef_sidecar.db.engine import get_session
     from fef_sidecar.db.models import SignalIter
     from fef_sidecar.engine.regime import RegimeSample
     from sqlmodel import select
 
     def _today_et() -> str:
-        et = timezone(__import__("datetime").timedelta(hours=-4))
-        return datetime.now(et).strftime("%Y-%m-%d")
+        return et_time.today_et()
 
     try:
         date = _today_et()
@@ -146,7 +146,7 @@ async def backfill_regime_from_db(state: AppState) -> None:
             ts = r.timestamp
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            et = ts.astimezone(timezone(__import__("datetime").timedelta(hours=-4)))
+            et = et_time.to_et(ts)
             mins = (et.hour - 9) * 60 + (et.minute - 30)
             samples.append(RegimeSample(
                 spx_price=r.spx_price,
@@ -200,12 +200,7 @@ async def daily_session_audit_runner(state: AppState) -> None:
     """
     import os
     from datetime import datetime, timedelta
-    try:
-        from zoneinfo import ZoneInfo
-        chi = ZoneInfo("America/Chicago")
-    except Exception:
-        from datetime import timezone
-        chi = timezone(timedelta(hours=-6))
+    chi = et_time.CT
 
     hour = int(os.environ.get("FEF_AUDIT_RUN_HOUR", "15"))
     minute = int(os.environ.get("FEF_AUDIT_RUN_MINUTE", "5"))  # 3:05pm CT — let last fills settle
@@ -230,9 +225,8 @@ async def daily_session_audit_runner(state: AppState) -> None:
 
 async def _run_session_audit(state: AppState) -> None:
     """Compute + persist DailyReview for today's session_date (ET)."""
-    from datetime import datetime, timedelta, timezone
     from fef_sidecar.engine.daily_review import compute_daily_review
-    today_et = datetime.now(timezone(timedelta(hours=-4))).strftime("%Y-%m-%d")
+    today_et = et_time.today_et()
     try:
         review = await compute_daily_review(today_et)
         logger.info(
@@ -254,7 +248,7 @@ async def _startup_audit_catchup(state: AppState) -> None:
     case so missed days still get a review row.
     """
     import os
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime
     from fef_sidecar.db.engine import get_session as _gs
     from fef_sidecar.db.models import DailyReview
     from sqlmodel import select as _s
@@ -262,16 +256,12 @@ async def _startup_audit_catchup(state: AppState) -> None:
     # Wait a few seconds for IBKR + DB to be fully up
     await asyncio.sleep(5)
 
-    try:
-        from zoneinfo import ZoneInfo
-        chi = ZoneInfo("America/Chicago")
-    except Exception:
-        chi = timezone(timedelta(hours=-6))
+    chi = et_time.CT
 
     hour = int(os.environ.get("FEF_AUDIT_RUN_HOUR", "15"))
     minute = int(os.environ.get("FEF_AUDIT_RUN_MINUTE", "5"))
     now_chi = datetime.now(chi)
-    today_et = datetime.now(timezone(timedelta(hours=-4))).strftime("%Y-%m-%d")
+    today_et = et_time.today_et()
     past_run_time_today = (now_chi.hour, now_chi.minute) >= (hour, minute)
 
     async with _gs() as session:
@@ -316,12 +306,7 @@ async def daily_prior_close_refresher(state: AppState) -> None:
     """
     import os
     from datetime import datetime, timedelta
-    try:
-        from zoneinfo import ZoneInfo
-        chi = ZoneInfo("America/Chicago")
-    except Exception:
-        from datetime import timezone
-        chi = timezone(timedelta(hours=-6))  # fallback fixed offset
+    chi = et_time.CT
 
     hour = int(os.environ.get("FEF_PRIOR_CLOSE_REFRESH_HOUR", "19"))
     logger.info("Daily prior-close refresher scheduled for %d:00 CT", hour)

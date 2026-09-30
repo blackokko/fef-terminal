@@ -3882,15 +3882,9 @@ def _eod_flat_start_et() -> str:
 
 
 def _et_now_hhmm_ymd() -> tuple[str, str]:
-    """('HH:MM', 'YYYYMMDD') in America/New_York (DST-correct); falls back
-    to fixed UTC-4 if zoneinfo is unavailable."""
-    from datetime import datetime
-    try:
-        from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo("America/New_York"))
-    except Exception:
-        from datetime import timedelta, timezone
-        now = datetime.now(timezone(timedelta(hours=-4)))
+    """('HH:MM', 'YYYYMMDD') in America/New_York (DST-correct)."""
+    from fef_sidecar import et_time
+    now = et_time.now_et()
     return now.strftime("%H:%M"), now.strftime("%Y%m%d")
 
 

@@ -7,12 +7,13 @@ so we can swap storage later without touching call sites.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import or_, select
 
+from fef_sidecar import et_time
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import (
     AuditLog,
@@ -35,8 +36,7 @@ from fef_sidecar.db.models import (
 
 
 def _today_et() -> str:
-    et = timezone(timedelta(hours=-4))
-    return datetime.now(et).strftime("%Y-%m-%d")
+    return et_time.today_et()
 
 
 def build_actionable_signals_sql(

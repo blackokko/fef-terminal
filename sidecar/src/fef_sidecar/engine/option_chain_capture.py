@@ -33,7 +33,9 @@ import asyncio
 import logging
 import os
 import time as _time
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+
+from fef_sidecar import et_time
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +49,13 @@ DEFAULT_OFFSET_PTS = 25.0      # ATM ± 25pt → 11 strikes per side
 DEFAULT_STEP_PTS = 5.0         # SPX strike grid
 DEFAULT_TIMEOUT_SEC = 5.0      # per-contract reqMktData wait
 
-# RTH window (UTC). 13:30-20:00 covers 8:30am-3:00pm CT regardless of DST
-# (the user trades 0DTE SPX which expires at market close anyway). The
-# fef_iter loop fires through this window so chain capture should too.
-RTH_START_UTC_HM = (13, 30)
-RTH_END_UTC_HM = (20, 0)
+# RTH window, ET wall clock: 09:30-16:00 (8:30am-3:00pm CT), whatever the DST
+# state (the user trades 0DTE SPX which expires at market close anyway). The
+# fef_iter loop fires through this window so chain capture should too. This
+# was 13:30-20:00 UTC, which is the same window only in EDT: in EST it ran
+# 08:30-15:00 ET and missed the last hour.
+RTH_START_ET_HM = (9, 30)
+RTH_END_ET_HM = (16, 0)
 
 
 def _enabled() -> bool:
@@ -61,16 +65,16 @@ def _enabled() -> bool:
 
 
 def _within_rth(now: datetime | None = None) -> bool:
-    """True if current UTC time is within 13:30-20:00 (8:30am-3:00pm CT)."""
-    now = now or datetime.now(UTC)
-    hm = (now.hour, now.minute)
-    return RTH_START_UTC_HM <= hm <= RTH_END_UTC_HM
+    """True if `now` (default: current time) is within 09:30-16:00 ET.
+    A naive `now` is taken as UTC."""
+    et_now = et_time.to_et(now or datetime.now(UTC))
+    hm = (et_now.hour, et_now.minute)
+    return RTH_START_ET_HM <= hm <= RTH_END_ET_HM
 
 
 def _today_session_date_et() -> str:
     """Return YYYY-MM-DD in ET so it matches signal_iter.session_date."""
-    et = timezone(timedelta(hours=-4))
-    return datetime.now(et).strftime("%Y-%m-%d")
+    return et_time.today_et()
 
 
 def _today_expiry_yyyymmdd() -> str:
@@ -78,8 +82,7 @@ def _today_expiry_yyyymmdd() -> str:
     lastTradeDateOrContractMonth). For weekends/holidays this naively returns
     today's date; capture will fail-gracefully on no-quote for non-trading
     days, no special-casing needed."""
-    et = timezone(timedelta(hours=-4))
-    return datetime.now(et).strftime("%Y%m%d")
+    return et_time.now_et().strftime("%Y%m%d")
 
 
 def _build_strike_list(spot: float, offset_pts: float, step_pts: float) -> list[float]:

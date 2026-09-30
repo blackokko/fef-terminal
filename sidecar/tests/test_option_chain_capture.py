@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 
 os.environ["FEF_DB_URL"] = "sqlite+aiosqlite:///:memory:"
 
+from fef_sidecar import et_time
 from fef_sidecar.db import dispose_db, init_db
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import HistoricalOptionChainPoint
@@ -189,7 +190,8 @@ def test_strike_list_handles_invalid_inputs() -> None:
 
 
 def test_rth_window_gate() -> None:
-    """RTH = 13:30 - 20:00 UTC. Outside that, capture should not fire."""
+    """RTH = 09:30-16:00 ET (13:30-20:00 UTC on this EDT date). Outside that,
+    capture should not fire. The EST side is pinned in test_et_time_dst.py."""
     inside_open = datetime(2026, 5, 26, 14, 0, tzinfo=UTC)
     inside_close = datetime(2026, 5, 26, 19, 59, tzinfo=UTC)
     pre_open = datetime(2026, 5, 26, 13, 0, tzinfo=UTC)
@@ -234,7 +236,7 @@ async def test_capture_once_skips_when_ibkr_disconnected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_capture_once_persists_chain_rows_with_greeks() -> None:
+async def test_capture_once_persists_chain_rows_with_greeks(monkeypatch) -> None:
     """Happy path: 11 strikes × 2 rights = 22 rows persisted with full greeks."""
     ib = _FakeIB(ticker_factory=lambda c: _FakeTicker(
         bid=10.0, ask=11.0, last=10.5, volume=42,
@@ -243,6 +245,9 @@ async def test_capture_once_persists_chain_rows_with_greeks() -> None:
     ))
     state = _build_state(spot=7414.5, ibkr_provider=_FakeIBKRProvider(ib))
     inside = datetime(2026, 5, 26, 14, 0, tzinfo=UTC)
+    # Freeze the ET clock at `inside` so the 0DTE expiry / session_date are
+    # checkable (they come from "now", not from the `now=` argument).
+    monkeypatch.setattr(et_time, "_utc_now", lambda: inside)
     # Use a small offset so the test runs in seconds
     n = await _capture_once(state, offset_pts=10.0, step=5.0, now=inside)
     # 5 strikes (atm-10, -5, 0, +5, +10) × 2 = 10 rows
@@ -264,10 +269,10 @@ async def test_capture_once_persists_chain_rows_with_greeks() -> None:
         assert r.spot_at_capture == pytest.approx(7414.5)
         assert r.source == "ibkr_snapshot"
         assert r.symbol == "SPX"
-        # 0DTE expiry — today
-        assert r.expiry == inside.astimezone(
-            timezone(timedelta(hours=-4))
-        ).strftime("%Y%m%d") or True  # tolerate ET vs UTC date difference
+        # 0DTE expiry and session date — today in ET (10:00 EDT on 5/26).
+        # Was `== <fixed UTC-4 date> or True`, which could never fail.
+        assert r.expiry == "20260526"
+        assert r.session_date == "2026-05-26"
 
 
 @pytest.mark.asyncio

@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 
 from sqlmodel import select
 
+from fef_sidecar import et_time
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import DailyReview, HistoricalBar, SignalIter
 from fef_sidecar.db.repository import SignalIterRepository
@@ -299,7 +300,7 @@ async def compute_daily_review(session_date: str) -> DailyReview:
             by_confidence[r.confidence.value if hasattr(r.confidence, "value") else str(r.confidence)].append(realized_R)
         except KeyError:
             pass
-        ct = ts.astimezone(timezone(timedelta(hours=-5)))
+        ct = et_time.to_ct(ts)
         hour_key = f"{ct.hour:02d}"
         by_hour_ct.setdefault(hour_key, []).append(realized_R)
         # By direction

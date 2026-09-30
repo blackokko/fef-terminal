@@ -9,6 +9,9 @@ dependencies = [
     "pydantic>=2.10",
     "httpx>=0.28",
     "ib_async>=1.0.3",
+    # 2026-09-30: fef_sidecar.et_time needs the IANA database; Windows has none, so
+    # zoneinfo reads this package. Declared explicitly (it also arrives via ib_async).
+    "tzdata>=2025.2",
     "sqlmodel>=0.0.22",
     "aiosqlite>=0.20",
     "websockets>=14.0",

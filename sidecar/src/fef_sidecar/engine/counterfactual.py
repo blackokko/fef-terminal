@@ -50,6 +50,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from fef_sidecar import et_time
+
 logger = logging.getLogger(__name__)
 
 
@@ -242,10 +244,10 @@ def simulate_one(parent: dict, cfg: CounterfactualConfig | None = None) -> dict:
     submitted = parent.get("submitted_at", "")
     if submitted:
         try:
-            # submitted_at is UTC ISO; CT is UTC-5 (or -6 in winter — both fine for our purposes)
+            # submitted_at is UTC ISO; CT is UTC-5 in CDT, UTC-6 in CST
             from datetime import datetime
             dt = datetime.fromisoformat(submitted.replace("Z", "+00:00"))
-            hour_ct = (dt.hour - 5) % 24
+            hour_ct = et_time.to_ct(dt).hour
         except Exception:
             pass
     t1_threshold = _t1_gain_for_time(hour_ct, cfg)

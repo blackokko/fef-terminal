@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from sqlmodel import select
 
+from fef_sidecar import et_time
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import (
     IBKRExecution, LiveOrder, SignalIter, TicketStatus, TradeTicket,
@@ -36,17 +37,9 @@ class BucketStat:
 def _utc_dt_to_ct_hour_label(dt) -> str:
     """Convert tz-naive UTC datetime → 12-hour CT label like '9 AM CT'.
     Uses America/Chicago zoneinfo so DST is handled — CT is UTC-6 in
-    winter (CST) and UTC-5 in summer (CDT). Falls back to fixed -6
-    offset if zoneinfo unavailable (Windows older Python builds).
+    winter (CST) and UTC-5 in summer (CDT).
     """
-    from datetime import timezone, timedelta
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    try:
-        from zoneinfo import ZoneInfo
-        ct = dt.astimezone(ZoneInfo("America/Chicago"))
-    except Exception:
-        ct = dt.astimezone(timezone(timedelta(hours=-6)))
+    ct = et_time.to_ct(dt)
     h24 = ct.hour
     period = "AM" if h24 < 12 else "PM"
     h12 = h24 % 12
@@ -88,20 +81,20 @@ async def attribution(session_date: str | None = None) -> dict[str, list[BucketS
         ts = t.closed_at or t.filled_at
         if ts is None:
             return False
-        from datetime import timezone, timedelta
+        from datetime import timezone
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        et = ts.astimezone(timezone(timedelta(hours=-4)))
+        et = et_time.to_et(ts)
         return et.strftime("%Y-%m-%d") == session_date
 
     def _parent_in_window(p):
         if session_date is None:
             return True
-        from datetime import timezone, timedelta
+        from datetime import timezone
         ts = p.submitted_at
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        et = ts.astimezone(timezone(timedelta(hours=-4)))
+        et = et_time.to_et(ts)
         return et.strftime("%Y-%m-%d") == session_date
 
     async with get_session() as session:

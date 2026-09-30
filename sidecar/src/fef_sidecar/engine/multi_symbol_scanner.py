@@ -26,6 +26,7 @@ import os
 import time as _time
 from typing import Any
 
+from fef_sidecar import et_time
 from fef_sidecar.config_store import load_config
 from fef_sidecar.db.repository import SignalIterRepository
 from fef_sidecar.engine import FEFEngine
@@ -528,13 +529,11 @@ def _fmt_minute_et(minute_of_day: int) -> str:
 
 
 def _now_et_parts(now_ms: int | None = None) -> tuple[str, int]:
-    """(session_date 'YYYY-MM-DD', minute_of_day) under the app's fixed-offset
-    ET convention (same as _today_et / chop_gate). Monkeypatchable in tests."""
-    from datetime import datetime, timedelta, timezone
-    et = timezone(timedelta(hours=-4))
+    """(session_date 'YYYY-MM-DD', minute_of_day) in real ET, DST-correct
+    (same zone as _today_et / chop_gate). Monkeypatchable in tests."""
     if now_ms is None:
         now_ms = int(_time.time() * 1000)
-    dt = datetime.fromtimestamp(now_ms / 1000, et)
+    dt = et_time.et_from_ms(now_ms)
     return dt.strftime("%Y-%m-%d"), dt.hour * 60 + dt.minute
 
 
@@ -1346,9 +1345,7 @@ async def handle_actionable_scanner_verdict(
 
 
 def _today_et() -> str:
-    from datetime import datetime, timedelta, timezone
-    et = timezone(timedelta(hours=-4))
-    return datetime.now(et).strftime("%Y-%m-%d")
+    return et_time.today_et()
 
 
 # [REMOVED 2026-08-25] QuantData subscription CANCELLED —

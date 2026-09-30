@@ -10,10 +10,11 @@ Idempotent: skips rows that already have regime_at_fire set.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from sqlmodel import select
 
+from fef_sidecar import et_time
 from fef_sidecar.db.engine import get_session
 from fef_sidecar.db.models import SignalIter
 from fef_sidecar.engine.regime import RegimeDetector, RegimeSample
@@ -26,7 +27,7 @@ def _to_sample(r: SignalIter) -> RegimeSample:
     ts = r.timestamp
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    et = ts.astimezone(timezone(timedelta(hours=-4)))
+    et = et_time.to_et(ts)
     mins = max(0, (et.hour - 9) * 60 + (et.minute - 30))
     return RegimeSample(
         spx_price=r.spx_price,

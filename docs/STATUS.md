@@ -127,16 +127,17 @@ ledgers, not caches.
 
 ## 4. Priorities, in order
 
-1. **Deploy the daylight-saving fix before Monday 2026-11-02.** The sidecar hard-codes ET as UTC−4 in
-   ~55 places (market-hours window, VWAP anchor, session dates, pause windows, expiry resolution); after
-   clocks fall back the loop would run 08:30–15:00 real ET. A patch routing every site through one
-   zoneinfo helper (`fef_sidecar/et_time.py`) is ready: 1,071 tests pass (+117 pinning both
-   transitions), zero behaviour change on every daylight-time minute of 2026, **adversarial review SHIP
-   (no blockers)**, and `git apply --check` passes on the live checkout. **Patch + runbook:
-   `D:\fef-data\_deploy\2026-10_dst_fix\` (`et_zoneinfo_dst_v2.patch`, `DEPLOY.md`).** It touches
-   `loop.py` and other live-path files: install only when the operator says "terminal closed", following
-   `DEPLOY.md`. Known leftovers with no trading effect are listed there (the frontend's
-   `ReplayPanel.todayET()` needs an app rebuild; replay default date only).
+1. ~~**Deploy the daylight-saving fix before Monday 2026-11-02.**~~ **DONE 2026-09-30** (operator:
+   "terminal closed, go ahead and install the DST fix"). The sidecar hard-coded ET as UTC−4 in ~55 places
+   (market-hours window, VWAP anchor, session dates, pause windows, expiry resolution); after clocks fall
+   back the loop would have run 08:30–15:00 real ET. Every site now goes through one zoneinfo helper,
+   `fef_sidecar/et_time.py`; `tzdata` is declared in `pyproject.toml`. Full suite **1072 passed** on the
+   live checkout (+117 tests pinning both transitions); zero behaviour change on every daylight-time
+   minute of 2026; adversarial review SHIP. **Rule from here: never write a fixed UTC offset for ET/CT —
+   use `et_time`.** Runbook and patch kept in `D:\fef-data\_deploy\2026-10_dst_fix\`. Known leftovers
+   with no trading effect are listed in its `DEPLOY.md` (the frontend's `ReplayPanel.todayET()` needs an
+   app rebuild; replay default date only; `pattern_overlay` 4h buckets matter only if pattern triggers
+   are armed). Watch the first sessions after Sun 11-01: the loop should run 09:30–16:00 ET (14:30–21:00Z).
 2. **Sleeve executor: running daily** (review SHIP; re-enabled 2026-09-30 and confirmed by the operator).
    It trades at 14:30 CT; `record-fills` books the fills at 15:15 CT. Watch the first run after the trend
    book refreshes (the missed month-end rebalance books on 10-01/10-02 — check `-PlanOnly` first). A day

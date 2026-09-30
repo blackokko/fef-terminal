@@ -87,10 +87,11 @@ def _filter_fe_band_1_3(row: SignalIter, ex: dict) -> bool:
 
 
 def _filter_market_hours_only(row: SignalIter, ex: dict) -> bool:
-    from datetime import timezone, timedelta
+    from datetime import timezone
+    from fef_sidecar import et_time
     ts = row.timestamp
     if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
-    ct = ts.astimezone(timezone(timedelta(hours=-5)))
+    ct = et_time.to_ct(ts)
     return 8 <= ct.hour <= 14  # rough RTH window in CT
 
 

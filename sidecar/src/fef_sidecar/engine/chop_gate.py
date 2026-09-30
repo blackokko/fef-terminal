@@ -38,18 +38,20 @@ from __future__ import annotations
 import logging
 import time as _time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Iterable, Sequence
+
+from fef_sidecar import et_time
 
 logger = logging.getLogger(__name__)
 
 MS_PER_MIN = 60_000
 
-# Same fixed-offset ET convention as the rest of the app (_today_et in
-# loop.py / multi_symbol_scanner.py). The +/-30 min TOD window absorbs the
-# residual DST edge cases; consistency with session_date grouping matters
-# more here than absolute wall-clock precision.
-_ET = timezone(timedelta(hours=-4))
+# Real ET (America/New_York), the same zone as the rest of the app (_today_et
+# in loop.py / multi_symbol_scanner.py). Each bar is converted at its own
+# offset, so session_date grouping and time-of-day matching both stay on the
+# ET clock across a DST change (a fixed UTC-4 put every winter bar an hour late).
+_ET = et_time.ET
 
 # ---- Validated spec constants (2026-07-02 sweep) ----
 R30_WINDOW_MIN = 30          # trailing range window (minutes)
