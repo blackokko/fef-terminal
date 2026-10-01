@@ -1,8 +1,15 @@
-# STATUS — 2026-09-30
+# STATUS — 2026-10-01
 
 Current state of the operation, what was just learned, and what to do next, in order. Written for an
 agent picking this up cold. The research detail behind every number here is in
 `blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
+
+**2026-10-01:** the **SPY put-spread runner went LIVE on paper** at the operator's request ("just start
+paper today. we can look at the backtest later today or going into friday and this weekend") — ahead of
+the `spypcs` study's verdict, whose data pull is 63 % done (it crawled after midnight on the ThetaData side
+and pauses for market hours; it resumes 16:05 ET). Tasks FEF-SPYPCS-Tick / -Backstop / -Record registered
+at 08:30 CT; first entry attempt 10:00 CT today. When the verdict lands, compare it with what the runner
+is doing; the operator decides whether it keeps running.
 
 **2026-09-30 in one paragraph:** the sleeve executor placed its first orders (10 MOC buys, all filled,
 booked and certified that evening). Two adversarial reviews of its new "own book" logic found and fixed
@@ -12,8 +19,8 @@ SPY side by side, paper) was built and reviewed, then left unscheduled when `pcs
 does not replicate. The terminal's daylight-time assumption (~55 places) was fixed and deployed. Five
 studies were pre-registered: `pcs0dte` (closed, does not replicate), `ivsignal` (pulling), `volxs`,
 `snflow2`, and in the evening **`spypcs`**, the operator's own SPY put-credit-spread process as a machine
-rule (pulling). A paper runner for `spypcs` is built and reviewed (three rounds, SHIP); it is scheduled
-only if the study passes its gates and the operator says go.
+rule (pulling). A paper runner for `spypcs` was built and reviewed (three rounds, SHIP) — live from
+2026-10-01, above.
 
 ---
 
@@ -24,7 +31,7 @@ only if the study passes its gates and the operator says go.
 | **0DTE directional bot** | **Retired 2026-08-25.** Its data source (QuantData) was cancelled; `snapshot_to_inputs` was the only bridge into the FEF engine. Its premise was independently falsified: intraday direction on SPX is structurally foreclosed (achievable edge 0.08–0.35 index pts vs a 0.442 pt friction floor; the inverted signal performs identically at 49.2%). |
 | **Credit-spread bot** (in the terminal; 0DTE put vertical, ~0.15Δ, 1 lot) | **OFF, and its order would be REJECTED.** Verified 2026-09-30 with an IBKR what-if (nothing transmitted): its combo form — legs SELL short / BUY long, order **SELL at a positive limit** — is refused by IBKR as a "riskless/guaranteed-loss combination". The accepted form is the same legs with order **BUY at a negative limit** (what-if margin +$200 on a $2 SPY spread). It also prices at the mid only, runs one symbol at a time (an SPX spread blocks a SPY one) and has no close-before-16:00 for SPY. **Superseded for paper by the put-spread runner below; do not turn it on.** Earlier history: 200 parents 08-12 → 08-25, zero fills (`Bag()` positional, env gate). |
 | **Put-spread runner** (`fef-research-archive/options_executor.py`, standalone, client 178, orderRef `fef-pcs-*`) | **Built 2026-09-30; three adversarial review rounds → SHIP (archive b15f16e; 82 tests, 53/53 mutations). NOT scheduled: `pcs0dte` found its strategy does not replicate; running it is the operator's call (§4.3).** Its IBKR what-ifs passed 2026-09-30 evening (SPX/CBOE open +$2,500 initial margin, SPY and SPX close forms $0; nothing transmitted, probe client 179; `D:\fef-data\_probes\2026-09-30_ibkr_whatif\`), so if the operator wants it, `install_tasks.ps1 -Only FEF-PCS` registers its five tasks. After the first 10:00 entry, read its log: "FILLED … credit from the legs" confirms IBKR's combo reporting; "FILL SUSPECT" means that instance blocks itself until `resolve`. Paper 0DTE put credit spreads per `pcs0dte_LOCK.md`: `spx25` (SPXW 25-wide 0.15Δ, hold to cash settlement) and `spy2` (SPY $2-wide 0.15Δ, closed at 15:30 ET if spot < short × 1.003) side by side, entries 10:00/12:00/14:00 ET at the natural credit. Strikes chosen with the study's own code on a ThetaData snapshot. 36 tests, 26/26 mutations caught. Wrapper `fef-watchers\run_options_executor.ps1`. Purpose: execution truth (fills vs natural, fees, SPY assignment); `pcs0dte` is the P&L evidence. |
-| **SPY put-spread runner** (`fef-research-archive/spypcs_executor.py`, standalone, client 180, orderRef `fef-spypcs-*`) | **Built 2026-09-30; three adversarial review rounds → SHIP (181 tests, 121/122 mutations); IBKR what-ifs incl. the 4-leg roll passed. NOT scheduled** until the `spypcs` study passes its gates and the operator says go (§4.4b). The operator's own process (7–14 DTE $10-wide SPY put spreads at the mid, take profit by sessions held, roll down and out at a 2× loss, Tue–Thu 10:00 CT entries), multi-day positions, one chain at a time. |
+| **SPY put-spread runner** (`fef-research-archive/spypcs_executor.py`, standalone, client 180, orderRef `fef-spypcs-*`) | **LIVE on paper since 2026-10-01** (operator: "just start paper today", ahead of the study's verdict). Built 2026-09-30; three adversarial review rounds → SHIP (182 tests, 121/122 mutations); IBKR what-ifs incl. the 4-leg roll passed. Tasks FEF-SPYPCS-Tick (09:00–14:30 CT every 30 min), -Backstop (14:45), -Record (15:25) (§4.4b). **Never press the terminal's sweep-orphans / panic-flat / kill-all while it holds a spread** — the terminal lists its legs as unmanaged orphans. The operator's own process (7–14 DTE $10-wide SPY put spreads at the mid, take profit by sessions held, roll down and out at a 2× loss, Tue–Thu 10:00 CT entries), multi-day positions, one chain at a time. |
 | **Sleeve executor** (trend v3 + PEAD → MOC orders, client 177, orderRef `fef-sleeve`) | **LIVE on paper since 2026-09-30.** First run: 10 MOC buys (SPY 2, IWM 4, EFA 15, EWJ 9, HYG 32, DBC 22, GLD 1; NVS 12, DELL 4, ARM 6), **all filled at the close and certified that evening**; its own book equals the account's stock positions. Trades only its OWN book (design rule 6); per-day certification — a later run can never certify an earlier day; `certify --date D --i-have-reconciled [--own SYM=N]` is the manual path. 93 tests, 49/49 mutations caught, three adversarial review rounds → **SHIP** (archive 9b5641c). **Daily task `FEF-SleeveExecute` (14:30 CT) ENABLED** — re-enabled 2026-09-30 after the review, confirmed by the operator the same day ("Keep it enabled"); first unattended run 2026-10-01. `record-fills` runs first in `FEF-DailyClose`. **The first large unattended rebalance is expected ~Fri 10-02**, once the trend ledger books the month-end it missed while frozen: look at `run_sleeve_executor.ps1 -PlanOnly` before 14:30 CT that day. Carry v1 disabled (de-allocate). |
 | **Reconciliation harness** (`recon.py`) | **Built and tested; no measurement yet.** Zero credit-spread fills exist to reconcile. Two of its four Rule-3 join gates currently fail — the join is sound, the recorded anchors are contaminated — so it correctly publishes no aggregate. The adverse-selection prior stays at −$16.34/ct, CI [−156, +84]: unmeasured. Its advisory cross-check read `chainfill_cache.db`, now gone (§3); the primary path (live `signal_log.db` + ThetaData via `recon_quotes.db`) is intact. |
 | **Collectors** | `runner_watch.py` and `caphead_watch.py` run from `D:\fef-data` (restarted there 2026-09-26, detached). Do not kill them during market hours. `FEF-DailyOpen` restarts them at 08:30 CT if they are down. Find them with `Get-CimInstance Win32_Process` filtered on the script name; PIDs change. |
@@ -153,7 +160,8 @@ ledgers, not caches.
    still wants it: `install_tasks.ps1 -Only FEF-PCS` (its IBKR what-ifs passed 2026-09-30 evening).
 4. **Research queue** (ThetaData-sequenced): ~~`pcs0dte`~~ (closed) → `ivsignal` (pulling) and `spypcs`
    (pulling, one request at a time until `ivsignal`'s panel is done) → `volxs` → `snflow2`.
-4b. **`spypcs` paper runner: review SHIP, NOT scheduled.** `fef-research-archive/spypcs_executor.py` (client
+4b. **`spypcs` paper runner: LIVE on paper since 2026-10-01** (operator's call, ahead of the study's verdict;
+   see the top). `fef-research-archive/spypcs_executor.py` (client
    180, orderRef `fef-spypcs-<chain>-<event>-<step>`) runs the study's primary cell (W3 × MID × roll) on the
    paper account: a 30-minute `tick` (manage, then the 10:00 CT entry), a 14:45 CT backstop for an
    expiration-day close, and an after-close `record`. Every order starts at the mid and steps a cent at a
@@ -164,8 +172,10 @@ ledgers, not caches.
    tasks are in `install_tasks.ps1` as OPT-IN (a plain run never registers a trading runner; `-Only
    FEF-SPYPCS` does). IBKR what-ifs passed 2026-09-30 evening (nothing transmitted, probe client 179): the
    $10 open (+$1,000 initial margin, a credit spread), the close ($0) and **the 4-leg roll, accepted at a
-   net −0.01 and at 0.00** (`D:\fef-data\_probes\2026-09-30_ibkr_whatif\`). **Scheduled only when the study
-   passes its gates AND the operator says go.**
+   net −0.01 and at 0.00** (`D:\fef-data\_probes\2026-09-30_ibkr_whatif\`). Registered 2026-10-01 08:30 CT
+   with `install_tasks.ps1 -Only FEF-SPYPCS`; `-Remove -Only FEF-SPYPCS` stops it. Its wrapper starts
+   ThetaTerminal if it is not serving. Read its logs in `fef-watchers\logs\spypcs_exec.*.log`; its record is
+   `spypcs_ledger.csv` (chains) and `spypcs_fills.csv` (every order vs the mid).
 5. ~~**Run what exists.**~~ **Done 2026-09-30** for the sleeves; see §1. ~~**Move the research caches
    out of Temp.**~~ **Done 2026-09-26** (§3).
 6. **The one cheap study that needs no new data:** the leverage question from `sizing` — the book
