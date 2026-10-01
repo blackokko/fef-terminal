@@ -30,7 +30,21 @@ and run only on a Phase-0 pass, after review. **Discovery result (2022-26), 11:3
 - Midpoint entries: -0.02 R/trade, which is the simulator's own bias. The best lead, 5m break -> midpoint, is +0.05 R at
   t 1.7 and does not pass.
 - The two independent implementations agree (99.7 % of events).
-The 2017-22 confirmation runs tonight. It cannot create a pass; it only shows whether the leads hold in other years.
+**FINAL: study CLOSED, no edge.** The 2017-22 confirmation repeats the negative rejection effect (-1.06 pp, t -2.33).
+The 5m break -> midpoint lead did not replicate (-0.027 R).
+
+At the operator's request, a display-only **"Levels" chart overlay** was built on branch `feature/structure-levels`:
+- the engine and `GET /chart/structure_levels` match the study's own code on 3,378/3,378 levels;
+- the suite gives 1,113 passed, plus one ThetaData-dependent parity test that failed only because ThetaData was busy with the
+  spypcs pull;
+- `tsc` is clean.
+It awaits "terminal closed" to merge, rebuild and restart.
+
+The operator also asked for two changes to the SPY spread runner (spypcs Amendment 9):
+- **re-entry** on any flat Tue-Thu at 10:00 CT, with no weekly cap and still no overlap;
+- **5 lots** with real partial-fill handling.
+Both are being built in a worktree and get an adversarial review before Tue 10/6 10:00 CT. **USO approved** for the trend
+sleeve, so the whole trend universe trades automatically.
 
 **2026-09-30 in one paragraph:** the sleeve executor placed its first orders (10 MOC buys, all filled,
 booked and certified that evening). Two adversarial reviews of its new "own book" logic found and fixed
