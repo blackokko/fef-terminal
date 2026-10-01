@@ -8,7 +8,9 @@ agent picking this up cold. The research detail behind every number here is in
 paper today. we can look at the backtest later today or going into friday and this weekend") — ahead of
 the `spypcs` study's verdict, whose data pull is 63 % done (it crawled after midnight on the ThetaData side
 and pauses for market hours; it resumes 16:05 ET). Tasks FEF-SPYPCS-Tick / -Backstop / -Record registered
-at 08:30 CT; first entry attempt 10:00 CT today. When the verdict lands, compare it with what the runner
+at 08:30 CT. **First entry FILLED 10:00 CT:** SPY 760.34, sold 744P / bought 734P exp 2026-10-12 (11 days),
+|delta| 0.197, credit **1.05 at the mid on the first ladder step** (ThetaData mid 1.055, natural 1.03); chain
+2026-10-01-1 open, reconciled by the 15:25 CT record task. When the verdict lands, compare it with what the runner
 is doing; the operator decides whether it keeps running.
 
 Also 2026-10-01: **`mtflevels` pre-registered** (archive E15, `mtflevels_LOCK.md`) at the operator's request. It
