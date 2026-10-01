@@ -24,6 +24,7 @@ import {
   loadStructureSettings,
   parseStructurePayload,
   saveStructureSettings,
+  structureNote,
   structureQuery,
   type StructureSettings,
 } from "./structureLevels";
@@ -763,11 +764,7 @@ export function ChartPane() {
           axisLabelVisible: ln.axisLabelVisible, title: ln.title,
         }));
         zones.setZones(plan.zones);
-        const c = plan.counts;
-        setLevelsNote((payload.status === "ok"
-          ? `levels ${c.levels} · zones ${c.zones}${showSetups ? ` · setups ${c.setups}` : ""}`
-          : `levels: ${payload.status}`)
-          + (payload.calendarStale ? " · NYSE calendar out of date (structure_levels.py)" : ""));
+        setLevelsNote(structureNote(payload, plan.counts, showSetups));
       } catch (e) {
         if (!cancelled) setLevelsNote("levels: fetch failed");
         console.error("structure levels fetch failed:", e);

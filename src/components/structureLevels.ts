@@ -145,7 +145,9 @@ export interface SlSetup {
 
 export interface SlPayload {
   status: string;
-  asof: number | null;
+  asof: number | null;      // end of the last complete bar the levels are computed from
+  now: number | null;       // the sidecar's clock when it answered
+  inSession: boolean;
   last_price: number | null;
   atr1D: number | null;
   calendarStale: boolean;   // the sidecar's NYSE holiday table no longer covers the data
@@ -218,6 +220,8 @@ export function parseStructurePayload(raw: unknown): SlPayload | null {
   return {
     status: isStr(o.status) ? o.status : "unknown",
     asof: isNum(o.asof) ? o.asof : null,
+    now: isNum(o.now) ? o.now : null,
+    inSession: o.in_session === true,
     last_price: isNum(o.last_price) ? o.last_price : null,
     atr1D: isNum(atr["1D"]) ? (atr["1D"] as number) : null,
     calendarStale: o.calendar_stale === true,
@@ -238,6 +242,19 @@ const LONG_COLOR = "#00e676";
 const SHORT_COLOR = "#ff5252";
 const ORIGIN_ABBR: Record<string, string> = { BREAK: "BRK", RECLAIM: "RCL", REJECT: "REJ" };
 const SETUP_LINE_LIMIT = 8;
+
+/** Status line for the toolbar: counts, plus loud warnings for stale data (during a session the
+ *  last bar should be at most a few minutes old) and an out-of-date NYSE calendar. */
+export function structureNote(p: SlPayload, counts: DrawPlan["counts"], showSetups: boolean): string {
+  let note = p.status === "ok"
+    ? `levels ${counts.levels} · zones ${counts.zones}${showSetups ? ` · setups ${counts.setups}` : ""}`
+    : `levels: ${p.status}`;
+  if (p.inSession && p.asof !== null && p.now !== null && p.now - p.asof > 5 * 60) {
+    note += ` · DATA ${Math.round((p.now - p.asof) / 60)} MIN OLD`;
+  }
+  if (p.calendarStale) note += " · NYSE calendar out of date (structure_levels.py)";
+  return note;
+}
 
 /** "#rrggbb" + alpha -> "#rrggbbaa" (canvas accepts 8-digit hex). */
 export function withAlpha(hex: string, a: number): string {
