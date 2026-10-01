@@ -5540,6 +5540,150 @@ async def chart_regression_channel(
     }
 
 
+# Multi-timeframe STRUCTURE LEVELS overlay -- engine/structure_levels.py, a port of the
+# `mtflevels` study's marker (fef-research-archive E15), which found NO mechanical edge in these
+# levels. DISPLAY ONLY: read-only bar fetches; nothing here reaches the scanner, the traders, a
+# gate or the order path.
+#
+# History comes from the shared 25-minute cache (_get_cached_bars, extended hours included, cut to
+# 09:30-16:00 ET by the engine). Daily bars cannot be cut to regular hours after the fact, so they
+# and today's 1-minute bars are fetched RTH-only through a small cache of their own. 4H levels can
+# live 300 4H-bars (~150 sessions): with 3 months of 30-minute bars the oldest 4H structure is not
+# drawn (tests/test_structure_levels.py measures it).
+_SL_HIST_5M = ("5 mins", "20 D")
+_SL_HIST_30M = ("30 mins", "3 M")
+_SL_DAILY = ("1 day", "2 Y")
+_SL_TODAY_1M = ("1 min", "2 D")
+_SL_DAILY_TTL_S = 25 * 60.0
+_SL_1M_TTL_S = 30.0
+_SL_RTH_CACHE: dict[tuple[str, str, str], tuple[float, list[Any]]] = {}
+
+
+async def _sl_fetch_rth(state: Any, symbol: str, bar_size: str, duration: str,
+                        ttl_s: float) -> list[Any]:
+    """use_rth=True fetch behind a TTL cache. Best effort: [] on failure, and an empty result is
+    not served from the cache (the next poll retries), like _get_cached_bars."""
+    import time as _t
+
+    from fef_sidecar.ibkr.models import Contract
+
+    key = (symbol, bar_size, duration)
+    now = _t.monotonic()
+    hit = _SL_RTH_CACHE.get(key)
+    if hit is not None and hit[1] and (now - hit[0]) < ttl_s:
+        return hit[1]
+    try:
+        bars = list(await state.ibkr.fetch_historical_bars(  # type: ignore[attr-defined]
+            Contract.for_symbol(symbol), bar_size=bar_size, duration=duration, use_rth=True,
+        ) or [])
+    except Exception:
+        logger.exception("structure_levels RTH fetch failed for %s (%s / %s)",
+                         symbol, bar_size, duration)
+        bars = []
+    _SL_RTH_CACHE[key] = (now, bars)
+    return bars
+
+
+def _sl_intraday(bars: list[Any]) -> list[dict[str, Any]]:
+    """ibkr Bar -> engine dict. `time` = bar START, epoch SECONDS (a naive timestamp is taken as
+    local time, the regression-channel convention; live intraday bars are tz-aware UTC)."""
+    out = []
+    for b in bars or []:
+        try:
+            out.append({"time": int(b.timestamp.timestamp()), "open": float(b.open),
+                        "high": float(b.high), "low": float(b.low), "close": float(b.close)})
+        except Exception:
+            continue
+    return out
+
+
+def _sl_daily(bars: list[Any]) -> list[dict[str, Any]]:
+    """Daily ibkr Bar -> engine dict keyed by the ET session date. IBKR daily bars arrive as naive
+    local-midnight datetimes (vix_daily_ingest._bar_session_date); tz-aware ones go through ET."""
+    out = []
+    for b in bars or []:
+        try:
+            ts = b.timestamp
+            d = ts.astimezone(et_time.ET).date() if ts.tzinfo is not None else ts.date()
+            out.append({"date": d.isoformat(), "open": float(b.open), "high": float(b.high),
+                        "low": float(b.low), "close": float(b.close)})
+        except Exception:
+            continue
+    return out
+
+
+@router.get("/chart/structure_levels")
+async def chart_structure_levels(
+    request: Request,
+    symbol: str = "SPX",
+    taus: str = "",
+    families: str = "",
+    setups: bool = True,
+) -> dict[str, Any]:
+    """Multi-timeframe structure levels + MIDENTRY setups for the chart (DISPLAY ONLY).
+
+    taus: comma list from 5m,15m,30m,1H,4H,1D (default all). families: comma list from
+    S,Z,M,F,P,D,R (default all). setups: include the midpoint-entry setups.
+
+    Returns the engine payload (engine.structure_levels.compute): `levels`, `groups`, `setups`,
+    `atr` per timeframe, `asof`, `last_price`, `status`. Times are epoch SECONDS. Fail-soft: a
+    `status` string and empty lists instead of an exception, like /chart/regression_channel.
+    """
+    import asyncio
+
+    from fef_sidecar.engine import structure_levels as SL
+    from fef_sidecar.ibkr.models import Contract
+
+    s = _state(request)
+    sym = (symbol or "").upper()
+    tau_list = ([t for t in (x.strip() for x in taus.split(",")) if t in SL.TAUS]
+                if taus and taus.strip() else list(SL.TAUS))
+    fam_list = ([f for f in (x.strip().upper() for x in families.split(",")) if f in SL.FAMILIES]
+                if families and families.strip() else list(SL.FAMILIES))
+
+    def _fail(status: str) -> dict[str, Any]:
+        return {"symbol": sym, "status": status, "asof": None, "last_price": None, "atr": {},
+                "taus": tau_list, "families": fam_list, "levels": [], "groups": [], "setups": []}
+
+    try:
+        Contract.for_symbol(sym)
+    except ValueError:
+        return _fail(f"unsupported symbol {sym!r}")
+    now_s = int(et_time.now_et().timestamp())
+    try:
+        b5 = await _get_cached_bars(s, sym, *_SL_HIST_5M)
+        b30 = await _get_cached_bars(s, sym, *_SL_HIST_30M)
+        bd = await _sl_fetch_rth(s, sym, *_SL_DAILY, ttl_s=_SL_DAILY_TTL_S)
+        b1 = await _sl_fetch_rth(s, sym, *_SL_TODAY_1M, ttl_s=_SL_1M_TTL_S)
+    except Exception:
+        logger.exception("structure_levels bar fetch failed for %s", sym)
+        return _fail("bar fetch failed")
+    inp = {"1m": _sl_intraday(b1), "5m": _sl_intraday(b5), "30m": _sl_intraday(b30),
+           "1D": _sl_daily(bd)}
+    # Today is rebuilt from the fresh 1-minute bars: drop its rows from the 25-minute-old sets.
+    today = et_time.today_et()
+
+    def _et_day(t: int) -> str:
+        return et_time.session_date_et(t * 1000)
+
+    if any(_et_day(x["time"]) == today for x in inp["1m"]):
+        for k in ("5m", "30m"):
+            inp[k] = [x for x in inp[k] if _et_day(x["time"]) != today]
+        inp["1D"] = [x for x in inp["1D"] if x["date"] != today]
+    if not any(inp.values()):
+        return _fail(f"no bars for {sym}")
+    try:
+        payload = await asyncio.to_thread(
+            SL.compute, inp, now_s, sym, taus=tau_list, families=fam_list,
+            with_setups=bool(setups),
+        )
+    except Exception:
+        logger.exception("structure_levels computation failed for %s", sym)
+        return _fail("structure levels computation failed")
+    payload["sources"] = {k: len(v) for k, v in inp.items()}
+    return payload
+
+
 @router.get("/chart/tick_candles")
 async def chart_tick_candles(
     request: Request,
