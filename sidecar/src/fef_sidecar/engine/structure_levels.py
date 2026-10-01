@@ -551,7 +551,6 @@ class Analysis:
         self.zones: dict[int, list[Level]] = {}
         self.origins: list[tuple] = []
         self.setups: list[Setup] = []
-        self.pending: list[dict] = []
         self.calendar_stale = False
         self.round_step = 5.0
         self.tick = 0.01
@@ -1575,10 +1574,15 @@ def compute(bars_by_res: Mapping[str, Any], now_s: int, symbol: str, *,
     one entry per level instance. P / D / R are reported once, at the 1H reaction scale, with
     ``tf`` = "1D" (they are daily levels); the timeframe filter does not apply to them. Between
     sessions the next session's P / D / R are listed with ``state`` = "pending".
-    ``groups``: point levels of different family-tau within 0.25 ATR_5m share a ``group`` id; the
-    group carries a merged label and the dominant (highest-timeframe) member's tf / family.
+    ``groups``: confluence -- point levels are clustered in price order, a cluster spanning at most
+    0.25 ATR_5m (the current 5m ATR); each cluster is one ``group`` with a merged label, the
+    dominant (highest-timeframe, P/D/R ranked as 1D) member's tf / family, and ``confluence`` = the
+    number of distinct family-tau in it. Zones are drawn as bands and are not grouped.
     ``setups``: MIDENTRY setups that are ``waiting`` or ``filled``, plus those resolved in the last
-    30 minutes (``recent``: true).
+    30 minutes (``recent``: true). ``won`` / ``lost`` = target / stop first; a fill bar that also
+    reaches O or X is AMBIGUOUS in the study and is shown as ``lost`` with ``ambiguous``: true (the
+    study's Phase-1 worst case); a filled setup still open at its horizon (16:00 for 5m-1H, five
+    sessions for 4H/1D) is ``expired`` with ``unresolved``: true and its mark-to-market ``R``.
     """
     taus = [t for t in taus if t in TAUS]
     fams = {f.upper() for f in families if isinstance(f, str) and f.upper() in FAMILIES}
