@@ -19,7 +19,15 @@ multi-touch zones, midpoints, fib 0.5 / 0.618 / 0.75 / 0.87, pivots, prior-sessi
 mechanical marker on **QQQ**. Phase 0 asks whether price reacts differently at marked levels than at matched
 placebo levels. Discovery uses the 2022-26 IBKR cache, so no ThetaData is needed during market hours;
 confirmation uses a 2017-22 IBKR pull after 16:35 ET. Phase 1 trade rules (QQQ shares) are fixed in the lock
-and run only on a Phase-0 pass, after review. Executor + an independent second implementation are running.
+and run only on a Phase-0 pass, after review. **Discovery result (2022-26), 11:30 CT: no edge.**
+- Price is rejected *less* at mechanically marked levels than at random nearby prices: -1.34 pp, t -2.79. Prior swing
+  and prior-day extremes get run through.
+- Breaks, reclaims and retests: nil.
+- Fib ratios and the midpoint are not special.
+- Midpoint entries: -0.02 R/trade, which is the simulator's own bias. The best lead, 5m break -> midpoint, is +0.05 R at
+  t 1.7 and does not pass.
+- The two independent implementations agree (99.7 % of events).
+The 2017-22 confirmation runs tonight. It cannot create a pass; it only shows whether the leads hold in other years.
 
 **2026-09-30 in one paragraph:** the sleeve executor placed its first orders (10 MOC buys, all filled,
 booked and certified that evening). Two adversarial reviews of its new "own book" logic found and fixed
