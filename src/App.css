@@ -796,6 +796,59 @@ body,
   border-color: var(--color-blue);
 }
 
+/* Structure levels: toggle + settings popover */
+.chart-levels-wrap {
+  position: relative;
+  display: inline-flex;
+  gap: 2px;
+}
+
+.chart-levels-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  min-width: 300px;
+  padding: 8px 10px;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text);
+}
+
+.chart-levels-hdr {
+  color: var(--color-text-muted);
+  margin: 2px 0 4px;
+}
+
+.chart-levels-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-bottom: 8px;
+}
+
+.chart-levels-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.chart-levels-note {
+  color: var(--color-amber);
+  border-top: 1px solid var(--color-border);
+  padding-top: 6px;
+}
+
+.chart-levels-status {
+  color: var(--color-text-muted);
+  margin-top: 4px;
+}
+
 .chart-container {
   flex: 1;
   min-height: 0;

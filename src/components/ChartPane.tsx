@@ -15,6 +15,18 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { useSidecar } from "../context/WebSocketContext";
+import {
+  SL_FAMILIES,
+  SL_TAUS,
+  StructureZonesPrimitive,
+  TAU_COLORS,
+  buildDrawPlan,
+  loadStructureSettings,
+  parseStructurePayload,
+  saveStructureSettings,
+  structureQuery,
+  type StructureSettings,
+} from "./structureLevels";
 // [REMOVED 2026-08-25] `import type { IterEvent, WallRow }` and
 // `formatExposureM` — both existed only to build the GEX/DEX wall price lines
 // and the NTM max-pain line. The QuantData API and data subscription were
@@ -225,6 +237,8 @@ const PATTERN_POLL_INTERVAL_MS = 5000;  // pattern overlay refresh
 const REGRESSION_POLL_INTERVAL_MS = 15000;  // regression channel refresh — the
 // server caches bars ~25min so repeated polls are cheap; this just eventually
 // picks up a freshly-closed bar into the fit.
+const LEVELS_POLL_INTERVAL_MS = 30000;  // structure levels refresh — the server's 1-min
+// bars are cached 30s, history 25min; levels move at most once a bar.
 
 // Pattern overlay payload (GET /chart/pattern_overlay). Times are epoch SECONDS.
 // We now consume ONLY the auto pivot trendlines — the candlestick-pattern
@@ -337,6 +351,16 @@ export function ChartPane() {
   const [showOverlay, setShowOverlay] = useState(false);
   const [overlayBarSize, setOverlayBarSize] = useState("1 day");
   const [overlayLookback, setOverlayLookback] = useState("6 M");
+  // Multi-timeframe STRUCTURE LEVELS (/chart/structure_levels): swings, zones, midpoints, fibs,
+  // pivots, prior day/week, round numbers + MIDENTRY setups. Display only — see structureLevels.ts.
+  const [showLevels, setShowLevels] = useState(false);
+  const [levelsSettings, setLevelsSettings] = useState<StructureSettings>(() => loadStructureSettings());
+  const [levelsMenuOpen, setLevelsMenuOpen] = useState(false);
+  const [levelsNote, setLevelsNote] = useState<string | null>(null);
+  const levelLinesRef = useRef<IPriceLine[]>([]);
+  const levelZonesRef = useRef<StructureZonesPrimitive | null>(null);
+  const levelsMenuRef = useRef<HTMLSpanElement | null>(null);
+  const lastCloseRef = useRef<number | null>(null);
   // [REMOVED 2026-08-25] priceLinesRef — held the GEX/DEX/max-pain price-line
   // handles. Its only writer was the wall-overlay effect, deleted with the
   // QuantData subscription. ambientLinesRef (Day H/L) is unrelated and stays.
@@ -685,6 +709,91 @@ export function ChartPane() {
     return () => { cancelled = true; window.clearInterval(id); clear(); };
   }, [showOverlay, symbol, overlayBarSize, overlayLookback, isTickTf, historicalDate]);
 
+  // Structure levels — poll /chart/structure_levels every 30s while on (and at once on toggle,
+  // symbol, timeframe or settings change); one price line per confluence group, zones as shaded
+  // bands (series primitive), MIDENTRY setups as entry / stop / target lines. Live time-bars only,
+  // like Trendlines. Everything is removed on toggle-off, symbol / timeframe / date change and
+  // unmount. A response that arrives after its effect was torn down is dropped.
+  useEffect(() => { saveStructureSettings(levelsSettings); }, [levelsSettings]);
+  useEffect(() => {
+    lastCloseRef.current = bars.length ? bars[bars.length - 1].close : null;
+  }, [bars]);
+  useEffect(() => {
+    const removeAll = () => {
+      const s = seriesRef.current;
+      try {
+        if (s) {
+          for (const l of levelLinesRef.current) s.removePriceLine(l);
+          if (levelZonesRef.current) s.detachPrimitive(levelZonesRef.current);
+        }
+      } catch { /* chart may be tearing down */ }
+      levelLinesRef.current = [];
+      levelZonesRef.current = null;
+    };
+    const series = seriesRef.current;
+    if (!showLevels || isTickTf || historicalDate || !series) {
+      removeAll();
+      setLevelsNote(null);
+      return;
+    }
+    let cancelled = false;
+    let inFlight = false;
+    const zones = new StructureZonesPrimitive();
+    try {
+      series.attachPrimitive(zones);
+      levelZonesRef.current = zones;
+    } catch { /* drawn without zones */ }
+    const query = structureQuery(symbol, levelsSettings);
+    const showSetups = levelsSettings.families.setups;
+    const fetchLevels = async () => {
+      if (inFlight) return;   // a slow IBKR fetch must not stack requests
+      inFlight = true;
+      try {
+        const r = await fetch(`${API_BASE}/chart/structure_levels?${query}`);
+        if (cancelled) return;
+        if (!r.ok) { setLevelsNote(`levels: HTTP ${r.status}`); return; }
+        const payload = parseStructurePayload(await r.json());
+        if (cancelled) return;
+        const s = seriesRef.current;
+        if (!payload || !s) { setLevelsNote("levels: unreadable response"); return; }
+        const plan = buildDrawPlan(payload, lastCloseRef.current, showSetups);
+        for (const l of levelLinesRef.current) s.removePriceLine(l);
+        levelLinesRef.current = plan.lines.map((ln) => s.createPriceLine({
+          price: ln.price, color: ln.color, lineWidth: ln.lineWidth, lineStyle: ln.lineStyle,
+          axisLabelVisible: ln.axisLabelVisible, title: ln.title,
+        }));
+        zones.setZones(plan.zones);
+        const c = plan.counts;
+        setLevelsNote(payload.status === "ok"
+          ? `levels ${c.levels} · zones ${c.zones}${showSetups ? ` · setups ${c.setups}` : ""}`
+          : `levels: ${payload.status}`);
+      } catch (e) {
+        if (!cancelled) setLevelsNote("levels: fetch failed");
+        console.error("structure levels fetch failed:", e);
+      } finally {
+        inFlight = false;
+      }
+    };
+    void fetchLevels();
+    const id = window.setInterval(fetchLevels, LEVELS_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      removeAll();
+    };
+  }, [showLevels, symbol, timeframe, historicalDate, isTickTf, levelsSettings]);
+
+  // Close the levels settings popover on an outside click.
+  useEffect(() => {
+    if (!levelsMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const el = levelsMenuRef.current;
+      if (el && e.target instanceof Node && !el.contains(e.target)) setLevelsMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [levelsMenuOpen]);
+
   // Toggle indicator visibility
   useEffect(() => {
     if (ema8SeriesRef.current) ema8SeriesRef.current.applyOptions({ visible: showEMA });
@@ -901,12 +1010,14 @@ export function ChartPane() {
     return { high, low };
   }, [bars]);
 
+  // Hidden while Levels is on: these are the high / low of the LOADED WINDOW (not the day) and
+  // would read like — and clash with — the overlay's PDH / PDL.
   useEffect(() => {
     if (!seriesRef.current) return;
     const series = seriesRef.current;
     for (const line of ambientLinesRef.current) series.removePriceLine(line);
     ambientLinesRef.current = [];
-    if (dayHighLow) {
+    if (dayHighLow && !showLevels) {
       ambientLinesRef.current.push(series.createPriceLine({
         price: dayHighLow.high, color: LEVEL_COLORS.DAY_HIGH, lineWidth: 1, lineStyle: LineStyle.Dotted,
         axisLabelVisible: true, title: `H ${dayHighLow.high.toFixed(2)}`,
@@ -916,7 +1027,7 @@ export function ChartPane() {
         axisLabelVisible: true, title: `L ${dayHighLow.low.toFixed(2)}`,
       }));
     }
-  }, [dayHighLow]);
+  }, [dayHighLow, showLevels]);
 
   // Dale preset — one click sets the chart timeframe + lookback (the
   // chart-following StdDev channel fits that window automatically) AND points
@@ -987,6 +1098,55 @@ export function ChartPane() {
                   title="Auto trendlines — support (green) / resistance (red) rays through the last two pivot lows/highs, projected to the newest bar. Detected sidecar-side; live time-bars only.">
             Trendlines
           </button>
+          <span className="chart-levels-wrap" ref={levelsMenuRef}>
+            <button className={`chart-toolbar-btn ${showLevels ? "active" : ""}`}
+                    onClick={() => setShowLevels(s => !s)}
+                    disabled={isTickTf || !!historicalDate}
+                    title="Structure levels — multi-timeframe swings, zones, midpoints, fibs, pivots, prior day/week, round numbers and midpoint-entry setups (study mtflevels). Decision support only; live time-bars only.">
+              Levels
+            </button>
+            <button className={`chart-toolbar-btn ${levelsMenuOpen ? "active" : ""}`}
+                    onClick={() => setLevelsMenuOpen(o => !o)}
+                    disabled={isTickTf || !!historicalDate}
+                    aria-expanded={levelsMenuOpen}
+                    title="Structure levels settings — timeframes and families">
+              ▾
+            </button>
+            {levelsMenuOpen && (
+              <div className="chart-levels-popover" role="dialog" aria-label="Structure levels settings">
+                <div className="chart-levels-hdr">Timeframes</div>
+                <div className="chart-levels-row">
+                  {SL_TAUS.map((t) => (
+                    <label key={t} style={{ color: TAU_COLORS[t] }}>
+                      <input type="checkbox" checked={levelsSettings.taus[t]}
+                             onChange={(e) => {
+                               const on = e.target.checked;
+                               setLevelsSettings(s => ({ ...s, taus: { ...s.taus, [t]: on } }));
+                             }} />
+                      {t}
+                    </label>
+                  ))}
+                </div>
+                <div className="chart-levels-hdr">Families</div>
+                <div className="chart-levels-row">
+                  {SL_FAMILIES.map((f) => (
+                    <label key={f.key}>
+                      <input type="checkbox" checked={levelsSettings.families[f.key]}
+                             onChange={(e) => {
+                               const on = e.target.checked;
+                               setLevelsSettings(s => ({ ...s, families: { ...s.families, [f.key]: on } }));
+                             }} />
+                      {f.label}
+                    </label>
+                  ))}
+                </div>
+                <div className="chart-levels-note">
+                  Decision support only — study mtflevels (QQQ 2022–26): no mechanical edge.
+                </div>
+                {showLevels && levelsNote && <div className="chart-levels-status">{levelsNote}</div>}
+              </div>
+            )}
+          </span>
         </div>
         <div className="chart-toolbar-group">
           {/* Independent StdDev-channel OVERLAY — a SECOND ±1/2/3σ channel at
@@ -1030,6 +1190,9 @@ export function ChartPane() {
             </span>
           )}
           {historicalDate && !isTickTf && <span style={{ marginLeft: 8, color: "var(--color-amber)" }}>HISTORICAL</span>}
+          {showLevels && !isTickTf && !historicalDate && levelsNote && (
+            <span style={{ marginLeft: 8 }} title="Structure levels overlay (display only)">{levelsNote}</span>
+          )}
         </div>
       </div>
       <div ref={containerRef} className="chart-container" />
