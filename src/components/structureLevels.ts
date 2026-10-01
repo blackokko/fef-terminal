@@ -426,6 +426,16 @@ class ZonesRenderer implements IPrimitivePaneRenderer {
   }
 
   draw(target: DrawTarget): void {
+    // Guarded: this runs inside the chart's paint loop, and a throw here would break every
+    // later frame of the main chart (the 2026-08-25 lesson: chart code can take the shell down).
+    try {
+      this.paint(target);
+    } catch {
+      /* skip this frame's zones */
+    }
+  }
+
+  private paint(target: DrawTarget): void {
     target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
       for (const r of this.rects) {
         const x0 = Math.max(0, r.x);
