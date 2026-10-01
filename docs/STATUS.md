@@ -11,6 +11,14 @@ and pauses for market hours; it resumes 16:05 ET). Tasks FEF-SPYPCS-Tick / -Back
 at 08:30 CT; first entry attempt 10:00 CT today. When the verdict lands, compare it with what the runner
 is doing; the operator decides whether it keeps running.
 
+Also 2026-10-01: **`mtflevels` pre-registered** (archive E15, `mtflevels_LOCK.md`) at the operator's request. It
+tests a profitable NQ trader's multi-timeframe structure marking (5m to 1D plus tick charts: swing points,
+multi-touch zones, midpoints, fib 0.5 / 0.618 / 0.75 / 0.87, pivots, prior-session levels, round numbers) as a
+mechanical marker on **QQQ**. Phase 0 asks whether price reacts differently at marked levels than at matched
+placebo levels. Discovery uses the 2022-26 IBKR cache, so no ThetaData is needed during market hours;
+confirmation uses a 2017-22 IBKR pull after 16:35 ET. Phase 1 trade rules (QQQ shares) are fixed in the lock
+and run only on a Phase-0 pass, after review. Executor + an independent second implementation are running.
+
 **2026-09-30 in one paragraph:** the sleeve executor placed its first orders (10 MOC buys, all filled,
 booked and certified that evening). Two adversarial reviews of its new "own book" logic found and fixed
 real duplicate-order paths. The trend and carry paper ledgers turned out to have been frozen at
