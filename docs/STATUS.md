@@ -10,7 +10,10 @@ the `spypcs` study's verdict, whose data pull is 63 % done (it crawled after mid
 and pauses for market hours; it resumes 16:05 ET). Tasks FEF-SPYPCS-Tick / -Backstop / -Record registered
 at 08:30 CT. **First entry FILLED 10:00 CT:** SPY 760.34, sold 744P / bought 734P exp 2026-10-12 (11 days),
 |delta| 0.197, credit **1.05 at the mid on the first ladder step** (ThetaData mid 1.055, natural 1.03); chain
-2026-10-01-1 open, reconciled by the 15:25 CT record task. When the verdict lands, compare it with what the runner
+2026-10-01-1 **closed the same day by take-profit** (30 % target on the opening session): the 13:00 CT
+try at 0.73 did not fill and was cancelled cleanly; 14:00 CT filled at debit **0.64** (mid 0.635), **+$38.20 net**
+(+39 % of the credit). Reconciled by the 15:25 CT record task. One entry per ISO week, so the next is Tue 10/6
+10:00 CT. When the verdict lands, compare it with what the runner
 is doing; the operator decides whether it keeps running.
 
 Also 2026-10-01: **`mtflevels` pre-registered** (archive E15, `mtflevels_LOCK.md`) at the operator's request. It
