@@ -31,9 +31,10 @@ bar of lookahead). Live, that bar is only known once it has printed. Snapshot mi
 not multiples of 5 (nothing becomes known exactly at the snapshot) and the generator skips any
 snapshot at which a leg level expires by "beyond" exactly at that bar (one was skipped).
 
-Measured, NOT asserted (dev run against the research DB, 2026-10-01): the route's actual windows
-(30m bars for 3 months) agree 100 % on every cell except 4H -- S-4H 16/39, Z-4H 0/12, M-4H 0/4 --
-because 4H levels can live 300 4H-bars (~150 sessions) and 3 months of 30m bars hold ~63.
+Measured, NOT asserted (fixtures/measure_structure_levels_live_windows.py, run by hand against
+the research DB, 2026-10-01): the route's actual windows (30m bars for 3 months) agree 100 % on
+every cell except 4H -- S-4H 16/39, Z-4H 0/12, M-4H 0/4 (208/247) -- because 4H levels can live
+300 4H-bars (~150 sessions) and 3 months of 30m bars hold ~63. 6 months: 232/247; 8 months: 247/247.
 
 Also here: DST-safe anchoring, 1H/4H anchoring, early closes, the round-number step, empty and
 short inputs, the payload contract, and speed.
@@ -483,6 +484,27 @@ def test_early_close_session_truncates() -> None:
     assert A30.n == 7 and A30.sessions[0].complete
 
 
+def test_beyond_the_calendar_is_flagged_and_degrades_gently() -> None:
+    """After 2027 the NYSE table ends: every weekday counts as a 16:00 session, the payload says
+    calendar_stale, and an unknown holiday (2028-01-17, MLK, absent from the data) neither kills
+    the next day's prior-day levels nor the next week's prior-week levels."""
+    assert SL.calendar_covers(date(2027, 12, 31)) and not SL.calendar_covers(date(2028, 1, 3))
+    days = [d for d in _weekdays(date(2028, 1, 3), 20) if d != date(2028, 1, 17)]
+    bs = _sessions(days)
+    now = int(datetime(2028, 1, 31, 12, 0, tzinfo=ET).timestamp())
+    P = SL.compute({"1m": bs[:-200]}, bs[-200]["time"], "QQQ", families=("P", "D", "R"))
+    assert P["calendar_stale"] is True and P["status"] == "ok"
+    assert any(r["kind"] == "P" for r in P["levels"])
+    A = SL.analyze({"1m": bs}, now, "QQQ")
+    tue = [i for i, se in enumerate(A.sessions) if se.date == date(2028, 1, 18)][0]
+    assert A._prev_ok(tue)                                   # Fri 01-14 -> Tue 01-18
+    assert {(f, k) for f, k, _, _ in A.pdr_rows(tue)} >= {("D", 2), ("D", 3), ("D", 4), ("P", 0)}
+    mon = [i for i, se in enumerate(A.sessions) if se.date == date(2028, 1, 24)][0]
+    assert any(f == "D" and k == 0 for f, k, _, _ in A.pdr_rows(mon))      # PWH from a 4-day week
+    P2 = SL.compute({"1m": _session(date(2026, 3, 11))}, now, "QQQ")
+    assert P2["calendar_stale"] is False
+
+
 def test_holiday_bars_are_ignored_and_in_progress_session() -> None:
     days = [date(2025, 12, 24), date(2025, 12, 26)]       # 12-25 is a holiday
     bs = _session(days[0], close_hm=(13, 0)) + _session(date(2025, 12, 25)) + _session(days[1])
@@ -492,14 +514,101 @@ def test_holiday_bars_are_ignored_and_in_progress_session() -> None:
     cur = A.sessions[-1]
     assert not cur.complete and A.in_session and cur.cov_end == 105       # 09:30 .. 11:14 done
     assert _hm(A.asof) == "11:15"
-    # the forming 1H bar (10:30-11:30) starts at its first 1m bar; the 15m one (11:15-11:30)
-    # started by the clock with no bar complete yet
-    assert _hm(A.t0[A.taus[SL.TI_1H].forming_start]) == "10:30"
-    assert A.taus[SL.TI_15M].forming_start == A.n
-    assert A.sess_end_idx(len(A.sessions) - 1) == cur.start + 389
-    # a level whose 300-bar max age ends at the forming bar's start is already expired
-    T = A.taus[SL.TI_15M]
-    assert T.start_of(T.nb) == A.n and T.start_of(T.nb + 1) == SL._BIG
+    # only completed tau-bars exist: 12-24 (early close) 4 x 1H + 14 x 15m, 12-26 1 x 1H (the
+    # 10:30-11:30 bar is still forming) + 7 x 15m, 1D only for 12-24
+    T1, T15, TD = A.taus[SL.TI_1H], A.taus[SL.TI_15M], A.taus[SL.TI_1D]
+    assert (T1.nb, T15.nb, TD.nb) == (5, 21, 1)
+    assert _hm(A.t1[T1.end[-1]]) == "10:30" and _hm(A.t1[T15.end[-1]]) == "11:15"
+    assert A.sess_end_idx(len(A.sessions) - 1) == cur.start + 389       # virtual 15:59 bar
+    assert A.sess_end_idx(len(A.sessions)) == SL._BIG                   # next session: future
+
+
+# =====================================================================================
+# exact boundaries the fixture cannot reach (each pinned so a mutation fails a test)
+# =====================================================================================
+def _daily_rows(days: list[date], closes: list[tuple[float, float, float, float]]) -> list[dict]:
+    return [{"date": d.isoformat(), "open": o, "high": h, "low": lo, "close": c}
+            for d, (o, h, lo, c) in zip(days, closes)]
+
+
+def _peak_then_range(n: int) -> list[tuple[float, float, float, float]]:
+    """rise to a 205 peak on day 20, drop (confirms the 1D swing high), then range 163-187
+    forever -- the 205 swing high is never broken."""
+    out = []
+    for i in range(n):
+        if i < 20:
+            c = 100.0 + 5 * i
+            out.append((c - 2, c + 2, c - 3, c))
+        elif i == 20:
+            out.append((196.0, 205.0, 195.0, 200.0))
+        elif i < 23:
+            c = 200.0 - 15 * (i - 20)
+            out.append((c + 5, c + 6, c - 6, c))
+        else:
+            c = round(175.0 + 9.0 * math.sin(i / 4.0), 2)
+            out.append((c - 1, c + 3, c - 3, c))
+    return out
+
+
+def test_max_age_boundary_1d() -> None:
+    """lock 2.11: a 1D level lives 250 sessions after the tau-bar following its known_from."""
+    days = _weekdays(date(2024, 1, 2), 280)
+    rows = _daily_rows(days, _peak_then_range(280))
+
+    def swing_205(k: int):
+        now = _epoch_after_close(days[k])
+        A = SL.analyze({"1D": rows[: k + 1]}, now, "QQQ", taus=("1D",))
+        lv = [x for x in A.levels if x.fam == "S" and x.ti == SL.TI_1D and x.lo == 205.0]
+        assert len(lv) == 1
+        return A, lv[0]
+
+    A, lv = swing_205(30)
+    assert lv.kf == 22 and lv.brk == -1                  # confirmed by day 21's close, never broken
+    A, lv = swing_205(270)                               # day 22 + 249 complete -> still ACTIVE
+    assert lv.state_at(A.n) == "active"
+    A, lv = swing_205(271)                               # the 250th 1D bar after it begins -> gone
+    assert lv.state_at(A.n) is None and lv.exp == 272 == A.n
+
+
+def _epoch_after_close(d: date) -> int:
+    return int(datetime(d.year, d.month, d.day, 16, 0, 1, tzinfo=ET).timestamp())
+
+
+def test_zone_member_window_boundary_1d() -> None:
+    """lock 2.4 + R8: zone members are pivots whose EXTREME bar is within the last 250 1D bars of
+    the new pivot's confirmation (bar > conf - 250)."""
+    days = _weekdays(date(2024, 1, 2), 300)
+    rows = _daily_rows(days, _peak_then_range(300))
+    A = SL.analyze({"1D": rows}, _epoch_after_close(days[-1]), "QQQ", taus=("1D",))
+    T = A.taus[SL.TI_1D]
+
+    def zones_with(first_bar: int, conf3: int) -> list:
+        bars = [first_bar, first_bar + 3, first_bar + 6, first_bar + 9, conf3 - 2]
+        confs = [first_bar + 2, first_bar + 5, first_bar + 8, first_bar + 11, conf3]
+        types = [1, -1, 1, -1, 1]
+        pxs = [205.0, 150.0, 205.5, 150.0, 205.2]
+        A.structs[SL.TI_1D] = SL._Struct(SL.TI_1D, types, pxs, bars, confs, [1.0] * 5,
+                                         [T.end[c] + 1 for c in confs], [0] * 5, [0] * T.nb)
+        return A.levels_Z(SL.TI_1D)
+
+    # the oldest member (bar 20) is IN the window when the third high confirms at bar 269 ...
+    z = zones_with(20, 269)
+    assert len(z) == 1 and (z[0].lo, z[0].hi) == (205.0, 205.5) and z[0].touches == 3
+    # ... and OUT of it at bar 270 (20 > 270 - 250 is false): two highs remain, no zone
+    assert zones_with(20, 270) == []
+    assert SL.ZONE_WIN_1D == 250 and SL.ZONE_WIN == 200 and SL.MAXAGE_1D == 250 and SL.MAXAGE_TAU == 300
+
+
+def test_zigzag_reversal_tie_is_inclusive() -> None:
+    """lock 2.3 / mtfl_core.zigzag: a reversal of EXACTLY k * ATR confirms (ties inclusive)."""
+    nan = float("nan")
+    h = [100.0] * 14 + [101.0, 100.5]
+    lo = [99.0] * 14 + [100.0, 98.0]
+    atr = [nan] * 13 + [1.0] * 3
+    ptype, ppx, pbar, pconf, _, _ = SL._zigzag(h, lo, atr, 3.0)
+    assert (ptype, ppx, pbar, pconf) == ([1], [101.0], [14], [15])     # 98.00 = 101 - 3 x 1.0
+    lo[-1] = 98.01
+    assert SL._zigzag(h, lo, atr, 3.0)[0] == []
 
 
 # =====================================================================================
@@ -633,6 +742,12 @@ def test_payload_contract_at_a_snapshot(bars, gold) -> None:
     t = sn["t"]
     P = SL.compute({"1m": bars[:t]}, sn["now_s"], "QQQ")
     assert P["status"] == "ok" and P["asof"] == sn["now_s"] and P["in_session"]
+    # Starlette's JSONResponse refuses NaN / inf: the payload must be strict JSON, even with every
+    # setup (forming, unqualified, unresolved) included
+    json.dumps(P, allow_nan=False)
+    every = SL.compute({"1m": bars[:t]}, sn["now_s"], "QQQ", include_all_setups=True)
+    json.dumps(every, allow_nan=False)
+    assert {s["status"] for s in every["setups"]} >= {"won", "lost", "expired", "unqualified", "forming"}
     assert P["last_price"] == bars[t - 1]["close"]
     assert set(P["atr"]) == set(SL.TAUS) and all(v > 0 for v in P["atr"].values())
     ids = set()
@@ -695,6 +810,7 @@ def test_pending_next_session_levels_after_the_close(bars) -> None:
     now = bars[-1]["time"] + 3600 * 5                       # Friday 2026-03-13, 21:00 ET
     P = SL.compute({"1m": bars}, now, "QQQ", families=("P", "D", "R"))
     assert not P["in_session"]
+    json.dumps(P, allow_nan=False)
     pend = [r for r in P["levels"] if r["state"] == "pending"]
     assert pend and P["next_session_open"] == int(datetime(2026, 3, 16, 9, 30, tzinfo=ET).timestamp())
     A = SL.analyze({"1m": bars}, now, "QQQ")

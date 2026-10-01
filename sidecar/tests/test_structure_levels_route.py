@@ -15,6 +15,7 @@ documented coarse-history effect.
 from __future__ import annotations
 
 import gzip
+import json
 import types
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,6 +134,7 @@ async def test_route_payload_matches_the_engine_on_clean_bars() -> None:
     ibkr = _FixtureIBKR(SNAP_NOW)
     out = await chart_structure_levels(_request(_state(ibkr)), symbol="QQQ")
     assert out["status"] == "ok", out["status"]
+    json.dumps(out, allow_nan=False)        # Starlette's JSONResponse refuses NaN / inf
     # the four fetches: history from the shared cache (ETH included), daily + today RTH-only
     assert sorted(ibkr.calls) == sorted([("QQQ", "5 mins", "20 D", False), ("QQQ", "30 mins", "3 M", False),
                                          ("QQQ", "1 day", "2 Y", True), ("QQQ", "1 min", "2 D", True)])
@@ -213,10 +215,12 @@ class _Boom:
 async def test_route_no_bars_and_failures_are_soft() -> None:
     out = await chart_structure_levels(_request(_state(_Empty())), symbol="QQQ")
     assert out["status"] == "no bars for QQQ" and out["levels"] == [] and out["setups"] == []
+    json.dumps(out, allow_nan=False)
     out = await chart_structure_levels(_request(_state(_Boom())), symbol="QQQ")
     assert out["status"] == "no bars for QQQ" and out["levels"] == []
     out = await chart_structure_levels(_request(_state(_Empty())), symbol="NOPE")
     assert out["status"].startswith("unsupported symbol") and out["groups"] == []
+    json.dumps(out, allow_nan=False)
 
 
 @pytest.mark.asyncio
@@ -227,3 +231,4 @@ async def test_route_with_the_mock_provider() -> None:
         out = await chart_structure_levels(_request(_state(MockIBKRProvider())), symbol=sym)
         assert isinstance(out["status"], str)
         assert isinstance(out["levels"], list) and isinstance(out["setups"], list)
+        json.dumps(out, allow_nan=False)

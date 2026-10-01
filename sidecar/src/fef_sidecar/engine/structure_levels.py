@@ -454,22 +454,14 @@ class _Tau:
         self.sess: list[int] = []
         self.atr: list[float] = []
         self.nb = 0
-        self.forming_start: int | None = None
         self.last_done: list[int] = []
         self.first_after: list[int] = []
         self.sp_cmax: _Sparse | None = None
         self.sp_cmin: _Sparse | None = None
         self.sess_bar: dict[int, int] = {}
 
-    def start_of(self, e: int) -> int:
-        """path index at which tau-bar e starts (the forming bar's start if e == nb)."""
-        if e < self.nb:
-            return self.start[e]
-        if e == self.nb and self.forming_start is not None:
-            return self.forming_start
-        return _BIG
-
     def end_of(self, e: int) -> int:
+        """path index of completed tau-bar e's last bar; _BIG for a bar not completed yet."""
         return self.end[e] if 0 <= e < self.nb else _BIG
 
 
@@ -671,12 +663,12 @@ class Analysis:
             if not _fits(se.res, ti):
                 continue
             j = se.start
-            last_complete_bucket = True
             while j <= se.end:
                 b = _bucket(self.mod0[j], ti)
                 k = j
                 while k + 1 <= se.end and _bucket(self.mod0[k + 1], ti) == b:
                     k += 1
+                # a bucket still forming (session in progress) is never a tau-bar
                 if se.complete or _bucket_end(b, ti, se.close) <= se.cov_end:
                     T.start.append(j)
                     T.end.append(k)
@@ -686,13 +678,7 @@ class Analysis:
                     T.c.append(self.c[k])
                     T.cc.append(self.cc[k])
                     T.sess.append(s)
-                    last_complete_bucket = True
-                else:
-                    T.forming_start = j
-                    last_complete_bucket = False
                 j = k + 1
-            if not se.complete and last_complete_bucket and se.cov_end < se.close:
-                T.forming_start = n          # next bucket began by the clock, no bar complete yet
         nb = T.nb = len(T.start)
         tr = [0.0] * nb
         for i in range(nb):
@@ -734,11 +720,17 @@ class Analysis:
         return T.atr[b] if b >= 0 else _NAN
 
     def maxage_exp(self, ti: int, kfb: int) -> int:
-        """S/Z/M/F max age: expire at the start of the 300th (1D: 250th) tau-bar after the one
-        containing known_from (mtfl_marker.maxage_exp)."""
+        """S/Z/M/F max age (lock 2.11): the level lives 300 (1D: 250) tau-bars counting the one
+        containing known_from, and expires when the last of them completes.
+
+        mtfl_marker.maxage_exp writes this as "the START of tau-bar b + 300", which in its
+        contiguous 1-minute index is the same bar as "the END of tau-bar b + 299, plus one". Live
+        the two differ when b + 299 is a session's last bar: the next bar only starts at the next
+        open, so the end form is used (the study's index equals it everywhere)."""
         T = self.taus[ti]
         b = T.first_after[kfb if kfb <= self.n else self.n]
-        return T.start_of(b + (MAXAGE_1D if ti == TI_1D else MAXAGE_TAU))
+        last = b + (MAXAGE_1D if ti == TI_1D else MAXAGE_TAU) - 1
+        return T.end[last] + 1 if last < T.nb else _BIG
 
     # ------------------------------------------------------------------ structure (zigzag)
     def build_structure(self, ti: int) -> None:

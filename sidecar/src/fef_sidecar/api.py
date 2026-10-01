@@ -5547,9 +5547,13 @@ async def chart_regression_channel(
 #
 # History comes from the shared 25-minute cache (_get_cached_bars, extended hours included, cut to
 # 09:30-16:00 ET by the engine). Daily bars cannot be cut to regular hours after the fact, so they
-# and today's 1-minute bars are fetched RTH-only through a small cache of their own. 4H levels can
-# live 300 4H-bars (~150 sessions): with 3 months of 30-minute bars the oldest 4H structure is not
-# drawn (tests/test_structure_levels.py measures it).
+# and today's 1-minute bars are fetched RTH-only through a small cache of their own.
+# 4H levels can live 300 4H-bars (~150 sessions), so the 30-minute window decides how much 4H
+# structure is drawn. Measured against the study (tests/fixtures/
+# measure_structure_levels_live_windows.py): 3 M -> 4H swings 16/39, 4H zones 0/12, every other
+# cell 100 %; 6 M -> 93.9 % overall; 8 M -> 100 %. 3 M is kept until an 8 M request has been
+# timed against IBKR (fetch_historical_bars times out at 20 s and then resets the historical
+# connection the chart shares).
 _SL_HIST_5M = ("5 mins", "20 D")
 _SL_HIST_30M = ("30 mins", "3 M")
 _SL_DAILY = ("1 day", "2 Y")

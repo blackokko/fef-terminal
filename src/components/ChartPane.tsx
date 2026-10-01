@@ -764,9 +764,10 @@ export function ChartPane() {
         }));
         zones.setZones(plan.zones);
         const c = plan.counts;
-        setLevelsNote(payload.status === "ok"
+        setLevelsNote((payload.status === "ok"
           ? `levels ${c.levels} · zones ${c.zones}${showSetups ? ` · setups ${c.setups}` : ""}`
-          : `levels: ${payload.status}`);
+          : `levels: ${payload.status}`)
+          + (payload.calendarStale ? " · NYSE calendar out of date (structure_levels.py)" : ""));
       } catch (e) {
         if (!cancelled) setLevelsNote("levels: fetch failed");
         console.error("structure levels fetch failed:", e);

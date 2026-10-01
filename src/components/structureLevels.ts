@@ -148,6 +148,7 @@ export interface SlPayload {
   asof: number | null;
   last_price: number | null;
   atr1D: number | null;
+  calendarStale: boolean;   // the sidecar's NYSE holiday table no longer covers the data
   levels: SlLevel[];
   groups: SlGroup[];
   setups: SlSetup[];
@@ -219,6 +220,7 @@ export function parseStructurePayload(raw: unknown): SlPayload | null {
     asof: isNum(o.asof) ? o.asof : null,
     last_price: isNum(o.last_price) ? o.last_price : null,
     atr1D: isNum(atr["1D"]) ? (atr["1D"] as number) : null,
+    calendarStale: o.calendar_stale === true,
     levels: parseList(o.levels, parseLevel),
     groups: parseList(o.groups, parseGroup),
     setups: parseList(o.setups, parseSetup),
