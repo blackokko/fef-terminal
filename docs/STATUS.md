@@ -62,6 +62,23 @@ agent picking this up cold. The research detail behind every number here is in
   - The live check (LV-1 / LV-M) needs the operator's real-money approval; LV-0 needs only their export.
 - **Dispatch 16:30 CT:** executors started for `ovlay` (E41) and `volman` (E23), both on disk. `pead2` is still
   running and pulls after `volxs` tonight. `volxs` files at about 21:00 CT.
+- **`ovlay` RAN (E41 → H43, archive 9b05dbf), the operator's "better entry rules" question.** Every variant is
+  Tier 0:
+  - P1, the operator's "sell when SPY ≤ my cost basis": INSUFFICIENT, 25 months, −$1.04/chain.
+  - P2, book drawdown ≥ 3 %: does not pay, −$6.11.
+  - P3, protective puts: a hedge at a price, the same as holding ~4 % less stock.
+  - **The live RE rule is PRO-CYCLICAL:** −$152 a lot in the book's losing months vs +$93, t −4.76.
+  - At 5 lots RE is **no better than SPY shares at the same risk** (−$474 a month, t −5.39). It deepens the book's
+    max drawdown from −16.4 % to −19.1 %.
+  - The channel touch (S3B) is the only SPY spread rule that is neither pro-cyclical nor worse than shares.
+  - SPYPCS-4 re-charged to M_eff 39 scores P 0.852 and stays Tier 1, labelled FILL-DEPENDENT. It holds while fills
+    stay ≤ 1.60¢ a leg from the mid (author ruling).
+  - **Operator decision open:** what to do with RE's 5 lots.
+- **`volman` RAN (E23 → H44, archive 3132207):** vol-managed sizing adds no exposure-matched return. TREND is Branch
+  D (harness) and SPY Branch F (one episode); both Tier 0.
+  - **§J:** trend v3's backtest filled at the NEXT OPEN, but the live MOC executor fills at a later close. The next
+    close alone costs 0.6–1.0 pp/yr.
+  - Candidate fix: MOO orders at S+1, a live-path change that needs the operator's go and a review.
 - **`spxwide2` (E21 → H42): Branch A, PROVISIONAL.**
   - P 0.986; +14.26 %/yr net β-matched alpha (t 2.19).
   - The alpha is concentrated in 2025–26: without it, +5.8 %/yr, t 1.56. Tick checks are pending.
