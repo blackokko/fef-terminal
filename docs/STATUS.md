@@ -55,6 +55,11 @@ agent picking this up cold. The research detail behind every number here is in
   - P 0.986; +14.26 %/yr net β-matched alpha (t 2.19).
   - The alpha is concentrated in 2025–26: without it, +5.8 %/yr, t 1.56. Tick checks are pending.
   - Forward ledger only. There is no runner unless the operator asks.
+  - **The forward PAPER ledger is LIVE:** task FEF-Spxwide2Ledger runs weekdays at 17:30 CT
+    (`run_ledgers.ps1 -Spxwide2`) and places no orders.
+    - The 10-02 dry run was exit 0, all FINAL: 504 members, 568 ThetaData EOD requests.
+    - The wrapper now waits, up to 40 min, while another study's pull log is fresh, then stamps its own log. If the
+      wait runs out it books with `--no-theta`; those days stay provisional.
 - **`ovlay` (E41) pre-registered:** the operator's "sell puts when SPY is below my cost basis" idea, plus protective
   puts, judged at book level.
 - **Operator answers, 10-02 ~13:00 CT** (they close the "decisions open" list below):
