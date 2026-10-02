@@ -4,6 +4,49 @@ Current state of the operation, what was just learned, and what to do next, in o
 agent picking this up cold. The research detail behind every number here is in
 `blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
 
+**2026-10-02 late afternoon — TWS's API stopped accepting connections: today's sleeve rebalance did NOT trade.**
+- **What happened:**
+  - At 14:30 CT the sleeve executor found port 7497 refusing connections and placed nothing. The trend month-end
+    rebalance (12 MOC orders at 1:1) did not trade.
+  - `record-fills` at 15:15 (exit 2) and the SPY runner's `record` at 15:25 (exit 7) failed the same way.
+- **The state of TWS:**
+  - TWS is running and logged in to paper (PID 2436, started 07:49).
+  - It listens on `[::]:7497` but completes no connection; the sidecar's reconnects sit in SYN_SENT.
+  - The API worked at 08:43 CT, when the morning `-PlanOnly` read positions.
+- **Nothing was at risk.**
+  - The SPY RE book was flat (no Friday entries).
+  - No executor order was placed, so no day is uncertified: certified 09-30, and 10-01 placed nothing.
+- **The operator must fix TWS** (a pop-up, or restart it). Agents: never kill TWS, and never restart the sidecar.
+- **The $250k resize: the operator chose option 3 on 10-02 (trend v3 $125k + PEAD $125k).**
+  - `sleeve-capital-250k` (review round 2 SHIP, 182 tests) merges once TWS accepts connections again. The order is:
+    1. `record-fills` by hand;
+    2. merge and test;
+    3. push;
+    4. `run_sleeve_executor.ps1 -PlanOnly`.
+  - Monday 10-05's plan is then the missed rebalance plus the resize.
+- **Channel-touch S3B runner** (operator: "Build the channel touch runner. It should be doing those orders even when
+  other things are open…"; patient-mid A/B: "run it"):
+  - Built: an independent book, client 184, 4 lots, take-profit + plain stop, binding kill rule. 395 tests, mutation
+    106/106.
+  - Review round 1: **SHIP AFTER FIXES**, 9 findings. The major one: an unreadable other-book state must not block an
+    expiration-day close. Also, the wrapper's `max()` of exit codes hid alarms.
+  - Fix round now, then review round 2, merge and the wrapper install. The earliest S3B order is Mon 10-05 15:30 ET.
+  - `fillq` Amendment 1 (archive f3e5173): the A/B covers both books, and RE is forced L while S3B holds a chain.
+- **`spxwide2` (E21 → H42): Branch A, PROVISIONAL.**
+  - P 0.986; +14.26 %/yr net β-matched alpha (t 2.19).
+  - The alpha is concentrated in 2025–26: without it, +5.8 %/yr, t 1.56. Tick checks are pending.
+  - Forward ledger only. There is no runner unless the operator asks.
+- **`ovlay` (E41) pre-registered:** the operator's "sell puts when SPY is below my cost basis" idea, plus protective
+  puts, judged at book level.
+- **Operator answers, 10-02 ~13:00 CT** (they close the "decisions open" list below):
+  - TWS API precautions: done.
+  - The RE runner is a "leverage sleeve": keep 5 lots and research better entries (`ovlay`).
+  - Build S3B; run the A/B.
+  - The real-money fill test comes later. The manual mid fills were real money (export pending).
+  - Commissions: Tiered.
+  - The SEC User-Agent is approved, for SEC requests only.
+  - A SPY short hedge is OK on paper.
+
 **2026-10-02 afternoon — research pipeline running** (operator: "I want to keep pre-registering 10s of approaches every few hours"):
 - `IDEAS_BACKLOG.md` holds 47 ranked ideas. **E21–E40 are pre-registered**, with shared harness docs for SPY timing,
   earnings and SPY options.
@@ -16,8 +59,9 @@ agent picking this up cold. The research detail behind every number here is in
 - **Running:** `spxwide2`, `pead2` (intraday cells pending ThetaData), `fillq`.
 - **Session crons** run new batches at 06:41/17:41 CT and dispatch every 4 h. Session-only: re-arm them if the session
   restarts.
-- **Operator decisions open:** the TWS API precautions (before Mon); the SPY runner's size and the channel-touch build;
-  a real-money fill test; the SEC contact string; a SPY short hedge; the IBKR commission plan.
+- ~~**Operator decisions open:** the TWS API precautions (before Mon); the SPY runner's size and the channel-touch build;
+  a real-money fill test; the SEC contact string; a SPY short hedge; the IBKR commission plan.~~ All answered at
+  ~13:00 CT (see the late-afternoon block above).
 
 **2026-10-02 late morning — rule D adopted, and the archive re-scored** (operator: "Do 1 and 2. Hold on 3.").
 - **The rule** (registry §D★, AGENTS.md rule 7): probability, not proof, decides what runs on paper.
@@ -30,8 +74,9 @@ agent picking this up cold. The research detail behind every number here is in
   - **PEAD is Tier 0:** the `pead2` interim (PIT universe, β-hedged) gives −$1.83 to −$5.07 per event; the old edge
     was market beta plus a hindsight stock list.
   - The operator's SPY RE rule scores P 0.58 at MID+1 (0.90 if fills really are at the mid).
-- **The $250k resize (`sleeve-capital-250k`, review SHIP) is HELD unmerged until the operator decides PEAD and
-  trend sizes.** If it is not merged, Monday's run trades at the old 1:1 size (safe).
+- ~~**The $250k resize (`sleeve-capital-250k`, review SHIP) is HELD unmerged until the operator decides PEAD and
+  trend sizes.**~~ Decided: option 3 (trend $125k + PEAD $125k). It is now held only until TWS's API is back (see the
+  late-afternoon block). If it is not merged, Monday's run trades at the old 1:1 size (safe).
 
 **2026-10-02 morning — operator requests in flight:**
 - **Sleeves sized to a $250k base** (50/50: trend v3 $125k, PEAD $125k, x12.5 on the $10k ledgers). Built on archive branch
@@ -53,7 +98,8 @@ agent picking this up cold. The research detail behind every number here is in
   - A same-day re-run leaves the ledgers byte-identical.
   - It was run by hand at 08:41 CT today, so **today's 14:30 run trades the trend month-end rebalance at the old 1:1
     size**: 12 MOC orders (SELL SPY, IWM, EFA, HYG, GLD and PEAD's NVS and DELL; BUY QQQ, EEM, USO, UUP and DBC).
-    Monday's $250k change is then a pure resize.
+    Monday's $250k change is then a pure resize. **It did not trade: TWS's API was down at 14:30; see the
+    late-afternoon block. Monday trades the rebalance and the resize together.**
   - `fef-watchers` is not in git: backups of the edited `run_ledgers.ps1` / `install_tasks.ps1` are in the session
     scratchpad.
 
