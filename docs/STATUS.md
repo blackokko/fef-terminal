@@ -30,8 +30,27 @@ agent picking this up cold. The research detail behind every number here is in
     106/106.
   - Review round 1: **SHIP AFTER FIXES**, 9 findings. The major one: an unreadable other-book state must not block an
     expiration-day close. Also, the wrapper's `max()` of exit codes hid alarms.
-  - Fix round now, then review round 2, merge and the wrapper install. The earliest S3B order is Mon 10-05 15:30 ET.
-  - `fillq` Amendment 1 (archive f3e5173): the A/B covers both books, and RE is forced L while S3B holds a chain.
+  - Review round 2 (16:15 CT): all nine fixes verified, 960 archive tests pass, mutation 173/173. **SHIP AFTER
+    FIXES**:
+    - a usage error (exit 2) must alarm in the wrapper — required;
+    - a degraded RE must reach its existing "roll failed on data → close after 2 marks" fallback — option (b), the
+      reviewer's pick, taken by the author; the operator was told and may override;
+    - two low items and some test gaps.
+  - Fix round 2 now, then a short round 3, merge and the wrapper install (only after the merge). The earliest S3B
+    order is Mon 10-05 15:30 ET.
+  - `fillq` amendments:
+    - Amendment 1 (f3e5173): the A/B covers both books, and RE is forced L while S3B holds a chain;
+    - Amendment 6 (db2fb13): a rest ending AT OR AFTER the limit is forced.
+- **`fillq` Phase 0 built (E25, archive 40a1238).**
+  - Every decision cell is PENDING until 20 forward fills per runner; the SPY runner's first report comes about
+    2026-11-20. F1 (MID+1) stays the fill model.
+  - **G5 flagged: IBKR paper MOC fills are not the official close** (09-30: 1 of 10 equal; mean +7.6 bp). So
+    `FORWARD_CHECKS.md` §1–2 now price the sleeves' MOC P&L and trend kill rule (c) at the official close plus
+    commission.
+  - New task **FEF-Fillq** at 18:15 CT (`run_ledgers.ps1 -Fillq`; no orders, no broker).
+  - The live check (LV-1 / LV-M) needs the operator's real-money approval; LV-0 needs only their export.
+- **Dispatch 16:30 CT:** executors started for `ovlay` (E41) and `volman` (E23), both on disk. `pead2` is still
+  running and pulls after `volxs` tonight. `volxs` files at about 21:00 CT.
 - **`spxwide2` (E21 → H42): Branch A, PROVISIONAL.**
   - P 0.986; +14.26 %/yr net β-matched alpha (t 2.19).
   - The alpha is concentrated in 2025–26: without it, +5.8 %/yr, t 1.56. Tick checks are pending.
