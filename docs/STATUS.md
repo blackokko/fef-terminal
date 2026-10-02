@@ -4,6 +4,21 @@ Current state of the operation, what was just learned, and what to do next, in o
 agent picking this up cold. The research detail behind every number here is in
 `blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
 
+**2026-10-01 evening — the `spypcs` verdict landed: Branch E (underpowered).** (archive H39)
+- **Results:**
+  - The operator's process run mechanically: primary W3 +$1.63 per chain (t +0.28; detection floor $14.42).
+  - The live rule RE: +$5.18 (t +1.30).
+  - About +0.7–3.4 %/yr on $10k at 1 lot, vs SPY +15.2 %/yr.
+- **What hurts:**
+  - The take-profit schedule COSTS money: holding to expiration day earns +$16.30 per chain (t +2.12).
+  - Rolling COSTS money: a plain 2x stop beats it by $3.08; there was never a second roll.
+  - It is a mid-fill strategy: the edge is about 1 cent of slippage per leg.
+- **Sizing:** 5 lots on $10k would have been wiped out in March 2020. One chain's max loss under 10 % of equity needs
+  about $48,900.
+- **A post-hoc lead:** the S3b channel-touch entry with a plain stop, +$24.75 (t +3.81). It needs its own pre-registration
+  and a forward ledger.
+- **The runner keeps running on paper** (RE + 5 lots, merged tonight). The operator decides what to change.
+
 **2026-10-01:** the **SPY put-spread runner went LIVE on paper** at the operator's request ("just start
 paper today. we can look at the backtest later today or going into friday and this weekend") — ahead of
 the `spypcs` study's verdict, whose data pull is 63 % done (it crawled after midnight on the ThetaData side
