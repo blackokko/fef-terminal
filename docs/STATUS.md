@@ -4,6 +4,20 @@ Current state of the operation, what was just learned, and what to do next, in o
 agent picking this up cold. The research detail behind every number here is in
 `blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
 
+**2026-10-02 late morning — rule D adopted, and the archive re-scored** (operator: "Do 1 and 2. Hold on 3.").
+- **The rule** (registry §D★, AGENTS.md rule 7): probability, not proof, decides what runs on paper.
+  - P = Φ(t − E[max of M_eff null t's]) at realistic fills.
+  - Tier 1 (P ≥ 0.75, capped worst case, kill rule) gets small paper orders.
+  - Watch (0.60–0.75) gets a ledger only.
+- **`DECISION_SCORES.md`** (archive b19c81d): 532 rows; **2 Tier 1, 14 Watch**.
+  - Tier 1: S3b channel-touch SPY spreads with a plain stop (P 0.93, 4 lots — ON HOLD per the operator) and trend
+    v3 (P 0.79; rule-D size ≈ $22k vs the planned $125k).
+  - **PEAD is Tier 0:** the `pead2` interim (PIT universe, β-hedged) gives −$1.83 to −$5.07 per event; the old edge
+    was market beta plus a hindsight stock list.
+  - The operator's SPY RE rule scores P 0.58 at MID+1 (0.90 if fills really are at the mid).
+- **The $250k resize (`sleeve-capital-250k`, review SHIP) is HELD unmerged until the operator decides PEAD and
+  trend sizes.** If it is not merged, Monday's run trades at the old 1:1 size (safe).
+
 **2026-10-02 morning — operator requests in flight:**
 - **Sleeves sized to a $250k base** (50/50: trend v3 $125k, PEAD $125k, x12.5 on the $10k ledgers). Built on archive branch
   `sleeve-capital-250k` (133 tests, mutation 60/60), under adversarial review. It merges only after a SHIP verdict; the
