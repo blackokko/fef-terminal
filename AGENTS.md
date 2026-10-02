@@ -30,10 +30,14 @@ the index of ~40 studies and 36 methodology rules, and its `README.md` orients a
 5. **Do not `git commit` unless the operator asks. Never push without being asked.**
 6. **No purchases, signups, trials, or credentials** — including data subscriptions and site
    memberships — without explicit approval.
-7. **Evidence-gated shipping.** Strategy or gate changes require an out-of-sample backtest showing
-   improvement, pre-registered in a `*_LOCK.md` in the archive before any data is touched.
-   Fifteen direction-signal nulls and the closed doors in registry §H stay closed; do not re-open
-   one without new evidence.
+7. **Evidence-gated shipping — rule D (registry §D★, from 2026-10-02).** Strategy or gate changes are
+   pre-registered in a `*_LOCK.md` in the archive before any data is touched, and measured honestly (every
+   registry §K measurement control). What may RUN is then decided by probability, not proof:
+   - **paper orders** need P(edge > 0 after costs) ≥ 0.75 by `fefharness.stats.p_positive` at the realistic
+     fill, a capped worst case and a pre-registered forward kill rule;
+   - **live money** needs a forward paper record (≥ 6 months and ≥ 30 trades, P ≥ 0.90) and the operator's go.
+   Closed doors whose best estimate was ≤ 0 at realistic fills stay closed (registry §H); do not re-open one
+   without new evidence. The ranked list of everything tested is `DECISION_SCORES.md` in the archive.
 8. **Research runs on ThetaData historical** (real NBBO to 2022), never on live-captured
    `historical_bar` rows from May–Jul 2026 (~40% stale minutes). Open every research DB
    `file:...?mode=ro` with `pragma query_only=1`.

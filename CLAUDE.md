@@ -17,9 +17,11 @@ This file keeps the Claude-specific notes.
   `loop.py`, `position_reconcile.py`) get an adversarial second-context review before shipping —
   green tests alone missed the 7/6 oversell race, the price-contamination bug, and the 8/12
   `Bag()` constructor error that silently killed 197 spread orders.
-- **Evidence-gated shipping**: strategy/gate changes require a backtest (out-of-sample) showing
-  improvement before going live. Every gate skip logs a counterfactual. 15 direction-signal nulls
-  are closed doors — do not re-open without new evidence (see user memory + OPERATING_CARD).
+- **Evidence-gated shipping — rule D** (registry §D★, 2026-10-02): measure honestly first (pre-registered LOCK,
+  every control); then paper incubation when P(edge > 0 after costs) ≥ 0.75 (`fefharness.stats.p_positive`),
+  capped worst case and a forward kill rule; live only after a forward paper record and the operator's go.
+  Every gate skip logs a counterfactual. The 15 direction-signal nulls were ≤ 0 at realistic fills: closed
+  doors, do not re-open without new evidence (see user memory + OPERATING_CARD).
 - Never place, modify, or cancel broker orders outside the bot's own logic unless the user asks.
 - Do not `git commit` unless the user asks.
 
