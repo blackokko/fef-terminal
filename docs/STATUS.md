@@ -36,8 +36,19 @@ agent picking this up cold. The research detail behind every number here is in
     - a degraded RE must reach its existing "roll failed on data → close after 2 marks" fallback — option (b), the
       reviewer's pick, taken by the author; the operator was told and may override;
     - two low items and some test gaps.
-  - Fix round 2 now, then a short round 3, merge and the wrapper install (only after the merge). The earliest S3B
-    order is Mon 10-05 15:30 ET.
+  - Review round 3: **SHIP** (970 tests, mutation 192/192, wrapper 149/149 under PS 5.1).
+  - **MERGED 17:30 CT (archive 3b85aa3) and INSTALLED.**
+    - `fef-watchers\run_spypcs_executor.ps1` + `spypcs_wrapper_lib.ps1` (from `deploy/`). It runs RE then S3B on
+      every command, with per-book toasts. All three switches are on: RE live, S3B live, A/B on.
+    - Smoke test `status`: both books flat, exit 0.
+    - Rollback: `D:\fef-data\watchers_backup\20261002\run_spypcs_executor.ps1.pre_s3b`, which runs RE alone with
+      the merged code.
+  - **S3B's earliest entry is Tue 10-06 at 14:30 CT** (Tue–Thu only, like RE). RE may rest patiently (the A/B) from
+    Mon 10-05.
+  - LOW follow-ups from round 3 (non-blocking):
+    - the reason text when an entry's final check blocks;
+    - test gaps Ma/Mk;
+    - a RUNBOOK line for the ghost-fill case.
   - `fillq` amendments:
     - Amendment 1 (f3e5173): the A/B covers both books, and RE is forced L while S3B holds a chain;
     - Amendment 6 (db2fb13): a rest ending AT OR AFTER the limit is forced.
