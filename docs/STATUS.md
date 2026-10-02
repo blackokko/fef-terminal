@@ -43,7 +43,10 @@ It awaits "terminal closed" to merge, rebuild and restart.
 The operator also asked for two changes to the SPY spread runner (spypcs Amendment 9):
 - **re-entry** on any flat Tue-Thu at 10:00 CT, with no weekly cap and still no overlap;
 - **5 lots** with real partial-fill handling.
-Both are being built in a worktree and get an adversarial review before Tue 10/6 10:00 CT. **USO approved** for the trend
+**Both are MERGED** (archive 26968e1, 2026-10-01 ~20:25 CT) after three adversarial review rounds: SHIP AFTER
+FIXES, SHIP AFTER FIXES, then SHIP. There are 278 tests and the mutation check catches 114/114. A read-only probe of the real
+paper TWS (client 179) timed the new position and execution reads at a few ms. The next entry is Tue 10/6 at 10:00 CT,
+for 5 lots. TODO before Fri 11-27: an early-close-day retry tick. **USO approved** for the trend
 sleeve, so the whole trend universe trades automatically.
 
 **2026-09-30 in one paragraph:** the sleeve executor placed its first orders (10 MOC buys, all filled,
