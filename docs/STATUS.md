@@ -4,6 +4,14 @@ Current state of the operation, what was just learned, and what to do next, in o
 agent picking this up cold. The research detail behind every number here is in
 `blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
 
+**2026-10-02 early — `ivsignal` RAN** (archive H40):
+- **SKEW:** Branch E — the right sign, but underpowered (FM t 1.43).
+- **VS:** Branch C, nothing.
+- Neither is a sleeve.
+- The shared single-stock option panel is complete (`D:\fef-data\xsopt\PANEL_DONE.txt`). The **`volxs` executor started ~04:10 CT.**
+- It also found that the "8-hour ThetaData stall" of the night of 10-01 was the PC being put to sleep by another program;
+  corrected in registry J.
+
 **2026-10-01 evening — the `spypcs` verdict landed: Branch E (underpowered).** (archive H39)
 - **Results:**
   - The operator's process run mechanically: primary W3 +$1.63 per chain (t +0.28; detection floor $14.42).
