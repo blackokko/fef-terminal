@@ -4,6 +4,21 @@ Current state of the operation, what was just learned, and what to do next, in o
 agent picking this up cold. The research detail behind every number here is in
 `blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
 
+**2026-10-02 afternoon — research pipeline running** (operator: "I want to keep pre-registering 10s of approaches every few hours"):
+- `IDEAS_BACKLOG.md` holds 47 ranked ideas. **E21–E40 are pre-registered**, with shared harness docs for SPY timing,
+  earnings and SPY options.
+- **Results so far:**
+  - `spypcs2` RAN (H41): the operator's live SPY rule is Tier 0, α −$44.75/month; the channel-touch × plain stop is
+    Tier 1 (P 0.87, 4 lots).
+  - `pead2` interim: PEAD Tier 0. The operator keeps it at $125k on paper; see `FORWARD_CHECKS.md`.
+  - `spxwide2` found look-ahead in the old dip-buy code; it is re-testing now, with an independent paper ledger due
+    to go live at 17:30 CT.
+- **Running:** `spxwide2`, `pead2` (intraday cells pending ThetaData), `fillq`.
+- **Session crons** run new batches at 06:41/17:41 CT and dispatch every 4 h. Session-only: re-arm them if the session
+  restarts.
+- **Operator decisions open:** the TWS API precautions (before Mon); the SPY runner's size and the channel-touch build;
+  a real-money fill test; the SEC contact string; a SPY short hedge; the IBKR commission plan.
+
 **2026-10-02 late morning — rule D adopted, and the archive re-scored** (operator: "Do 1 and 2. Hold on 3.").
 - **The rule** (registry §D★, AGENTS.md rule 7): probability, not proof, decides what runs on paper.
   - P = Φ(t − E[max of M_eff null t's]) at realistic fills.
