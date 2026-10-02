@@ -15,10 +15,18 @@ agent picking this up cold. The research detail behind every number here is in
   - `pead2`: the live PEAD re-tested on a PIT universe, with real earnings dates, a beta hedge and entry timing;
   - `strev`: short-term reversal.
   The `pead2` executor is running (daily-data cells first). The others queue on ThetaData behind `volxs`.
-- **Found: the live executor trades ledger bookings a session late.** The 15:15 CT ledger job books yesterday's events
-  after that day's 14:30 CT executor run, so PEAD entries filled at the day+2 close and trend rebalances three sessions
-  after the signal. `fef-watchers/run_ledgers.ps1 -PreExec` (pead + trend updaters only) fixes the ordering. It is built
-  and dry-run tested; scheduling it daily is pending the operator's OK.
+- **Fixed 10-02 (operator: "fix the timing issues"): the executor traded ledger bookings a session late.** The
+  15:15 CT ledger job booked yesterday's events after that day's 14:30 CT executor run, so PEAD filled at the day+2
+  close and trend three sessions after the signal.
+  - New weekday task **`FEF-LedgerPreExec` at 08:45 CT** runs `fef-watchers/run_ledgers.ps1 -PreExec`: the pead + trend
+    updaters only, with no record-fills and no broker contact.
+  - The executor now trades PEAD at the day+1 close and trend at the S+2 close.
+  - A same-day re-run leaves the ledgers byte-identical.
+  - It was run by hand at 08:41 CT today, so **today's 14:30 run trades the trend month-end rebalance at the old 1:1
+    size**: 12 MOC orders (SELL SPY, IWM, EFA, HYG, GLD and PEAD's NVS and DELL; BUY QQQ, EEM, USO, UUP and DBC).
+    Monday's $250k change is then a pure resize.
+  - `fef-watchers` is not in git: backups of the edited `run_ledgers.ps1` / `install_tasks.ps1` are in the session
+    scratchpad.
 
 **2026-10-02 early — `ivsignal` RAN** (archive H40):
 - **SKEW:** Branch E — the right sign, but underpowered (FM t 1.43).
