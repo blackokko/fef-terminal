@@ -1,8 +1,24 @@
-# STATUS — 2026-10-01
+# STATUS — 2026-10-02
 
 Current state of the operation, what was just learned, and what to do next, in order. Written for an
 agent picking this up cold. The research detail behind every number here is in
 `blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
+
+**2026-10-02 morning — operator requests in flight:**
+- **Sleeves sized to a $250k base** (50/50: trend v3 $125k, PEAD $125k, x12.5 on the $10k ledgers). Built on archive branch
+  `sleeve-capital-250k` (133 tests, mutation 60/60), under adversarial review. It merges only after a SHIP verdict; the
+  resize trades at the next 14:30 CT run after the merge (target Mon 10-05).
+- **Five equity studies pre-registered** (archive c3c8420, registry E16-E20):
+  - `sspcs`: single-stock put spreads / CSPs;
+  - `sswheel`: single-stock wheel and buy-write;
+  - `dispersion`: SPY vs constituents;
+  - `pead2`: the live PEAD re-tested on a PIT universe, with real earnings dates, a beta hedge and entry timing;
+  - `strev`: short-term reversal.
+  The `pead2` executor is running (daily-data cells first). The others queue on ThetaData behind `volxs`.
+- **Found: the live executor trades ledger bookings a session late.** The 15:15 CT ledger job books yesterday's events
+  after that day's 14:30 CT executor run, so PEAD entries filled at the day+2 close and trend rebalances three sessions
+  after the signal. `fef-watchers/run_ledgers.ps1 -PreExec` (pead + trend updaters only) fixes the ordering. It is built
+  and dry-run tested; scheduling it daily is pending the operator's OK.
 
 **2026-10-02 early — `ivsignal` RAN** (archive H40):
 - **SKEW:** Branch E — the right sign, but underpowered (FM t 1.43).
