@@ -8,6 +8,10 @@ agent picking this up cold. The research detail behind every number here is in
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
 - **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
 - **The PC force-slept 23:06 Fri → 12:48 Sat.** The FEF tasks have WakeToRun=False. The operator must keep it awake (and TWS up) Monday.
+- **`spxwide2` checks applied (archive 7507898):** Branch A and Tier 1 hold: +14.17 %/yr, P 0.985, ≈ $19k (cautious $11.6k). Without 2025–26 it is +5.7 %/yr.
+  - G0(f) gap fills are PARTIAL (39/50). 19 requests run Sunday after `chanx`.
+  - Runner note: entries must join the listing exchange's opening auction.
+  - The forward ledger stays the plan, no runner unless the operator asks.
 - **`pead2` FINAL (E19 → H48, archive 49bb7ae): Branch C, Tier 0.** The live PEAD edge is market beta plus a look-ahead universe.
   - P1 hedged: −$4.95/event (t −0.70). The live-like hedged cell: −$1.61 (P 0.42).
   - The live lag costs nothing measurable.
