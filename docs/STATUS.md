@@ -8,6 +8,10 @@ agent picking this up cold. The research detail behind every number here is in
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
 - **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
 - **The PC force-slept 23:06 Fri → 12:48 Sat.** The FEF tasks have WakeToRun=False. The operator must keep it awake (and TWS up) Monday.
+- **`bookcomp` RAN (E58 → H50, archive eca60cf): no deployable strategy pays when the book loses.** Only the trend short side does, and it is SPY beta, not deployable, era-unstable and costly.
+  - Better than SPY shares at matched risk: `spxwide2` (+$223/mo, t 2.93) and overnight arm B (+$50/mo).
+  - Not better: the RE rule (pro-cyclical) and idxdip's S3b × SPY (−$39/mo), so idxdip gets a ledger only.
+  - §H is delivered as `bookcomp_h.py`. LOCK_TEMPLATE §7c points to it, with Amendment 4's gap-tested labels.
 - **`peadrisk` RAN (E55 → H49, archive 965aaad):** if PEAD keeps running, use 10 × $12.5k slots instead of 5 × $25k.
   - That cuts the bad-year drawdown 29.5 % at no measurable cost. It is not an edge, and it is universe- and threshold-dependent.
   - Caps, the SPY hedge and equal-risk sizing don't earn their keep.
