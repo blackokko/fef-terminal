@@ -8,6 +8,11 @@ agent picking this up cold. The research detail behind every number here is in
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
 - **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
 - **The PC force-slept 23:06 Fri → 12:48 Sat.** The FEF tasks have WakeToRun=False. The operator must keep it awake (and TWS up) Monday.
+- **`peadrisk` RAN (E55 → H49, archive 965aaad):** if PEAD keeps running, use 10 × $12.5k slots instead of 5 × $25k.
+  - That cuts the bad-year drawdown 29.5 % at no measurable cost. It is not an edge, and it is universe- and threshold-dependent.
+  - Caps, the SPY hedge and equal-risk sizing don't earn their keep.
+  - Puts straddle: the real-quote check needs the operator's yes.
+  - The change touches the ledger and the executor, so it needs the operator's go and a review.
 - **`spxwide2` checks applied (archive 7507898):** Branch A and Tier 1 hold: +14.17 %/yr, P 0.985, ≈ $19k (cautious $11.6k). Without 2025–26 it is +5.7 %/yr.
   - G0(f) gap fills are PARTIAL (39/50). 19 requests run Sunday after `chanx`.
   - Runner note: entries must join the listing exchange's opening auction.
