@@ -8,6 +8,15 @@ agent picking this up cold. The research detail behind every number here is in
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
 - **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
 - **The PC force-slept 23:06 Fri → 12:48 Sat.** The FEF tasks have WakeToRun=False. The operator must keep it awake (and TWS up) Monday.
+- **`idxdip` RAN (E26 → H47, archive c98c651):**
+  - **S3b channel touch on SPY SHARES is Tier 1 by rule D** (P 0.919, ≈ $9.9k), out of sample on 1993–2016. It is NOT confirmed:
+    - a plain 5-day-drop twin earns 90 % as much;
+    - time reversal earns more;
+    - the edge is ≈ 0 since 2010;
+    - it is the same bet as SPYPCS-4.
+  - RSI(2) is Tier 0: the 15:30 clock eats 97 %.
+  - **No runner without the operator's go**, plus a ≥ 1-month forward ledger and L1–L5 (incl. the per-sleeve governor).
+  - K43 added.
 - **Batch 3 pre-registered (archive 18032e4), E52–E61:**
   - datetime: the honest backtest is impossible on disk, so it is Watch-capped;
   - peerxfer, dipnews, fipmom;
