@@ -8,6 +8,15 @@ agent picking this up cold. The research detail behind every number here is in
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
 - **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
 - **The PC force-slept 23:06 Fri → 12:48 Sat.** The FEF tasks have WakeToRun=False. The operator must keep it awake (and TWS up) Monday.
+- **Batch 4 pre-registered (archive d6633c1 + this commit), E62–E69.**
+  - Decision support:
+    - **govcap** (E62): the executor turnover governor, report due 10-16; running.
+    - **regate** (E63): the RE leverage sleeve's sizing; running.
+    - dipexec (E64) and bookdd (E65).
+  - Strategies:
+    - **dipmid** (E66): the S&P 400 dip-buy, P(T1) ≈ 0.40. Its ≈ 8k EOD pull is queued ahead of `sspcs`.
+    - earnmid (E67) and insidmid (E68): likely to fail on the mid-cap drift under a SPY-only hedge.
+    - dipvol (E69): a `spxwide2` variant covered by O-FIX.
 - **`bookcomp` RAN (E58 → H50, archive eca60cf): no deployable strategy pays when the book loses.** Only the trend short side does, and it is SPY beta, not deployable, era-unstable and costly.
   - Better than SPY shares at matched risk: `spxwide2` (+$223/mo, t 2.93) and overnight arm B (+$50/mo).
   - Not better: the RE rule (pro-cyclical) and idxdip's S3b × SPY (−$39/mo), so idxdip gets a ledger only.
