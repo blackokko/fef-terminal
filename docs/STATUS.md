@@ -1,8 +1,23 @@
-# STATUS — 2026-10-02
+# STATUS — 2026-10-03
 
 Current state of the operation, what was just learned, and what to do next, in order. Written for an
 agent picking this up cold. The research detail behind every number here is in
 `blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
+
+**2026-10-03 (Sat):**
+- **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
+- **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
+- **The PC force-slept 23:06 Fri → 12:48 Sat.** The FEF tasks have WakeToRun=False. The operator must keep it awake (and TWS up) Monday.
+- **Batch 3 pre-registered (archive 18032e4), E52–E61:**
+  - datetime: the honest backtest is impossible on disk, so it is Watch-capped;
+  - peerxfer, dipnews, fipmom;
+  - four decision-support studies on paper money: peadrisk, dipslots, carrycost, bookcomp;
+  - ctrydip;
+  - ivinnov: a duplicate record.
+- **LOCK_TEMPLATE §7c:** a "book fit" exhibit is now required.
+- **spxwide2 O-FIX ruling:** the runner stays on P1.
+- **Fixed:** the ledger mirror had overwritten the archive's `spxwide2_trades.csv` (never committed; restored). The ledger now mirrors as `spxwide2_ledger_trades.csv`.
+- **The executor's 20× governor** refuses whole plans and flat-book plans, so every new sleeve needs a per-sleeve governor. It is a live-path item, bundled with the trend MOO change, awaiting the operator.
 
 **2026-10-02 late afternoon — TWS's API stopped accepting connections: today's sleeve rebalance did NOT trade.**
 - **What happened:**
