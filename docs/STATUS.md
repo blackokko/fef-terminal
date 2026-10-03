@@ -74,6 +74,10 @@ agent picking this up cold. The research detail behind every number here is in
   - SPYPCS-4 re-charged to M_eff 39 scores P 0.852 and stays Tier 1, labelled FILL-DEPENDENT. It holds while fills
     stay ≤ 1.60¢ a leg from the mid (author ruling).
   - **Operator decision open:** what to do with RE's 5 lots.
+- **Batch 2 pre-registered (20:00 CT, archive e38c084), E42–E51:** divmonth, insider4, mergarb, divpay, vixts, tailtime, trendbreadth, spybwb, resmom and retseas.
+  - Most are long shots. vixts and divpay are INSUFFICIENT by construction.
+  - `spytiming_HARNESS` Amendment 1: Tiered decision costs; N_eff,clusters is computed before any return, and below 30 is INSUFFICIENT. That is likely for batch 1A's fomcwk, credgate and vrptime.
+  - The scout added 13 cards (backlog: 60). EX-3 `trendclock` is the top dollar item: trend v3's live T+3 close vs next open.
 - **`volman` RAN (E23 → H44, archive 3132207):** vol-managed sizing adds no exposure-matched return. TREND is Branch
   D (harness) and SPY Branch F (one episode); both Tier 0.
   - **§J:** trend v3's backtest filled at the NEXT OPEN, but the live MOC executor fills at a later close. The next
