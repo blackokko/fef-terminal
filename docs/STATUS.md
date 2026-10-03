@@ -12,7 +12,7 @@ agent picking this up cold. The research detail behind every number here is in
   - P1 hedged: −$4.95/event (t −0.70). The live-like hedged cell: −$1.61 (P 0.42).
   - The live lag costs nothing measurable.
   - The study recommends stopping the live PEAD orders and keeping a tracker. It is the operator's call; their 10-02 choice to run it at $125k stands until they change it.
-  - PARTIAL: 14 T1 days are unpulled (ThetaData queue). Resume with `p2_repull.py pull` → `p2_seq.py intraday` → the report / registry / bundle scripts (D:ef-data\pead2\). It cannot change the verdict.
+  - PARTIAL: 14 T1 days are unpulled (ThetaData queue). Resume with `p2_repull.py pull` → `p2_seq.py intraday` → the report / registry / bundle scripts (`D:\fef-data\pead2\`). It cannot change the verdict.
 - **`idxdip` RAN (E26 → H47, archive c98c651):**
   - **S3b channel touch on SPY SHARES is Tier 1 by rule D** (P 0.919, ≈ $9.9k), out of sample on 1993–2016. It is NOT confirmed:
     - a plain 5-day-drop twin earns 90 % as much;
