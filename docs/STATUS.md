@@ -74,6 +74,11 @@ agent picking this up cold. The research detail behind every number here is in
   - SPYPCS-4 re-charged to M_eff 39 scores P 0.852 and stays Tier 1, labelled FILL-DEPENDENT. It holds while fills
     stay ≤ 1.60¢ a leg from the mid (author ruling).
   - **Operator decision open:** what to do with RE's 5 lots.
+- **`volxs` FINAL (E12 → H45, archive ba90b6c):** single-stock option volatility sorts on the PIT S&P 500 come out Branch E on both signals (HV − IV and the term slope), with G0 PASS and nothing to trade.
+  - HV − IV: +0.26 %/month at the mid (t +0.12). Term slope: +0.62 %/month (t +0.24).
+  - Selling the rich names' iron flies loses −11.2 % of max loss a month at bid/ask.
+  - This is the third confirmation that single-stock option spreads eat any volatility premium.
+  - M facts: a ThetaData option-data hole (roots LB…MCO, 2019-08 → 2020-03), and `expiration=*` drops.
 - **Batch 2 pre-registered (20:00 CT, archive e38c084), E42–E51:** divmonth, insider4, mergarb, divpay, vixts, tailtime, trendbreadth, spybwb, resmom and retseas.
   - Most are long shots. vixts and divpay are INSUFFICIENT by construction.
   - `spytiming_HARNESS` Amendment 1: Tiered decision costs; N_eff,clusters is computed before any return, and below 30 is INSUFFICIENT. That is likely for batch 1A's fomcwk, credgate and vrptime.
