@@ -74,6 +74,12 @@ agent picking this up cold. The research detail behind every number here is in
   - SPYPCS-4 re-charged to M_eff 39 scores P 0.852 and stays Tier 1, labelled FILL-DEPENDENT. It holds while fills
     stay ≤ 1.60¢ a leg from the mid (author ruling).
   - **Operator decision open:** what to do with RE's 5 lots.
+- **`trendbreadth` RAN (E48 → H46, archive 4c7514e):** adding sector and style ETFs does not help trend v3 (Branch C, Tier 0; −0.33 %/yr at the live book's risk). It also MEASURED the live clock: the executor fills at the close of T+3.
+  - That costs **0.88 pp/yr CAGR vs the next open (≈ $1,100/yr at $125k)** and deepens the max DD to −16.3 % (vs −14.5 %).
+  - The rule-D size on the live clock is ≈ $20.4k, and the FORWARD_CHECKS §2 drawdown line moves to 24.5 %.
+  - **Flag:** the executor's 20× rule-28 governor would have refused ~23 % of trend-only rebalances; with PEAD in the denominator this is unmeasured.
+  - Candidate change, ONE reviewed live-path change on the operator's go: MOO at T+1 plus a per-sleeve or post-resize-anchored governor.
+  - **Monday after 15:15 CT:** run `python -B D:/fef-data/trendbreadth/tb_g0d_check.py` (read-only) to confirm the 09-30 rebalance traded on 10-05.
 - **`volxs` FINAL (E12 → H45, archive ba90b6c):** single-stock option volatility sorts on the PIT S&P 500 come out Branch E on both signals (HV − IV and the term slope), with G0 PASS and nothing to trade.
   - HV − IV: +0.26 %/month at the mid (t +0.12). Term slope: +0.62 %/month (t +0.24).
   - Selling the rich names' iron flies loses −11.2 % of max loss a month at bid/ask.
