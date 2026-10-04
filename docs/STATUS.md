@@ -1,8 +1,20 @@
-# STATUS — 2026-10-03
+# STATUS — 2026-10-04
 
 Current state of the operation, what was just learned, and what to do next, in order. Written for an
 agent picking this up cold. The research detail behind every number here is in
 `blackokko/fef-research-archive` — `RESEARCH_REGISTRY.md` (§E for the studies below, §J corrections).
+
+**⚠ 2026-10-04 — URGENT, `govcap` (E62 → H55, archive 23be31b):** the sleeve executor's 20× turnover cap on `main` is UNSAFE.
+- It will probably refuse the Wed 11-04 month-end rebalance, exits included: P 0.83. It can bind from Fri 10-30.
+- The `sleeve-capital-250k` branch lowers that to P 0.34, but its reduce-only lock can last until the book is empty.
+- **Recommended: build G6 CHURN on top of the branch.**
+  - Remove rule 28 as a gate.
+  - Attribute the own book to sleeves, with a NET bucket.
+  - Withhold only a sleeve's re-entry within 5 sessions of its own reduction.
+  - Keep the gross guard.
+  - Remove the wrapper's `--accept-unknown-turnover`.
+- **Needs the operator's go**, then a build, tests and an adversarial review before 10-30.
+- The PC ran critically low on memory at 23:10 CT on 10-03. Run at most 2 heavy executors.
 
 **2026-10-03 (Sat):**
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
