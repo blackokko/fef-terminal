@@ -8,6 +8,10 @@ agent picking this up cold. The research detail behind every number here is in
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
 - **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
 - **The PC force-slept 23:06 Fri → 12:48 Sat.** The FEF tasks have WakeToRun=False. The operator must keep it awake (and TWS up) Monday.
+- **`bookdd` RAN (E65 → H54, archive 22e8024): pool the budget, keep the mix.**
+  - The four Tier-1 sleeves diversify each other: DR 1.75. No re-weighting beats the rule-D proportions.
+  - Author ruling: pooling scales only by the diversification credit, and only for sleeves with their own ≥ 3-month forward record. None qualifies yet, so **no size changes**.
+  - The book kill line is report-only.
 - **`carrycost` RAN (E57 → H53, archive cfc8857):** at IBKR, idle cash earns ≈ 0.46 %/yr under T-bills (0 % on the first $10k), and a ≈ $100k SPY short hedge costs ≈ 4.5–4.9 %/yr (0 % on the first $100k of proceeds).
   - **K40 is amended to the measured rates.** No tier changes.
   - Operator scope call (O4): a T-bill ETF for idle cash, ≈ +$270–650/yr.
