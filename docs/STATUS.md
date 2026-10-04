@@ -8,6 +8,9 @@ agent picking this up cold. The research detail behind every number here is in
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
 - **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
 - **The PC force-slept 23:06 Fri → 12:48 Sat.** The FEF tasks have WakeToRun=False. The operator must keep it awake (and TWS up) Monday.
+- **`carrycost` RAN (E57 → H53, archive cfc8857):** at IBKR, idle cash earns ≈ 0.46 %/yr under T-bills (0 % on the first $10k), and a ≈ $100k SPY short hedge costs ≈ 4.5–4.9 %/yr (0 % on the first $100k of proceeds).
+  - **K40 is amended to the measured rates.** No tier changes.
+  - Operator scope call (O4): a T-bill ETF for idle cash, ≈ +$270–650/yr.
 - **`chanx` RAN (E40 → H52, archive c0eff18): SPYPCS-4 is UNREPLICATED on QQQ + IWM.**
   - +$3.51/chain, t 0.46, P 0.678 → Watch.
   - Its timing is no better than random, and a plain "fell 1 %" rule does as well.
