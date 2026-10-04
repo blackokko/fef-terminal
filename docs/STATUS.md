@@ -16,6 +16,8 @@ agent picking this up cold. The research detail behind every number here is in
 - **Needs the operator's go**, then a build, tests and an adversarial review before 10-30.
 - The PC ran critically low on memory at 23:10 CT on 10-03. Run at most 2 heavy executors.
 
+- **`earnprem` RAN (E32 → H56, archive ecc9b01):** the earnings-announcement premium is Tier 0 after costs (−$1.07 an event, t −0.46; +$0.03 before costs). The shared earnings harness `eh` is frozen, which unblocks E33 / E34 / E52 / E53 / E67.
+
 **2026-10-03 (Sat):**
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
 - **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
