@@ -16,6 +16,7 @@ agent picking this up cold. The research detail behind every number here is in
 - **Needs the operator's go**, then a build, tests and an adversarial review before 10-30.
 - The PC ran critically low on memory at 23:10 CT on 10-03. Run at most 2 heavy executors.
 
+- **`dipslots` RAN (E56 → H57):** keep the dip-buy at 5 × 20 %. The alternatives earn fewer rule-D dollars because the cap rarely binds. Branch D is on a negative-side vehicle gate, within its measured false-failure rate.
 - **`earnprem` RAN (E32 → H56, archive ecc9b01):** the earnings-announcement premium is Tier 0 after costs (−$1.07 an event, t −0.46; +$0.03 before costs). The shared earnings harness `eh` is frozen, which unblocks E33 / E34 / E52 / E53 / E67.
 
 **2026-10-03 (Sat):**
