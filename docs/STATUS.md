@@ -16,6 +16,11 @@ agent picking this up cold. The research detail behind every number here is in
 - **Needs the operator's go**, then a build, tests and an adversarial review before 10-30.
 - The PC ran critically low on memory at 23:10 CT on 10-03. Run at most 2 heavy executors.
 
+- **Four more studies RAN (archive fac533f), no tier changes:**
+  - `dipnews` (E54 → H58) and `dipvol` (E69 → H59): the dip-buy keeps its rule. Skipping earnings-day dips changes nothing (Δ −0.13 %/yr, t −0.08). Skipping ordinary-volume dips costs 3.1 %/yr, and there is no volume effect once drop size is held fixed. SPXWIDE2-P1 stays Tier 1 at P 0.985 (O-FIX).
+  - `resmom` (E50 → H60): residual momentum is Tier 0 (−0.36 %/yr, t −0.10) and mostly MTUM.
+  - `retseas` (E51 → H61): same-month seasonality LOST 7.95 %/yr (t −2.75, P 0.003).
+  - New §M facts: the shared earnings harness `eh` drops real crash days as "split-like jumps", and the earnings calendar's holes are the later-delisted names. E33 / E34 / E52 / E53 / E67 must adjudicate both before any outcome. K49 has an addendum; K50 is new (random-name controls must match turnover).
 - **`dipslots` RAN (E56 → H57):** keep the dip-buy at 5 × 20 %. The alternatives earn fewer rule-D dollars because the cap rarely binds. Branch D is on a negative-side vehicle gate, within its measured false-failure rate.
 - **`earnprem` RAN (E32 → H56, archive ecc9b01):** the earnings-announcement premium is Tier 0 after costs (−$1.07 an event, t −0.46; +$0.03 before costs). The shared earnings harness `eh` is frozen, which unblocks E33 / E34 / E52 / E53 / E67.
 
