@@ -8,6 +8,12 @@ agent picking this up cold. The research detail behind every number here is in
 - **`spypcs2` is FINAL:** G0(h) PASS, 20/20 tick windows (archive 0979519).
 - **Running:** `pead2`, `chanx` (its pull waits for `spxwide2`'s tick checks), and `idxdip` (the SPY/QQQ/IWM share twin of the channel touch, scored pre-2017 only).
 - **The PC force-slept 23:06 Fri → 12:48 Sat.** The FEF tasks have WakeToRun=False. The operator must keep it awake (and TWS up) Monday.
+- **`chanx` RAN (E40 → H52, archive c0eff18): SPYPCS-4 is UNREPLICATED on QQQ + IWM.**
+  - +$3.51/chain, t 0.46, P 0.678 → Watch.
+  - Its timing is no better than random, and a plain "fell 1 %" rule does as well.
+  - The live RE rule loses to its own index exposure there too (α −$107/mo).
+  - **The S3B book stays on paper at 4 lots** under its kill rule (its SPY tier is unchanged). No step toward live money before SPY's own forward record and a live fill check.
+  - The pull took 10,155 requests in 6.1 h.
 - **`regate` RAN (E63 → H51, archive 155f594): RE's size is the only lever (Branch C).**
   - Book excess Sharpe: + S3B at matched risk 0.731; + SPY shares (≈ $38.5k) 0.691; no sleeve 0.642; fewer RE lots 0.60; **RE at 5 lots 0.591**.
   - The drawdown gate cuts RE's added DD 58 %, but at matched risk it is no better than fewer lots.
