@@ -16,6 +16,15 @@ agent picking this up cold. The research detail behind every number here is in
 - **Needs the operator's go**, then a build, tests and an adversarial review before 10-30.
 - The PC ran critically low on memory at 23:10 CT on 10-03. Run at most 2 heavy executors.
 
+- **Evening (archive 6e0668c): four more studies, nothing to run.**
+  - `fomcwk` (E28 → H62): INSUFFICIENT (N_eff 21.3); it LOST 4.45 %/yr after publication (+7.50 %/yr in the paper's years).
+  - `vrptime` (E30 → H63): Tier 0 (+0.03 %/yr, P 0.512).
+  - `termcal` (E37 → H64): Watch, capped by FILL-DEPENDENT. +$18.97 a calendar at MID+1, but 2025 carries all of it and the sign flips without the early-exercise rule. No ledger now (author ruling).
+  - `fomcvol` (E38 → H65): Tier 0 (−$11.29 an event); the FOMC crush is real but priced. Its CPI arm is dropped: BLS refuses automated clients without a contact User-Agent, and only the SEC string is approved (operator decision).
+  - Frozen family harnesses: `spytiming` (`bacf91a1…`) for E27/E29/E31/E47 and `spyopt` (`dda975bb…`) for E36/E39. K51 added.
+  - For the G6 build: `fomcwk`'s out-weeks last exactly 5 sessions, so G6's N = 5 churn rule would withhold almost every re-entry of a calendar sleeve; such sleeves need N ≤ 2 or an exemption.
+  - **`pead2` PARTIAL cleared** (19:20 CT): the 14 missing name-days were pulled; no gate, branch or tier changed.
+  - **Batch 5 being pre-registered (E70–E78):** `trendclock` (trend v3's execution clock — decision support for the MOO change), `pcstrend`, `putback`, `activist`, `buyback`, `spinco`, `hivol`, `netissue`, `stmom`; a scout is adding backlog cards.
 - **Four more studies RAN (archive fac533f), no tier changes:**
   - `dipnews` (E54 → H58) and `dipvol` (E69 → H59): the dip-buy keeps its rule. Skipping earnings-day dips changes nothing (Δ −0.13 %/yr, t −0.08). Skipping ordinary-volume dips costs 3.1 %/yr, and there is no volume effect once drop size is held fixed. SPXWIDE2-P1 stays Tier 1 at P 0.985 (O-FIX).
   - `resmom` (E50 → H60): residual momentum is Tier 0 (−0.36 %/yr, t −0.10) and mostly MTUM.
