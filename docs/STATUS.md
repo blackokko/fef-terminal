@@ -16,6 +16,7 @@ agent picking this up cold. The research detail behind every number here is in
 - **Needs the operator's go**, then a build, tests and an adversarial review before 10-30.
 - The PC ran critically low on memory at 23:10 CT on 10-03. Run at most 2 heavy executors.
 
+- **`spxwide2` is FINAL (19:50 CT):** G0(f)'s gap fills closed at 49 / 50 (target opens 48 / 50). Branch A, Tier 1, P 0.985, unchanged; still a forward ledger only.
 - **Evening (archive 6e0668c): four more studies, nothing to run.**
   - `fomcwk` (E28 → H62): INSUFFICIENT (N_eff 21.3); it LOST 4.45 %/yr after publication (+7.50 %/yr in the paper's years).
   - `vrptime` (E30 → H63): Tier 0 (+0.03 %/yr, P 0.512).
