@@ -16,6 +16,7 @@ agent picking this up cold. The research detail behind every number here is in
 - **Needs the operator's go**, then a build, tests and an adversarial review before 10-30.
 - The PC ran critically low on memory at 23:10 CT on 10-03. Run at most 2 heavy executors.
 - **`trendclock` (E70 → H66, 2026-10-05): RECOMMEND moving trend v3 to MOO at T+1** (+0.83 %/yr ≈ $1,030 a year at $125k, P 0.857, SAME-SAMPLE). It is a live-path build to ship with or after G6 (a pre-open MOO mode for the trend sleeve, the ledger booking T's evening, a shadow K3 line). The first adopted fill would be Mon 11-02. Needs the operator's go, bundled with G6.
+- **`pcstrend` (E71 → H67, 2026-10-05): Branch C.** Gating RE by trend v3's SPY state is Tier 0 at M_eff 43 (+$2.01 / −$0.88 a chain): it trades less, no better than fewer lots, and SPY shares beat it at the same risk. SPYPCS-4 re-charged to P 0.843 at M_eff 43, still Tier 1. RE's size stays the operator's decision.
 
 - **`spxwide2` is FINAL (19:50 CT):** G0(f)'s gap fills closed at 49 / 50 (target opens 48 / 50). Branch A, Tier 1, P 0.985, unchanged; still a forward ledger only.
 - **Evening (archive 6e0668c): four more studies, nothing to run.**
