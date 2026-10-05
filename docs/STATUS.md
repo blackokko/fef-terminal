@@ -25,7 +25,7 @@ agent picking this up cold. The research detail behind every number here is in
   - Frozen family harnesses: `spytiming` (`bacf91a1…`) for E27/E29/E31/E47 and `spyopt` (`dda975bb…`) for E36/E39. K51 added.
   - For the G6 build: `fomcwk`'s out-weeks last exactly 5 sessions, so G6's N = 5 churn rule would withhold almost every re-entry of a calendar sleeve; such sleeves need N ≤ 2 or an exemption.
   - **`pead2` PARTIAL cleared** (19:20 CT): the 14 missing name-days were pulled; no gate, branch or tier changed.
-  - **Batch 5 being pre-registered (E70–E78):** `trendclock` (trend v3's execution clock — decision support for the MOO change), `pcstrend`, `putback`, `activist`, `buyback`, `spinco`, `hivol`, `netissue`, `stmom`; a scout is adding backlog cards.
+  - **Batch 5 PRE-REGISTERED (archive 54b278b), E70–E78:** `trendclock` (E70, decision support: trend v3's execution clock; Phase 1 on disk, then ≈ 2,060 ThetaData requests; it runs first, for the 10-30 G6/MOO decision), `pcstrend`, `putback`, `activist`, `buyback`, `spinco`, `hivol`, `netissue` (owns the SHARES-PIT share-count build), `stmom`; `strev_AMENDMENT_1.md`; backlog §3.13 adds 11 cards, including the decision card `assignrisk` (early assignment of a live short SPY put), queued first among the new cards.
 - **Four more studies RAN (archive fac533f), no tier changes:**
   - `dipnews` (E54 → H58) and `dipvol` (E69 → H59): the dip-buy keeps its rule. Skipping earnings-day dips changes nothing (Δ −0.13 %/yr, t −0.08). Skipping ordinary-volume dips costs 3.1 %/yr, and there is no volume effect once drop size is held fixed. SPXWIDE2-P1 stays Tier 1 at P 0.985 (O-FIX).
   - `resmom` (E50 → H60): residual momentum is Tier 0 (−0.36 %/yr, t −0.10) and mostly MTUM.
