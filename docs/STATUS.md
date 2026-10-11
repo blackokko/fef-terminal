@@ -2,6 +2,12 @@
 
 **⚠ 2026-10-10 — THE PC SLEPT ALL WEEK (10-05 00:57 CT → 10-10 23:10 CT). Nothing ran after Fri 10-02:** no sleeve executor (the 10-02 trend rebalance is still untraded), no SPY runner ticks (S3B never entered), no ledgers, no fillq. The book holds the ten 9/30 buys; both spread books are flat. The FEF tasks have WakeToRun=False. For Mon 10-12: TWS up and logged in, and the PC awake (the operator's call: WakeToRun / power plan). Still open: "merge it" ($250k), the G6 go (deadline 10-30), the trendclock MOO add-on, RE's lots, PEAD, the BLS contact string.
 
+**⚠ 2026-10-10 — `assignrisk` (E79 → H68): two HARMFUL runner paths, one SILENT executor path (archive, this commit).**
+- With both SPY books in the same spread, one book's early assignment silently stalls the other book's 2× stop or roll (exit 3, no URGENT, no toast); RE's case also loops.
+- `main` reports MOC buys rejected for buying power as transmitted (exit 0); the reviewed $250k branch catches it.
+- Assignment itself is rare at these rules (RE λ 0.31 a year, S3B 0), so no must-close. Recommended: S1 (URGENT + exit 4 when a must-close is blocked by the other book) and alarm/text fixes S3–S7 in one SPY-runner build, plus S2 via the $250k merge. Each needs tests, an adversarial review and the operator's go.
+- Interim: treat POSITION MISSING / CANNOT CHECK on a shared spread as a possible assignment; sell only the assigned SPY shares, keep the long put until they are sold, and never follow the expiry-day "close N lots" text after an assignment.
+
 
 Current state of the operation, what was just learned, and what to do next, in order. Written for an
 agent picking this up cold. The research detail behind every number here is in
