@@ -1,4 +1,7 @@
-# STATUS — 2026-10-04
+# STATUS — 2026-10-10
+
+**⚠ 2026-10-10 — THE PC SLEPT ALL WEEK (10-05 00:57 CT → 10-10 23:10 CT). Nothing ran after Fri 10-02:** no sleeve executor (the 10-02 trend rebalance is still untraded), no SPY runner ticks (S3B never entered), no ledgers, no fillq. The book holds the ten 9/30 buys; both spread books are flat. The FEF tasks have WakeToRun=False. For Mon 10-12: TWS up and logged in, and the PC awake (the operator's call: WakeToRun / power plan). Still open: "merge it" ($250k), the G6 go (deadline 10-30), the trendclock MOO add-on, RE's lots, PEAD, the BLS contact string.
+
 
 Current state of the operation, what was just learned, and what to do next, in order. Written for an
 agent picking this up cold. The research detail behind every number here is in
